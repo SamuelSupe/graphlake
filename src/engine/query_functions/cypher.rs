@@ -1,0 +1,939 @@
+mod arithmetic;
+pub(in crate::engine) mod collect;
+mod entity;
+mod hydrate;
+mod map;
+mod numeric_distinct;
+mod range;
+pub(in crate::engine) mod reduce;
+
+use std::{cmp::Ordering, collections::HashSet, sync::Arc};
+
+use datafusion::{
+    arrow::{
+        array::{
+            Array, ArrayRef, BinaryBuilder, BooleanBuilder, ListArray, MutableArrayData,
+            StructArray, make_array, new_null_array,
+        },
+        buffer::{NullBuffer, OffsetBuffer},
+        compute::cast,
+        datatypes::{DataType, Field, Fields},
+        row::{RowConverter, SortField},
+    },
+    common::{Result, ScalarValue, exec_err},
+    logical_expr::{
+        BinaryExpr, ColumnarValue, Expr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+        Signature, Volatility,
+        simplify::{ExprSimplifyResult, SimplifyContext},
+    },
+    prelude::SessionContext,
+};
+
+pub(super) fn register(context: &SessionContext) {
+    for (name, signature) in [
+        (
+            "__graphlake_cypher_property",
+            Signature::variadic_any(Volatility::Immutable),
+        ),
+        (
+            "__graphlake_cypher_case",
+            Signature::any(2, Volatility::Immutable),
+        ),
+    ] {
+        context.register_udf(ScalarUDF::from(Property { name, signature }));
+    }
+    context.register_udf(ScalarUDF::from(CypherList(Signature::variadic_any(
+        Volatility::Immutable,
+    ))));
+    entity::register(context);
+    hydrate::register(context);
+    arithmetic::register(context);
+    map::register(context);
+    numeric_distinct::register(context);
+    range::register(context);
+    for mode in [KeyMode::Equivalence, KeyMode::Order, KeyMode::GremlinOrder] {
+        context.register_udf(ScalarUDF::from(ValueKey {
+            mode,
+            signature: Signature::any(1, Volatility::Immutable),
+        }));
+    }
+    for (name, arity) in [
+        ("__graphlake_cypher_equals", 2),
+        ("__graphlake_cypher_in", 2),
+        ("__graphlake_cypher_compare", 3),
+    ] {
+        context.register_udf(ScalarUDF::from(Predicate {
+            name,
+            signature: Signature::any(arity, Volatility::Immutable),
+        }));
+    }
+}
+
+const VARIANT: &str = "graphlake.cypher.variant";
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Property {
+    name: &'static str,
+    signature: Signature,
+}
+
+fn normalized(ty: &DataType) -> DataType {
+    match ty {
+        DataType::Dictionary(_, value) => normalized(value),
+        ty if text_type(ty) => DataType::Utf8View,
+        ty => ty.clone(),
+    }
+}
+
+pub(super) fn value_types(ty: &DataType, types: &mut Vec<DataType>) {
+    if let DataType::Struct(fields) = ty
+        && is_variant(fields)
+    {
+        for field in fields {
+            value_types(field.data_type(), types);
+        }
+    } else if !ty.is_null() {
+        types.push(normalized(ty));
+    }
+}
+
+fn common_value_type<'a>(inputs: impl Iterator<Item = &'a DataType>) -> DataType {
+    let mut types = Vec::new();
+    for ty in inputs {
+        value_types(ty, &mut types);
+    }
+    let items = types
+        .iter()
+        .filter_map(|ty| match ty {
+            DataType::List(item) => Some(item.data_type()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if items.len() > 1 {
+        let list = DataType::new_list(common_value_type(items.into_iter()), true);
+        types.retain(|ty| !matches!(ty, DataType::List(_)));
+        types.push(list);
+    }
+    types.sort_by_cached_key(|ty| (ty.to_string(), ty.clone()));
+    types.dedup();
+    match types.as_slice() {
+        [] => DataType::Null,
+        [ty] => ty.clone(),
+        types => {
+            // Each slot has a native Arrow type. Slots have a stable order even
+            // when a CASE or a later UNION adds types to an existing value.
+            let fields = types
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| {
+                    let name = if types[..index]
+                        .iter()
+                        .any(|previous| previous.to_string() == ty.to_string())
+                    {
+                        format!("{ty}_{index}")
+                    } else {
+                        ty.to_string()
+                    };
+                    Field::new(name, ty.clone(), true)
+                        .with_metadata([(VARIANT.into(), "1".into())].into())
+                })
+                .collect::<Fields>();
+            DataType::Struct(fields)
+        }
+    }
+}
+
+pub(super) fn flatten_value(array: ArrayRef, lanes: &mut Vec<ArrayRef>) {
+    if let Some(record) = array.as_any().downcast_ref::<StructArray>()
+        && is_variant(record.fields())
+    {
+        for child in record.flatten().1 {
+            flatten_value(child, lanes);
+        }
+    } else if !array.data_type().is_null() {
+        lanes.push(array);
+    }
+}
+
+fn merge_values(arrays: Vec<ArrayRef>, ty: &DataType, rows: usize) -> Result<ArrayRef> {
+    let mut lanes = Vec::new();
+    for array in arrays {
+        flatten_value(array, &mut lanes);
+    }
+    if let DataType::Struct(fields) = ty
+        && is_variant(fields)
+    {
+        let columns = fields
+            .iter()
+            .map(|field| merge_lanes(&lanes, field.data_type(), rows))
+            .collect::<Result<Vec<_>>>()?;
+        let present = (0..rows)
+            .map(|index| columns.iter().any(|column| column.is_valid(index)))
+            .collect::<Vec<_>>();
+        Ok(Arc::new(StructArray::try_new(
+            fields.clone(),
+            columns,
+            Some(NullBuffer::from(present)),
+        )?))
+    } else {
+        merge_lanes(&lanes, ty, rows)
+    }
+}
+
+impl ScalarUDFImpl for Property {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+        if self.name == "__graphlake_cypher_case" {
+            let DataType::Struct(fields) = &args[1] else {
+                return exec_err!("CASE branches must be a record");
+            };
+            return Ok(common_value_type(
+                fields.iter().map(|field| field.data_type()),
+            ));
+        }
+        Ok(common_value_type(args.iter()))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let mut arrays = args
+            .args
+            .iter()
+            .map(|arg| arg.to_array(args.number_rows))
+            .collect::<Result<Vec<_>>>()?;
+        if self.name == "__graphlake_cypher_case" {
+            arrays = arrays[0]
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("typed CASE record")
+                .flatten()
+                .1;
+        }
+        Ok(ColumnarValue::Array(merge_values(
+            arrays,
+            args.return_field.data_type(),
+            args.number_rows,
+        )?))
+    }
+}
+
+pub(super) fn merge_lanes(arrays: &[ArrayRef], ty: &DataType, rows: usize) -> Result<ArrayRef> {
+    let arrays = arrays
+        .iter()
+        .filter_map(|a| {
+            if a.data_type() == ty {
+                return Some(Ok(Arc::clone(a)));
+            }
+            if let (DataType::List(item), Some(list)) = (ty, a.as_any().downcast_ref::<ListArray>())
+            {
+                return Some(
+                    merge_values(
+                        vec![Arc::clone(list.values())],
+                        item.data_type(),
+                        list.values().len(),
+                    )
+                    .and_then(|values| {
+                        Ok(Arc::new(ListArray::try_new(
+                            Arc::clone(item),
+                            list.offsets().clone(),
+                            values,
+                            list.nulls().cloned(),
+                        )?) as ArrayRef)
+                    }),
+                );
+            }
+            (!a.data_type().is_null() && normalized(a.data_type()) == *ty).then(|| Ok(cast(a, ty)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if arrays.is_empty() {
+        return Ok(new_null_array(ty, rows));
+    }
+    if arrays.len() == 1 {
+        return Ok(arrays.into_iter().next().expect("single property lane"));
+    }
+    let data = arrays
+        .iter()
+        .map(|array| array.to_data())
+        .collect::<Vec<_>>();
+    let mut merged = MutableArrayData::new(data.iter().collect(), true, rows);
+    for index in 0..rows {
+        if let Some(lane) = arrays.iter().position(|array| array.is_valid(index)) {
+            merged.try_extend(lane, index, index + 1)?;
+        } else {
+            merged.try_extend_nulls(1)?;
+        }
+    }
+    Ok(make_array(merged.freeze()))
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CypherList(Signature);
+
+impl ScalarUDFImpl for CypherList {
+    fn name(&self) -> &str {
+        "__graphlake_cypher_list"
+    }
+    fn signature(&self) -> &Signature {
+        &self.0
+    }
+
+    fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+        Ok(DataType::new_list(common_value_type(args.iter()), true))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let arrays = args
+            .args
+            .iter()
+            .map(|arg| arg.to_array(args.number_rows))
+            .collect::<Result<Vec<_>>>()?;
+        let types = arrays
+            .iter()
+            .map(|array| array.data_type().clone())
+            .collect::<Vec<_>>();
+        let width = arrays.len();
+        let rows = args.number_rows;
+        if width
+            .checked_mul(rows)
+            .is_none_or(|len| len > i32::MAX as usize)
+        {
+            return exec_err!("Cypher list exceeds the Arrow offset range");
+        }
+        let DataType::List(item) = self.return_type(&types)? else {
+            unreachable!()
+        };
+        let arrays = arrays
+            .into_iter()
+            .map(|array| merge_values(vec![array], item.data_type(), rows))
+            .collect::<Result<Vec<_>>>()?;
+        let values = interleave_list(&arrays, item.data_type(), rows)?;
+        let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(width, rows));
+        Ok(ColumnarValue::Array(Arc::new(ListArray::try_new(
+            item, offsets, values, None,
+        )?)))
+    }
+}
+
+fn interleave_list(arrays: &[ArrayRef], ty: &DataType, rows: usize) -> Result<ArrayRef> {
+    if arrays.is_empty() {
+        return Ok(new_null_array(ty, 0));
+    }
+    let data = arrays
+        .iter()
+        .map(|array| array.to_data())
+        .collect::<Vec<_>>();
+    let mut values = MutableArrayData::new(data.iter().collect(), true, rows * arrays.len());
+    for row in 0..rows {
+        for lane in 0..arrays.len() {
+            values.try_extend(lane, row, row + 1)?;
+        }
+    }
+    Ok(make_array(values.freeze()))
+}
+
+pub(in crate::engine) fn is_variant(fields: &Fields) -> bool {
+    fields
+        .first()
+        .is_some_and(|field| field.metadata().contains_key(VARIANT))
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Predicate {
+    name: &'static str,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for Predicate {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> Result<ExprSimplifyResult> {
+        let operator = match (self.name, args.as_slice()) {
+            ("__graphlake_cypher_equals", [_, _]) => Some(Operator::Eq),
+            (
+                "__graphlake_cypher_compare",
+                [
+                    _,
+                    _,
+                    Expr::Literal(ScalarValue::Utf8(Some(op)) | ScalarValue::Utf8View(Some(op)), _),
+                ],
+            ) => sql_operator(op),
+            _ => None,
+        };
+        if let Some(operator) = operator {
+            let left = info.get_data_type(&args[0])?;
+            let right = info.get_data_type(&args[1])?;
+            if (text_type(&left) && text_type(&right))
+                || (left == DataType::Boolean && right == DataType::Boolean)
+            {
+                return Ok(ExprSimplifyResult::Simplified(Expr::BinaryExpr(
+                    BinaryExpr::new(
+                        Box::new(args[0].clone()),
+                        operator,
+                        Box::new(args[1].clone()),
+                    ),
+                )));
+            }
+            // Preserve integer predicate pushdown when the operands already
+            // agree or when a constant fits the column type exactly.
+            if left.is_integer() && right.is_integer() {
+                let operands = if left == right {
+                    Some((args[0].clone(), args[1].clone()))
+                } else if let Some(value) = integer_literal_as(&args[1], &left)? {
+                    Some((args[0].clone(), value))
+                } else {
+                    integer_literal_as(&args[0], &right)?.map(|value| (value, args[1].clone()))
+                };
+                if let Some((left, right)) = operands {
+                    return Ok(ExprSimplifyResult::Simplified(Expr::BinaryExpr(
+                        BinaryExpr::new(Box::new(left), operator, Box::new(right)),
+                    )));
+                }
+            }
+        }
+        Ok(ExprSimplifyResult::Original(args))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let input = args.args[0].to_array(args.number_rows)?;
+        let right = args.args[1].to_array(args.number_rows)?;
+        let op = if self.name == "__graphlake_cypher_compare" {
+            args.args[2].to_array(args.number_rows)?
+        } else {
+            new_null_array(&DataType::Null, args.number_rows)
+        };
+        let mut output = BooleanBuilder::with_capacity(args.number_rows);
+        for row in 0..args.number_rows {
+            let left = unpack(ScalarValue::try_from_array(&input, row)?)?;
+            let right = unpack(ScalarValue::try_from_array(&right, row)?)?;
+            let result = match self.name {
+                "__graphlake_cypher_in" => membership(&left, &right)?,
+                "__graphlake_cypher_equals" => equal(&left, &right)?,
+                _ => {
+                    let op = ScalarValue::try_from_array(&op, row)?.cast_to(&DataType::Utf8)?;
+                    let ScalarValue::Utf8(Some(op)) = op else {
+                        return exec_err!("missing comparison operator");
+                    };
+                    match op.as_str() {
+                        "=" => equal(&left, &right)?,
+                        "<>" => equal(&left, &right)?.map(|same| !same),
+                        _ if left.is_null() || right.is_null() => None,
+                        _ if float(&left).is_some_and(f64::is_nan)
+                            || float(&right).is_some_and(f64::is_nan) =>
+                        {
+                            Some(false)
+                        }
+                        _ => ordering(&left, &right)?.map(|order| match op.as_str() {
+                            "<" => order.is_lt(),
+                            "<=" => !order.is_gt(),
+                            ">" => order.is_gt(),
+                            ">=" => !order.is_lt(),
+                            _ => unreachable!("generated comparison operator"),
+                        }),
+                    }
+                }
+            };
+            output.append_option(result);
+        }
+        Ok(ColumnarValue::Array(Arc::new(output.finish())))
+    }
+}
+
+fn unpack(value: ScalarValue) -> Result<ScalarValue> {
+    if let ScalarValue::Dictionary(_, inner) = value {
+        return unpack(*inner);
+    }
+    if let ScalarValue::Struct(values) = &value
+        && is_variant(values.fields())
+    {
+        return values
+            .columns()
+            .iter()
+            .find(|array| array.is_valid(0) && values.is_valid(0))
+            .map_or(Ok(ScalarValue::Null), |array| {
+                unpack(ScalarValue::try_from_array(array, 0)?)
+            });
+    }
+    Ok(value)
+}
+
+fn list_items(value: &ScalarValue) -> Option<ArrayRef> {
+    match value {
+        ScalarValue::List(array) => Some(array.value(0)),
+        ScalarValue::LargeList(array) => Some(array.value(0)),
+        ScalarValue::FixedSizeList(array) => Some(array.value(0)),
+        ScalarValue::ListView(array) => Some(array.value(0)),
+        ScalarValue::LargeListView(array) => Some(array.value(0)),
+        _ => None,
+    }
+}
+
+fn membership(left: &ScalarValue, right: &ScalarValue) -> Result<Option<bool>> {
+    if right.is_null() {
+        return Ok(None);
+    }
+    let Some(items) = list_items(right) else {
+        return exec_err!("Cypher IN expects a list");
+    };
+    let mut found = Some(false);
+    for index in 0..items.len() {
+        match equal(left, &unpack(ScalarValue::try_from_array(&items, index)?)?)? {
+            Some(true) => return Ok(Some(true)),
+            None => found = None,
+            Some(false) => {}
+        }
+    }
+    Ok(found)
+}
+
+pub(super) fn text_type(value: &DataType) -> bool {
+    matches!(
+        value,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+fn integer_literal_as(expr: &Expr, ty: &DataType) -> Result<Option<Expr>> {
+    let Expr::Literal(value, metadata) = expr else {
+        return Ok(None);
+    };
+    let Ok(converted) = value.cast_to(ty) else {
+        return Ok(None);
+    };
+    Ok((converted.cast_to(&value.data_type())? == *value)
+        .then(|| Expr::Literal(converted, metadata.clone())))
+}
+
+fn sql_operator(op: &str) -> Option<Operator> {
+    Some(match op {
+        "=" => Operator::Eq,
+        "<>" => Operator::NotEq,
+        "<" => Operator::Lt,
+        "<=" => Operator::LtEq,
+        ">" => Operator::Gt,
+        ">=" => Operator::GtEq,
+        _ => return None,
+    })
+}
+
+fn float(value: &ScalarValue) -> Option<f64> {
+    match value {
+        ScalarValue::Float16(value) => value.map(|value| f64::from(value.to_f32())),
+        ScalarValue::Float32(value) => value.map(f64::from),
+        ScalarValue::Float64(value) => *value,
+        _ => None,
+    }
+}
+
+fn numeric_order(left: &ScalarValue, right: &ScalarValue) -> Option<Ordering> {
+    let a = float(left);
+    let b = float(right);
+    if let (Some(a), Some(b)) = (a, b) {
+        return a.partial_cmp(&b);
+    }
+    if let Some(a) = a.filter(|n| !n.is_finite()) {
+        return a.partial_cmp(&0.0);
+    }
+    if let Some(b) = b.filter(|n| !n.is_finite()) {
+        return 0.0f64.partial_cmp(&b);
+    }
+    if left.data_type() == right.data_type() {
+        return left.partial_cmp(right);
+    }
+    Some(crate::scalar::finite_decimal(left)?.cmp(&crate::scalar::finite_decimal(right)?))
+}
+
+fn ordering(left: &ScalarValue, right: &ScalarValue) -> Result<Option<Ordering>> {
+    if let (Some(left), Some(right)) = (list_items(left), list_items(right)) {
+        for index in 0..left.len().min(right.len()) {
+            let a = unpack(ScalarValue::try_from_array(&left, index)?)?;
+            let b = unpack(ScalarValue::try_from_array(&right, index)?)?;
+            if a.is_null() || b.is_null() {
+                return Ok(None);
+            }
+            let result = ordering(&a, &b)?;
+            if result != Some(Ordering::Equal) {
+                return Ok(result);
+            }
+        }
+        return Ok(Some(left.len().cmp(&right.len())));
+    }
+    let left_id = entity::identity(left)?;
+    let right_id = entity::identity(right)?;
+    if left_id.is_some() || right_id.is_some() {
+        return match (left_id, right_id) {
+            (Some([left_kind, ..]), Some([right_kind, ..]))
+                if equal(&left_kind, &right_kind)? == Some(true) =>
+            {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                encode_order(left.clone(), &mut a, false)?;
+                encode_order(right.clone(), &mut b, false)?;
+                Ok(Some(a.cmp(&b)))
+            }
+            _ => Ok(None),
+        };
+    }
+    let a = left.data_type();
+    let b = right.data_type();
+    Ok(if a.is_numeric() && b.is_numeric() {
+        numeric_order(left, right)
+    } else if text_type(&a) && text_type(&b) {
+        left.cast_to(&DataType::Utf8)?
+            .partial_cmp(&right.cast_to(&DataType::Utf8)?)
+    } else if a == b {
+        left.partial_cmp(right)
+    } else {
+        None
+    })
+}
+
+fn equal(left: &ScalarValue, right: &ScalarValue) -> Result<Option<bool>> {
+    if left.is_null() || right.is_null() {
+        return Ok(None);
+    }
+    let left_id = entity::identity(left)?;
+    let right_id = entity::identity(right)?;
+    if left_id.is_some() || right_id.is_some() {
+        return match (left_id, right_id) {
+            (Some(left), Some(right)) => equal_items(left.into_iter().zip(right).map(Ok)),
+            _ => Ok(Some(false)),
+        };
+    }
+    if let (Some(left), Some(right)) = (list_items(left), list_items(right)) {
+        if left.len() != right.len() {
+            return Ok(Some(false));
+        }
+        return equal_items((0..left.len()).map(|index| {
+            Ok((
+                ScalarValue::try_from_array(&left, index)?,
+                ScalarValue::try_from_array(&right, index)?,
+            ))
+        }));
+    }
+    if let (ScalarValue::Struct(left), ScalarValue::Struct(right)) = (left, right) {
+        if left.num_columns() != right.num_columns()
+            || left
+                .fields()
+                .iter()
+                .any(|field| right.column_by_name(field.name()).is_none())
+        {
+            return Ok(Some(false));
+        }
+        return equal_items(
+            left.fields()
+                .iter()
+                .zip(left.columns())
+                .map(|(field, column)| {
+                    let other = right.column_by_name(field.name()).expect("same map keys");
+                    Ok((
+                        ScalarValue::try_from_array(column, 0)?,
+                        ScalarValue::try_from_array(other, 0)?,
+                    ))
+                }),
+        );
+    }
+    if left.data_type() == right.data_type() && !left.data_type().is_numeric() {
+        return Ok(Some(left == right));
+    }
+    Ok(Some(ordering(left, right)? == Some(Ordering::Equal)))
+}
+
+fn equal_items(
+    items: impl Iterator<Item = Result<(ScalarValue, ScalarValue)>>,
+) -> Result<Option<bool>> {
+    let mut result = Some(true);
+    for item in items {
+        let (a, b) = item?;
+        match equal(&unpack(a)?, &unpack(b)?)? {
+            Some(false) => return Ok(Some(false)),
+            None => result = None,
+            Some(true) => {}
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum KeyMode {
+    Equivalence,
+    Order,
+    GremlinOrder,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ValueKey {
+    mode: KeyMode,
+    signature: Signature,
+}
+
+impl ValueKey {
+    fn encodes(&self, ty: &DataType) -> bool {
+        self.mode == KeyMode::GremlinOrder || needs_equivalence_key(ty)
+    }
+}
+
+impl ScalarUDFImpl for ValueKey {
+    fn name(&self) -> &str {
+        match self.mode {
+            KeyMode::Equivalence => "__graphlake_cypher_equivalence",
+            KeyMode::Order => "__graphlake_cypher_order",
+            KeyMode::GremlinOrder => "__graphlake_gremlin_order",
+        }
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+        let ty = &args[0];
+        Ok(if self.encodes(ty) {
+            DataType::Binary
+        } else {
+            ty.clone()
+        })
+    }
+
+    fn simplify(&self, mut args: Vec<Expr>, info: &SimplifyContext) -> Result<ExprSimplifyResult> {
+        if !self.encodes(&info.get_data_type(&args[0])?) {
+            return Ok(ExprSimplifyResult::Simplified(args.remove(0)));
+        }
+        Ok(ExprSimplifyResult::Original(args))
+    }
+
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let input = args.args.remove(0);
+        if !self.encodes(&input.data_type()) {
+            return Ok(input);
+        }
+        let input = input.to_array(args.number_rows)?;
+        let mut keys = BinaryBuilder::new();
+        let mut key = Vec::new();
+        for index in 0..input.len() {
+            key.clear();
+            let value = ScalarValue::try_from_array(&input, index)?;
+            if matches!(self.mode, KeyMode::Order | KeyMode::GremlinOrder) {
+                let value = unpack(value)?;
+                if value.is_null() {
+                    keys.append_null();
+                    continue;
+                }
+                encode_order(value, &mut key, self.mode == KeyMode::GremlinOrder)?;
+            } else {
+                encode_equivalence(value, &mut key)?;
+            }
+            keys.append_value(&key);
+        }
+        Ok(ColumnarValue::Array(Arc::new(keys.finish())))
+    }
+}
+
+fn distinct_list(input: ArrayRef) -> Result<ArrayRef> {
+    let Some(list) = input.as_any().downcast_ref::<ListArray>() else {
+        return exec_err!("collect(DISTINCT) requires a list");
+    };
+    let DataType::List(field) = list.data_type() else {
+        unreachable!("collect list type")
+    };
+    let data = list.values().to_data();
+    let mut values = MutableArrayData::new(vec![&data], true, list.values().len());
+    let mut seen = HashSet::new();
+    let mut lengths = Vec::with_capacity(list.len());
+    for window in list.value_offsets().windows(2) {
+        seen.clear();
+        for index in window[0] as usize..window[1] as usize {
+            let mut key = Vec::new();
+            encode_equivalence(ScalarValue::try_from_array(list.values(), index)?, &mut key)?;
+            if seen.insert(key) {
+                values.try_extend(0, index, index + 1)?;
+            }
+        }
+        lengths.push(seen.len());
+    }
+    Ok(Arc::new(ListArray::try_new(
+        field.clone(),
+        OffsetBuffer::from_lengths(lengths),
+        make_array(values.freeze()),
+        list.nulls().cloned(),
+    )?))
+}
+
+fn needs_equivalence_key(ty: &DataType) -> bool {
+    ty.is_nested() || ty.is_floating() || matches!(ty, DataType::Dictionary(..))
+}
+
+fn encode_equivalence(value: ScalarValue, key: &mut Vec<u8>) -> Result<()> {
+    let value = unpack(value)?;
+    if value.is_null() {
+        key.push(0);
+    } else if let Some(identity) = entity::identity(&value)? {
+        key.push(8);
+        for part in identity {
+            encode_equivalence(part, key)?;
+        }
+    } else if value.data_type().is_numeric() {
+        key.push(1);
+        let decimal = crate::scalar::finite_decimal(&value).map(|n| n.normalized().to_string());
+        let number =
+            decimal.unwrap_or_else(|| float(&value).expect("non-finite number").to_string());
+        encode_bytes(number.as_bytes(), key);
+    } else if let ScalarValue::Utf8(Some(text))
+    | ScalarValue::Utf8View(Some(text))
+    | ScalarValue::LargeUtf8(Some(text)) = &value
+    {
+        key.push(2);
+        encode_bytes(text.as_bytes(), key);
+    } else if let ScalarValue::Boolean(Some(value)) = &value {
+        key.push(if *value { 6 } else { 7 });
+    } else if let Some(items) = list_items(&value) {
+        key.push(3);
+        key.extend_from_slice(&items.len().to_le_bytes());
+        for index in 0..items.len() {
+            encode_equivalence(ScalarValue::try_from_array(&items, index)?, key)?;
+        }
+    } else if let ScalarValue::Struct(record) = value {
+        key.push(4);
+        let mut fields = record
+            .fields()
+            .iter()
+            .zip(record.columns())
+            .collect::<Vec<_>>();
+        fields.sort_unstable_by_key(|(field, _)| field.name());
+        key.extend_from_slice(&fields.len().to_le_bytes());
+        for (field, column) in fields {
+            encode_bytes(field.name().as_bytes(), key);
+            encode_equivalence(ScalarValue::try_from_array(column, 0)?, key)?;
+        }
+    } else {
+        key.push(5);
+        let ty = value.data_type();
+        encode_bytes(ty.to_string().as_bytes(), key);
+        let converter = RowConverter::new(vec![SortField::new(ty)])?;
+        let rows = converter.convert_columns(&[value.to_array()?])?;
+        encode_bytes(rows.row(0).as_ref(), key);
+    }
+    Ok(())
+}
+
+fn encode_bytes(bytes: &[u8], key: &mut Vec<u8>) {
+    key.extend_from_slice(&bytes.len().to_le_bytes());
+    key.extend_from_slice(bytes);
+}
+
+// Cypher orders incomparable types for sorting, while comparison operators
+// still return null for values without an ordering relation.
+fn encode_order(value: ScalarValue, key: &mut Vec<u8>, gremlin: bool) -> Result<()> {
+    let value = unpack(value)?;
+    if value.is_null() {
+        key.push(if gremlin { 1 } else { 255 });
+    } else if let Some([kind, label, id]) = entity::identity(&value)? {
+        key.push(
+            if matches!(kind, ScalarValue::Utf8(Some(name))
+                | ScalarValue::Utf8View(Some(name))
+                | ScalarValue::LargeUtf8(Some(name)) if name == "node")
+            {
+                2
+            } else {
+                3
+            },
+        );
+        encode_order(label, key, gremlin)?;
+        encode_order(id, key, gremlin)?;
+    } else if let Some(items) = list_items(&value) {
+        key.push(if gremlin { 9 } else { 4 });
+        for index in 0..items.len() {
+            encode_order(ScalarValue::try_from_array(&items, index)?, key, gremlin)?;
+        }
+        key.push(0);
+    } else if let ScalarValue::Struct(record) = &value {
+        key.push(if gremlin { 11 } else { 1 });
+        let mut fields = record
+            .fields()
+            .iter()
+            .zip(record.columns())
+            .collect::<Vec<_>>();
+        fields.sort_unstable_by_key(|(field, _)| field.name());
+        for (field, column) in fields {
+            key.push(1);
+            encode_order_bytes(field.name().as_bytes(), key);
+            encode_order(ScalarValue::try_from_array(column, 0)?, key, gremlin)?;
+        }
+        key.push(0);
+    } else if let ScalarValue::Utf8(Some(text))
+    | ScalarValue::Utf8View(Some(text))
+    | ScalarValue::LargeUtf8(Some(text)) = &value
+    {
+        key.push(if gremlin { 5 } else { 6 });
+        encode_order_bytes(text.as_bytes(), key);
+    } else if let ScalarValue::Boolean(Some(value)) = value {
+        key.extend_from_slice(&[if gremlin { 2 } else { 7 }, u8::from(value)]);
+    } else if value.data_type().is_numeric() {
+        key.push(if gremlin { 3 } else { 8 });
+        if let Some(decimal) = crate::scalar::finite_decimal(&value) {
+            let (coefficient, scale) = decimal.normalized().as_bigint_and_exponent();
+            let digits = coefficient.to_string();
+            if digits == "0" {
+                key.push(2);
+            } else {
+                let (negative, digits) = match digits.strip_prefix('-') {
+                    Some(digits) => (true, digits),
+                    None => (false, digits.as_str()),
+                };
+                key.push(if negative { 1 } else { 3 });
+                // Sort magnitude by scientific exponent and then significand.
+                let exponent = (digits.len() as i64 - scale) as u64 ^ (1 << 63);
+                let bytes = exponent
+                    .to_be_bytes()
+                    .into_iter()
+                    .chain(digits.bytes())
+                    .chain(std::iter::once(0));
+                key.extend(bytes.map(|byte| if negative { !byte } else { byte }));
+            }
+        } else {
+            let number = float(&value).expect("non-finite number");
+            key.push(if number.is_nan() {
+                5
+            } else if number.is_sign_positive() {
+                4
+            } else {
+                0
+            });
+        }
+    } else {
+        let ty = value.data_type();
+        key.push(if gremlin {
+            match ty {
+                DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) => 4,
+                _ => 12,
+            }
+        } else {
+            9
+        });
+        encode_order_bytes(ty.to_string().as_bytes(), key);
+        let converter = RowConverter::new(vec![SortField::new(ty)])?;
+        let rows = converter.convert_columns(&[value.to_array()?])?;
+        encode_order_bytes(rows.row(0).as_ref(), key);
+    }
+    Ok(())
+}
+
+fn encode_order_bytes(bytes: &[u8], key: &mut Vec<u8>) {
+    for byte in bytes {
+        key.push(*byte);
+        if *byte == 0 {
+            key.push(255);
+        }
+    }
+    key.extend_from_slice(&[0, 0]);
+}

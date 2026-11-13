@@ -1,0 +1,75 @@
+[workspace]
+members = ["bindings/python", "bindings/c"]
+exclude = ["vendor/leiden-rs", "vendor/boltr"]
+default-members = ["."]
+resolver = "3"
+
+[package]
+name = "graphlake"
+version = "0.1.0"
+default-run = "graphlake"
+edition = "2024"
+rust-version = "1.95"
+description = "Embedded graph analytics over databases and lakehouse tables"
+
+[features]
+admin = ["dep:argon2", "dep:axum", "dep:boltr", "dep:hmac", "dep:libc", "dep:rpassword", "dep:subtle"]
+
+[[bin]]
+name = "graphlake-admin"
+path = "src/bin/graphlake-admin.rs"
+required-features = ["admin"]
+
+[dependencies]
+anyhow = "1"
+argon2 = { version = "0.5.3", optional = true }
+arrow-array-58 = { package = "arrow-array", version = "58" }
+arrow-ipc-58 = { package = "arrow-ipc", version = "58" }
+arrow-schema-58 = { package = "arrow-schema", version = "58" }
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"], optional = true }
+base64 = "0.22"
+bigdecimal = "0.4"
+boltr = { version = "0.3", path = "vendor/boltr", optional = true }
+bytes = "1"
+chrono = "0.4"
+chrono-tz = "0.10"
+leiden-rs = { version = "0.8.1", path = "vendor/leiden-rs", default-features = false }
+rand = { version = "0.9", features = ["small_rng"] }
+clap = { version = "4", features = ["derive"] }
+datafusion = { version = "55.2", default-features = false, features = ["sql", "parquet", "nested_expressions", "math_expressions", "datetime_expressions", "string_expressions", "recursive_protection"] }
+datafusion-datasource = "55.2"
+deltalake-core = { version = "=1.1.2", features = ["datafusion"] }
+futures = "0.3"
+google-cloud-spanner = { version = "0.35", default-features = false }
+hdbconnect_async = "0.33"
+hmac = { version = "0.13", optional = true }
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-fs", "opendal-s3"] }
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "rustls-tls", "tls12", "ring", "chrono"] }
+libc = { version = "0.2", optional = true }
+object_store = { version = "0.13.2", features = ["aws", "http"] }
+opencypher = "0.1.4"
+parquet = { version = "59.2", features = ["async"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "gzip"] }
+rpassword = { version = "7", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.11"
+stacker = "0.1.24"
+subtle = { version = "2", optional = true }
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-uuid-1"] }
+tokio-postgres-rustls = "0.14"
+tokio-util = { version = "0.7", features = ["io"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.dev]
+debug = 0

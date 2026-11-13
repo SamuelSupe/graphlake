@@ -1,0 +1,440 @@
+pub(super) mod bolt;
+mod entities;
+pub(super) mod gremlin;
+
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+use anyhow::{Result, ensure};
+use axum::http::StatusCode;
+use boltr::{
+    packstream::encode::encode_value,
+    types::{BoltDict, BoltValue},
+};
+use futures::TryStreamExt;
+use serde_json::Value;
+
+use super::{ApiResult, App, Error, access::Principal, models::Models, query};
+use crate::{
+    Engine, Language, QueryResult, ScalarValue,
+    arrow::{
+        array::{
+            Array, ArrayRef, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray,
+            LargeStringArray, RecordBatch, StringArray, StringViewArray, StructArray,
+        },
+        datatypes::{Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, DecimalType},
+    },
+    engine::ReadTransaction,
+};
+
+const ROW_BYTES: usize = 1024 * 1024;
+
+pub(super) struct Access {
+    pub(super) model: String,
+    sockets: tokio::sync::Semaphore,
+}
+
+impl Access {
+    pub(super) fn load(models: &Models, model: String) -> Result<Self> {
+        ensure!(
+            models.active_revision(&model).ok().flatten().is_some(),
+            "--driver-model must name a published model"
+        );
+        Ok(Self {
+            model,
+            sockets: tokio::sync::Semaphore::new(16),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct Target {
+    principal: Principal,
+    model: String,
+    protocol: &'static str,
+}
+
+impl Target {
+    fn engine(&self, app: &App) -> ApiResult<(String, Engine)> {
+        app.access.check(&self.principal, &self.model)?;
+        let mut models = app.models.lock().unwrap();
+        let revision = models
+            .active_revision(&self.model)?
+            .ok_or_else(Error::not_found)?;
+        let engine = models.query_engine(&self.model, &revision, &self.principal)?;
+        Ok((revision, engine))
+    }
+
+    fn audit(&self, app: &App, action: &str, outcome: &str, code: u16) {
+        app.access.record(
+            Some(&self.principal),
+            self.protocol,
+            action,
+            Some(&self.model),
+            outcome,
+            code,
+        );
+    }
+}
+
+struct Rows {
+    app: Arc<App>,
+    target: Target,
+    language: Language,
+    active: query::Active,
+    engine: Engine,
+    result: QueryResult,
+    batch: Option<RecordBatch>,
+    offset: usize,
+    finished: bool,
+    columns: Vec<String>,
+    revision: String,
+}
+
+async fn execute(
+    app: &Arc<App>,
+    target: Target,
+    language: Language,
+    statement: &str,
+    parameters: BTreeMap<String, Value>,
+    timeout: Option<Duration>,
+    transaction: Option<(&str, &Engine, &ReadTransaction)>,
+) -> ApiResult<Rows> {
+    let mut abandoned = PendingQuery {
+        app,
+        target: &target,
+        language,
+        pending: true,
+    };
+    let result = execute_inner(
+        app,
+        &target,
+        language,
+        statement,
+        parameters,
+        timeout,
+        transaction,
+    )
+    .await;
+    abandoned.pending = false;
+    if let Err(error) = &result {
+        app.metrics.driver(language, false);
+        target.audit(app, "query", "error", error.status.as_u16());
+    }
+    result
+}
+
+struct PendingQuery<'a> {
+    app: &'a App,
+    target: &'a Target,
+    language: Language,
+    pending: bool,
+}
+
+impl Drop for PendingQuery<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            self.app.metrics.driver(self.language, false);
+            self.target.audit(self.app, "query", "abandoned", 499);
+        }
+    }
+}
+
+async fn execute_inner(
+    app: &Arc<App>,
+    target: &Target,
+    language: Language,
+    statement: &str,
+    parameters: BTreeMap<String, Value>,
+    timeout: Option<Duration>,
+    transaction: Option<(&str, &Engine, &ReadTransaction)>,
+) -> ApiResult<Rows> {
+    app.access.check(&target.principal, &target.model)?;
+    if statement.trim().is_empty() || statement.len() > 64 * 1024 {
+        return Err(Error::invalid(
+            "invalid_query",
+            "Query must contain 1 to 65536 bytes",
+        ));
+    }
+    let mut options = app.options.clone();
+    if let Some(timeout) = timeout {
+        if timeout.is_zero() {
+            return Err(Error::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                "Read transaction expired",
+            ));
+        }
+        options.timeout = options.timeout.min(timeout);
+    }
+    options.parameters = parameters;
+    let active = query::admit(
+        app,
+        uuid::Uuid::new_v4(),
+        &target.model,
+        &target.principal,
+        &mut options,
+    )
+    .await?;
+    let (revision, engine, pinned) = if let Some((revision, engine, pinned)) = transaction {
+        (revision.to_owned(), engine.clone(), Some(pinned))
+    } else {
+        let (revision, engine) = target.engine(app)?;
+        (revision, engine, None)
+    };
+    let result = Box::pin(engine.driver_query(language, statement, options, pinned))
+        .await
+        .map_err(query::query_error)?;
+    let columns = result
+        .batches
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    Ok(Rows {
+        app: app.clone(),
+        target: target.clone(),
+        language,
+        active,
+        engine,
+        result,
+        batch: None,
+        offset: 0,
+        finished: false,
+        columns,
+        revision,
+    })
+}
+
+impl Rows {
+    fn finish(&mut self, outcome: &str, status: u16) {
+        if !self.finished {
+            self.finished = true;
+            self.app.metrics.driver(self.language, status == 200);
+            self.target.audit(&self.app, "query", outcome, status);
+        }
+    }
+
+    async fn next(&mut self) -> ApiResult<Option<Vec<BoltValue>>> {
+        let result = self.next_inner().await;
+        match &result {
+            Ok(None) if matches!(self.language, Language::Cypher) => self.finish("ok", 200),
+            Err(error) => self.finish("error", error.status.as_u16()),
+            _ => {}
+        }
+        result
+    }
+
+    async fn next_inner(&mut self) -> ApiResult<Option<Vec<BoltValue>>> {
+        if self.finished {
+            return Ok(None);
+        }
+        if self.active.token.is_cancelled() {
+            return Err(Error::new(
+                StatusCode::CONFLICT,
+                "cancelled",
+                "Query cancelled",
+            ));
+        }
+        loop {
+            if let Some(batch) = &self.batch
+                && self.offset < batch.num_rows()
+            {
+                break;
+            }
+            self.batch = self
+                .result
+                .batches
+                .try_next()
+                .await
+                .map_err(|error| query::query_error(error.into()))?;
+            self.offset = 0;
+            if self.batch.is_none() {
+                return Ok(None);
+            }
+        }
+        let batch = self.batch.as_ref().unwrap();
+        let mut budget = ROW_BYTES;
+        let values = if let Some((label, node)) = self.result.graph_output.row_entity.clone() {
+            vec![
+                entities::fields(
+                    &self.engine.catalog,
+                    &mut self.result,
+                    &label,
+                    node,
+                    self.offset,
+                    |name| batch.column_by_name(name),
+                    &mut budget,
+                )
+                .await?,
+            ]
+        } else {
+            let mut values = Vec::with_capacity(batch.num_columns());
+            for (name, column) in self.columns.iter().zip(batch.columns()) {
+                let shape = self.result.graph_output.columns.get(name).cloned();
+                let variant = self.result.graph_output.gremlin_variant;
+                values.push(
+                    entities::value(
+                        &self.engine.catalog,
+                        &mut self.result,
+                        column,
+                        self.offset,
+                        shape.as_ref(),
+                        variant,
+                        &mut budget,
+                    )
+                    .await?,
+                );
+            }
+            values
+        };
+        let mut encoded = bytes::BytesMut::new();
+        for value in &values {
+            encode_value(&mut encoded, value);
+        }
+        if encoded.len() > ROW_BYTES {
+            return Err(result_limit());
+        }
+        self.offset += 1;
+        Ok(Some(values))
+    }
+}
+
+impl Drop for Rows {
+    fn drop(&mut self) {
+        self.finish("abandoned", 499);
+    }
+}
+
+fn result_limit() -> Error {
+    Error::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "result_limit",
+        "Driver record exceeds the 1 MiB encoding budget",
+    )
+}
+
+fn value_at(
+    column: &ArrayRef,
+    row: usize,
+    depth: usize,
+    gremlin_variant: bool,
+    remaining: &mut usize,
+) -> ApiResult<BoltValue> {
+    if depth > 24 {
+        return Err(result_limit());
+    }
+    // Account for the in-memory values before constructing nested records.
+    *remaining = remaining
+        .checked_sub(std::mem::size_of::<BoltValue>())
+        .ok_or_else(result_limit)?;
+    if column.is_null(row) {
+        return Ok(BoltValue::Null);
+    }
+    let array = column.as_any();
+    macro_rules! variable_width {
+        ($($type:ty),+ => $variant:ident) => {
+            $(if let Some(array) = array.downcast_ref::<$type>() {
+                let value = array.value(row);
+                if value.len() > *remaining {
+                    return Err(result_limit());
+                }
+                return Ok(BoltValue::$variant(value.to_owned()));
+            })+
+        };
+    }
+    variable_width!(StringArray, StringViewArray, LargeStringArray => String);
+    variable_width!(BinaryArray, BinaryViewArray, LargeBinaryArray, FixedSizeBinaryArray => Bytes);
+    if let Some(record) = array.downcast_ref::<StructArray>()
+        && (gremlin_variant || crate::engine::variant_fields(record.fields()))
+    {
+        return match record.columns().iter().find(|item| item.is_valid(row)) {
+            Some(item) => value_at(item, row, depth + 1, false, remaining),
+            None => Ok(BoltValue::Null),
+        };
+    }
+    use ScalarValue::*;
+    let value = ScalarValue::try_from_array(column, row)
+        .map_err(|_| Error::invalid("result_type", "Unsupported driver result type"))?;
+    if value.is_null() {
+        return Ok(BoltValue::Null);
+    }
+    let mut list = |array: ArrayRef| -> ApiResult<BoltValue> {
+        if array.len() > *remaining / std::mem::size_of::<BoltValue>() {
+            return Err(result_limit());
+        }
+        Ok(BoltValue::List(
+            (0..array.len())
+                .map(|i| value_at(&array, i, depth + 1, false, remaining))
+                .collect::<ApiResult<_>>()?,
+        ))
+    };
+    Ok(match value {
+        Boolean(Some(v)) => BoltValue::Boolean(v),
+        Int8(Some(v)) => BoltValue::Integer(v.into()),
+        Int16(Some(v)) => BoltValue::Integer(v.into()),
+        Int32(Some(v)) => BoltValue::Integer(v.into()),
+        Int64(Some(v)) => BoltValue::Integer(v),
+        UInt8(Some(v)) => BoltValue::Integer(v.into()),
+        UInt16(Some(v)) => BoltValue::Integer(v.into()),
+        UInt32(Some(v)) => BoltValue::Integer(v.into()),
+        UInt64(Some(v)) => {
+            i64::try_from(v).map_or_else(|_| BoltValue::String(v.to_string()), BoltValue::Integer)
+        }
+        Float16(Some(v)) => BoltValue::Float(v.to_f64()),
+        Float32(Some(v)) => BoltValue::Float(v.into()),
+        Float64(Some(v)) => BoltValue::Float(v),
+        Utf8(Some(v)) | Utf8View(Some(v)) | LargeUtf8(Some(v)) => BoltValue::String(v),
+        Binary(Some(v))
+        | BinaryView(Some(v))
+        | LargeBinary(Some(v))
+        | FixedSizeBinary(_, Some(v)) => BoltValue::Bytes(v),
+        Decimal32(Some(v), p, s) => BoltValue::String(Decimal32Type::format_decimal(v, p, s)),
+        Decimal64(Some(v), p, s) => BoltValue::String(Decimal64Type::format_decimal(v, p, s)),
+        Decimal128(Some(v), p, s) => BoltValue::String(Decimal128Type::format_decimal(v, p, s)),
+        Decimal256(Some(v), p, s) => BoltValue::String(Decimal256Type::format_decimal(v, p, s)),
+        List(v) => list(v.value(0))?,
+        LargeList(v) => list(v.value(0))?,
+        FixedSizeList(v) => list(v.value(0))?,
+        ListView(v) => list(v.value(0))?,
+        LargeListView(v) => list(v.value(0))?,
+        Struct(v) => BoltValue::Dict(
+            v.fields()
+                .iter()
+                .zip(v.columns())
+                .map(|(field, col)| {
+                    Ok((
+                        field.name().clone(),
+                        value_at(col, 0, depth + 1, false, remaining)?,
+                    ))
+                })
+                .collect::<ApiResult<BoltDict>>()?,
+        ),
+        Map(v) => {
+            let entries = v.value(0);
+            let mut fields = BoltDict::new();
+            for index in 0..entries.len() {
+                let key = value_at(entries.column(0), index, depth + 1, false, remaining)?;
+                let BoltValue::String(key) = key else {
+                    return Err(Error::invalid(
+                        "result_type",
+                        "Driver maps require string keys",
+                    ));
+                };
+                fields.insert(
+                    key,
+                    value_at(entries.column(1), index, depth + 1, false, remaining)?,
+                );
+            }
+            BoltValue::Dict(fields)
+        }
+        _ => {
+            let formatter = crate::arrow::util::display::ArrayFormatter::try_new(
+                column.as_ref(),
+                &Default::default(),
+            )
+            .map_err(|_| Error::invalid("result_type", "Unsupported driver result type"))?;
+            BoltValue::String(formatter.value(row).to_string())
+        }
+    })
+}

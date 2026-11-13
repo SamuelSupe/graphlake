@@ -1,0 +1,115 @@
+export type Status = 'unchecked' | 'passed' | 'failed';
+
+export type ModelSummary = {
+  id: string;
+  name: string;
+  sources: number;
+  nodes: number;
+  edges: number;
+  status: Status;
+  active_revision: string | null;
+};
+
+export type SavedModel = { id: string; yaml: string; revision: string; active_revision: string | null; status: Status };
+export type Column = { name: string; data_type: string; nullable: boolean };
+export type ValidationSite = { kind: 'table'; table: string; column: string | null }
+  | { kind: 'field'; label: string; field: string; index: number | null }
+  | { kind: 'input_column'; label: string; input: number; column: string };
+export type Validation = { status: Status; check_data: boolean; labels: Record<string, Column[]>; error?: string; location?: ValidationSite };
+export type VersionHistory = { active_revision: string | null; versions: {
+  revision: string; action: 'adopt' | 'publish' | 'rollback'; at_ms: number;
+}[] };
+export type Listing = { schemas: string[]; tables: string[]; columns: Column[]; truncated: boolean };
+export type PathPreview = { row: number; column: string; items: { kind: 'vertex' | 'edge'; label: string; key: string }[] };
+export type QueryResult = {
+  model_revision: string;
+  paths: PathPreview[];
+  graph: GraphFragment;
+  graph_snapshot?: string;
+  graph_next?: number;
+  graph_options: Record<string, unknown>;
+  columns: Pick<Column, 'name' | 'data_type'>[];
+  rows: (string | null)[][];
+  sources: { source: string; version: string; consistency: string }[];
+  elapsed_ms: number;
+  truncated: boolean;
+  snapshot: string | null;
+  snapshot_complete: boolean;
+};
+
+export class ApiError extends Error {
+  constructor(message: string, readonly code?: string, readonly location?: ValidationSite) { super(message); }
+}
+
+export const authRequired = 'graphlake:auth-required';
+
+export async function request(path: string, options?: RequestInit): Promise<Response> {
+  const response = await fetch('/api/v1' + path, {
+    ...options,
+    headers: { ...(options?.body ? { 'Content-Type': 'application/json' } : {}), ...options?.headers },
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => null);
+    const code = error?.code ?? (response.status === 401 && !path.startsWith('/auth/') ? 'auth_required' : undefined);
+    if (code === 'auth_required') window.dispatchEvent(new Event(authRequired));
+    throw new ApiError(error?.message ?? (code === 'auth_required' ? '请登录 GraphLake 管理后台' : '请求失败（' + response.status + '）'), code, error?.location);
+  }
+  return response;
+}
+
+export async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await request(path, options);
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
+}
+
+export function downloadFile(href: string, filename: string) {
+  const link = document.createElement('a');
+  link.href = href;
+  link.download = filename;
+  link.click();
+}
+
+export function downloadText(text: string, filename: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/yaml;charset=utf-8' }));
+  downloadFile(url, filename);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function errorText(error: unknown) {
+  return error instanceof Error ? error.message : '操作失败';
+}
+
+export type GraphIdentity = { kind: 'node' | 'edge'; label: string; key: string[] };
+export type GraphElement = GraphIdentity & {
+  id: string;
+  properties: Record<string, string | null> | null;
+  from?: string;
+  to?: string;
+  directed?: boolean;
+  transient?: boolean;
+  property_preview?: boolean;
+};
+export type GraphFragment = { elements: GraphElement[]; truncated: boolean; steps: [string, string][] };
+export type QueryGraphPage = { graph: GraphFragment; next: number | null; incomplete: boolean; model_revision: string };
+export type GraphComparison = 'eq' | 'ne' | 'lt' | 'le' | 'gt' | 'ge' | 'is_null' | 'is_not_null';
+export type NeighborFilter = {
+  direction: 'both' | 'in' | 'out';
+  edge_label?: string;
+  properties: { column: string; op: GraphComparison; value?: string }[];
+};
+export type GraphSchema = { graph: string; nodes: Record<string, { key: string[]; properties: string[] }>;
+  edges: Record<string, { key: string[]; properties: string[]; from: { node: string }; to: { node: string } }> };
+export type GraphExploration = {
+  selected: GraphElement | null;
+  graph: GraphFragment;
+  sources: QueryResult['sources'];
+  next_cursor: string | null;
+  page_cursor: string | null;
+  previous_cursor: string | null;
+  page_number: number;
+};
+
+
+export type ExplorationMatch = GraphIdentity & { id: string; page: number; cursor: string };
+export type ExplorationSearch = { matches: ExplorationMatch[]; total: number };

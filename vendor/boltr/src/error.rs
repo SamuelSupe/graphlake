@@ -1,0 +1,112 @@
+//! Error types for the Bolt protocol.
+
+use std::collections::HashMap;
+
+use crate::types::BoltValue;
+
+/// Errors that can occur during Bolt protocol operations.
+#[derive(Debug, thiserror::Error)]
+pub enum BoltError {
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
+    #[error("authentication error: {0}")]
+    Authentication(String),
+
+    #[error("session error: {0}")]
+    Session(String),
+
+    #[error("transaction error: {0}")]
+    Transaction(String),
+
+    #[error("query error {code}: {message}")]
+    Query { code: String, message: String },
+
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Permission denied: authenticated but lacks required role/permission.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("backend error: {0}")]
+    Backend(String),
+
+    #[cfg(feature = "ws")]
+    #[error("WebSocket error: {0}")]
+    WebSocket(String),
+}
+
+impl BoltError {
+    /// Wraps any displayable error as a backend error.
+    ///
+    /// ```
+    /// use boltr::error::BoltError;
+    ///
+    /// let err = BoltError::backend("table not found");
+    /// assert_eq!(err.to_string(), "backend error: table not found");
+    /// ```
+    pub fn backend(e: impl std::fmt::Display) -> Self {
+        Self::Backend(e.to_string())
+    }
+
+    /// Converts this error into a Bolt FAILURE metadata dictionary.
+    ///
+    /// Returns a map with `"code"` and `"message"` keys matching the
+    /// Neo4j status code format.
+    ///
+    /// ```
+    /// use boltr::error::BoltError;
+    /// use boltr::types::BoltValue;
+    ///
+    /// let err = BoltError::Authentication("bad password".to_string());
+    /// let meta = err.to_failure_metadata();
+    ///
+    /// assert_eq!(
+    ///     meta.get("code"),
+    ///     Some(&BoltValue::String("Neo.ClientError.Security.Unauthorized".to_string()))
+    /// );
+    /// assert_eq!(
+    ///     meta.get("message"),
+    ///     Some(&BoltValue::String("bad password".to_string()))
+    /// );
+    /// ```
+    pub fn to_failure_metadata(&self) -> HashMap<String, BoltValue> {
+        let (code, message) = match self {
+            Self::Protocol(m) => ("Neo.ClientError.Request.Invalid", m.clone()),
+            Self::Authentication(m) => ("Neo.ClientError.Security.Unauthorized", m.clone()),
+            Self::Session(m) => ("Neo.ClientError.Request.Invalid", m.clone()),
+            Self::Transaction(m) => (
+                "Neo.ClientError.Transaction.TransactionStartFailed",
+                m.clone(),
+            ),
+            Self::Query { code, message } => (code.as_str(), message.clone()),
+            Self::ResourceExhausted(m) => (
+                "Neo.TransientError.General.MemoryPoolOutOfMemoryError",
+                m.clone(),
+            ),
+            Self::Io(e) => (
+                "Neo.TransientError.General.DatabaseUnavailable",
+                e.to_string(),
+            ),
+            Self::Forbidden(m) => ("Neo.ClientError.Security.Forbidden", m.clone()),
+            Self::Backend(m) => ("Neo.DatabaseError.General.UnknownError", m.clone()),
+            #[cfg(feature = "ws")]
+            Self::WebSocket(m) => ("Neo.TransientError.General.DatabaseUnavailable", m.clone()),
+        };
+        HashMap::from([
+            ("code".to_string(), BoltValue::String(code.to_string())),
+            ("message".to_string(), BoltValue::String(message)),
+        ])
+    }
+}
+
+#[cfg(feature = "ws")]
+impl From<tokio_tungstenite::tungstenite::Error> for BoltError {
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(e.to_string())
+    }
+}

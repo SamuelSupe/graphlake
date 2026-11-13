@@ -1,0 +1,17 @@
+[package]
+name = "graphlake-c"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[lib]
+name = "graphlake_c"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+arrow-array = { version = "59.3", features = ["ffi"] }
+futures = "0.3"
+graphlake-engine = { package = "graphlake", path = "../.." }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

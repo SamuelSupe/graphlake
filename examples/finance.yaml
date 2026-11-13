@@ -1,0 +1,22 @@
+graph: finance
+sources:
+  crm:
+    type: postgres
+    dsn_env: GRAPHLAKE_POSTGRES_DSN
+  lake:
+    type: parquet
+    tables:
+      finance.transfers:
+        - s3://finance-lake/transfers/2026-11.parquet
+nodes:
+  Account:
+    source: crm.public.accounts
+    key: [tenant_id, account_id]
+    properties: [status]
+edges:
+  Transfer:
+    source: lake.finance.transfers
+    key: [tenant_id, transfer_id]
+    from: {node: Account, columns: [tenant_id, from_account_id]}
+    to: {node: Account, columns: [tenant_id, to_account_id]}
+    properties: [amount, event_time]

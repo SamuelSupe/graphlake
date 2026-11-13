@@ -1,0 +1,25 @@
+[Unit]
+Description=GraphLake graph query and administration service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=graphlake
+Group=graphlake
+WorkingDirectory=/var/lib/graphlake
+StateDirectory=graphlake
+StateDirectoryMode=0700
+EnvironmentFile=-/etc/graphlake/graphlake.env
+ExecStart=/opt/graphlake/current/bin/graphlake-admin --catalog-dir /var/lib/graphlake/catalog --assets-dir /opt/graphlake/current/web --query-slots 4
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

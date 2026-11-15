@@ -36,6 +36,7 @@ use parquet::{
 };
 use url::Url;
 
+use super::parquet_snapshot::{self, Part, Snapshot};
 use super::{ReadStats, SourceVersion};
 
 #[cfg(feature = "admin")]
@@ -44,9 +45,22 @@ pub(crate) async fn object_version(
     pool: Arc<dyn MemoryPool>,
     stats: Arc<ReadStats>,
 ) -> Result<SourceVersion> {
+    if let Some(path) = parquet_snapshot::managed_location(location)
+        && let Some(snapshot) = Snapshot::read(&path)?
+    {
+        return Ok(snapshot_version(location, &snapshot));
+    }
     Ok(PinnedFile::open(location, pool, stats)
         .await?
         .version(location))
+}
+
+fn snapshot_version(location: &str, snapshot: &Snapshot) -> SourceVersion {
+    SourceVersion {
+        source: location.to_owned(),
+        version: snapshot.generation.to_string(),
+        consistency: "pinned object",
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +351,8 @@ pub(crate) struct ScanObject {
     pub version: String,
     pub size: u64,
     pub row_groups: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<Part>,
 }
 
 impl ParquetFileReaderFactory for PinnedReaderFactory {
@@ -401,6 +417,12 @@ impl ParquetTable {
     }
 
     pub(crate) fn integer_groups(&self, column: &str) -> Option<Vec<(i64, i64, usize)>> {
+        if self.files.iter().any(|file| {
+            file.extension::<datafusion_datasource_parquet::ParquetRowSelection>()
+                .is_some()
+        }) {
+            return None;
+        }
         self.metadata
             .iter()
             .flat_map(|file| file.row_groups())
@@ -428,24 +450,73 @@ impl ParquetTable {
         stats: Arc<ReadStats>,
     ) -> Result<(Self, Vec<SourceVersion>)> {
         let mut versions = Vec::new();
+        let mut inputs = Vec::new();
+        for location in locations {
+            if let Some(path) = parquet_snapshot::managed_location(location)
+                && let Some(snapshot) = Snapshot::read(&path)?
+            {
+                versions.push(snapshot_version(location, &snapshot));
+                inputs.extend(snapshot_inputs(&path, snapshot));
+            } else {
+                inputs.push((location.clone(), None));
+            }
+        }
+        let (table, physical_versions) = Self::open_inputs(inputs, columns, pool, stats).await?;
+        versions.extend(physical_versions);
+        Ok((table, versions))
+    }
+
+    #[cfg(feature = "admin")]
+    pub(crate) async fn open_snapshot(
+        path: &Path,
+        snapshot: Snapshot,
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+    ) -> Result<Self> {
+        Ok(
+            Self::open_inputs(snapshot_inputs(path, snapshot), &[], pool, stats)
+                .await?
+                .0,
+        )
+    }
+
+    async fn open_inputs(
+        inputs: Vec<(String, Option<Part>)>,
+        columns: &[String],
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+    ) -> Result<(Self, Vec<SourceVersion>)> {
+        let mut versions = Vec::new();
         let mut schema = None;
         let mut readers = BTreeMap::new();
         let mut files = Vec::new();
         let mut metadata = Vec::new();
         #[cfg(feature = "admin")]
         let mut scan_objects = Vec::new();
-        for (index, location) in locations.iter().enumerate() {
-            let file = PinnedFile::open(location, Arc::clone(&pool), Arc::clone(&stats)).await?;
+        for (index, (location, mask)) in inputs.into_iter().enumerate() {
+            let file = PinnedFile::open(&location, Arc::clone(&pool), Arc::clone(&stats)).await?;
             let builder = ParquetRecordBatchStreamBuilder::new(file.clone())
                 .await
                 .with_context(|| format!("reading Parquet schema for {location}"))?;
             metadata.push(Arc::clone(builder.metadata()));
+            if let Some(mask) = &mask {
+                ensure!(
+                    usize::try_from(builder.metadata().file_metadata().num_rows())? == mask.rows,
+                    "local Parquet snapshot part row count changed"
+                );
+            } else {
+                versions.push(file.version(&location));
+            }
             #[cfg(feature = "admin")]
             scan_objects.push(ScanObject {
                 path: format!("object-{index}.parquet"),
                 location: location.clone(),
-                version: file.version(location).version,
+                version: file.version(&location).version,
                 size: file.meta.size,
+                mask: mask
+                    .as_ref()
+                    .filter(|part| !part.deleted.is_empty())
+                    .cloned(),
                 row_groups: builder
                     .metadata()
                     .row_groups()
@@ -504,12 +575,15 @@ impl ParquetTable {
                         .collect::<Vec<_>>(),
                 )));
             }
-            versions.push(file.version(location));
             let mut meta = file.meta.clone();
             // The same object path can occur in different buckets or on different hosts.
             meta.location = ObjectPath::from(format!("object-{index}.parquet"));
             readers.insert(meta.location.clone(), file);
-            files.push(PartitionedFile::new_from_meta(meta));
+            let mut file = PartitionedFile::new_from_meta(meta);
+            if let Some(mask) = mask {
+                file = parquet_snapshot::select_rows(file, mask.rows, &mask.deleted);
+            }
+            files.push(file);
         }
         Ok((
             Self {
@@ -523,6 +597,14 @@ impl ParquetTable {
             versions,
         ))
     }
+}
+
+fn snapshot_inputs(path: &Path, snapshot: Snapshot) -> Vec<(String, Option<Part>)> {
+    snapshot
+        .parts
+        .into_iter()
+        .map(|part| (part.path(path).to_string_lossy().into_owned(), Some(part)))
+        .collect()
 }
 
 #[async_trait]

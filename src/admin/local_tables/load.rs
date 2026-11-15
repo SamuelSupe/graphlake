@@ -11,13 +11,14 @@ use futures::TryStreamExt;
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 
 use super::{
-    row_groups,
+    overlay, row_groups,
     store::{Mode, Table},
 };
 use crate::{
     Catalog, QueryOptions,
     catalog::ident,
     engine::{QueryScope, stage_scope},
+    source::{parquet::ParquetTable, parquet_snapshot::Snapshot},
 };
 
 pub(super) async fn run(
@@ -38,7 +39,17 @@ async fn load(
 ) -> Result<(u64, u64)> {
     let config = &table.config;
     let context = scope.session();
-    let previous = if path.is_file() {
+    let snapshot = Snapshot::read(path)?;
+    let previous = if let Some(snapshot) = &snapshot {
+        let table = ParquetTable::open_snapshot(
+            path,
+            snapshot.clone(),
+            Arc::clone(&scope.runtime.memory_pool),
+            Arc::clone(&scope.reads),
+        )
+        .await?;
+        Some(context.read_table(Arc::new(table))?)
+    } else if path.is_file() {
         Some(
             context
                 .read_parquet(
@@ -57,20 +68,44 @@ async fn load(
                 .watermark_column
                 .as_deref()
                 .context("missing watermark column")?;
-            let batches = context
-                .sql(&format!(
-                    "SELECT MAX({}), COUNT(*) FROM previous",
-                    ident(name)
-                ))
-                .await?
-                .collect()
-                .await?;
-            let watermark = ScalarValue::try_from_array(batches[0].column(0), 0)?;
-            let rows = ScalarValue::try_from_array(batches[0].column(1), 0)?;
-            let ScalarValue::Int64(Some(rows)) = rows else {
-                anyhow::bail!("invalid local row count")
-            };
-            Some((watermark, u64::try_from(rows)?))
+            if let Some(snapshot) = &snapshot {
+                // The newest delta was filtered at the previous watermark. It
+                // therefore contains the maximum of the committed snapshot.
+                let latest = snapshot
+                    .parts
+                    .last()
+                    .expect("manifest has parts")
+                    .path(path);
+                context
+                    .register_parquet(
+                        "checkpoint",
+                        latest.to_str().context("invalid local path")?,
+                        ParquetReadOptions::default(),
+                    )
+                    .await?;
+                let batches = context
+                    .sql(&format!("SELECT MAX({}) FROM checkpoint", ident(name)))
+                    .await?
+                    .collect()
+                    .await?;
+                let watermark = ScalarValue::try_from_array(batches[0].column(0), 0)?;
+                Some((watermark, snapshot.rows()))
+            } else {
+                let batches = context
+                    .sql(&format!(
+                        "SELECT MAX({}), COUNT(*) FROM previous",
+                        ident(name)
+                    ))
+                    .await?
+                    .collect()
+                    .await?;
+                let watermark = ScalarValue::try_from_array(batches[0].column(0), 0)?;
+                let rows = ScalarValue::try_from_array(batches[0].column(1), 0)?;
+                let ScalarValue::Int64(Some(rows)) = rows else {
+                    anyhow::bail!("invalid local row count")
+                };
+                Some((watermark, u64::try_from(rows)?))
+            }
         }
         _ => None,
     };
@@ -156,13 +191,25 @@ async fn load(
     let root = path.parent().context("missing local table directory")?;
     let delta = staging_file(root)?;
     let loaded = write(incoming, delta.as_file().try_clone()?, scope).await?;
-    context
-        .register_parquet(
-            "incoming",
-            delta.path().to_str().unwrap(),
-            ParquetReadOptions::default(),
+    if snapshot.is_some() {
+        let locations = [delta.path().to_string_lossy().into_owned()];
+        let (table, _) = ParquetTable::open(
+            &locations,
+            &[],
+            Arc::clone(&scope.runtime.memory_pool),
+            Arc::clone(&scope.reads),
         )
         .await?;
+        context.register_table("incoming", Arc::new(table))?;
+    } else {
+        context
+            .register_parquet(
+                "incoming",
+                delta.path().to_str().unwrap(),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+    }
     let incoming = context.table("incoming").await?;
     if let Some(previous) = &previous {
         let same = previous
@@ -240,15 +287,35 @@ async fn load(
                 .data_type()
                 .is_signed_integer()
         {
-            let previous = File::open(path)?;
-            let incoming = delta.reopen()?;
-            let root = root.to_owned();
-            let key = key.clone();
-            let scope = Arc::clone(scope);
-            tokio::task::spawn_blocking(move || {
-                row_groups::merge(previous, incoming, &root, &key, &scope)
-            })
-            .await??
+            if delta.as_file().metadata()?.len() <= overlay::MAX_DELTA_BYTES {
+                let anchor = path.to_owned();
+                let previous = snapshot.clone();
+                let staged = delta.reopen()?;
+                let key = key.clone();
+                let worker_scope = Arc::clone(scope);
+                if let Some(next) = tokio::task::spawn_blocking(move || {
+                    overlay::prepare(&anchor, previous, staged, &key, &worker_scope)
+                })
+                .await??
+                    && overlay::publish(path, &delta, snapshot.is_none(), &next, scope)?
+                {
+                    clean_parts(path);
+                    return Ok((loaded, next.rows()));
+                }
+            }
+            if snapshot.is_none() {
+                let previous = File::open(path)?;
+                let incoming = delta.reopen()?;
+                let root = root.to_owned();
+                let key = key.clone();
+                let scope = Arc::clone(scope);
+                tokio::task::spawn_blocking(move || {
+                    row_groups::merge(previous, incoming, &root, &key, &scope)
+                })
+                .await??
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -276,7 +343,14 @@ async fn load(
     // advance a separate checkpoint past the data that was atomically installed.
     output.persist(path)?;
     File::open(root)?.sync_all()?;
+    clean_parts(path);
     Ok((loaded, total))
+}
+
+fn clean_parts(path: &Path) {
+    if let Err(error) = overlay::clean(path) {
+        eprintln!("GraphLake local-table part cleanup failed: {error}");
+    }
 }
 
 pub(super) fn staging_file(root: &Path) -> std::io::Result<tempfile::NamedTempFile> {

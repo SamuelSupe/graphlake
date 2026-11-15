@@ -381,6 +381,117 @@ async fn local_tables_incremental_reuses_row_groups_and_preserves_the_footer() -
 }
 
 #[tokio::test]
+async fn local_tables_scattered_overlay_reads_recovers_and_compacts() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let source = root.path().join("source.parquet");
+    let last = 8192 * 10 + 5;
+    parquet_rows(
+        &source,
+        &(1..=last)
+            .map(|id| (id, "original", id))
+            .collect::<Vec<_>>(),
+    )?;
+    fs::write(
+        root.path().join("payments.yaml"),
+        yaml(
+            "{type: parquet, tables: {items: [source.parquet]}}",
+            "input.items",
+        ),
+    )?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let definition = create(&server, "overlay", "input.items").await?;
+    let path = definition["path"].as_str().unwrap();
+    assert_eq!(load(&server, "overlay", "full").await?["total_rows"], last);
+    let base = fs::File::open(path)?;
+
+    let changed = (0..10)
+        .map(|group| (group * 8192 + 1, "changed", last + 1))
+        .chain([(last, "original", last), (last + 1, "new", last + 1)])
+        .collect::<Vec<_>>();
+    parquet_rows(&source, &changed)?;
+    let run = load(&server, "overlay", "incremental").await?;
+    assert_eq!(run["status"], "succeeded", "{run}");
+    assert_eq!(run["total_rows"], last + 1);
+    let committed = fs::read(path)?;
+    assert!(committed.starts_with(b"GLPQ1\n"));
+    let parts = Path::new(path).with_extension("parts");
+    let files = fs::read_dir(&parts)?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(files.len(), 2);
+    #[cfg(unix)]
+    assert!(
+        files
+            .iter()
+            .any(|file| file.metadata().unwrap().ino() == base.metadata().unwrap().ino())
+    );
+
+    let result = rows(root.path(), path).await?;
+    assert_eq!(result.len(), (last + 1) as usize);
+    assert!(
+        result
+            .iter()
+            .enumerate()
+            .all(|(i, row)| row.0 == i as i64 + 1)
+    );
+    for &(id, value, version) in &changed {
+        assert_eq!(result[(id - 1) as usize], (id, value.into(), version));
+    }
+    let engine = Engine::new(Catalog::load(root.path().join("verify.yaml"))?)?;
+    let counts = engine
+        .query(
+            Language::Sql,
+            "SELECT COUNT(*) AS n FROM \"Person\"",
+            QueryOptions::default(),
+        )
+        .await?
+        .batches
+        .try_collect::<Vec<_>>()
+        .await?;
+    assert_eq!(
+        counts[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        last + 1
+    );
+
+    drop(server);
+    let orphan = parts.join(format!("{}.parquet", Uuid::new_v4()));
+    fs::write(&orphan, b"uncommitted")?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    assert!(!orphan.exists());
+    assert_eq!(fs::read(path)?, committed);
+    let duplicate = [(1, "invalid", last + 2), (1, "duplicate", last + 2)];
+    parquet_rows(&source, &duplicate)?;
+    assert_eq!(
+        load(&server, "overlay", "incremental").await?["status"],
+        "failed"
+    );
+    assert_eq!(fs::read(path)?, committed);
+
+    // Repeated writes of key 1 must mask its older delta-file positions. At
+    // the part limit a full merge compacts the live rows and reclaims old files.
+    for version in last + 2..=last + 16 {
+        parquet_rows(&source, &[(1, "again", version)])?;
+        let run = load(&server, "overlay", "incremental").await?;
+        assert_eq!(run["status"], "succeeded", "{run}");
+        assert_eq!(run["total_rows"], last + 1);
+    }
+    assert!(fs::read(path)?.starts_with(b"PAR1"));
+    assert_eq!(fs::read_dir(parts)?.count(), 0);
+    let result = rows(root.path(), path).await?;
+    assert_eq!(result.len(), (last + 1) as usize);
+    assert_eq!(result[0], (1, "again".into(), last + 16));
+    assert_eq!(result.last(), Some(&(last + 1, "new".into(), last + 1)));
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_tables_schedule_persists_and_pauses() -> Result<()> {
     let root = tempfile::tempdir()?;
     setup_assets(root.path())?;

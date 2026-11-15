@@ -1,4 +1,5 @@
 mod load;
+mod overlay;
 mod row_groups;
 mod store;
 

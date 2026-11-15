@@ -692,9 +692,28 @@ pub(super) async fn decode(
             .1
             .clone()
             .with_parquet_file_reader_factory(ParquetTable::pinned_scan(&objects, scope).await?);
+        let mut groups = config.file_groups.clone();
+        groups[task.partition] = FileGroup::new(
+            files
+                .files()
+                .iter()
+                .cloned()
+                .map(|file| {
+                    let object = objects
+                        .iter()
+                        .find(|object| object.path == file.object_meta.location.as_ref());
+                    if let Some(mask) = object.and_then(|object| object.mask.as_ref()) {
+                        crate::source::parquet_snapshot::select_rows(file, mask.rows, &mask.deleted)
+                    } else {
+                        file
+                    }
+                })
+                .collect(),
+        );
         input = DataSourceExec::from_data_source(
             FileScanConfigBuilder::from(config.clone())
                 .with_preserve_order(true)
+                .with_file_groups(groups)
                 .with_source(Arc::new(source))
                 .build(),
         );

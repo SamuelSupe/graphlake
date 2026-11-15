@@ -3236,6 +3236,7 @@ dependencies = [
  "clap",
  "datafusion",
  "datafusion-datasource",
+ "datafusion-datasource-parquet",
  "datafusion-proto",
  "deltalake-core",
  "futures",

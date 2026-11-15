@@ -2851,7 +2851,23 @@ async fn cluster_queries_survive_coordinator_restart_and_worker_loss() -> Result
     setup_assets(root.path())?;
     setup_credentials(root.path())?;
     parquet_file(&root.path().join("payments.parquet"), false)?;
-    payments_file(&root.path().join("payments-extra.parquet"), false, &[9])?;
+    let extra = root
+        .path()
+        .join(".graphlake-local")
+        .join(format!("{}.parquet", Uuid::new_v4()));
+    let parts = extra.with_extension("parts");
+    fs::create_dir_all(&parts)?;
+    let base = Uuid::new_v4();
+    let delta = Uuid::new_v4();
+    payments_file(&parts.join(format!("{base}.parquet")), false, &[9, 9])?;
+    payments_file(&parts.join(format!("{delta}.parquet")), false, &[9])?;
+    fs::write(
+        &extra,
+        format!(
+            "GLPQ1\n{}",
+            json!({"generation": Uuid::new_v4(), "parts": [{"id": base, "rows": 2, "deleted": [0, 1]}, {"id": delta, "rows": 1}]})
+        ),
+    )?;
     fs::write(
         root.path().join("payments.yaml"),
         r#"
@@ -2868,7 +2884,7 @@ edges:
     from: {node: Account, columns: [tenant_id, from_account_id]}
     to: {node: Merchant, columns: [tenant_id, to_merchant_id]}
     properties: [amount, payment_id, score, channel]
-"#,
+"#.replace("payments-extra.parquet", extra.to_str().unwrap()),
     )?;
     let config = root.path().join("cluster.yaml");
     let keyless = fs::read_to_string(root.path().join("payments.yaml"))?
@@ -3353,7 +3369,7 @@ edges:
         .json()
         .await?;
     assert_eq!(before["rows"].as_array().unwrap().len(), 2);
-    payments_file(&root.path().join("payments-extra.parquet"), false, &[8])?;
+    payments_file(&extra, false, &[8])?;
     let after: Value = coordinator
         .request(Method::POST, "models/payments/query")
         .json(&pinned_cypher())

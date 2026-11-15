@@ -189,7 +189,7 @@ fn integers(array: &dyn Array) -> Result<&Int64Array> {
         .expect("signed integer cast"))
 }
 
-fn signed_bounds(group: &RowGroupMetaData, leaf: usize) -> Option<(i64, i64)> {
+pub(super) fn signed_bounds(group: &RowGroupMetaData, leaf: usize) -> Option<(i64, i64)> {
     let statistics = group.column(leaf).statistics()?;
     if !statistics.min_is_exact() || !statistics.max_is_exact() {
         return None;

@@ -190,6 +190,10 @@ impl Store {
             tables,
             _lease: lease,
         };
+        for table in store.tables.values() {
+            super::overlay::clean(&store.path(table))
+                .context("recovering local Parquet snapshot parts")?;
+        }
         store
             .persist(&store.tables)
             .map_err(|e| anyhow::anyhow!(e.message))?;

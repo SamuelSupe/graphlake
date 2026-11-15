@@ -24,6 +24,8 @@ use super::{
     models,
 };
 
+pub(super) mod delegation;
+
 const LIMIT: usize = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,12 +69,17 @@ struct Directory {
     accounts: BTreeMap<String, Account>,
     #[serde(default)]
     groups: BTreeMap<String, Group>,
+    #[serde(default)]
+    mcp: super::mcp::settings::Config,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    ai_tokens: BTreeMap<String, delegation::Token>,
 }
 
 struct Live {
     directory: Directory,
     revision: i64,
     watches: BTreeMap<String, watch::Sender<()>>,
+    ai_watches: BTreeMap<String, watch::Sender<()>>,
 }
 
 pub(super) struct Users {
@@ -82,6 +89,32 @@ pub(super) struct Users {
 }
 
 impl Users {
+    pub(super) fn mcp_config(&self) -> super::mcp::settings::Config {
+        self.live.lock().unwrap().directory.mcp.clone()
+    }
+
+    pub(super) fn bearer(&self, token: &str) -> Option<Credential> {
+        if !access::valid_token(token) {
+            return None;
+        }
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let name = {
+            let live = self.live.lock().unwrap();
+            live.directory
+                .accounts
+                .iter()
+                .find(|(_, account)| {
+                    !account.disabled
+                        && account
+                            .token_sha256
+                            .as_ref()
+                            .is_some_and(|hash| bool::from(hash.ct_eq(&digest)))
+                })
+                .map(|(name, _)| name.clone())?
+        };
+        self.service(&name, token)
+    }
+
     pub(super) async fn load(root: &std::path::Path, ha: Option<&super::ha::Ha>) -> Result<Self> {
         let path = root.join(".graphlake-auth/users.json");
         let (directory, revision) = if let Some(ha) = ha {
@@ -118,12 +151,18 @@ impl Users {
             .keys()
             .map(|name| (name.clone(), watch::channel(()).0))
             .collect();
+        let ai_watches = directory
+            .ai_tokens
+            .keys()
+            .map(|name| (name.clone(), watch::channel(()).0))
+            .collect();
         Ok(Self {
             path,
             live: Mutex::new(Live {
                 directory,
                 revision,
                 watches,
+                ai_watches,
             }),
             writes: Default::default(),
         })
@@ -255,6 +294,7 @@ pub(super) fn disable_restored_accounts(value: &mut serde_json::Value) -> ApiRes
         group.members.clear();
         group.version = Uuid::new_v4();
     }
+    directory.ai_tokens.clear();
     *value = serde_json::to_value(directory).map_err(|_| Error::storage())?;
     Ok(())
 }
@@ -276,6 +316,8 @@ fn account<'a>(live: &'a Live, principal: &Principal) -> Option<&'a Account> {
 }
 
 fn check_directory(directory: &Directory) -> ApiResult<()> {
+    directory.mcp.validate()?;
+    delegation::validate(directory)?;
     if directory.accounts.len() > 64
         || directory.groups.len() > 64
         || serde_json::to_vec(directory)
@@ -474,6 +516,9 @@ pub(super) async fn update(
             reset_required,
         };
         let response = user_view(&next, &name, &entry);
+        if has_new_credential || edit.disabled {
+            next.ai_tokens.remove(&name);
+        }
         next.accounts.insert(name.clone(), entry);
         commit(&app, next, revision, BTreeSet::from([name])).await?;
         Ok(Json(response))
@@ -499,6 +544,7 @@ pub(super) async fn delete(
             ));
         }
         next.accounts.remove(&name);
+        next.ai_tokens.remove(&name);
         for group in next.groups.values_mut() {
             if group.members.remove(&name) {
                 group.version = Uuid::new_v4();
@@ -543,8 +589,12 @@ pub(super) async fn update_group(
         }
         {
             let models = app.models.lock().unwrap();
-            for model in edit.grants.keys() {
-                models.get(model)?;
+            for (model, roles) in &edit.grants {
+                if let Err(error) = models.get(model)
+                    && !(error.status == StatusCode::NOT_FOUND && roles.contains(&Role::Modeler))
+                {
+                    return Err(error);
+                }
             }
         }
         let before = serde_json::to_value(existing).map_err(|_| Error::storage())?;
@@ -612,6 +662,28 @@ fn snapshot(app: &App) -> (Directory, i64) {
     (live.directory.clone(), live.revision)
 }
 
+pub(super) async fn save_mcp(
+    app: Arc<App>,
+    config: super::mcp::settings::Config,
+    expected: String,
+) -> ApiResult<()> {
+    tokio::spawn(async move {
+        let _writes = app.users.writes.lock().await;
+        let (mut next, revision) = snapshot(&app);
+        if next.mcp.revision() != expected {
+            return Err(Error::new(
+                StatusCode::CONFLICT,
+                "mcp_conflict",
+                "MCP 配置已变更，请重新加载",
+            ));
+        }
+        next.mcp = config;
+        commit(&app, next, revision, BTreeSet::new()).await
+    })
+    .await
+    .map_err(|_| Error::storage())?
+}
+
 async fn commit(
     app: &App,
     next: Directory,
@@ -643,6 +715,24 @@ async fn commit(
         revision
     };
     let mut live = app.users.live.lock().unwrap();
+    let ai_changed = live
+        .directory
+        .ai_tokens
+        .keys()
+        .chain(next.ai_tokens.keys())
+        .filter(|name| {
+            affected.contains(*name)
+                || live.directory.ai_tokens.get(*name) != next.ai_tokens.get(*name)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for name in ai_changed {
+        if next.ai_tokens.contains_key(&name) {
+            live.ai_watches.insert(name, watch::channel(()).0);
+        } else {
+            live.ai_watches.remove(&name);
+        }
+    }
     for name in affected {
         if next.accounts.contains_key(&name) {
             live.watches.insert(name, watch::channel(()).0);

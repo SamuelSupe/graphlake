@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add a configurable MCP server for read-only queries, source-scoped model creation, validation, draft updates and optional publication. Reuse user roles, tenant scopes, optimistic revisions, HA receipts and audit logging.
+- Add a standalone AI sidebar with a compact three-step Agent setup guide, copyable query/modeling prompts, personal MCP tokens bound to live user permissions, per-model capability previews and optional connection diagnostics. Reveal token management, JSON configuration and permission details on demand; keep global service settings administrator-only and collapsed by default.
+
 ## v1.0.0
 
 The first stable GraphLake release contains the embedded engine, command line, Linux administration service, and browser workbench.

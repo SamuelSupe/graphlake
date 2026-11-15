@@ -592,6 +592,18 @@ pub(super) fn operation(method: &axum::http::Method, path: &str) -> Operation {
             ("backup_status", None, false)
         }
         (&Method::PUT, ["", "api", "v1", "settings"]) => ("save_settings", None, false),
+        (&Method::GET | &Method::HEAD, ["", "api", "v1", "mcp", "settings"]) => {
+            ("read_mcp_settings", None, false)
+        }
+        (&Method::PUT, ["", "api", "v1", "mcp", "settings"]) => ("save_mcp_settings", None, false),
+        (&Method::GET | &Method::HEAD, ["", "api", "v1", "mcp", "access"]) => {
+            ("mcp_access", None, false)
+        }
+        (&Method::GET | &Method::HEAD, ["", "api", "v1", "mcp", "token"]) => {
+            ("ai_token_status", None, false)
+        }
+        (&Method::POST, ["", "api", "v1", "mcp", "token"]) => ("ai_token_issue", None, false),
+        (&Method::DELETE, ["", "api", "v1", "mcp", "token"]) => ("ai_token_revoke", None, false),
         (&Method::GET | &Method::HEAD, ["", "api", "v1", "users"]) => ("list_users", None, false),
         (&Method::GET | &Method::HEAD, ["", "api", "v1", "roles"]) => ("list_roles", None, false),
         (&Method::PUT, ["", "api", "v1", "roles", _]) => ("update_role", None, false),
@@ -692,7 +704,8 @@ pub(super) fn permits_operation(app: &super::App, principal: &Principal, op: &Op
         Principal::User { .. } => match (op.action, op.model.as_deref()) {
             (
                 "list_models" | "my_roles" | "options" | "logout" | "validate" | "mutation_status"
-                | "query_result" | "cancel" | "download",
+                | "query_result" | "cancel" | "download" | "mcp_access" | "ai_token_status"
+                | "ai_token_issue" | "ai_token_revoke",
                 None,
             ) => true,
             (action, Some(id)) => {

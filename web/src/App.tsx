@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Database, LogOut, Network, Settings2, ShieldCheck, Terminal } from 'lucide-react';
+import { Bot, Database, LogOut, Network, Settings2, ShieldCheck, Terminal } from 'lucide-react';
 import { api, errorText, type ModelSummary, type SavedModel } from './api';
 import { AuthGate, type Session } from './Auth';
 import { Access, type Grants } from './Access';
@@ -14,6 +14,7 @@ import './styles.css';
 import './panels.css';
 
 const Settings = lazy(() => import('./Settings'));
+const AI = lazy(() => import('./AI'));
 const RecoveryConsole = lazy(() => import('./RecoveryConsole'));
 
 const nav = [
@@ -95,7 +96,8 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   const navigate = useCallback((next: string, replace = false) => {
     if (next === current.current) return;
     const leaving = current.current.replace(/\/$/, '');
-    const unsaved = leaving === '/new' && dirty.current.has('') || leaving === '/settings' && dirty.current.has('/settings');
+    const unsaved = leaving === '/new' && dirty.current.has('')
+      || (leaving === '/settings' || leaving === '/ai') && dirty.current.has(leaving);
     if (unsaved && !replace && !window.confirm('当前页面有未保存的修改。离开当前页面？')) {
       if (window.location.pathname !== current.current) window.history.pushState(null, '', current.current);
       return;
@@ -138,6 +140,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   const location = route(path);
   const accessPage = path.replace(/\/$/, '') === '/access';
   const settingsPage = path.replace(/\/$/, '') === '/settings';
+  const aiPage = path.replace(/\/$/, '') === '/ai';
   const id = location.id;
   const availableModels = administrator ? models : grants && models?.filter(model => grantFor(model.id).length);
   function grantFor(model: string) { return grants && Object.hasOwn(grants, model) ? grants[model] : []; }
@@ -155,7 +158,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   });
   useEffect(() => { if (id) lastModel.current = id; }, [id]);
   useLayoutEffect(() => { window.scrollTo(0, ['/', '/catalogs', '/query'].includes(path) ? directory.current[workspace].scroll : 0); }, [path, workspace]);
-  useEffect(() => { if (!locked) document.title = 'GraphLake · ' + (settingsPage ? '运行配置' : accessPage ? '权限管理' : nav.find(item => item.key === workspace)!.label); }, [accessPage, locked, settingsPage, workspace]);
+  useEffect(() => { if (!locked) document.title = 'GraphLake · ' + (aiPage ? 'AI' : settingsPage ? '运行配置' : accessPage ? '权限管理' : nav.find(item => item.key === workspace)!.label); }, [accessPage, aiPage, locked, settingsPage, workspace]);
   const newModel = administrator && path === '/new' ? draft : undefined;
 
   async function importModel(file: File) {
@@ -199,9 +202,15 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
       <button className="rail-brand" aria-label="GraphLake 首页" onClick={() => navigate('/')}><Mark size={26} /><span>GraphLake</span></button>
       <div className="rail-items">{nav.filter(({ key }) => key === 'query' ? canUseQuery : key === 'catalogs' ? administrator : hasModelAccess)
         .map(({ key, label, Icon }) =>
-          <button key={key} className="rail-link" aria-current={!accessPage && !settingsPage && workspace === key ? 'page' : undefined} onClick={() => openWorkspace(key)}>
+          <button key={key} className="rail-link" aria-current={!accessPage && !settingsPage && !aiPage && workspace === key ? 'page' : undefined} onClick={() => openWorkspace(key)}>
             <Icon size={20} aria-hidden="true" /><span>{label}</span>
           </button>)}
+        <a className="rail-link" href="/ai" aria-current={aiPage ? 'page' : undefined} onClick={event => {
+          if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+          event.preventDefault(); navigate('/ai');
+        }}>
+          <Bot size={20} aria-hidden="true" /><span>AI</span>
+        </a>
         {administrator && identity.enabled && <button className="rail-link" aria-current={accessPage ? 'page' : undefined} onClick={() => navigate('/access')}>
           <ShieldCheck size={20} aria-hidden="true" /><span>权限管理</span>
         </button>}
@@ -221,7 +230,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
       const modelers = administrator || grantFor(model).includes('modeler');
       const publishers = administrator || grantFor(model).includes('publisher');
       const page = !canReadModel(model) || workspace === 'query' && canQuery(model) ? 'query' : administrator && workspace === 'catalogs' ? 'catalogs' : 'graph';
-      const show = !accessPage && !settingsPage && model === id;
+      const show = !accessPage && !settingsPage && !aiPage && model === id;
       const summary = availableModels?.find(entry => entry.id === model);
       if (!canReadModel(model) && (!canQuery(model) || !summary?.active_revision)) return null;
       return <div className="model-workspace" key={model} data-inactive={!show || undefined}
@@ -247,7 +256,8 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
       changeModel={key => navigate(modelPath(key, workspace))} changed={reloadModels} created={key => navigate(modelPath(key), true)} />}
     {accessPage && (administrator && identity.enabled ? <Access models={models ?? []} /> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
     {settingsPage && (administrator ? <Suspense fallback={<p className="empty" role="status">正在打开运行配置…</p>}><Settings initialTab={settingsTab} openModel={(id, page) => navigate(modelPath(id, page))} models={models ?? []} locked={locked} onDirty={onDirty} /></Suspense> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
-    {!accessPage && !settingsPage && !newModel && (!id || !canReadModel(id) && !canQuery(id)) &&
+    {aiPage && <Suspense fallback={<p className="empty" role="status">正在打开 AI…</p>}><AI locked={locked} administrator={administrator} onDirty={onDirty} /></Suspense>}
+    {!accessPage && !settingsPage && !aiPage && !newModel && (!id || !canReadModel(id) && !canQuery(id)) &&
       <Models key={workspace} memory={directory.current[workspace]} models={id && !administrator && grants ? [] : workspace === 'query' ? availableModels?.filter(model => canQuery(model.id)) : availableModels?.filter(model => canReadModel(model.id))} error={permissionError || error}
         importError={workspace === 'graph' ? importError : ''} retry={reloadModels} workspace={workspace}
         administrator={administrator} canQuery={canQuery} health={() => { setSettingsTab('health'); navigate('/settings'); }}

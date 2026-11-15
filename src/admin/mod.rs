@@ -6,6 +6,7 @@ mod backup;
 mod browse;
 pub(crate) mod cluster;
 mod ha;
+mod mcp;
 mod models;
 mod ops;
 mod query;
@@ -432,6 +433,11 @@ pub async fn serve_clustered_with_status(
         .route("/v1/models/{id}/readiness", get(ops::model_ready))
         .route("/v1/models/{id}/browse", post(browse::browse))
         .route("/v1/backups/status", get(backup::overview))
+        .route("/v1/mcp/access", get(mcp::settings::access))
+        .route("/v1/mcp/token", get(users::delegation::status).post(users::delegation::issue).delete(users::delegation::revoke)
+            .layer(DefaultBodyLimit::max(4096)))
+        .route("/v1/mcp/settings", get(mcp::settings::read).put(mcp::settings::save)
+            .layer(DefaultBodyLimit::max(4096)))
         .route("/v1/settings", get(telemetry::settings::read).put(telemetry::settings::save)
             .layer(DefaultBodyLimit::max(32 * 1024)))
         .route(
@@ -466,6 +472,13 @@ pub async fn serve_clustered_with_status(
             .layer(DefaultBodyLimit::max(256 * 1024)));
     let router = Router::new()
         .nest("/api", api)
+        .route(
+            "/mcp",
+            post(mcp::handle)
+                .get(mcp::no_stream)
+                .delete(mcp::no_stream)
+                .layer(DefaultBodyLimit::max(6 * CATALOG_LIMIT + 4096)),
+        )
         .route("/healthz", get(ops::health))
         .route("/readyz", get(ops::ready))
         .route("/coordinator/active", get(ha::active))
@@ -542,6 +555,7 @@ async fn guard(State(app): State<Arc<App>>, request: Request, next: Next) -> Res
         "/recovery/check" => Some("recovery_check"),
         "/recovery/verify" => Some("recovery_verify"),
         "/gremlin" => Some("gremlin_upgrade"),
+        "/mcp" => Some("mcp"),
         _ => None,
     });
     let started = std::time::Instant::now();
@@ -594,6 +608,7 @@ async fn guard_request(
         "/healthz" | "/readyz" | "/metrics" | "/coordinator/active" | "/coordinator/recovery"
     );
     let is_gremlin = path == "/gremlin";
+    let is_mcp = path == "/mcp";
     let recovery_rpc = matches!(
         (request.method(), path),
         (&Method::GET | &Method::HEAD, "/recovery/status")
@@ -645,8 +660,14 @@ async fn guard_request(
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return response;
     }
-    let credential = (valid_host && is_api && basic)
-        .then(|| access::http(&app, headers))
+    let credential = (valid_host && (is_api || is_mcp) && basic)
+        .then(|| {
+            if is_mcp {
+                mcp::authenticate(app, headers)
+            } else {
+                access::http(&app, headers)
+            }
+        })
         .flatten();
     let mut live = credential
         .as_ref()
@@ -666,7 +687,9 @@ async fn guard_request(
         None
     };
     let mut principal = principal;
-    if let Some(user @ Principal::User { .. }) = &principal {
+    if let Some(user @ Principal::User { .. }) = &principal
+        && live.is_none()
+    {
         live = app.users.watch(user);
         if live.is_none() {
             principal = None;
@@ -681,14 +704,16 @@ async fn guard_request(
         .into_response()
     } else if app.shutdown.is_cancelled() && !is_probe {
         Error::new(StatusCode::SERVICE_UNAVAILABLE, "draining", "服务正在停止").into_response()
-    } else if !same_origin && (is_api && !read && (origin || !basic) || recovery_rpc && origin) {
+    } else if !same_origin
+        && (is_api && !read && (origin || !basic) || (recovery_rpc || is_mcp) && origin)
+    {
         Error::new(
             StatusCode::FORBIDDEN,
             "invalid_origin",
             "管理操作需要来自同一站点",
         )
         .into_response()
-    } else if is_api && !public && principal.is_none() {
+    } else if (is_api && !public || is_mcp) && principal.is_none() {
         Error::new(
             StatusCode::UNAUTHORIZED,
             "auth_required",
@@ -761,10 +786,26 @@ async fn guard_request(
             operation.target.as_deref(),
         );
     }
-    if is_api || is_probe || is_gremlin || recovery_rpc {
+    if is_api || is_probe || is_gremlin || is_mcp || recovery_rpc {
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
+    if is_mcp && !response.status().is_success() {
+        app.access.record(
+            principal.as_ref(),
+            "mcp",
+            "request",
+            None,
+            "error",
+            response.status().as_u16(),
+        );
+        if response.status() == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"GraphLake MCP\""),
+            );
+        }
     }
     response
         .headers_mut()

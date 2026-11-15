@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v1.1.0
+
+- Load configured source tables into managed Parquet copies and refresh them manually or on a schedule. Incremental refresh reads from a typed watermark and replaces rows by primary key.
+- Publish local snapshots with atomic manifest replacement and recover interrupted loads on restart. Reuse unchanged row groups, compact delta files, and reclaim affected base partitions. A full refresh can rebuild an indexed snapshot with missing data parts while checking the committed schema.
+- Prune local data files by signed primary-key ranges and filter before reading wide payload pages. Compact dense deletion masks as ranges while accepting existing position lists.
 
 - Show datasource brand SVGs on connector cards and object-storage provider settings.
 

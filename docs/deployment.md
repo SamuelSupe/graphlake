@@ -1,13 +1,13 @@
 # Deploy GraphLake
 
-The v1.0.0 release provides Linux packages for `aarch64` (ARM64) and `x86_64` (AMD64). Debian 12 with systemd is the installation baseline. For each host, keep the architecture-specific archive, its SHA-256 file, and the `BUILD-INFO` stored inside the archive.
+The v1.1.0 release provides Linux packages for `aarch64` (ARM64) and `x86_64` (AMD64). Debian 12 with systemd is the installation baseline. For each host, keep the architecture-specific archive, its SHA-256 file, and the `BUILD-INFO` stored inside the archive.
 
 ## Standalone service
 
-Download both files for the host architecture from the [v1.0.0 release](https://github.com/SamuelSupe/graphlake/releases/tag/v1.0.0). Run the commands below in the download directory. Set `artifact` to the actual archive filename without `.tar.gz`.
+Download both files for the host architecture from the [v1.1.0 release](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.0). Run the commands below in the download directory. Set `artifact` to the actual archive filename without `.tar.gz`.
 
 ```sh
-artifact=graphlake-v1.0.0-SOURCE_SHA12-linux-$(uname -m)
+artifact=graphlake-v1.1.0-SOURCE_SHA12-linux-$(uname -m)
 sha256sum -c "$artifact.tar.gz.sha256"
 release_dir="/opt/graphlake/releases/${artifact#graphlake-}"
 
@@ -56,14 +56,16 @@ For Coordinator failover, provision an etcd quorum and S3-compatible shared cont
 
 Keep the previous archive and the existing `/opt/graphlake/current` target. Back up the complete catalog directory, credentials, and any externally stored datasets before installation.
 
+For local tables, include `catalog/.graphlake-local/` in the backup. Restore the pre-upgrade catalog when rolling back the service. Coordinators and Workers that read local copies need the same absolute paths. [Local table storage and recovery](local-tables.zh-CN.md#存储与部署)
+
 Stop the standalone service, unpack the new release into a separate directory, update the systemd unit if needed, and atomically switch `current`. Start the service and verify the reported build, the published model revision, and a known-result query. To roll back, stop the service, switch `current` and the unit back to the previous version, and restore the matching saved catalog if its state changed. [Detailed upgrade procedure](../deploy/README.md#升级回退与恢复)
 
 ## Build a package from source
 
-On Debian 12, install Rust 1.95 or later, a native C/C++ toolchain, binutils, Git, and Node.js 24. From a clean checkout, run:
+On Debian 12, install Rust 1.95 or later, a native C/C++ toolchain, binutils, LLD, Git, and Node.js 24. From a clean checkout, run:
 
 ```sh
-sh deploy/package.sh v1.0.0 dist
+RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.0 dist
 ```
 
 Run this on each target architecture or provide the corresponding cross linker and Rust target, then set `GRAPHLAKE_BUILD_TARGET` to `aarch64-unknown-linux-gnu` or `x86_64-unknown-linux-gnu`. The script checks the architecture, embedded source version, and glibc baseline and writes an accompanying source archive and checksums.

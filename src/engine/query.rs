@@ -44,12 +44,50 @@ pub(crate) fn graph_statement(
     })
 }
 
+pub(super) fn gremlin_statement(
+    state: &SessionState,
+    sql: &str,
+) -> datafusion::common::Result<Statement> {
+    use datafusion::sql::sqlparser::parser::ParserError;
+    let statement = match graph_statement(state, sql) {
+        Err(DataFusionError::SQL(error, _))
+            if matches!(*error, ParserError::RecursionLimitExceeded) =>
+        {
+            return datafusion::common::plan_err!(
+                "Gremlin traversal exceeds the correlated plan size limit"
+            );
+        }
+        result => result?,
+    };
+    crate::gremlin::cost::check(&statement)?;
+    Ok(statement)
+}
+
 pub(crate) async fn graph_frame(
     context: &SessionContext,
     sql: &str,
 ) -> datafusion::common::Result<DataFrame> {
+    generated_frame(context, sql, false).await
+}
+
+pub(crate) async fn gremlin_frame(
+    context: &SessionContext,
+    sql: &str,
+) -> datafusion::common::Result<DataFrame> {
+    generated_frame(context, sql, true).await
+}
+
+async fn generated_frame(
+    context: &SessionContext,
+    sql: &str,
+    gremlin: bool,
+) -> datafusion::common::Result<DataFrame> {
     let state = context.state();
-    let statement = graph_statement(&state, sql)?;
+    let statement = if gremlin {
+        gremlin_statement(&state, sql)?
+    } else {
+        graph_statement(&state, sql)?
+    };
     context
         .execute_logical_plan(graph_logical_plan(&state, statement).await?)
         .await

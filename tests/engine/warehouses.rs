@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use graphlake::{
     Catalog, Engine, Language, QueryOptions,
@@ -313,7 +313,7 @@ nodes:
 #[ignore = "requires the Spanner emulator graphlake/test/finance fixture"]
 async fn spanner_joins_tables_at_one_read_timestamp_and_pushes_integer_keys() -> Result<()> {
     let uri = std::env::var("GRAPHLAKE_TEST_SPANNER_URI")?;
-    let engine = engine(&format!(
+    let mapping = format!(
         "graph: finance
 sources:
   remote:
@@ -332,13 +332,30 @@ edges:
     from: {{node: Account, columns: [src]}}
     to: {{node: Account, columns: [dst]}}
     properties: [amount, recorded]"
-    ))?;
+    );
     let mut options = QueryOptions::default();
     options.graph.require_consistent_snapshot = true;
+    let precise = engine(&mapping)?;
+    let error = precise
+        .query(
+            Language::Cypher,
+            "MATCH (:Account)-[e:Transfer]->(:Account) RETURN e.recorded AS recorded",
+            options.clone(),
+        )
+        .await
+        .err()
+        .context("an inexact timestamp must not be returned")?;
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("recorded") && detail.contains("microseconds"),
+        "{detail}"
+    );
+
+    let engine = engine(&mapping.replace("[amount, recorded]", "[amount]"))?;
     let mut result = engine
         .query(
             Language::Cypher,
-            "MATCH (a:Account)-[e:Transfer]->(b:Account) RETURN a.id AS id, b.status AS status, e.amount AS amount, e.recorded AS recorded",
+            "MATCH (a:Account)-[e:Transfer]->(b:Account) RETURN a.id AS id, b.status AS status, e.amount AS amount",
             options.clone(),
         )
         .await?;
@@ -353,7 +370,6 @@ edges:
     assert_eq!(records[0]["id"], 9007199254740993_i64);
     assert_eq!(records[0]["status"], "target");
     assert_eq!(records[0]["amount"], 12.250000001);
-    assert_eq!(records[0]["recorded"], "2026-01-02T03:04:05.123456789Z");
 
     let mut result = engine
         .query(

@@ -7,7 +7,7 @@ use base64::{
 };
 use datafusion::{
     arrow::ipc::{reader::StreamReader, writer::StreamWriter},
-    common::{DataFusionError, tree_node::TreeNodeRecursion},
+    common::{DataFusionError, JoinType, tree_node::TreeNodeRecursion},
     datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource},
     execution::TaskContext,
     physical_expr::{EquivalenceProperties, PhysicalExpr},
@@ -20,7 +20,7 @@ use datafusion::{
         execution_plan::{
             Boundedness, ChildrenPropertiesMode, EmissionType, ReplaceChildrenOptions,
         },
-        joins::{HashJoinExec, PartitionMode, SortMergeJoinExec},
+        joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec},
         repartition::RepartitionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec,
     },
@@ -374,11 +374,23 @@ pub(super) fn build(
     partitions: usize,
     has_staged_input: bool,
 ) -> Result<Option<(Arc<dyn ExecutionPlan>, Vec<Stage>)>> {
-    // Some operators (for example null-aware anti joins) require CollectLeft
-    // regardless of optimizer thresholds.
+    // Each stage task gets a separate join instance. Any join that must
+    // combine a build-side bitmap across probe partitions has to stay local.
     if contains(root.as_ref(), |plan| {
         plan.downcast_ref::<HashJoinExec>()
             .is_some_and(|join| join.partition_mode() == &PartitionMode::CollectLeft)
+            || plan
+                .downcast_ref::<NestedLoopJoinExec>()
+                .is_some_and(|join| {
+                    matches!(
+                        join.join_type(),
+                        JoinType::Left
+                            | JoinType::Full
+                            | JoinType::LeftSemi
+                            | JoinType::LeftAnti
+                            | JoinType::LeftMark
+                    )
+                })
     }) {
         return Ok(None);
     }

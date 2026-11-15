@@ -1,16 +1,16 @@
 use datafusion::{
     arrow::{
-        array::{ArrayRef, AsArray},
+        array::{Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray},
         compute::{CastOptions, cast_with_options, sum_checked},
         datatypes::{
-            ArrowNumericType, DataType, Decimal128Type, Decimal256Type, DecimalType, Float64Type,
-            Int64Type, UInt64Type,
+            ArrowNativeTypeOp, ArrowNumericType, DataType, Decimal128Type, Decimal256Type,
+            DecimalType, Float64Type, Int64Type, UInt64Type,
         },
     },
     common::{Result, ScalarValue, exec_err},
     logical_expr::{
-        Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility,
-        function::AccumulatorArgs,
+        Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature,
+        Volatility, function::AccumulatorArgs,
     },
     prelude::SessionContext,
 };
@@ -41,6 +41,137 @@ impl AggregateUDFImpl for Sum {
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         accumulator(args.return_field.data_type())
     }
+
+    fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        !args.is_distinct
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        let ty = args.return_field.data_type().clone();
+        fn groups<T: ArrowNumericType>(ty: DataType) -> Box<dyn GroupsAccumulator> {
+            Box::new(GroupedSum::<T> {
+                ty,
+                values: Vec::new(),
+            })
+        }
+        Ok(match ty {
+            DataType::Int64 => groups::<Int64Type>(ty),
+            DataType::UInt64 => groups::<UInt64Type>(ty),
+            DataType::Float64 => groups::<Float64Type>(ty),
+            DataType::Decimal128(..) => groups::<Decimal128Type>(ty),
+            DataType::Decimal256(..) => groups::<Decimal256Type>(ty),
+            _ => return exec_err!("unsupported Cypher sum type {ty}"),
+        })
+    }
+}
+
+struct GroupedSum<T: ArrowNumericType> {
+    ty: DataType,
+    values: Vec<Option<T::Native>>,
+}
+
+impl<T: ArrowNumericType> GroupedSum<T> {
+    fn drain(&mut self, emit: EmitTo) -> ArrayRef {
+        let values = emit.take_needed(&mut self.values);
+        let array: PrimitiveArray<T> = values.into_iter().collect();
+        std::sync::Arc::new(array.with_data_type(self.ty.clone()))
+    }
+}
+
+impl<T: ArrowNumericType> GroupsAccumulator for GroupedSum<T> {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        groups: &[usize],
+        filter: Option<&BooleanArray>,
+        total: usize,
+    ) -> Result<()> {
+        let values = checked_cast(&values[0], &self.ty)?;
+        self.values.resize(total, None);
+        for (row, (&group, value)) in groups
+            .iter()
+            .zip(values.as_primitive::<T>().iter())
+            .enumerate()
+        {
+            if let Some(value) = value
+                && filter.is_none_or(|f| f.is_valid(row) && f.value(row))
+            {
+                let sum = &mut self.values[group];
+                *sum = Some(match *sum {
+                    Some(previous) => previous.add_checked(value)?,
+                    None => value,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef], groups: &[usize], total: usize) -> Result<()> {
+        self.update_batch(states, groups, None, total)
+    }
+
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let values = checked_cast(&values[0], &self.ty)?;
+        if let Some(filter) = filter {
+            let array: PrimitiveArray<T> = values
+                .as_primitive::<T>()
+                .iter()
+                .enumerate()
+                .map(|(row, value)| {
+                    if filter.is_valid(row) && filter.value(row) {
+                        value
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Ok(vec![std::sync::Arc::new(
+                array.with_data_type(self.ty.clone()),
+            )])
+        } else {
+            Ok(vec![values])
+        }
+    }
+
+    fn evaluate(&mut self, emit: EmitTo) -> Result<ArrayRef> {
+        let array = self.drain(emit);
+        match self.ty {
+            DataType::Decimal128(precision, _) => array
+                .as_primitive::<Decimal128Type>()
+                .validate_decimal_precision(precision)?,
+            DataType::Decimal256(precision, _) => array
+                .as_primitive::<Decimal256Type>()
+                .validate_decimal_precision(precision)?,
+            _ => {}
+        }
+        Ok(array)
+    }
+
+    fn state(&mut self, emit: EmitTo) -> Result<Vec<ArrayRef>> {
+        Ok(vec![self.drain(emit)])
+    }
+
+    fn size(&self) -> usize {
+        size_of::<Self>() + self.values.capacity() * size_of::<Option<T::Native>>()
+    }
+}
+
+fn checked_cast(values: &ArrayRef, ty: &DataType) -> Result<ArrayRef> {
+    Ok(cast_with_options(
+        values,
+        ty,
+        &CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )?)
 }
 
 pub(super) fn accumulator(ty: &DataType) -> Result<Box<dyn Accumulator>> {
@@ -61,14 +192,7 @@ impl Accumulator for CheckedSum {
         }
 
         let ty = self.0.data_type();
-        let values = cast_with_options(
-            &values[0],
-            &ty,
-            &CastOptions {
-                safe: false,
-                ..Default::default()
-            },
-        )?;
+        let values = checked_cast(&values[0], &ty)?;
         let values = &values;
         let total = match &ty {
             DataType::Int64 => batch_sum::<Int64Type>(values, &ty)?,

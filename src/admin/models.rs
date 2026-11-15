@@ -101,6 +101,7 @@ pub(super) struct Validation {
 pub(super) struct Models {
     dir: PathBuf,
     sources: PathBuf,
+    snapshot: Option<Arc<tempfile::TempDir>>,
     checks: BTreeMap<String, (String, Status)>,
     engines: Arc<Mutex<VecDeque<(String, String, Engine)>>>,
 }
@@ -121,9 +122,16 @@ impl Models {
         Self {
             dir,
             sources,
+            snapshot: None,
             checks: BTreeMap::new(),
             engines: Default::default(),
         }
+    }
+
+    pub(super) fn in_snapshot(snapshot: Arc<tempfile::TempDir>, sources: PathBuf) -> Self {
+        let mut models = Self::with_sources(snapshot.path().to_owned(), sources);
+        models.snapshot = Some(snapshot);
+        models
     }
 
     pub(super) fn path(&self, id: &str) -> ApiResult<PathBuf> {
@@ -462,12 +470,13 @@ impl Models {
         self.get(id)
     }
 
-    // Published files are atomically replaced. Readers can validate a pinned
-    // archive without holding the lock used for draft and manifest mutations.
+    // Keep a coordinator snapshot on disk for as long as an unlocked reader
+    // can still open its manifests and archives by path.
     pub(super) fn read_files(&self) -> Self {
         Self {
             dir: self.dir.clone(),
             sources: self.sources.clone(),
+            snapshot: self.snapshot.clone(),
             checks: BTreeMap::new(),
             engines: Arc::clone(&self.engines),
         }
@@ -1005,3 +1014,29 @@ async fn inspect(
 }
 
 pub(super) use versions::{archived_yaml, history, publish, restore_archive, rollback, unpublish};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_catalog_snapshot_survives_an_unlocked_reader() -> anyhow::Result<()> {
+        let snapshot = Arc::new(tempfile::tempdir()?);
+        let dir = snapshot.path().to_owned();
+        let yaml = "graph: prior generation";
+        fs::write(dir.join("fixture.yaml"), yaml)?;
+        let models = Models::in_snapshot(snapshot, dir.clone());
+        let reader = models.read_files();
+        drop(models);
+        assert_eq!(
+            reader
+                .get("fixture")
+                .map_err(|error| anyhow::anyhow!(error.message))?
+                .yaml,
+            yaml
+        );
+        drop(reader);
+        assert!(!dir.exists());
+        Ok(())
+    }
+}

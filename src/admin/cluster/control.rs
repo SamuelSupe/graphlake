@@ -29,6 +29,7 @@ const HEARTBEAT: Duration = Duration::from_millis(450);
 const LEGACY_CATALOG_LIMIT: u64 = 128 * 1024 * 1024;
 const CATALOG_MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
 const CATALOG_BLOB_LIMIT: u64 = (8 * crate::admin::CATALOG_LIMIT) as u64;
+const CATALOG_UPLOAD_IDLE: Duration = Duration::from_secs(60);
 pub(in crate::admin) const CATALOG_BYTES_LIMIT: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -866,7 +867,14 @@ impl Leadership {
         let generation = Uuid::new_v4().to_string();
         let upload = async {
             let mut saved: BTreeSet<String> = match previous {
-                Some(previous) => match self.control.read_snapshot(previous).await? {
+                Some(previous) => match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.control.read_snapshot(previous),
+                )
+                .await
+                .map_err(|_| timeout())?
+                .map_err(|_| unavailable())?
+                {
                     CatalogSnapshot::Manifest { entries } => {
                         entries.into_values().map(|entry| entry.digest).collect()
                     }
@@ -875,27 +883,37 @@ impl Leadership {
                 None => BTreeSet::new(),
             };
             let objects = &self.control.objects;
-            stream::iter(
-                entries
-                    .into_iter()
-                    .filter(|(_, entry)| saved.insert(entry.digest.clone())),
-            )
-            .map(|(name, entry)| async move {
-                let key = objects.control_catalog_blob(&entry.digest);
-                objects
-                    .put_immutable(&key, state.files[&name].as_bytes().to_vec())
-                    .await
-            })
-            .buffer_unordered(8)
-            .try_collect::<Vec<_>>()
-            .await?;
+            let blobs = entries
+                .into_iter()
+                .filter(|(_, entry)| saved.insert(entry.digest.clone()));
+            let mut uploads = stream::iter(blobs)
+                .map(|(name, entry)| async move {
+                    let key = objects.control_catalog_blob(&entry.digest);
+                    // Full uploads and timed-out attempts share these
+                    // immutable objects even without a prior manifest.
+                    if !objects.exists(&key).await? {
+                        objects
+                            .put_immutable(&key, state.files[&name].as_bytes().to_vec())
+                            .await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .buffer_unordered(8);
+            // Full migrations can take minutes. Bound the interval between
+            // completed objects so a slow but progressing upload can finish.
+            while tokio::time::timeout(CATALOG_UPLOAD_IDLE, uploads.try_next())
+                .await
+                .map_err(|_| timeout())?
+                .map_err(|_| unavailable())?
+                .is_some()
+            {}
             let key = objects.control_catalog(&generation);
-            objects.put_immutable(&key, manifest).await
+            tokio::time::timeout(CATALOG_UPLOAD_IDLE, objects.put_immutable(&key, manifest))
+                .await
+                .map_err(|_| timeout())?
+                .map_err(|_| unavailable())
         };
-        tokio::time::timeout(Duration::from_secs(10), upload)
-            .await
-            .map_err(|_| timeout())?
-            .map_err(|_| unavailable())?;
+        upload.await?;
         Ok(generation)
     }
 

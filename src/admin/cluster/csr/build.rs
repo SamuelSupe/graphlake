@@ -87,7 +87,7 @@ impl ArcRuns {
 
     async fn publish(
         mut self,
-        scope: &QueryScope,
+        scope: &Arc<QueryScope>,
         objects: &Objects,
         prefix: &Key,
         shard: usize,
@@ -100,6 +100,23 @@ impl ArcRuns {
             }
             return Ok(());
         }
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        let io_scope = Arc::clone(scope);
+        let budget = self.budget.new_empty();
+        budget.try_grow(3 * BLOCK_BYTES)?;
+        let reader = tokio::task::spawn_blocking(move || self.read_runs(&io_scope, send));
+        while let Some(rows) = receive.recv().await {
+            scope.check()?;
+            arc_block(objects, prefix, shard, partition, &rows).await?;
+        }
+        reader.await?
+    }
+
+    fn read_runs(
+        mut self,
+        scope: &QueryScope,
+        send: tokio::sync::mpsc::Sender<Vec<ArcEntry>>,
+    ) -> Result<()> {
         self.spill(scope)?;
         while self.runs.len() > RUN_FAN_IN {
             let mut previous = std::mem::take(&mut self.runs).into_iter();
@@ -116,18 +133,23 @@ impl ArcRuns {
             }
         }
         let budget = self.budget.new_empty();
-        budget.try_grow(self.runs.len() * (4096 + 128) + BLOCK_BYTES)?;
+        budget.try_grow(self.runs.len() * (4096 + 128))?;
         let mut merge = ArcRunMerge::new(&self.runs)?;
         let mut batch = Vec::with_capacity((BLOCK_BYTES - 4) / 36);
         while let Some(arc) = merge.next()? {
             batch.push(arc);
             if batch.len() == (BLOCK_BYTES - 4) / 36 {
                 scope.check()?;
-                arc_block(objects, prefix, shard, partition, &batch).await?;
-                batch.clear();
+                send.blocking_send(batch)
+                    .context("CSR adjacency upload stopped")?;
+                batch = Vec::with_capacity((BLOCK_BYTES - 4) / 36);
             }
         }
-        arc_block(objects, prefix, shard, partition, &batch).await
+        if !batch.is_empty() {
+            send.blocking_send(batch)
+                .context("CSR adjacency upload stopped")?;
+        }
+        Ok(())
     }
     fn merge_run(&self, runs: Vec<ArcRun>, scope: &QueryScope) -> Result<ArcRun> {
         let budget = self.budget.new_empty();
@@ -407,7 +429,7 @@ fn edge_record(
 
 pub(super) async fn build(
     engine: &Engine,
-    scope: &QueryScope,
+    scope: &Arc<QueryScope>,
     objects: &Objects,
     prefix: &Key,
     generation: Generation<'_>,

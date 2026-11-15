@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 
 use crate::{
     Catalog,
-    engine::{QueryScope, graph_frame},
+    engine::{QueryScope, gremlin_frame},
     source::snapshot::Buffer,
 };
 
@@ -60,7 +60,7 @@ impl Repeat {
                 "graph label collides with internal Gremlin loop name"
             );
         }
-        let initial = graph_frame(context, &self.initial).await?;
+        let initial = gremlin_frame(context, &self.initial).await?;
         let schema = Arc::new(Schema::new(
             initial
                 .schema()
@@ -121,7 +121,7 @@ impl Repeat {
                 nested_budget
                     .push(Box::pin(nested.register(catalog, context, scope, false)).await?);
             }
-            let mut body = graph_frame(context, &self.body)
+            let mut body = gremlin_frame(context, &self.body)
                 .await?
                 .execute_stream()
                 .await?;
@@ -178,7 +178,7 @@ impl Repeat {
         for nested in &self.checked_nested {
             budget.push(Box::pin(nested.register(catalog, context, scope, false)).await?);
         }
-        let mut checked = graph_frame(context, &self.checked)
+        let mut checked = gremlin_frame(context, &self.checked)
             .await?
             .execute_stream()
             .await?;

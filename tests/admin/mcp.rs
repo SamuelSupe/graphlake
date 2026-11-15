@@ -1165,3 +1165,59 @@ async fn personal_ai_tokens_inherit_live_user_permissions_and_are_mcp_only() -> 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn issuing_mcp_token_after_restore_cannot_reenable_old_console_password() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    server
+        .request(Method::PUT, "users/restore-user")
+        .json(&json!({"password":PASSWORD,"disabled":false}))
+        .send()
+        .await?
+        .error_for_status()?;
+    drop(server);
+
+    let path = root.path().join(".graphlake-auth/users.json");
+    let mut directory: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let restored = &mut directory["accounts"]["restore-user"];
+    restored["disabled"] = true.into();
+    restored["reset_required"] = true.into();
+    let version = restored["version"].clone();
+    fs::write(path, serde_json::to_vec(&directory)?)?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let issued: Value = server.request(Method::PUT, "users/restore-user")
+        .json(&json!({"version":version, "disabled":false, "console_access":false,"issue_mcp_token":true}))
+        .send().await?.error_for_status()?.json().await?;
+    assert!(issued["mcp_token"].is_string());
+    let response = server
+        .request(Method::PUT, "users/restore-user")
+        .json(&json!({"version":issued["version"],"disabled":false,"console_access":true}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.json::<Value>().await?["code"], "password_required");
+    let new_password = "fixture-only replacement console password";
+    server.request(Method::PUT, "users/restore-user")
+        .json(&json!({"version":issued["version"],"disabled":false,"console_access":true,"password":new_password}))
+        .send().await?.error_for_status()?;
+    for (password, expected) in [
+        (PASSWORD, StatusCode::UNAUTHORIZED),
+        (new_password, StatusCode::OK),
+    ] {
+        assert_eq!(
+            server
+                .guest(Method::POST, "auth/login")
+                .json(&json!({"username":"restore-user","password":password}))
+                .send()
+                .await?
+                .status(),
+            expected
+        );
+    }
+    Ok(())
+}

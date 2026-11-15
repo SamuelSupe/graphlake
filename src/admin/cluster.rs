@@ -8,10 +8,11 @@ mod store;
 mod worker;
 
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4},
     path::{Path as FsPath, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -51,6 +52,37 @@ pub(super) struct Coordinator {
     next: AtomicUsize,
     graph_partitions: usize,
     memory_bytes: usize,
+    heartbeats: Mutex<Heartbeats>,
+}
+
+#[derive(Default)]
+struct Heartbeats {
+    jobs: HashMap<Uuid, (i64, Instant, Instant)>,
+    last_prune: Option<Instant>,
+}
+
+impl Heartbeats {
+    fn age(&mut self, id: Uuid, revision: i64, now: Instant) -> Duration {
+        let interval = Duration::from_millis(WORKER_HEARTBEAT_TIMEOUT_MS);
+        if self
+            .last_prune
+            .is_none_or(|last| now.duration_since(last) >= interval)
+        {
+            self.jobs
+                .retain(|_, (_, _, seen)| now.duration_since(*seen) <= 4 * interval);
+            self.last_prune = Some(now);
+        }
+        let (current, since, seen) = self.jobs.entry(id).or_insert((revision, now, now));
+        if revision < *current {
+            return Duration::ZERO;
+        }
+        if revision > *current {
+            *current = revision;
+            *since = now;
+        }
+        *seen = now;
+        now.duration_since(*since)
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -96,6 +128,7 @@ impl Coordinator {
             next: AtomicUsize::new(0),
             graph_partitions: config.distributed_partitions,
             memory_bytes: config.memory_mib * 1024 * 1024,
+            heartbeats: Default::default(),
         })
     }
 
@@ -361,6 +394,7 @@ impl Coordinator {
                     .map_err(storage)?
                     .ok_or_else(expired)?;
                 if !matches!(saved.job.state, JobState::Running) {
+                    self.heartbeats.lock().unwrap().jobs.remove(&id);
                     return self.response(id, &saved.job).await;
                 }
                 if self.mark_worker_lost(id, &saved).await? {
@@ -387,18 +421,25 @@ impl Coordinator {
         let Some(worker) = saved.job.worker else {
             return Ok(false);
         };
-        let heartbeat_age = now_ms().saturating_sub(saved.job.worker_seen_ms);
-        if !matches!(saved.job.state, JobState::Running)
-            || heartbeat_age <= WORKER_HEARTBEAT_TIMEOUT_MS
-        {
+        if !matches!(saved.job.state, JobState::Running) {
+            self.heartbeats.lock().unwrap().jobs.remove(&id);
+            return Ok(false);
+        }
+        // etcd changes the revision on every heartbeat. Time its last change
+        // locally so a worker's wall clock cannot speed up or delay expiry.
+        let heartbeat_age = self
+            .heartbeats
+            .lock()
+            .unwrap()
+            .age(id, saved.revision, Instant::now());
+        let heartbeat_timeout = Duration::from_millis(WORKER_HEARTBEAT_TIMEOUT_MS);
+        if heartbeat_age <= heartbeat_timeout {
             return Ok(false);
         }
         // A long query can delay lease writes while the worker process still owns
         // the attempt. A live process gets one grace window, but it cannot
         // extend the lifetime of a query indefinitely without heartbeats.
-        if heartbeat_age <= 2 * WORKER_HEARTBEAT_TIMEOUT_MS
-            && self.worker_identity_is_live(worker).await
-        {
+        if heartbeat_age <= 2 * heartbeat_timeout && self.worker_identity_is_live(worker).await {
             return Ok(false);
         }
         let mut job = saved.job.clone();
@@ -736,4 +777,33 @@ pub async fn serve_worker(
     shutdown.cancel();
     signal.abort();
     Ok(result?)
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn observations_follow_revision_progress_on_the_coordinator_clock() {
+        let id = Uuid::new_v4();
+        let start = Instant::now();
+        let mut heartbeats = Heartbeats::default();
+        assert_eq!(heartbeats.age(id, 17, start), Duration::ZERO);
+        assert_eq!(
+            heartbeats.age(id, 17, start + Duration::from_secs(13)),
+            Duration::from_secs(13)
+        );
+        assert_eq!(
+            heartbeats.age(id, 18, start + Duration::from_secs(14)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            heartbeats.age(id, 17, start + Duration::from_secs(15)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            heartbeats.age(id, 18, start + Duration::from_secs(16)),
+            Duration::from_secs(2)
+        );
+    }
 }

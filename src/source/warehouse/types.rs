@@ -7,7 +7,8 @@ use datafusion::arrow::{
     array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
         Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, UInt8Array,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray, UInt8Array,
     },
     datatypes::{DataType, SchemaRef, TimeUnit},
 };
@@ -86,11 +87,16 @@ pub(crate) fn batch(
                     .map(|date| (date - epoch).num_days() as i32))
                 }
                 DataType::Time64(TimeUnit::Microsecond) => {
-                    converted!(Time64MicrosecondArray, |value| time_nanos(value)
-                        .map(|n| n / 1_000))
+                    converted!(Time64MicrosecondArray, |value| {
+                        exact_fraction(value, 6, "microseconds")?;
+                        time_nanos(value).map(|n| n / 1_000)
+                    })
                 }
                 DataType::Time64(TimeUnit::Nanosecond) => {
-                    converted!(Time64NanosecondArray, time_nanos)
+                    converted!(Time64NanosecondArray, |value| {
+                        exact_fraction(value, 9, "nanoseconds")?;
+                        time_nanos(value)
+                    })
                 }
                 DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
                     let cells = values()
@@ -101,15 +107,35 @@ pub(crate) fn batch(
                                     {
                                         Ok(value.parse::<i64>()?)
                                     } else {
+                                        exact_fraction(value, 6, "microseconds")?;
                                         Ok(timestamp(value, timezone.is_some(), encoding)?
                                             .timestamp_micros())
                                     }
                                 })
                                 .transpose()
                         })
-                        .collect::<Result<Vec<_>>>()?;
+                        .collect::<Result<Vec<_>>>()
+                        .with_context(|| format!("decoding warehouse column {}", field.name()))?;
                     Arc::new(
                         TimestampMicrosecondArray::from(cells).with_timezone_opt(timezone.clone()),
+                    )
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, timezone) => {
+                    let cells = values()
+                        .map(|value| {
+                            value
+                                .map(|value| {
+                                    exact_fraction(value, 9, "nanoseconds")?;
+                                    timestamp(value, timezone.is_some(), encoding)?
+                                        .timestamp_nanos_opt()
+                                        .context("timestamp exceeds Arrow nanosecond range; expose it as text in the source view")
+                                })
+                                .transpose()
+                        })
+                        .collect::<Result<Vec<_>>>()
+                        .with_context(|| format!("decoding warehouse column {}", field.name()))?;
+                    Arc::new(
+                        TimestampNanosecondArray::from(cells).with_timezone_opt(timezone.clone()),
                     )
                 }
                 DataType::Decimal128(precision, scale) => {
@@ -131,6 +157,22 @@ pub(crate) fn batch(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+// Check the source text before chrono parses it. Some databases return
+// more than nine fractional digits, which chrono may already discard.
+fn exact_fraction(value: &str, digits: usize, unit: &str) -> Result<()> {
+    if let Some((_, fraction)) = value.split_once('.') {
+        ensure!(
+            !fraction
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .skip(digits)
+                .any(|digit| digit != b'0'),
+            "fractional precision exceeds Arrow {unit}; expose it as text in the source view"
+        );
+    }
+    Ok(())
 }
 
 fn timestamp(value: &str, zoned: bool, encoding: Encoding) -> Result<DateTime<chrono::Utc>> {
@@ -209,8 +251,8 @@ mod tests {
         ]));
         let rows = vec![
             vec![
-                Some("9999-12-31 23:59:59.123456789".into()),
-                Some("9999-12-31T23:59:59.123456789Z".into()),
+                Some("9999-12-31 23:59:59.123456000".into()),
+                Some("9999-12-31T23:59:59.123456000Z".into()),
             ],
             vec![None, None],
         ];
@@ -226,5 +268,20 @@ mod tests {
             );
         }
         Ok(())
+    }
+    #[test]
+    fn timestamp_keys_reject_a_fraction_that_would_collide_at_microseconds() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_key",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]));
+        let rows = vec![
+            vec![Some("2025-01-01T00:00:00.123456000Z".into())],
+            vec![Some("2025-01-01T00:00:00.123456000001Z".into())],
+        ];
+        let error = batch(schema, &rows, Encoding::Rfc3339).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("time_key") && message.contains("microseconds"));
     }
 }

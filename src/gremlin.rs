@@ -1,4 +1,5 @@
 mod control;
+pub(crate) mod cost;
 mod math;
 mod parse;
 pub(crate) mod repeat;
@@ -6,7 +7,7 @@ mod values;
 mod variants;
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
@@ -17,7 +18,7 @@ use opencypher::ExprKind;
 use crate::{
     Catalog,
     catalog::{columns, equal_keys, ident, qualified},
-    cypher::{Plan, literal, string},
+    cypher::{Plan, disjoin, literal, string},
 };
 
 use parse::{Step, integer, parse_chain, parse_expr, text};
@@ -106,7 +107,6 @@ struct Traversers<'a> {
     control_columns: Vec<String>,
     group: Option<control::Group>,
     ctes: Vec<String>,
-    inline_copies: Rc<Cell<usize>>,
     repeats: Rc<RefCell<Vec<repeat::Repeat>>>,
 }
 
@@ -220,7 +220,6 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
                 control_columns: Vec::new(),
                 group: None,
                 ctes: Vec::new(),
-                inline_copies: Rc::new(Cell::new(1)),
                 repeats: Rc::default(),
             })
         })
@@ -961,11 +960,7 @@ fn condition(field: &str, arg: &str) -> Result<String> {
                     .iter()
                     .map(|value| Ok(gremlin_compare(field, "=", &literal(value)?)))
                     .collect::<Result<Vec<_>>>()?;
-                let matches = if values.is_empty() {
-                    "FALSE".into()
-                } else {
-                    values.join(" OR ")
-                };
+                let matches = disjoin(&values);
                 return Ok(if within {
                     format!("({matches})")
                 } else {

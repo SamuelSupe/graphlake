@@ -95,9 +95,22 @@ pub(in crate::admin::cluster) struct ArcBlocks(std::sync::Mutex<ArcBlockState>);
 
 #[derive(Default)]
 struct ArcBlockState {
-    generation: Option<Uuid>,
+    generations: VecDeque<(Uuid, GenerationBlocks)>,
+}
+
+#[derive(Default)]
+struct GenerationBlocks {
     used: usize,
     blocks: BTreeMap<Key, ([u8; 32], bytes::Bytes)>,
+}
+
+impl GenerationBlocks {
+    fn trim(&mut self, limit: usize) {
+        while self.used > limit {
+            let (key, (_, data)) = self.blocks.pop_last().expect("cached block");
+            self.used -= data.len() + key.as_ref().len() + 160;
+        }
+    }
 }
 
 impl ArcBlocks {
@@ -106,31 +119,53 @@ impl ArcBlocks {
         tokio::task::consume_budget().await;
         graph.scope.check()?;
         {
-            let state = self.0.lock().unwrap();
-            if state.generation == Some(generation)
-                && let Some((sha, data)) = state.blocks.get(key)
-                && *sha == block.sha256
+            let mut state = self.0.lock().unwrap();
+            if let Some(index) = state
+                .generations
+                .iter()
+                .position(|(id, _)| *id == generation)
             {
-                return Ok(data.clone());
+                let entry = state.generations.remove(index).unwrap();
+                let cached = entry
+                    .1
+                    .blocks
+                    .get(key)
+                    .filter(|(sha, _)| *sha == block.sha256)
+                    .map(|(_, data)| data.clone());
+                state.generations.push_back(entry);
+                if let Some(data) = cached {
+                    return Ok(data);
+                }
             }
         }
         let data = read_block(graph.objects, key, block, graph.scope).await?;
         let capacity = (graph.scope.options.memory_bytes / 8).min(8 * 1024 * 1024);
         let mut state = self.0.lock().unwrap();
-        if state.generation != Some(generation) {
-            *state = ArcBlockState {
-                generation: Some(generation),
-                ..Default::default()
-            };
+        if !state.generations.iter().any(|(id, _)| *id == generation) {
+            if state.generations.len() == 2 {
+                state.generations.pop_front();
+            }
+            state
+                .generations
+                .push_back((generation, GenerationBlocks::default()));
         }
+        let limit = capacity / state.generations.len();
+        for (_, blocks) in &mut state.generations {
+            blocks.trim(limit);
+        }
+        let (_, blocks) = state
+            .generations
+            .iter_mut()
+            .find(|(id, _)| *id == generation)
+            .unwrap();
         // A stable subset is useful on each iteration even when a partition
         // is larger than the cache. Evicting on sequential misses would thrash.
         let bytes = data.len() + key.as_ref().len() + 160;
-        if state.used + bytes <= capacity && !state.blocks.contains_key(key) {
-            state
+        if blocks.used + bytes <= limit && !blocks.blocks.contains_key(key) {
+            blocks
                 .blocks
                 .insert(key.clone(), (block.sha256, data.clone()));
-            state.used += bytes;
+            blocks.used += bytes;
         }
         Ok(data)
     }

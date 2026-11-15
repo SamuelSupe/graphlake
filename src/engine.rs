@@ -19,7 +19,7 @@ pub(crate) mod sql_read;
 #[cfg(feature = "admin")]
 pub(crate) use query::spilled_bytes as execution_spill;
 pub use query::{EngineLimits, QueryMetrics, QueryOptions, QueryResult};
-pub(crate) use query::{QueryScope, graph_frame};
+pub(crate) use query::{QueryScope, graph_frame, gremlin_frame};
 
 #[cfg(feature = "admin")]
 pub(crate) fn variant_fields(fields: &crate::arrow::datatypes::Fields) -> bool {
@@ -332,12 +332,14 @@ impl Engine {
                     }
                     Language::Gremlin => {
                         let plan = crate::gremlin::plan(&self.catalog, text)?;
+                        let statement =
+                            query::gremlin_statement(&state, &format!("{prefix}{}", plan.sql))?;
                         #[cfg(feature = "admin")]
                         {
                             graph_output = plan.graph_output;
                         }
                         (
-                            query::graph_statement(&state, &format!("{prefix}{}", plan.sql))?,
+                            statement,
                             plan.labels,
                             true,
                             plan.expansions,
@@ -412,7 +414,9 @@ impl Engine {
                     csr.is_none()
                         && !schema_only
                         && prefix.is_empty()
-                        && calls.is_empty()
+                        && calls
+                            .iter()
+                            .all(|call| matches!(call.mode, cypher::apply::Mode::Materialize))
                         && repeats.is_empty()
                         && expansions.is_empty()
                         && procedures.is_empty()

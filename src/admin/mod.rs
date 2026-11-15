@@ -84,8 +84,7 @@ struct App {
     wire: Option<wire::Access>,
     cluster: Option<cluster::Coordinator>,
     ha: Option<ha::Ha>,
-    _ha_bootstrap: Option<tempfile::TempDir>,
-    ha_cache: Mutex<Option<tempfile::TempDir>>,
+    _ha_bootstrap: Option<Arc<tempfile::TempDir>>,
     ha_ready: std::sync::atomic::AtomicBool,
 }
 
@@ -238,7 +237,10 @@ pub async fn serve_clustered_with_status(
         .as_deref()
         .map(cluster::Coordinator::load)
         .transpose()?;
-    let ha_cache = coordinator_failover.then(tempfile::tempdir).transpose()?;
+    let ha_cache = coordinator_failover
+        .then(tempfile::tempdir)
+        .transpose()?
+        .map(Arc::new);
     let metadata_dir = ha_cache
         .as_ref()
         .map_or(catalog_dir.as_path(), |dir| dir.path());
@@ -333,7 +335,10 @@ pub async fn serve_clustered_with_status(
             .map(|model| (model, driver_token_env.as_str())),
         coordinator_failover,
     )?;
-    let models = models::Models::with_sources(metadata_dir.to_owned(), catalog_dir);
+    let models = match &ha_cache {
+        Some(snapshot) => models::Models::in_snapshot(Arc::clone(snapshot), catalog_dir),
+        None => models::Models::new(catalog_dir),
+    };
     if ha.is_none() {
         models
             .adopt_existing()
@@ -401,7 +406,6 @@ pub async fn serve_clustered_with_status(
         cluster,
         ha,
         _ha_bootstrap: ha_cache,
-        ha_cache: Mutex::new(None),
         ha_ready: std::sync::atomic::AtomicBool::new(false),
     });
     if let Some(status) = status {
@@ -727,7 +731,7 @@ async fn guard_request(
         access::forbidden().into_response()
     } else {
         let leadership = if !is_probe && let Some(ha) = &app.ha {
-            match ha.leader.confirm().await {
+            match ha.leader.admission() {
                 Ok(token) => Some(token),
                 Err(error) => {
                     let mut response = error.into_response();

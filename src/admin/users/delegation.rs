@@ -92,6 +92,7 @@ pub(in crate::admin) fn authenticate(app: &App, value: &str) -> Option<Credentia
         let account = live.directory.accounts.get(name)?;
         if account.disabled
             || account.reset_required
+            || account.mcp_disabled
             || account.token_sha256.is_some()
             || token.owner != account.id.to_string()
         {
@@ -135,6 +136,25 @@ pub(in crate::admin) struct Change {
     revision: Option<Uuid>,
 }
 
+pub(super) fn generate(owner: String) -> ApiResult<(Token, String)> {
+    let mut random = [0; 32];
+    OsRng
+        .try_fill_bytes(&mut random)
+        .map_err(|_| Error::storage())?;
+    let value = format!("glai_{}", URL_SAFE_NO_PAD.encode(random));
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::storage())?
+        .as_millis() as u64;
+    let token = Token {
+        owner,
+        revision: Uuid::new_v4(),
+        digest: Sha256::digest(value.as_bytes()).into(),
+        created_at_ms,
+    };
+    Ok((token, value))
+}
+
 pub(in crate::admin) async fn issue(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Principal>,
@@ -147,10 +167,7 @@ pub(in crate::admin) async fn issue(
         if !mcp::can_use(&app, &principal) { return Err(access::forbidden()); }
         let previous = next.ai_tokens.get(principal.audit_name()).filter(|token| token.owner == owner);
         if previous.map(|token|token.revision) != change.revision { return Err(conflict()); }
-        let mut random = [0; 32];
-        OsRng.try_fill_bytes(&mut random).map_err(|_| Error::storage())?;
-        let value = format!("glai_{}", URL_SAFE_NO_PAD.encode(random));
-        let token = Token { owner, revision: Uuid::new_v4(), digest: Sha256::digest(value.as_bytes()).into(), created_at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_|Error::storage())?.as_millis() as u64 };
+        let (token, value) = generate(owner)?;
         let response = json!({"owner":principal.audit_name(),"active":true,"revision":token.revision,"created_at_ms":token.created_at_ms,"token":value});
         next.ai_tokens.insert(principal.audit_name().into(), token);
         commit(&app, next, revision, BTreeSet::new()).await?;

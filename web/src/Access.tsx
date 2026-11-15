@@ -13,18 +13,26 @@ export const roles = {
 } as const;
 export type Role = keyof typeof roles;
 export type Grants = Record<string, Role[]>;
-type User = { username: string; version: string; disabled: boolean; service?: boolean; roles: string[] };
+type User = { username: string; version: string; disabled: boolean; service: boolean; console_access: boolean; mcp_access: boolean; roles: string[] };
+type SavedUser = User & { mcp_token?: string };
 type RolePartition = { column: string; op: 'eq'; value: string | number | boolean };
 type ModelRole = { version: string; grants: Grants; members: string[]; partitions?: Record<string, RolePartition> };
+const tabs = [['roles', '角色'], ['members', '成员']] as const;
+type AccessTab = typeof tabs[number][0];
 
-export function Access({ models }: { models: ModelSummary[] }) {
+export function Access({ models, locked }: { models: ModelSummary[]; locked: boolean }) {
+  const [tab, setTab] = useState<AccessTab>('roles');
   const [users, setUsers] = useState<User[]>();
   const [groups, setGroups] = useState<Record<string, ModelRole>>();
   const [groupEdit, setGroupEdit] = useState<string>();
   const [edit, setEdit] = useState<User | 'new'>();
+  const [issuedToken, setIssuedToken] = useState<{ username: string; token: string }>();
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    if (locked && issuedToken) setIssuedToken(undefined);
+  }, [locked, issuedToken]);
   useEffect(() => {
     const controller = new AbortController();
     const options = { signal: controller.signal };
@@ -46,62 +54,111 @@ export function Access({ models }: { models: ModelSummary[] }) {
     <header className="workspace-header">
       <div className="workspace-title"><h1>权限管理</h1></div>
       <div className="workspace-context">
-        <button className="button compact" onClick={() => setEdit('new')} disabled={!users}><Plus size={16} />新建成员</button>
-        <button className="button primary compact" onClick={() => setGroupEdit('')} disabled={!groups}><Plus size={16} />新建角色</button>
+        {tab === 'roles'
+          ? <button className="button primary compact" onClick={() => setGroupEdit('')} disabled={!groups}><Plus size={16} />新建角色</button>
+          : <button className="button primary compact" onClick={() => setEdit('new')} disabled={!users}><Plus size={16} />新建成员</button>}
       </div>
     </header>
+    <div className="workspace-tabs" role="tablist" aria-label="权限管理分类">
+      {tabs.map(([key, label], index) => <button key={key} id={'access-tab-' + key} type="button" role="tab"
+        aria-selected={tab === key} tabIndex={tab === key ? 0 : -1} onClick={() => setTab(key)} onKeyDown={event => {
+          let next: AccessTab;
+          if (event.key === 'Home') next = 'roles';
+          else if (event.key === 'End') next = 'members';
+          else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') next = tabs[1 - index][0];
+          else return;
+          event.preventDefault();
+          setTab(next);
+          document.getElementById('access-tab-' + next)?.focus();
+        }}>{label}</button>)}
+    </div>
     <div className="listing access-page">
       <p role="status" className={notice ? 'notice' : 'sr-only'}>{notice}</p>
       {error && <p className="notice error" role="alert">{error}{' '}
         <button className="text-button" onClick={() => { setError(''); setAttempt(value => value + 1); }}>重新读取</button>
       </p>}
-      <h2>角色</h2>
-      <div className="panel-table access-table">
-        <table>
+      <div className="panel-table directory access-table" role="tabpanel" aria-labelledby="access-tab-roles"
+        hidden={tab !== 'roles'} tabIndex={tab === 'roles' ? 0 : undefined}>
+        <table role="table">
           <caption className="sr-only">角色权限与成员</caption>
-          <thead><tr><th scope="col">角色</th><th scope="col">模型权限</th><th scope="col">成员</th><th scope="col">操作</th></tr></thead>
-          <tbody>{Object.entries(groups ?? {}).map(([name, group]) => <tr key={name}>
-            <th scope="row"><code>{name}</code></th>
-            <td>{Object.keys(group.grants).length ? <ul className="access-grants">{Object.entries(group.grants).map(([model, assigned]) =>
+          <thead role="rowgroup"><tr role="row"><th scope="col">角色</th><th scope="col">模型权限</th><th scope="col">成员</th><th scope="col">操作</th></tr></thead>
+          <tbody role="rowgroup">{Object.entries(groups ?? {}).map(([name, group]) => <tr key={name} role="row" className="directory-row">
+            <th scope="row" role="rowheader" className="directory-name"><code>{name}</code></th>
+            <td role="cell" className="access-data"><small className="directory-field-label">模型权限</small>{Object.keys(group.grants).length ? <ul className="access-grants">{Object.entries(group.grants).map(([model, assigned]) =>
               <li key={model}><code>{model}</code> {assigned.map(role => roles[role]).join('、')}{group.partitions?.[model] && <small> · {group.partitions[model].column} = {JSON.stringify(group.partitions[model].value)}</small>}</li>)}</ul> : '暂无权限'}</td>
-            <td>{group.members.length ? group.members.join('、') : '暂无成员'}</td>
-            <td><button className="button compact" aria-label={'编辑角色 ' + name} onClick={() => setGroupEdit(name)}>编辑</button></td>
+            <td role="cell" className="access-data"><small className="directory-field-label">成员</small>{group.members.length ? group.members.join('、') : '暂无成员'}</td>
+            <td role="cell" className="directory-actions"><button className="button compact" aria-label={'编辑角色 ' + name} onClick={() => setGroupEdit(name)}>编辑</button></td>
           </tr>)}
-          {groups && !Object.keys(groups).length && <tr><td colSpan={4}>暂无自定义角色</td></tr>}
+          {groups && !Object.keys(groups).length && <tr role="row"><td role="cell" colSpan={4} className="access-empty">暂无自定义角色</td></tr>}
           </tbody>
         </table>
       </div>
-      <h2>成员</h2>
-      <div className="panel-table access-table">
-        <table>
+      <div className="panel-table directory access-table" role="tabpanel" aria-labelledby="access-tab-members"
+        hidden={tab !== 'members'} tabIndex={tab === 'members' ? 0 : undefined}>
+        <table role="table">
           <caption className="sr-only">成员及所属角色</caption>
-          <thead><tr><th scope="col">成员</th><th scope="col">状态</th><th scope="col">所属角色</th><th scope="col">操作</th></tr></thead>
-          <tbody>
-            <tr><th scope="row"><Shield size={16} aria-hidden="true" /> <code>admin</code></th><td>启用</td><td>系统管理员 · 全部模型</td><td>内置账号</td></tr>
-            {users?.map(user => <tr key={user.username}>
-              <th scope="row"><code>{user.service ? 'svc/' : ''}{user.username}</code>{user.service && <small> · 服务账号</small>}</th>
-              <td><span className={'status ' + (user.disabled ? 'failed' : 'passed')}>{user.disabled ? '停用' : '启用'}</span></td>
-              <td>{user.roles.length ? user.roles.join('、') : '暂无角色'}</td>
-              <td><button className="button compact" aria-label={'编辑成员 ' + user.username} onClick={() => setEdit(user)}>编辑</button></td>
+          <thead role="rowgroup"><tr role="row"><th scope="col">成员</th><th scope="col" className="access-status-heading">状态</th><th scope="col">接入权限</th><th scope="col">所属角色</th><th scope="col">操作</th></tr></thead>
+          <tbody role="rowgroup">
+            <tr role="row" className="directory-row">
+              <th scope="row" role="rowheader" className="directory-name"><Shield size={16} aria-hidden="true" /> <code>admin</code></th>
+              <td role="cell" className="access-data"><small className="directory-field-label">状态</small><span className="status passed">启用</span></td>
+              <td role="cell" className="access-data"><small className="directory-field-label">接入权限</small>控制台、MCP</td>
+              <td role="cell" className="access-member-roles"><small className="directory-field-label">所属角色</small>系统管理员 · 全部模型</td>
+              <td role="cell" className="directory-actions muted">内置账号</td>
+            </tr>
+            {users?.map(user => <tr key={user.username} role="row" className="directory-row">
+              <th scope="row" role="rowheader" className="directory-name"><code>{user.service ? 'svc/' : ''}{user.username}</code>{user.service && <small className="access-account-kind">服务账号</small>}</th>
+              <td role="cell" className="access-data"><small className="directory-field-label">状态</small><span className={'status ' + (user.disabled ? 'failed' : 'passed')}>{user.disabled ? '停用' : '启用'}</span></td>
+              <td role="cell" className="access-data"><small className="directory-field-label">接入权限</small>{[user.service && '驱动 / API', user.console_access && '控制台', user.mcp_access && 'MCP'].filter(Boolean).join('、') || '无'}</td>
+              <td role="cell" className="access-member-roles"><small className="directory-field-label">所属角色</small>{user.roles.length ? user.roles.join('、') : '暂无角色'}</td>
+              <td role="cell" className="directory-actions"><button className="button compact" aria-label={'编辑成员 ' + user.username} onClick={() => setEdit(user)}>编辑</button></td>
             </tr>)}
           </tbody>
         </table>
       </div>
-      {!users && !error && <p className="empty" role="status">正在读取成员…</p>}
+      {!users && !error && <p className="empty" role="status">{tab === 'roles' ? '正在读取角色…' : '正在读取成员…'}</p>}
     </div>
     {edit && <Member item={edit === 'new' ? undefined : edit} close={() => setEdit(undefined)}
-      removed={name => changed(name + ' 已删除')} saved={user => changed(user.disabled ? user.username + ' 已停用' : user.username + ' 的账号已保存')} />}
+      removed={name => changed(name + ' 已删除')} saved={user => {
+        changed(user.disabled ? user.username + ' 已停用' : user.username + ' 的账号已保存');
+        if (user.mcp_token) setIssuedToken({ username: user.username, token: user.mcp_token });
+      }} />}
+    {issuedToken && !locked && <IssuedMcpToken {...issuedToken} close={() => setIssuedToken(undefined)} />}
     {groupEdit !== undefined && <RoleEditor name={groupEdit} item={groups && Object.hasOwn(groups, groupEdit) ? groups[groupEdit] : undefined} models={models} users={users ?? []}
       close={() => setGroupEdit(undefined)} saved={changed} />}
   </main>;
 }
 
+function IssuedMcpToken({ username, token, close }: { username: string; token: string; close: () => void }) {
+  const [notice, setNotice] = useState('');
+  async function copy() {
+    try { await navigator.clipboard.writeText(token); setNotice('已复制令牌。'); }
+    catch { setNotice('无法访问剪贴板，请选中令牌后手动复制。'); }
+  }
+  return <Modal title={'MCP 令牌 · ' + username} layout="center" close={close}>
+    <div className="dialog-form">
+      <p>关闭后无法再次查看此令牌。将它填入 Agent 的 Bearer Token 设置。</p>
+      <label>令牌<input className="mono" data-initial-focus readOnly value={token} onFocus={event => event.currentTarget.select()} /></label>
+      {notice && <p role="status">{notice}</p>}
+      <div className="dialog-actions">
+        <button type="button" className="button" onClick={close}>完成</button>
+        <button type="button" className="button primary" onClick={() => void copy()}>复制令牌</button>
+      </div>
+    </div>
+  </Modal>;
+}
+
 function Member({ item, close, removed, saved }: {
-  item?: User; close: () => void; removed: (name: string) => void; saved: (user: User) => void;
+  item?: User; close: () => void; removed: (name: string) => void; saved: (user: SavedUser) => void;
 }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [service, setService] = useState(item?.service ?? false);
+  const [consoleAccess, setConsoleAccess] = useState(item?.console_access ?? true);
+  const [mcpAccess, setMcpAccess] = useState(item?.mcp_access ?? true);
+  const [disabled, setDisabled] = useState(item?.disabled ?? false);
+  const showCredential = service || consoleAccess;
+  const canIssue = !service && !consoleAccess && mcpAccess && !disabled;
   async function remove() {
     if (!item || !window.confirm('删除 ' + item.username + ' 并将其从所有角色移除？')) return;
     setError('');
@@ -125,9 +182,11 @@ function Member({ item, close, removed, saved }: {
     setError('');
     setBusy(true);
     try {
-      saved(await api<User>('/users/' + encodeURIComponent(username), {
+      saved(await api<SavedUser>('/users/' + encodeURIComponent(username), {
         method: 'PUT', body: JSON.stringify({
-          version: item?.version, service, disabled: data.has('disabled'),
+          version: item?.version, service, disabled,
+          console_access: !service && consoleAccess, mcp_access: mcpAccess,
+          issue_mcp_token: canIssue && data.has('issue_mcp_token'),
           ...(service ? { token: secret || undefined } : { password: secret || undefined }),
         }),
       }));
@@ -150,15 +209,24 @@ function Member({ item, close, removed, saved }: {
         aria-describedby={service ? 'access-service-help' : undefined} pattern={modelIdPattern} maxLength={64}
         required data-initial-focus={!item || undefined} /></label>
       {service && <p className="muted" id="access-service-help">客户端用户名为 <code>svc/{item?.username ?? '账号名称'}</code>。</p>}
-      <div className="access-passwords" key={String(service)}>
+      <fieldset className="access-members">
+        <legend>接入权限</legend>
+        <div className="access-role-grid">
+          {!service && <label className="access-check"><input type="checkbox" checked={consoleAccess} onChange={event => setConsoleAccess(event.target.checked)} />允许登录控制台</label>}
+          <label className="access-check"><input type="checkbox" checked={mcpAccess} onChange={event => setMcpAccess(event.target.checked)} />允许接入 MCP</label>
+        </div>
+        {!mcpAccess && <p className="muted">保存后，该账号的 MCP 请求会被拒绝。</p>}
+      </fieldset>
+      {showCredential && <><div className="access-passwords" key={String(service)}>
         <label htmlFor="access-secret">{service ? (item ? '新令牌（选填）' : '初始令牌') : (item ? '新密码（选填）' : '初始密码')}
           <input id="access-secret" name="secret" type="password" autoComplete={service ? 'off' : 'new-password'}
             minLength={service ? 32 : 15} maxLength={256} required={!item} aria-describedby="access-password-help" /></label>
         <label htmlFor="access-confirm">{service ? '确认令牌' : '确认密码'}<input id="access-confirm" name="confirm"
           type="password" autoComplete={service ? 'off' : 'new-password'} maxLength={256} required={!item} /></label>
       </div>
-      <p className="muted" id="access-password-help">{service ? '使用随机生成的 32 至 256 个可打印 ASCII 字符。' : '密码长度为 15 至 128 个字符。'}{item && '留空保留原凭据。'}</p>
-      <label className="access-check"><input type="checkbox" name="disabled" defaultChecked={item?.disabled} />停用账号</label>
+      <p className="muted" id="access-password-help">{service ? '使用随机生成的 32 至 256 个可打印 ASCII 字符。' : '密码长度为 15 至 128 个字符。'}{item && '留空保留原凭据。'}</p></>}
+      {canIssue && <label className="access-check"><input type="checkbox" name="issue_mcp_token" defaultChecked={!item} />签发 MCP 令牌{item && '（已有令牌会失效）'}</label>}
+      <label className="access-check"><input type="checkbox" checked={disabled} onChange={event => setDisabled(event.target.checked)} />停用账号</label>
       <p className="muted">将账号加入角色后才可访问对应的模型。</p>
       {item && <p className="muted">{service ? '保存后会关闭此账号的现有连接。' : '保存后该成员需要重新登录。'}</p>}
       {error && <p className="notice error" role="alert">{error}</p>}

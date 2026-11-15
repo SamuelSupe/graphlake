@@ -10,7 +10,7 @@ export const mcpServiceLabels: Record<McpService, string> = { query: '查询 MCP
 type McpServiceStatus = { endpoint: string; enabled: boolean; allowed: boolean };
 
 export type McpAccess = McpSnapshot & {
-  owner: string; can_issue: boolean; services: Record<McpService, McpServiceStatus>;
+  owner: string; account_allowed: boolean; can_issue: boolean; services: Record<McpService, McpServiceStatus>;
   scope: { models: McpModel[]; modeling_targets: string[] };
 };
 

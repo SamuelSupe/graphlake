@@ -140,7 +140,7 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
         </>}
       </div>
     </header>
-    <div className="settings-tabs" role="tablist" aria-label="运行配置分类">
+    <div className="workspace-tabs" role="tablist" aria-label="运行配置分类">
       {tabs.map(([key, label], index) => <button key={key} id={tabButton(key)} type="button" role="tab"
         autoFocus={key === 'mcp' && initialTab === 'mcp'}
         aria-controls={tabPanel(key)} aria-selected={key === tab} tabIndex={key === tab ? 0 : -1} onClick={() => setTab(key)} onKeyDown={event => {

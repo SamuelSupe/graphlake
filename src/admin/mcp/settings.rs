@@ -106,11 +106,13 @@ pub(in crate::admin) async fn access(
         "modeling": service(Service::Modeling, "modeling"),
     });
     value["owner"] = json!(principal.audit_name());
+    let account_allowed = app.users.mcp_allowed(&principal);
+    value["account_allowed"] = json!(account_allowed);
     value["can_issue"] =
         json!(super::can_use(&app, &principal) && app.auth.ai_owner_key().is_some());
     let mut effective = config;
-    effective.query &= effective.enabled;
-    effective.modeling &= effective.enabled;
+    effective.query &= effective.enabled && account_allowed;
+    effective.modeling &= effective.enabled && account_allowed;
     effective.publish &= effective.modeling;
     value["scope"] = super::tools::scope(&app, &principal, &effective)?;
     Ok(Json(value))

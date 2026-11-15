@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Bot, Database, LayoutDashboard, LogOut, Network, Settings2, ShieldCheck, Terminal } from 'lucide-react';
+import { Bot, Database, LayoutDashboard, LogOut, Network, Settings2, ShieldCheck, Terminal, UserRound } from 'lucide-react';
 import { api, errorText, type ModelSummary, type SavedModel } from './api';
 import { AuthGate, type Session } from './Auth';
 import { Access, type Grants } from './Access';
@@ -238,11 +238,20 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
           <Settings2 size={20} aria-hidden="true" /><span>运行配置</span>
         </button>}
       </div>
-      {logout && <div className="rail-items rail-account">
-        <button className="rail-link" onClick={() => dirty.current.size ? setConfirmLogout(true) : void signOut()} disabled={loggingOut}>
+      <div className="rail-items rail-account">
+        <div className="rail-identity">
+          <UserRound size={20} aria-hidden="true" />
+          <div className="rail-identity-text">
+            {identity.enabled ? <>
+              <bdi className="rail-username" title={identity.username ?? undefined}>{identity.username}</bdi>
+              <span>{administrator ? '管理员' : '普通用户'}</span>
+            </> : <span>未启用认证</span>}
+          </div>
+        </div>
+        {logout && <button className="rail-link" onClick={() => dirty.current.size ? setConfirmLogout(true) : void signOut()} disabled={loggingOut}>
           <LogOut size={20} aria-hidden="true" /><span>退出登录</span>
-        </button>
-      </div>}
+        </button>}
+      </div>
     </nav>
     <div className="app-content" id="workspace-content" tabIndex={-1}>
     {mutations.banner && <div className="global-mutation">{mutations.banner}</div>}
@@ -278,7 +287,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
       workspace={workspace} models={models ?? []} close={() => navigate('/')} goTo={next => navigate(modelPath(newModel.id, next))}
       changeModel={key => navigate(modelPath(key, workspace))} changed={reloadModels} created={key => navigate(modelPath(key), true)} />
       </Suspense>}
-    {accessPage && (administrator && identity.enabled ? <Access models={models ?? []} /> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
+    {accessPage && (administrator && identity.enabled ? <Access models={models ?? []} locked={locked} /> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
     {administrator && overviewVisited && <div hidden={!overviewPage}>
         <Suspense fallback={<p className="empty" role="status">正在打开平台概览…</p>}>
           <Overview active={overviewPage && !locked} openModel={(id, page) => navigate(modelPath(id, page))}

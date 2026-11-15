@@ -296,6 +296,8 @@ HAProxy 对 HTTPS 后端检查 `/coordinator/active`，对 Bolt 后端通过实�
 
 ### 在线控制状态备份与恢复
 
+管理员可在「运行配置 → 备份与恢复」选择「立即备份」。在每台启用故障接管的 Coordinator 上设置 `GRAPHLAKE_MANUAL_BACKUP_DIR`，指向服务用户可写、权限为 `0700` 的现有私有绝对目录，例如 systemd 配置下的 `/var/lib/graphlake/manual-backups`。配置后重启服务。文件采用与命令行导出相同的格式和校验，页面报告服务器文件名和检查点时间。手动结果记录在同目录的 `manual-export-status.json`，与定时任务独立。将该目录纳入保留和异地同步策略。
+
 导出时 Coordinator 可持续接单。命令在同一 etcd 事务读取模型指针、用户角色和服务账号，随后下载该代次的不可变归档。输出为经过校验的 `0600` 文件，包含草稿、历史、授权以及密码哈希，按凭据备份保管。安装随包提供的 `graphlake-backup.service` 与 `graphlake-backup.timer` 可每小时导出一次。配置独立目录同步与保留策略，将备份副本迁出 etcd 与对象存储所在故障域。监控进程根据导出和异地校验状态触发故障与过期告警。[生产监控与恢复检查](monitoring.md)
 
 ```sh
@@ -311,7 +313,7 @@ graphlake-admin --cluster-config /etc/graphlake/cluster.yaml backup export \
 
 - `GRAPHLAKE_RESTORE_INBOX` 指向可信、只读的异地副本目录，可由异地对象存储同步或挂载。每个检查点用一个以字母或数字开头的子目录，目录名可含连字符和下划线。子目录根下放置 `control.json`、`manifest.json` 和 `postgres.dump`，Parquet 文件沿用清单的相对路径。各站点需保留这些只读副本供验收重验。
 - `GRAPHLAKE_RESTORE_POSTGRES_DSN_ENV` 填目标站 DSN 的环境变量名，须与清单的 `postgres.dsn_env` 一致。该变量在目标站解析到专用空库，使用单一 TCP 地址并明确给出数据库和用户。开启 TLS 时会验证主机名与 CA，可为 `pg_restore` 通过 `GRAPHLAKE_RESTORE_PG_CA_FILE` 指定 CA。
-- `GRAPHLAKE_RECOVERY_TOKEN` 使用 `openssl rand -hex 32` 生成并在所有候选 Coordinator 上配置。部署随包 HAProxy 配置并启动 Worker、Coordinator。保持源数据冻结，在目标站打开 `/recovery`，读取状态，选择备份并确认恢复。清单及归档通过校验后，系统写入 Parquet、在单事务中恢复 PostgreSQL，再提交控制状态。已有 Parquet 文件仅在摘要一致时复用。开始写入后重试须使用同一检查点。普通业务入口会保持关闭，直到验收通过；页面还会检查同一 HTTPS 地址的业务入口是否就绪。
+- `GRAPHLAKE_RECOVERY_TOKEN` 使用 `openssl rand -hex 32` 生成并在所有候选 Coordinator 上配置。部署随包 HAProxy 配置并启动 Worker、Coordinator。保持源数据冻结，在管理后台选择「运行配置 → 备份与恢复 → 恢复备份」，输入目标站 HTTPS 地址。也可以直接访问目标站 `/recovery`。在目标站输入恢复令牌，选择并检查恢复点。检查会读取控制备份和清单，显示检查点、表和文件数量。确认后，服务会再次核对清单摘要及数据归档，然后写入 Parquet、在单事务中恢复 PostgreSQL，再提交控制状态。已有 Parquet 文件仅在摘要一致时复用。开始写入后重试须使用同一检查点。普通业务入口会保持关闭，直到验收通过。页面还会检查同一 HTTPS 地址的业务入口是否就绪。
 
 以下步骤适用于手工准备检查点和使用现有 CLI 恢复。UI 恢复使用步骤 1 生成的同格式检查点。
 

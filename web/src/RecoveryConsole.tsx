@@ -3,7 +3,7 @@ import { ArrowLeft, ShieldCheck } from 'lucide-react';
 import { errorText } from './api';
 import { Mark, Modal } from './ui';
 import RecoveryImport from './RecoveryImport';
-import { recovery, type Gate, type RecoveryStatus, type RestoreStatus } from './recoveryApi';
+import { recovery, type Gate, type RecoveryPointCheck, type RecoveryStatus, type RestoreStatus } from './recoveryApi';
 
 type Manifest = { manifest_sha256: string; postgres_relations: number; parquet_files: number; canaries: number };
 type Action = 'status' | 'check' | 'verify';
@@ -55,8 +55,8 @@ export default function RecoveryConsole() {
     return () => { window.clearTimeout(timer); controller.abort(); };
   }, [running, token, applyStatus]);
 
-  async function startRestore(bundle: string) {
-    await recovery<void>('import', token, { body: JSON.stringify({ bundle }) });
+  async function startRestore({ bundle, manifest_sha256 }: RecoveryPointCheck) {
+    await recovery<void>('import', token, { body: JSON.stringify({ bundle, manifest_sha256 }) });
     setRestore(previous => previous && {
       mode: 'restore', job: { bundle, phase: 'validate', running: true, bound: previous.job?.bound ?? false, failure: null },
     });

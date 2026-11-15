@@ -16,7 +16,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::Mutex};
 
-use super::{Gate, authorize, configured_token, data, versioned_manifest};
+use super::{Gate, Manifest, authorize, configured_token, data, valid_digest, versioned_manifest};
 use crate::{
     CancellationToken,
     admin::{
@@ -71,6 +71,17 @@ struct Candidate {
 #[serde(deny_unknown_fields)]
 struct Start {
     bundle: String,
+    #[serde(default)]
+    manifest_sha256: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CandidateCheck {
+    bundle: String,
+    checkpoint_ms: Option<u64>,
+    manifest_sha256: String,
+    postgres_relations: usize,
+    parquet_files: usize,
 }
 
 struct Stage {
@@ -82,6 +93,7 @@ struct Stage {
     target: PathBuf,
     dsn_env: String,
     job: Arc<Mutex<()>>,
+    review: Arc<Mutex<()>>,
     shutdown: CancellationToken,
 }
 
@@ -150,6 +162,7 @@ pub(in crate::admin) async fn serve(
         dsn_env,
         token: configured_token()?,
         job: Arc::new(Mutex::new(())),
+        review: Arc::new(Mutex::new(())),
         shutdown: shutdown.clone(),
     });
     let router = Router::new()
@@ -160,6 +173,10 @@ pub(in crate::admin) async fn serve(
         )
         .route("/recovery/status", get(status))
         .route("/recovery/backups", get(backups))
+        .route(
+            "/recovery/check",
+            post(check_candidate).layer(DefaultBodyLimit::max(1024)),
+        )
         .route(
             "/recovery/import",
             post(start).layer(DefaultBodyLimit::max(1024)),
@@ -220,7 +237,7 @@ async fn guard(State(stage): State<Arc<Stage>>, request: Request, next: Next) ->
         .into_response()
     } else if matches!(
         request.uri().path(),
-        "/recovery/status" | "/recovery/backups" | "/recovery/import"
+        "/recovery/status" | "/recovery/backups" | "/recovery/check" | "/recovery/import"
     ) && headers.contains_key(header::ORIGIN)
         && !exact_header(headers, header::ORIGIN, &stage.origin)
     {
@@ -245,12 +262,14 @@ async fn guard(State(stage): State<Arc<Stage>>, request: Request, next: Next) ->
 
 async fn status(State(stage): State<Arc<Stage>>, headers: HeaderMap) -> ApiResult<Json<Status>> {
     authorize(&headers, &stage.token)?;
+    // Read the persisted job before releasing an idle slot so it cannot race a new start.
+    let idle = stage.job.try_lock().ok();
     let job = stage
         .leader
         .get::<Option<Job>>(JOB_KEY)
         .await?
         .and_then(|(job, _)| job);
-    let running = stage.job.try_lock().is_err()
+    let running = idle.is_none()
         || job
             .as_ref()
             .is_some_and(|job| job.phase == Phase::Control && job.failure.is_none())
@@ -316,6 +335,54 @@ async fn backups(
     Ok(Json(list))
 }
 
+async fn check_candidate(
+    State(stage): State<Arc<Stage>>,
+    headers: HeaderMap,
+    Json(form): Json<Start>,
+) -> ApiResult<Json<CandidateCheck>> {
+    authorize(&headers, &stage.token)?;
+    let slot = stage
+        .review
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| Error::busy())?;
+    let timeout = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let dir = bundle_dir(&stage.inbox, &form.bundle)
+                .map_err(|_| super::failed("异地备份目录不可读"))?;
+            let (backup, manifest, manifest_sha256) = read_bundle(&dir, &stage.dsn_env)
+                .map_err(|error| super::failed(error.to_string()))?;
+            Ok(Json(CandidateCheck {
+                bundle: form.bundle,
+                checkpoint_ms: backup.created_at_ms,
+                manifest_sha256,
+                postgres_relations: manifest.postgres.relations.len(),
+                parquet_files: manifest.parquet.len(),
+            }))
+        }),
+    )
+    .await;
+    timeout
+        .map_err(|_| super::timed_out())?
+        .map_err(|_| Error::storage())?
+}
+
+fn read_bundle(dir: &FsPath, dsn_env: &str) -> Result<(backup::Backup, Manifest, String)> {
+    let backup = backup::read(&dir.join("control.json")).context("控制备份无效或不可读")?;
+    let (manifest, digest) = versioned_manifest(dir).context("恢复清单无效或不可读")?;
+    ensure!(
+        manifest.control_sha256 == backup.sha256,
+        "恢复清单与控制备份摘要不匹配"
+    );
+    ensure!(
+        manifest.postgres.dsn_env == dsn_env,
+        "清单中的 PostgreSQL 连接与目标站配置不一致"
+    );
+    Ok((backup, manifest, digest))
+}
+
 async fn start(
     State(stage): State<Arc<Stage>>,
     headers: HeaderMap,
@@ -324,6 +391,13 @@ async fn start(
     authorize(&headers, &stage.token)?;
     if !models::valid_id(&form.bundle) {
         return Err(super::failed("异地备份标识无效"));
+    }
+    if form
+        .manifest_sha256
+        .as_deref()
+        .is_some_and(|digest| !valid_digest(digest))
+    {
+        return Err(super::failed("恢复清单摘要无效"));
     }
     let slot = stage
         .job
@@ -349,6 +423,7 @@ async fn start(
         } else {
             (None, false)
         };
+    let reviewed = form.manifest_sha256;
     let mut job = Job {
         bundle: form.bundle,
         phase: Phase::Validate,
@@ -363,7 +438,7 @@ async fn start(
             biased;
             _ = leader.cancelled() => Err(anyhow::anyhow!("Coordinator 主权暂不可用，请重试")),
             _ = stage.shutdown.cancelled() => return,
-            result = tokio::time::timeout(RESTORE_TIMEOUT, stage.run(&mut job, &mut revision)) =>
+            result = tokio::time::timeout(RESTORE_TIMEOUT, stage.run(&mut job, &mut revision, reviewed.as_deref())) =>
                 result.unwrap_or_else(|_| Err(anyhow::anyhow!("恢复作业超时"))),
         };
         if let Err(error) = result {
@@ -400,32 +475,23 @@ impl Stage {
         Ok(())
     }
 
-    async fn run(&self, job: &mut Job, revision: &mut i64) -> Result<()> {
+    async fn run(&self, job: &mut Job, revision: &mut i64, reviewed: Option<&str>) -> Result<()> {
         let bundle = bundle_dir(&self.inbox, &job.bundle)?;
         let dir = bundle.clone();
+        let dsn_env = self.dsn_env.clone();
         let (backup, manifest, manifest_sha256) =
-            tokio::task::spawn_blocking(move || -> Result<_> {
-                let backup =
-                    backup::read(&dir.join("control.json")).context("控制备份无效或不可读")?;
-                let (manifest, digest) =
-                    versioned_manifest(&dir).context("恢复清单无效或不可读")?;
-                ensure!(
-                    manifest.control_sha256 == backup.sha256,
-                    "恢复清单与控制备份摘要不匹配"
-                );
-                Ok((backup, manifest, digest))
-            })
-            .await
-            .context("无法读取备份")??;
+            tokio::task::spawn_blocking(move || read_bundle(&dir, &dsn_env))
+                .await
+                .context("无法读取备份")??;
+        ensure!(
+            reviewed.is_none_or(|digest| digest == manifest_sha256),
+            "恢复清单在检查后已变更，请重新检查恢复点"
+        );
         ensure!(
             job.bound
                 .as_ref()
                 .is_none_or(|bound| bound == &manifest_sha256),
             "此备份清单已变更，请恢复原清单"
-        );
-        ensure!(
-            manifest.postgres.dsn_env == self.dsn_env,
-            "清单中的 PostgreSQL 连接与目标站配置不一致"
         );
         let postgres = data::Destination::load(&self.dsn_env)?;
         let mut archive = data::archive(&bundle, &manifest.postgres.dump_sha256).await?;

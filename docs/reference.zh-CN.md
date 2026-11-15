@@ -59,7 +59,9 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 侧边栏独立的「AI」页面默认展示 Agent 接入指南，用户可生成、轮换或撤销个人 AI 令牌，查看自身可用模型并测试连接。AI 继承令牌所属用户当前的查询、建模、发布权限及租户范围，审计记录归属实际用户。查询与建模各有一个 MCP 地址（`/mcp/query` 和 `/mcp/modeling`），管理员在「运行配置 → MCP 服务」中独立启停。详见 [MCP 接入与能力边界](mcp.md)。
 
-后台和 Worker 提供 Prometheus 指标。「运行配置」包括日志与遥测、健康检查、备份与恢复及 MCP 服务。管理员可编辑日志和 OpenTelemetry 配置、检查发布模型的数据源、查看最近备份状态和配置 MCP 服务。目标站可在 HTTPS 恢复页选择已同步的异地备份，恢复控制状态、PostgreSQL 和 Parquet 数据，随后执行验收并核对切流状态。[恢复操作](../deploy/cluster.md#绑定恢复点并开放入口) · [OpenTelemetry 配置](../deploy/README.md#opentelemetry-上报)
+后台和 Worker 提供 Prometheus 指标。「运行配置」包括日志与遥测、健康检查、备份与恢复及 MCP 服务。管理员可编辑日志和 OpenTelemetry 配置、检查发布模型的数据源、查看最近备份状态和配置 MCP 服务。从「备份与恢复 → 恢复备份」进入目标站 HTTPS 恢复页，可选择并检查已同步的恢复点，确认恢复后查看各阶段进度、执行验收并核对切流状态。[恢复操作](../deploy/cluster.md#绑定恢复点并开放入口) · [OpenTelemetry 配置](../deploy/README.md#opentelemetry-上报)
+
+启用 Coordinator 故障接管并配置私有目录后，管理员可在「备份与恢复」选择「立即备份」，在服务器生成已校验的控制状态文件。PostgreSQL 与 Parquet 源数据另行备份。[配置手动备份](../deploy/cluster.md#在线控制状态备份与恢复)
 
 在浏览器打开 [本机管理后台](http://127.0.0.1:7337/)。使用 `--port` 可指定端口，`--timeout-ms` 可将默认 60 秒的执行期限调短。服务绑定 IPv4 回环地址，页面和 API 共用同一个来源。模型文件命名为 `<标识>.yaml`，标识以 ASCII 字母或数字开头，可包含下划线和连字符，长度最多 64。模型目录中的文件继续使用原有 YAML 格式和相对路径规则。启动服务前，在同一进程环境中设置 Catalog 引用的凭据变量。
 

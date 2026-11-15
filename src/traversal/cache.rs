@@ -27,11 +27,15 @@ use super::{COOPERATIVE_INTERVAL, Direction, Neighbor, Topology, row_converter, 
 const MAGIC: &[u8; 8] = b"GLCSR001";
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const IPC_ROWS: usize = 8192;
+#[cfg(unix)]
+const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct Cache {
     dir: PathBuf,
     binding: String,
+    #[cfg(unix)]
+    recent: Arc<std::sync::Mutex<Option<Recent>>>,
 }
 
 #[derive(Debug)]
@@ -40,6 +44,35 @@ pub(super) struct Loaded {
     pub(super) versions: Vec<SourceVersion>,
     pub(super) generation: String,
     _budget: MemoryReservation,
+}
+
+#[cfg(unix)]
+type FileId = (u64, u64, u64, i64, i64, i64, i64);
+
+#[cfg(unix)]
+fn file_id(file: &File) -> std::io::Result<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata()?;
+    Ok((
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    ))
+}
+
+#[cfg(unix)]
+struct Recent {
+    path: PathBuf,
+    direction: Direction,
+    id: FileId,
+    topology: Arc<Topology>,
+    versions: Vec<SourceVersion>,
+    generation: String,
+    reserved: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,7 +103,12 @@ impl Engine {
             self.catalog.as_ref(),
             permission_scope,
         ))?));
-        self.cache = Some(Cache { dir, binding });
+        self.cache = Some(Cache {
+            dir,
+            binding,
+            #[cfg(unix)]
+            recent: Default::default(),
+        });
         Ok(self)
     }
 
@@ -188,16 +226,51 @@ impl Cache {
         let binding = self.binding(&scope.options.graph)?;
         let path = self.path(edge, &binding);
         let edge = edge.to_owned();
+        #[cfg(unix)]
+        let recent = Arc::clone(&self.recent);
         tokio::task::spawn_blocking(move || {
             let file = match File::open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
-            read(file, &binding, &edge, direction, &scope)
-                .map(Arc::new)
-                .map(Some)
-                .with_context(|| format!("reading CSR generation {}", path.display()))
+            #[cfg(unix)]
+            let (id, file_check) = {
+                let id = file_id(&file)?;
+                if let Some(entry) = recent.lock().unwrap().as_ref().filter(|entry| {
+                    entry.id == id && entry.path == path && entry.direction == direction
+                }) {
+                    scope.check()?;
+                    let budget = MemoryConsumer::new("GraphLake persisted CSR")
+                        .register(&scope.runtime.memory_pool);
+                    budget.try_grow(entry.reserved)?;
+                    return Ok(Some(Arc::new(Loaded {
+                        topology: Arc::clone(&entry.topology),
+                        versions: entry.versions.clone(),
+                        generation: entry.generation.clone(),
+                        _budget: budget,
+                    })));
+                }
+                (id, file.try_clone()?)
+            };
+            let loaded = read(file, &binding, &edge, direction, &scope)
+                .with_context(|| format!("reading CSR generation {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                let reserved = loaded._budget.size();
+                if reserved <= MAX_RETAINED_BYTES && file_id(&file_check)? == id {
+                    *recent.lock().unwrap() = Some(Recent {
+                        path,
+                        direction,
+                        id,
+                        topology: Arc::clone(&loaded.topology),
+                        versions: loaded.versions.clone(),
+                        generation: loaded.generation.clone(),
+                        reserved,
+                    });
+                }
+            }
+            Ok(Some(Arc::new(loaded)))
         })
         .await?
     }

@@ -21,6 +21,8 @@ use crate::admin::{
     mcp,
 };
 
+const TOKEN_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Token {
@@ -28,6 +30,23 @@ pub(super) struct Token {
     revision: Uuid,
     digest: [u8; 32],
     created_at_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+impl Token {
+    fn expires_at_ms(&self) -> u64 {
+        self.created_at_ms.saturating_add(TOKEN_TTL_MS)
+    }
+
+    fn active(&self, now: u64) -> bool {
+        self.created_at_ms <= now && now < self.expires_at_ms()
+    }
 }
 
 pub(super) fn validate(directory: &Directory) -> ApiResult<()> {
@@ -86,6 +105,9 @@ pub(in crate::admin) fn authenticate(app: &App, value: &str) -> Option<Credentia
         .ai_tokens
         .iter()
         .find(|(_, token)| bool::from(token.digest.ct_eq(&digest)))?;
+    if !token.active(now_ms()) {
+        return None;
+    }
     let principal = if name == "admin" {
         (app.auth.ai_owner_key().as_ref() == Some(&token.owner)).then_some(Principal::Admin)?
     } else {
@@ -119,7 +141,7 @@ fn view(app: &App, principal: &Principal) -> ApiResult<Value> {
         .get(principal.audit_name())
         .filter(|token| token.owner == owner);
     Ok(
-        json!({"owner":principal.audit_name(),"active":token.is_some(),"revision":token.map(|token|token.revision),"created_at_ms":token.map(|token|token.created_at_ms)}),
+        json!({"owner":principal.audit_name(),"active":token.is_some_and(|token| token.active(now_ms())),"revision":token.map(|token|token.revision),"created_at_ms":token.map(|token|token.created_at_ms),"expires_at_ms":token.map(Token::expires_at_ms)}),
     )
 }
 
@@ -168,7 +190,7 @@ pub(in crate::admin) async fn issue(
         let previous = next.ai_tokens.get(principal.audit_name()).filter(|token| token.owner == owner);
         if previous.map(|token|token.revision) != change.revision { return Err(conflict()); }
         let (token, value) = generate(owner)?;
-        let response = json!({"owner":principal.audit_name(),"active":true,"revision":token.revision,"created_at_ms":token.created_at_ms,"token":value});
+        let response = json!({"owner":principal.audit_name(),"active":true,"revision":token.revision,"created_at_ms":token.created_at_ms,"expires_at_ms":token.expires_at_ms(),"token":value});
         next.ai_tokens.insert(principal.audit_name().into(), token);
         commit(&app, next, revision, BTreeSet::new()).await?;
         Ok(Json(response))
@@ -205,4 +227,21 @@ fn conflict() -> Error {
         "ai_token_conflict",
         "AI 令牌已在其他页面变更，请刷新令牌状态后重试",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issued_credential_expires_at_its_persisted_issue_date_plus_ttl() {
+        let token = Token {
+            owner: "user".to_owned(),
+            revision: Uuid::new_v4(),
+            digest: [0; 32],
+            created_at_ms: 123,
+        };
+        assert!(token.active(123 + TOKEN_TTL_MS - 1));
+        assert!(!token.active(123 + TOKEN_TTL_MS));
+    }
 }

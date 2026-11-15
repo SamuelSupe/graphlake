@@ -303,13 +303,7 @@ impl Models {
         }
         if self.archived(id, expected).is_err() {
             atomic_write(&path, yaml.as_bytes(), false)?;
-            if self
-                .engine
-                .as_ref()
-                .is_some_and(|(model, _, _)| model == id)
-            {
-                self.engine = None;
-            }
+            self.engines.lock().unwrap().retain(|(key, _, _)| key != id);
         }
         self.get(id)
     }
@@ -450,13 +444,7 @@ impl Models {
         state.active = None;
         state.offline_at_ms = Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
         self.write_state(id, &state)?;
-        if self
-            .engine
-            .as_ref()
-            .is_some_and(|(model, _, _)| model == id)
-        {
-            self.engine = None;
-        }
+        self.engines.lock().unwrap().retain(|(key, _, _)| key != id);
         model.active_revision = None;
         Ok(model)
     }

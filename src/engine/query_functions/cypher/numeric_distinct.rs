@@ -6,10 +6,10 @@ use datafusion::{
         datatypes::{DataType, Field, Schema},
     },
     common::{Result, ScalarValue, plan_err},
-    functions_aggregate::{average::avg_udaf, sum::sum_udaf},
+    functions_aggregate::average::avg_udaf,
     logical_expr::{
-        AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-        Volatility, function::AccumulatorArgs,
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+        function::AccumulatorArgs,
     },
     physical_expr::expressions::Column,
     prelude::SessionContext,
@@ -36,10 +36,6 @@ struct NumericDistinct {
 }
 
 impl NumericDistinct {
-    fn aggregate(&self) -> Arc<AggregateUDF> {
-        if self.average { avg_udaf() } else { sum_udaf() }
-    }
-
     fn input_type(&self, ty: &DataType) -> Result<DataType> {
         let DataType::List(field) = ty else {
             return plan_err!("DISTINCT numeric aggregate requires a list of values");
@@ -67,7 +63,12 @@ impl ScalarUDFImpl for NumericDistinct {
     }
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
-        self.aggregate().return_type(&[self.input_type(&args[0])?])
+        let ty = self.input_type(&args[0])?;
+        if self.average {
+            avg_udaf().return_type(&[ty])
+        } else {
+            Ok(ty)
+        }
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -80,7 +81,7 @@ impl ScalarUDFImpl for NumericDistinct {
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("distinct list");
-        let aggregate = self.aggregate();
+        let avg = avg_udaf();
         let field = Arc::new(Field::new("value", ty.clone(), true));
         let fields = [field];
         let schema = Schema::new(fields.to_vec());
@@ -100,17 +101,21 @@ impl ScalarUDFImpl for NumericDistinct {
                     let items = list.value(index);
                     let rows = items.len();
                     let values = numeric_array(vec![items], &ty, rows)?;
-                    let mut accumulator = aggregate.accumulator(AccumulatorArgs {
-                        return_field: args.return_field.clone(),
-                        schema: &schema,
-                        ignore_nulls: true,
-                        order_bys: &[],
-                        is_reversed: false,
-                        name: aggregate.name(),
-                        is_distinct: false,
-                        exprs: &exprs,
-                        expr_fields: &fields,
-                    })?;
+                    let mut accumulator = if self.average {
+                        avg.accumulator(AccumulatorArgs {
+                            return_field: args.return_field.clone(),
+                            schema: &schema,
+                            ignore_nulls: true,
+                            order_bys: &[],
+                            is_reversed: false,
+                            name: avg.name(),
+                            is_distinct: false,
+                            exprs: &exprs,
+                            expr_fields: &fields,
+                        })?
+                    } else {
+                        super::sum::accumulator(&ty)?
+                    };
                     accumulator.update_batch(&[values])?;
                     accumulator.evaluate()
                 })

@@ -32,7 +32,11 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 use tokio::{runtime::Handle, task::JoinHandle};
-use tokio_postgres::{Client, Column, Config, Row, config::SslMode, types::Type};
+use tokio_postgres::{
+    Client, Column, Config, Row,
+    config::SslMode,
+    types::{FromSql, Type},
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use super::{ReadStats, decimal128};
@@ -944,7 +948,7 @@ fn field(col: &Column) -> Result<Field> {
             let typmod = col.type_modifier();
             ensure!(
                 typmod >= 4,
-                "PostgreSQL NUMERIC column {} requires declared precision and scale",
+                "PostgreSQL NUMERIC column {} requires declared precision and scale; for unrestricted values expose the column as text in a PostgreSQL view",
                 col.name()
             );
             let precision = (typmod - 4) >> 16;
@@ -959,6 +963,42 @@ fn field(col: &Column) -> Result<Field> {
         ref ty => bail!("unsupported PostgreSQL type {ty} for column {}", col.name()),
     };
     Ok(Field::new(col.name(), ty, true))
+}
+
+struct Temporal<T>(T);
+
+impl<'a, T: FromSql<'a>> FromSql<'a> for Temporal<T> {
+    fn accepts(ty: &Type) -> bool {
+        T::accepts(ty)
+    }
+
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // PostgreSQL uses reserved signed integer bounds for temporal infinities.
+        let special = if *ty == Type::DATE {
+            raw.try_into()
+                .ok()
+                .and_then(|bytes| match i32::from_be_bytes(bytes) {
+                    i32::MAX => Some("infinity"),
+                    i32::MIN => Some("-infinity"),
+                    _ => None,
+                })
+        } else {
+            raw.try_into()
+                .ok()
+                .and_then(|bytes| match i64::from_be_bytes(bytes) {
+                    i64::MAX => Some("infinity"),
+                    i64::MIN => Some("-infinity"),
+                    _ => None,
+                })
+        };
+        if let Some(value) = special {
+            return Err(anyhow!("PostgreSQL {ty} {value} has no Arrow temporal representation; expose the column as text in a PostgreSQL view").into());
+        }
+        T::from_sql(ty, raw).map(Self)
+    }
 }
 
 fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
@@ -1000,8 +1040,9 @@ fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
                     Arc::new(Date32Array::from(
                         rows.iter()
                             .map(|row| {
-                                row.try_get::<_, Option<NaiveDate>>(i)
-                                    .map(|v| v.map(|v| (v - epoch).num_days() as i32))
+                                row.try_get::<_, Option<Temporal<NaiveDate>>>(i)
+                                    .map(|v| v.map(|v| (v.0 - epoch).num_days() as i32))
+                                    .with_context(|| format!("decoding PostgreSQL column {}", f.name()))
                             })
                             .collect::<Result<Vec<_>, _>>()?,
                     ))
@@ -1011,12 +1052,12 @@ fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
                         .iter()
                         .map(|row| match timezone {
                             Some(_) => row
-                                .try_get::<_, Option<DateTime<Utc>>>(i)
-                                .map(|v| v.map(|v| v.timestamp_micros())),
+                                .try_get::<_, Option<Temporal<DateTime<Utc>>>>(i)
+                                .map(|v| v.map(|v| v.0.timestamp_micros())),
                             None => row
-                                .try_get::<_, Option<NaiveDateTime>>(i)
-                                .map(|v| v.map(|v| v.and_utc().timestamp_micros())),
-                        })
+                                .try_get::<_, Option<Temporal<NaiveDateTime>>>(i)
+                                .map(|v| v.map(|v| v.0.and_utc().timestamp_micros())),
+                        }.with_context(|| format!("decoding PostgreSQL column {}", f.name())))
                         .collect::<Result<Vec<_>, _>>()?;
                     Arc::new(
                         TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone()),
@@ -1027,7 +1068,13 @@ fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
                         .iter()
                         .map(|row| {
                             row.try_get::<_, Option<&str>>(i)?
-                                .map(|v| decimal128(v, *scale))
+                                .map(|v| {
+                                    ensure!(v != "NaN",
+                                        "PostgreSQL NUMERIC column {} contains NaN, which Decimal128 cannot represent; expose the column as text in a PostgreSQL view",
+                                        f.name()
+                                    );
+                                    decimal128(v, *scale)
+                                })
                                 .transpose()
                         })
                         .collect::<Result<Vec<_>>>()?;

@@ -486,7 +486,7 @@ async fn write_batches(result: &mut QueryResult, format: Format) -> Result<()> {
     let mut out = BufWriter::new(out.lock());
     match format {
         Format::Jsonl => {
-            let mut writer = arrow::json::WriterBuilder::new()
+            let mut writer = graphlake::json_writer()
                 .with_explicit_nulls(true)
                 .build::<_, arrow::json::writer::LineDelimited>(&mut out);
             while let Some(batch) = result.batches.try_next().await? {

@@ -1,5 +1,10 @@
 use anyhow::{Context, Result, bail, ensure};
-use opencypher::{ExprKind, parse_expr};
+use opencypher::{Expr, ExprKind};
+
+pub(super) fn parse_expr(input: &str) -> Result<Expr> {
+    crate::cypher::check_expression_complexity(input, "Gremlin expression")?;
+    Ok(opencypher::parse_expr(input)?)
+}
 
 use crate::cypher::paths::skip_literal;
 

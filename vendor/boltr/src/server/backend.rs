@@ -59,6 +59,10 @@ pub trait RecordStream: Send {
     async fn next(&mut self) -> Result<Option<BoltRecord>, BoltError>;
     fn summary(&self) -> BoltDict;
     fn discard(&mut self);
+    /// When a retained result must release its backend resources.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        None
+    }
 }
 
 /// A query result backed by a lazy record producer.

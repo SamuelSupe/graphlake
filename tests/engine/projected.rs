@@ -1140,7 +1140,7 @@ async fn cypher_lists_exists_and_polymorphic_fields_preserve_semantics() -> Resu
             "MATCH (a:Account) RETURN a.id AS id, EXISTS { MATCH (a)-[:Transfer]->(b:Account) WITH b ORDER BY b.id SKIP 1 LIMIT 1 WHERE a.id < b.id } AS hit, COUNT { (a)-[:Transfer]->(:Account) } AS hits ORDER BY id",
             vec![
                 json!({"id":1,"hit":true,"hits":3}),
-                json!({"id":2,"hit":false,"hits":2}),
+                json!({"id":2,"hit":true,"hits":2}),
                 json!({"id":3,"hit":false,"hits":0}),
             ],
         ),

@@ -90,6 +90,52 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+#[derive(Default)]
+pub(in crate::admin::cluster) struct ArcBlocks(std::sync::Mutex<ArcBlockState>);
+
+#[derive(Default)]
+struct ArcBlockState {
+    generation: Option<Uuid>,
+    used: usize,
+    blocks: BTreeMap<Key, ([u8; 32], bytes::Bytes)>,
+}
+
+impl ArcBlocks {
+    async fn read(&self, graph: &Graph<'_>, key: &Key, block: &Block) -> Result<bytes::Bytes> {
+        let generation = graph.manifest.generation;
+        tokio::task::consume_budget().await;
+        graph.scope.check()?;
+        {
+            let state = self.0.lock().unwrap();
+            if state.generation == Some(generation)
+                && let Some((sha, data)) = state.blocks.get(key)
+                && *sha == block.sha256
+            {
+                return Ok(data.clone());
+            }
+        }
+        let data = read_block(graph.objects, key, block, graph.scope).await?;
+        let capacity = (graph.scope.options.memory_bytes / 8).min(8 * 1024 * 1024);
+        let mut state = self.0.lock().unwrap();
+        if state.generation != Some(generation) {
+            *state = ArcBlockState {
+                generation: Some(generation),
+                ..Default::default()
+            };
+        }
+        // A stable subset is useful on each iteration even when a partition
+        // is larger than the cache. Evicting on sequential misses would thrash.
+        let bytes = data.len() + key.as_ref().len() + 160;
+        if state.used + bytes <= capacity && !state.blocks.contains_key(key) {
+            state
+                .blocks
+                .insert(key.clone(), (block.sha256, data.clone()));
+            state.used += bytes;
+        }
+        Ok(data)
+    }
+}
+
 // All keys include the published generation. Keep a small cache per query so
 // the path stream, separate hydration expressions and graph preview can reuse it.
 #[derive(Default)]
@@ -317,6 +363,7 @@ struct Graph<'a> {
     budget: MemoryReservation,
     types: BTreeSet<u32>,
     direction: Direction,
+    arc_cache: &'a ArcBlocks,
 }
 
 impl Graph<'_> {
@@ -430,13 +477,10 @@ impl Graph<'_> {
             if frontier.is_some_and(|ids| ids.range(block.first..=block.last).next().is_none()) {
                 continue;
             }
-            let data = read_block(
-                self.objects,
-                &prefix.clone().join(index.to_string()),
-                block,
-                self.scope,
-            )
-            .await?;
+            let memory = self.budget.new_empty();
+            memory.try_grow(block.decoded_size())?;
+            let key = prefix.clone().join(index.to_string());
+            let data = self.arc_cache.read(self, &key, block).await?;
             ensure!(data.len() >= 4, "invalid CSR block");
             let rows = u32_at(&data, 0) as usize;
             let adjacency = 4 + rows * 12;
@@ -576,6 +620,7 @@ pub(in crate::admin::cluster) async fn run_task(
             scope: &scope,
             direction: task.direction,
             types: task.types,
+            arc_cache: &worker.arc_cache,
         };
         ensure!(
             task.shard < graph.manifest.partitions.len(),
@@ -711,6 +756,7 @@ impl<'a> Execution<'a> {
                 scope,
                 types,
                 direction,
+                arc_cache: &worker.arc_cache,
                 budget: MemoryConsumer::new("GraphLake CSR execution")
                     .register(&scope.runtime.memory_pool),
             },

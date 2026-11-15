@@ -1,4 +1,9 @@
-use std::sync::Arc;
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    io::{BufReader, BufWriter, Write},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, ensure};
 use datafusion::{
@@ -28,9 +33,13 @@ struct Records {
 
 // Arc rows have a fixed width. Spill sorted runs and keep one current row per run
 // during the merge, even when one source vertex owns most of a shard's edges.
+const RUN_ROWS: usize = 8192;
+const RUN_FAN_IN: usize = 64;
+type ArcRun = Arc<dyn datafusion::execution::spill_file::SpillFile>;
+
 struct ArcRuns {
     rows: Vec<ArcEntry>,
-    runs: Vec<Arc<dyn datafusion::execution::spill_file::SpillFile>>,
+    runs: Vec<ArcRun>,
     budget: datafusion::execution::memory_pool::MemoryReservation,
 }
 
@@ -47,14 +56,13 @@ impl ArcRuns {
     fn push(&mut self, arc: ArcEntry, scope: &QueryScope) -> Result<()> {
         self.budget.try_grow(std::mem::size_of::<ArcEntry>() * 2)?;
         self.rows.push(arc);
-        if self.rows.len() == 8192 {
+        if self.rows.len() == RUN_ROWS {
             self.spill(scope)?;
         }
         Ok(())
     }
 
     fn spill(&mut self, scope: &QueryScope) -> Result<()> {
-        use std::io::Write;
         if self.rows.is_empty() {
             return Ok(());
         }
@@ -64,17 +72,8 @@ impl ArcRuns {
             .runtime
             .disk_manager
             .create_tmp_file("CSR adjacency run")?;
-        let mut writer = std::io::BufWriter::new(file.open_writer()?);
-        for run in self.rows.chunk_by(|left, right| left.from == right.from) {
-            writer.write_all(&run[0].from.to_le_bytes())?;
-            writer.write_all(&(run.len() as u16).to_le_bytes())?;
-            for arc in run {
-                writer.write_all(&arc.to.to_le_bytes())?;
-                writer.write_all(&arc.edge.to_le_bytes())?;
-                writer.write_all(&arc.kind.to_le_bytes())?;
-                writer.write_all(&[u8::from(arc.reverse)])?;
-            }
-        }
+        let mut writer = BufWriter::new(file.open_writer()?);
+        write_arcs(&mut writer, &self.rows)?;
         writer
             .into_inner()
             .map_err(|err| err.into_error())?
@@ -102,14 +101,94 @@ impl ArcRuns {
             return Ok(());
         }
         self.spill(scope)?;
+        while self.runs.len() > RUN_FAN_IN {
+            let mut previous = std::mem::take(&mut self.runs).into_iter();
+            loop {
+                let group: Vec<_> = previous.by_ref().take(RUN_FAN_IN).collect();
+                if group.is_empty() {
+                    break;
+                }
+                if group.len() == 1 {
+                    self.runs.extend(group);
+                    break;
+                }
+                self.runs.push(self.merge_run(group, scope)?);
+            }
+        }
         let budget = self.budget.new_empty();
         budget.try_grow(self.runs.len() * (4096 + 128) + BLOCK_BYTES)?;
-        let mut readers = self
-            .runs
+        let mut merge = ArcRunMerge::new(&self.runs)?;
+        let mut batch = Vec::with_capacity((BLOCK_BYTES - 4) / 36);
+        while let Some(arc) = merge.next()? {
+            batch.push(arc);
+            if batch.len() == (BLOCK_BYTES - 4) / 36 {
+                scope.check()?;
+                arc_block(objects, prefix, shard, partition, &batch).await?;
+                batch.clear();
+            }
+        }
+        arc_block(objects, prefix, shard, partition, &batch).await
+    }
+    fn merge_run(&self, runs: Vec<ArcRun>, scope: &QueryScope) -> Result<ArcRun> {
+        let budget = self.budget.new_empty();
+        budget.try_grow(runs.len() * (4096 + 128) + RUN_ROWS * std::mem::size_of::<ArcEntry>())?;
+        let mut merge = ArcRunMerge::new(&runs)?;
+        let file = scope
+            .runtime
+            .disk_manager
+            .create_tmp_file("compacting CSR adjacency runs")?;
+        let mut writer = BufWriter::new(file.open_writer()?);
+        let mut batch = Vec::with_capacity(RUN_ROWS);
+        while let Some(arc) = merge.next()? {
+            batch.push(arc);
+            if batch.len() == RUN_ROWS {
+                scope.check()?;
+                write_arcs(&mut writer, &batch)?;
+                batch.clear();
+            }
+        }
+        write_arcs(&mut writer, &batch)?;
+        writer
+            .into_inner()
+            .map_err(|err| err.into_error())?
+            .finish()?;
+        scope.reads.snapshot_spill(file.size().unwrap_or_default());
+        Ok(file)
+    }
+}
+
+fn arc_order(arc: &ArcEntry) -> (u64, u64, u64) {
+    (arc.from, arc.to, arc.edge)
+}
+
+fn write_arcs(writer: &mut impl Write, rows: &[ArcEntry]) -> Result<()> {
+    for run in rows.chunk_by(|left, right| left.from == right.from) {
+        writer.write_all(&run[0].from.to_le_bytes())?;
+        writer.write_all(&(run.len() as u16).to_le_bytes())?;
+        for arc in run {
+            writer.write_all(&arc.to.to_le_bytes())?;
+            writer.write_all(&arc.edge.to_le_bytes())?;
+            writer.write_all(&arc.kind.to_le_bytes())?;
+            writer.write_all(&[u8::from(arc.reverse)])?;
+        }
+    }
+    Ok(())
+}
+
+type RunHead = ((u64, u64, u64), usize, u32, bool);
+
+struct ArcRunMerge {
+    readers: Vec<ArcRunReader>,
+    queue: BinaryHeap<Reverse<RunHead>>,
+}
+
+impl ArcRunMerge {
+    fn new(runs: &[ArcRun]) -> Result<Self> {
+        let readers = runs
             .iter()
             .map(|file| {
                 Ok(ArcRunReader {
-                    input: std::io::BufReader::with_capacity(
+                    input: BufReader::with_capacity(
                         4096,
                         std::fs::File::open(file.path().context("CSR adjacency spill path")?)?,
                     ),
@@ -118,44 +197,37 @@ impl ArcRuns {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut queue = std::collections::BinaryHeap::new();
-        let insert = |queue: &mut std::collections::BinaryHeap<_>, index, arc: ArcEntry| {
-            queue.push(std::cmp::Reverse((
-                arc_order(&arc),
-                index,
-                arc.kind,
-                arc.reverse,
-            )));
+        let mut result = Self {
+            readers,
+            queue: BinaryHeap::new(),
         };
-        for (index, reader) in readers.iter_mut().enumerate() {
-            if let Some(arc) = reader.next()? {
-                insert(&mut queue, index, arc);
-            }
+        for index in 0..result.readers.len() {
+            result.advance(index)?;
         }
-        let mut batch = Vec::with_capacity((BLOCK_BYTES - 4) / 36);
-        while let Some(std::cmp::Reverse(((from, to, edge), index, kind, reverse))) = queue.pop() {
-            batch.push(ArcEntry {
-                from,
-                to,
-                edge,
-                kind,
-                reverse,
-            });
-            if batch.len() == (BLOCK_BYTES - 4) / 36 {
-                scope.check()?;
-                arc_block(objects, prefix, shard, partition, &batch).await?;
-                batch.clear();
-            }
-            if let Some(arc) = readers[index].next()? {
-                insert(&mut queue, index, arc);
-            }
-        }
-        arc_block(objects, prefix, shard, partition, &batch).await
+        Ok(result)
     }
-}
 
-fn arc_order(arc: &ArcEntry) -> (u64, u64, u64) {
-    (arc.from, arc.to, arc.edge)
+    fn advance(&mut self, index: usize) -> Result<()> {
+        if let Some(arc) = self.readers[index].next()? {
+            self.queue
+                .push(Reverse((arc_order(&arc), index, arc.kind, arc.reverse)));
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<ArcEntry>> {
+        let Some(Reverse(((from, to, edge), index, kind, reverse))) = self.queue.pop() else {
+            return Ok(None);
+        };
+        self.advance(index)?;
+        Ok(Some(ArcEntry {
+            from,
+            to,
+            edge,
+            kind,
+            reverse,
+        }))
+    }
 }
 
 struct ArcRunReader {

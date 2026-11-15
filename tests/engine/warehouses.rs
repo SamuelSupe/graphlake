@@ -469,7 +469,11 @@ nodes:
   Account:
     source: remote.graphlake.nodes
     key: [id]
-    properties: [amount, name]"
+    properties: [amount, name, posted]
+  StringKey:
+    source: remote.graphlake.nodes
+    key: [name]
+    properties: [amount]"
     ))?;
     let mut result = engine
         .query(
@@ -488,6 +492,43 @@ nodes:
             "n": 3000, "amount": 4499250.0, "name": "node-1"
         })]
     );
+    let mut dates = engine
+        .query(
+            Language::Sql,
+            r#"SELECT posted FROM "Account" WHERE id <= 2 ORDER BY id"#,
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(
+        dates.batches.schema().field(0).data_type(),
+        &graphlake::arrow::datatypes::DataType::Date32
+    );
+    assert_eq!(
+        rows(&mut dates).await?,
+        [
+            serde_json::json!({"posted": "2026-01-02"}),
+            serde_json::json!({}),
+        ]
+    );
+    for (value, count) in [("node-1", 1), (r#"测试''节点\path"#, 0)] {
+        let mut filtered = engine
+            .query(
+                Language::Sql,
+                &format!(r#"SELECT amount FROM "StringKey" WHERE name = '{value}'"#),
+                Default::default(),
+            )
+            .await?;
+        let mut control = engine.query(
+            Language::Sql,
+            &format!(r#"WITH full_scan AS (SELECT * FROM "StringKey") SELECT amount FROM full_scan WHERE name = '{value}'"#),
+            Default::default(),
+        ).await?;
+        let expected = rows(&mut control).await?;
+        assert_eq!(expected.len(), count);
+        assert_eq!(rows(&mut filtered).await?, expected);
+        assert_eq!(filtered.metrics().reads.warehouse_rows, count as u64);
+        assert_eq!(control.metrics().reads.warehouse_rows, 3000);
+    }
     Ok(())
 }
 

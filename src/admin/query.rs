@@ -361,11 +361,9 @@ async fn start(
         Some(permit)
     };
     active.acquire(&mut options).await?;
-    let engine = app
-        .models
-        .lock()
-        .unwrap()
-        .query_engine(id, &request.model_revision, principal)?;
+    let (_, _, engine) = app
+        .query_model(id, &request.model_revision, principal)
+        .await?;
     if let Some(term) = access::partition(app, principal, id)? {
         super::users::apply_partition(&engine.catalog, &mut options.graph, &term)?;
     }
@@ -858,6 +856,8 @@ pub(super) fn explain_error(error: &anyhow::Error) -> String {
             return column.to_owned();
         }
         if message.starts_with("missing PostgreSQL column in ")
+            || message.starts_with("PostgreSQL ")
+                && message.ends_with("expose the column as text in a PostgreSQL view")
             || message.starts_with("invalid Cypher: ")
             || message.starts_with("missing Cypher parameter $")
         {

@@ -27,7 +27,7 @@ pub(crate) fn variant_fields(fields: &crate::arrow::datatypes::Fields) -> bool {
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -72,6 +72,7 @@ pub struct Engine {
     pub(crate) catalog: Arc<Catalog>,
     pub(crate) cache: Option<crate::traversal::Cache>,
     admission: Arc<query::Admission>,
+    parquet_keys: Arc<model::KeyChecks>,
     spanner: Arc<BTreeMap<String, source::warehouse::spanner::Client>>,
 }
 
@@ -101,6 +102,7 @@ impl Engine {
             catalog: Arc::new(catalog),
             cache: None,
             admission,
+            parquet_keys: Arc::new(Mutex::new(BTreeMap::new())),
             spanner: Arc::new(spanner),
         })
     }
@@ -863,6 +865,14 @@ impl Engine {
         let mut versions = BTreeMap::<String, SourceVersion>::new();
         let mut tables = BTreeMap::new();
         let mut postgres = BTreeMap::new();
+        let duckdb_sources = required
+            .keys()
+            .filter_map(|reference| match catalog.source(reference).ok()? {
+                (name, _, Source::Duckdb { .. }) => Some(name),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
         for (reference, fields) in required {
             let (name, relation, source) = catalog.source(reference)?;
             #[cfg(feature = "admin")]
@@ -878,6 +888,7 @@ impl Engine {
             }
             let fields = fields.into_iter().collect::<Vec<_>>();
             let predicates = &filters[reference];
+            let mut parquet_versions = None;
             let table: Arc<dyn TableProvider> = match source {
                 Source::Duckdb { .. }
                 | Source::SqlserverNative { .. }
@@ -891,6 +902,7 @@ impl Engine {
                                 scope.options.timeout,
                                 Arc::clone(&scope.runtime),
                                 Arc::clone(&scope.reads),
+                                duckdb_sources,
                             ))
                             .await?,
                         ),
@@ -1458,6 +1470,12 @@ impl Engine {
                     } else {
                         table
                     };
+                    parquet_versions = Some(
+                        objects
+                            .iter()
+                            .map(|object| (object.source.clone(), object.version.clone()))
+                            .collect(),
+                    );
                     for object in objects {
                         #[cfg(feature = "admin")]
                         if let Some(transaction) = read.transaction {
@@ -1482,7 +1500,14 @@ impl Engine {
             let alias = format!("raw_{}", tables.len());
             let schema = table.schema();
             private.register_table(TableReference::bare(alias.as_str()), table)?;
-            tables.insert(reference, Raw { alias, schema });
+            tables.insert(
+                reference,
+                Raw {
+                    alias,
+                    schema,
+                    parquet_versions,
+                },
+            );
         }
         for snapshot in mysql_snapshots.into_values() {
             snapshot.close().await?;
@@ -1506,6 +1531,7 @@ impl Engine {
                     raw: &tables,
                     postgres: &postgres,
                     proven_key_label,
+                    parquet_keys: &self.parquet_keys,
                 },
                 scope,
                 read,
@@ -1608,6 +1634,7 @@ pub(crate) struct Prepared {
 struct Raw {
     alias: String,
     schema: SchemaRef,
+    parquet_versions: Option<Vec<(String, String)>>,
 }
 
 async fn materialize_edges(

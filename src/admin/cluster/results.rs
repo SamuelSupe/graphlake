@@ -1,6 +1,5 @@
 use axum::{
     Json,
-    body::Body,
     extract::{Extension, Path, State},
     http::{Method, header},
     response::{IntoResponse, Response},
@@ -118,11 +117,6 @@ impl Coordinator {
             }
         }
         let length = result.meta.size;
-        let stream = async_stream::stream! {
-            let _permit = permit;
-            let mut bytes = result.into_stream();
-            while let Some(chunk) = futures::StreamExt::next(&mut bytes).await { yield chunk; }
-        };
         let mut response = (
             [
                 (
@@ -139,7 +133,7 @@ impl Coordinator {
                     job.revision,
                 ),
             ],
-            Body::from_stream(stream),
+            query::download::download_body(result.into_stream(), permit),
         )
             .into_response();
         response.extensions_mut().insert(AuditModel(job.model));

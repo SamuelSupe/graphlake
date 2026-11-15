@@ -662,77 +662,81 @@ pub(super) fn project_with(
             });
         }
     }
-    let mut next = super::project_with(
+    super::project_with(
         catalog,
         &bindings,
         with,
         &body,
         input.input(),
-        |sql, scope, order| {
-            let Some(empty) = empty else { return Ok(sql) };
-            for name in imports {
-                scope
+        |next| {
+            if let Some(empty) = empty {
+                for name in imports {
+                    next.scope
+                        .columns
+                        .insert(name.clone(), input.scope.columns[name].clone());
+                }
+                let mut fields = next
+                    .scope
                     .columns
-                    .insert(name.clone(), input.scope.columns[name].clone());
-            }
-            let mut fields = scope
-                .columns
-                .keys()
-                .map(|name| {
-                    if name == key || imports.contains(name) {
-                        qualified("s", name)
-                    } else {
-                        format!(
-                            "CASE WHEN {} IS NULL THEN {} ELSE {} END AS {}",
-                            qualified("g", key),
-                            qualified("e", name),
-                            qualified("g", name),
-                            ident(name)
-                        )
-                    }
-                })
-                .collect::<Vec<_>>();
-            fields.extend(order.iter().map(|item| qualified("g", &item.column)));
-            Ok(format!(
-                "SELECT {} FROM ({seed}) AS s CROSS JOIN ({empty}) AS e LEFT JOIN ({sql}) AS g
+                    .keys()
+                    .map(|name| {
+                        if name == key || imports.contains(name) {
+                            qualified("s", name)
+                        } else {
+                            format!(
+                                "CASE WHEN {} IS NULL THEN {} ELSE {} END AS {}",
+                                qualified("g", key),
+                                qualified("e", name),
+                                qualified("g", name),
+                                ident(name)
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                fields.extend(next.order.iter().map(|item| qualified("g", &item.column)));
+                next.sql = format!(
+                    "SELECT {} FROM ({seed}) AS s CROSS JOIN ({empty}) AS e LEFT JOIN ({}) AS g
              ON {} IS NOT DISTINCT FROM {}",
-                fields.join(", "),
-                qualified("s", key),
-                qualified("g", key)
-            ))
+                    fields.join(", "),
+                    next.sql,
+                    qualified("s", key),
+                    qualified("g", key)
+                );
+            }
+            if paged {
+                if single_seed && next.order.is_empty() {
+                    next.sql = format!("SELECT l.*{} LIMIT {limit} OFFSET {skip}", next.input());
+                    return Ok(());
+                }
+                let mut rank = format!("{key}_with_rank_{}", with.span.start);
+                while next.scope.columns.contains_key(&rank) {
+                    rank.push('_');
+                }
+                let terms = next
+                    .order
+                    .iter()
+                    .map(|order| order.term(Some("l")))
+                    .collect::<Vec<_>>();
+                next.sql = format!(
+                    "SELECT l.*, {}{}",
+                    rank_column("l", key, &rank, &terms),
+                    next.input()
+                );
+                next.sql = format!(
+                    "SELECT * FROM ({}) AS p WHERE {rank} > {skip} AND {rank} <= {}",
+                    next.sql,
+                    skip.saturating_add(limit),
+                    rank = ident(&rank)
+                );
+                next.order = vec![OrderKey {
+                    column: rank,
+                    descending: false,
+                    native: true,
+                }];
+            }
+            Ok(())
         },
+        imports,
         plan,
-    )?;
-    if paged {
-        if single_seed && next.order.is_empty() {
-            next.sql = format!("SELECT l.*{} LIMIT {limit} OFFSET {skip}", next.input());
-            return Ok(next);
-        }
-        let mut rank = format!("{key}_with_rank_{}", with.span.start);
-        while next.scope.columns.contains_key(&rank) {
-            rank.push('_');
-        }
-        let terms = next
-            .order
-            .iter()
-            .map(|order| order.term(Some("l")))
-            .collect::<Vec<_>>();
-        next.sql = format!(
-            "SELECT l.*, {}{}",
-            rank_column("l", key, &rank, &terms),
-            next.input()
-        );
-        next.sql = format!(
-            "SELECT * FROM ({}) AS p WHERE {rank} > {skip} AND {rank} <= {}",
-            next.sql,
-            skip.saturating_add(limit),
-            rank = ident(&rank)
-        );
-        next.order = vec![OrderKey {
-            column: rank,
-            descending: false,
-            native: true,
-        }];
-    }
-    Ok(next)
+    )
 }

@@ -6,6 +6,7 @@ use std::{
 
 use boltr::{
     error::BoltError,
+    packstream::{decode_value, encode_value},
     server::{
         AuthCredentials, AuthInfo, AuthValidator, BoltBackend, BoltRecord, BoltServer,
         RecordStream, ResultMetadata, ResultStream, SessionConfig, SessionHandle, SessionProperty,
@@ -14,7 +15,11 @@ use boltr::{
     types::{BoltDict, BoltValue},
 };
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
+    net::TcpListener,
+};
 
 use super::super::{App, Error, access::Principal};
 use super::{Rows, Target};
@@ -297,7 +302,7 @@ impl BoltBackend for Backend {
         } else {
             timeout(extra)?
         };
-        let result = super::execute(
+        let mut result = super::execute(
             &self.app,
             target,
             Language::Cypher,
@@ -310,13 +315,26 @@ impl BoltBackend for Backend {
         )
         .await
         .map_err(query_error)?;
-        Ok(ResultStream {
-            metadata: ResultMetadata {
-                columns: result.columns.clone(),
-                extra: BoltDict::new(),
-            },
-            records: Box::new(result),
-        })
+        let metadata = ResultMetadata {
+            columns: result.columns.clone(),
+            extra: BoltDict::new(),
+        };
+        let records: Box<dyn RecordStream> =
+            if let Some(tx) = pinned.filter(|_| self.app.options.spill_bytes > 0) {
+                // A client can RUN again before it PULLs this result. Finish the
+                // engine stream now to release admission and its memory reservation.
+                let limit = self.app.options.spill_bytes.min(64 * 1024 * 1024);
+                let spool = tokio::time::timeout_at(
+                    tx.deadline.into(),
+                    TransactionResult::capture(&mut result, limit, tx.deadline),
+                )
+                .await
+                .map_err(|_| result_expired())??;
+                Box::new(spool)
+            } else {
+                Box::new(result)
+            };
+        Ok(ResultStream { metadata, records })
     }
 
     async fn begin_transaction(
@@ -422,6 +440,10 @@ impl Backend {
 
 #[async_trait::async_trait]
 impl RecordStream for Rows {
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        Some(self.deadline.into())
+    }
+
     async fn next(&mut self) -> Result<Option<BoltRecord>, BoltError> {
         Ok(Rows::next(self)
             .await
@@ -446,6 +468,85 @@ impl RecordStream for Rows {
                 BoltValue::String(self.revision.clone()),
             ),
         ])
+    }
+}
+
+struct TransactionResult {
+    data: BufReader<File>,
+    rows: u64,
+    summary: BoltDict,
+    deadline: Instant,
+}
+
+fn result_expired() -> BoltError {
+    query_error(Error::new(
+        axum::http::StatusCode::GATEWAY_TIMEOUT,
+        "timeout",
+        "Read transaction expired",
+    ))
+}
+
+impl TransactionResult {
+    async fn capture(
+        result: &mut Rows,
+        mut remaining: u64,
+        deadline: Instant,
+    ) -> Result<Self, BoltError> {
+        let mut writer = BufWriter::new(File::from_std(tempfile::tempfile()?));
+        let mut encoded = bytes::BytesMut::new();
+        let mut rows = 0;
+        while let Some(values) = result.next().await.map_err(query_error)? {
+            encoded.clear();
+            encode_value(&mut encoded, &BoltValue::List(values));
+            let len = encoded.len() as u32;
+            remaining = remaining
+                .checked_sub(u64::from(len) + 4)
+                .ok_or_else(|| query_error(super::result_limit()))?;
+            writer.write_u32(len).await?;
+            writer.write_all(&encoded).await?;
+            rows += 1;
+        }
+        writer.flush().await?;
+        let mut data = writer.into_inner();
+        data.rewind().await?;
+        Ok(Self {
+            data: BufReader::new(data),
+            rows,
+            summary: result.summary(),
+            deadline,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl RecordStream for TransactionResult {
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        Some(self.deadline.into())
+    }
+
+    async fn next(&mut self) -> Result<Option<BoltRecord>, BoltError> {
+        if Instant::now() >= self.deadline {
+            return Err(result_expired());
+        }
+        if self.rows == 0 {
+            return Ok(None);
+        }
+        let len = self.data.read_u32().await? as usize;
+        let mut bytes = vec![0; len];
+        self.data.read_exact(&mut bytes).await?;
+        let BoltValue::List(values) = decode_value(&mut bytes.as_slice())? else {
+            return Err(BoltError::Protocol("Invalid buffered Bolt result".into()));
+        };
+        self.rows -= 1;
+        Ok(Some(BoltRecord { values }))
+    }
+
+    fn discard(&mut self) {
+        self.rows = 0;
+    }
+
+    fn summary(&self) -> BoltDict {
+        self.summary.clone()
     }
 }
 

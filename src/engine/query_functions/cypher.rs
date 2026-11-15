@@ -6,6 +6,7 @@ mod map;
 mod numeric_distinct;
 mod range;
 pub(in crate::engine) mod reduce;
+mod sum;
 
 use std::{cmp::Ordering, collections::HashSet, sync::Arc};
 
@@ -23,8 +24,9 @@ use datafusion::{
     common::{Result, ScalarValue, exec_err},
     logical_expr::{
         BinaryExpr, ColumnarValue, Expr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-        Signature, Volatility,
+        Signature, Volatility, expr_fn,
         simplify::{ExprSimplifyResult, SimplifyContext},
+        type_coercion::binary::BinaryTypeCoercer,
     },
     prelude::SessionContext,
 };
@@ -50,6 +52,7 @@ pub(super) fn register(context: &SessionContext) {
     arithmetic::register(context);
     map::register(context);
     numeric_distinct::register(context);
+    sum::register(context);
     range::register(context);
     for mode in [
         KeyMode::Equivalence,
@@ -391,15 +394,28 @@ impl ScalarUDFImpl for Predicate {
                     ),
                 )));
             }
-            // Preserve integer predicate pushdown when the operands already
-            // agree or when a constant fits the column type exactly.
+            // Prefer narrowing an exact literal for predicate pushdown.
+            // Otherwise widen both integers to DataFusion's lossless common type.
             if left.is_integer() && right.is_integer() {
                 let operands = if left == right {
                     Some((args[0].clone(), args[1].clone()))
                 } else if let Some(value) = integer_literal_as(&args[1], &left)? {
                     Some((args[0].clone(), value))
+                } else if let Some(value) = integer_literal_as(&args[0], &right)? {
+                    Some((value, args[1].clone()))
+                } else if left.is_signed_integer() == right.is_signed_integer() {
+                    let (lhs, rhs) =
+                        BinaryTypeCoercer::new(&left, &operator, &right).get_input_types()?;
+                    let widen = |expr: &Expr, actual: DataType, target: DataType| {
+                        if actual == target {
+                            expr.clone()
+                        } else {
+                            expr_fn::cast(expr.clone(), target)
+                        }
+                    };
+                    Some((widen(&args[0], left, lhs), widen(&args[1], right, rhs)))
                 } else {
-                    integer_literal_as(&args[0], &right)?.map(|value| (value, args[1].clone()))
+                    None
                 };
                 if let Some((left, right)) = operands {
                     return Ok(ExprSimplifyResult::Simplified(Expr::BinaryExpr(

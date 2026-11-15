@@ -192,7 +192,7 @@ impl Snapshot {
                     TypeCode::Bytes => DataType::Binary,
                     TypeCode::Date => DataType::Date32,
                     TypeCode::Timestamp => {
-                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+                        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
                     }
                     TypeCode::Numeric => DataType::Decimal128(38, 9),
                     kind => bail!("unsupported Spanner type {kind:?} for {name}"),

@@ -550,7 +550,10 @@ impl Traversers<'_> {
         match end {
             Some(("times", arg, before)) => {
                 let times = super::integer(arg)?;
-                ensure!(times <= 256, "repeat() is limited to 256 iterations");
+                ensure!(
+                    times <= super::MAX_REPEAT_ROUNDS,
+                    "repeat() is limited to 256 iterations"
+                );
                 let rounds = if before { times } else { times.max(1) };
                 if emit.is_none() && !traversal_contains(&body, depth + 1, barrier)? {
                     for _ in 0..rounds {
@@ -936,7 +939,7 @@ impl Traversers<'_> {
         let marker = ident(&seen);
         let (condition, _) = self.loop_predicate(predicate)?;
         let condition = if after {
-            format!("{marker} AND ({condition})")
+            format!("{marker} > 0 AND ({condition})")
         } else {
             condition
         };
@@ -957,9 +960,9 @@ impl Traversers<'_> {
         self.next_column = self.next_column.max(step.next_column);
         let columns = self.select_columns("v");
         self.sql = format!(
-            "WITH RECURSIVE {} AS (SELECT {columns}, FALSE AS {marker} FROM ({}) AS v
-             UNION ALL SELECT {columns}, TRUE AS {marker} FROM ({}) AS v)
-             SELECT {columns} FROM {} AS v WHERE {condition}",
+            "WITH RECURSIVE {} AS (SELECT {columns}, CAST(0 AS BIGINT) AS {marker} FROM ({}) AS v
+             UNION ALL SELECT {columns}, __graphlake_gremlin_repeat_depth(v.{marker} + 1) AS {marker}
+             FROM ({}) AS v) SELECT {columns} FROM {} AS v WHERE {condition}",
             ident(&table),
             self.sql,
             step.sql,

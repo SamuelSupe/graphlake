@@ -49,10 +49,11 @@ impl Driver {
         timeout: Duration,
         runtime: Arc<RuntimeEnv>,
         stats: Arc<ReadStats>,
+        duckdb_sources: usize,
     ) -> Result<Self> {
         Ok(match source {
             Source::Duckdb { path } => {
-                Self::Duckdb(duckdb::Driver::open(path, runtime, stats).await?)
+                Self::Duckdb(duckdb::Driver::open(path, runtime, stats, duckdb_sources).await?)
             }
             Source::SqlserverNative { .. } => {
                 Self::Sqlserver(sqlserver::Driver::open(source, timeout, runtime, stats).await?)

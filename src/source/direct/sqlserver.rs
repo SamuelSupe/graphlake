@@ -137,7 +137,6 @@ impl Driver {
             let kind = row.try_get::<&str, _>(1)?.context("missing column type")?;
             let precision = row.try_get::<i32, _>(2)?.unwrap_or(0);
             let scale = row.try_get::<i32, _>(3)?.unwrap_or(0);
-            let fractional = row.try_get::<i32, _>(5)?.unwrap_or(0);
             let ty = match kind {
                 "bit" => DataType::Boolean,
                 "tinyint" => DataType::UInt8,
@@ -151,22 +150,10 @@ impl Driver {
                 "smallmoney" => DataType::Decimal128(10, 4),
                 "date" => DataType::Date32,
                 "time" => DataType::Time64(TimeUnit::Nanosecond),
-                "datetime" | "smalldatetime" | "datetime2" => DataType::Timestamp(
-                    if fractional > 6 {
-                        TimeUnit::Nanosecond
-                    } else {
-                        TimeUnit::Microsecond
-                    },
-                    None,
-                ),
-                "datetimeoffset" => DataType::Timestamp(
-                    if fractional > 6 {
-                        TimeUnit::Nanosecond
-                    } else {
-                        TimeUnit::Microsecond
-                    },
-                    Some("UTC".into()),
-                ),
+                "datetime" | "smalldatetime" | "datetime2" => {
+                    DataType::Timestamp(TimeUnit::Microsecond, None)
+                }
+                "datetimeoffset" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 "binary" | "varbinary" | "image" | "timestamp" | "rowversion" => DataType::Binary,
                 "char" | "varchar" | "nchar" | "nvarchar" | "text" | "ntext"
                 | "uniqueidentifier" | "xml" => DataType::Utf8,

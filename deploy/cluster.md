@@ -51,7 +51,7 @@ Worker 固定监听 IPv4 回环地址。跨主机时在 Worker 前部署只开�
 
 `distributed_partitions` 省略或设为 `0` 时，每条查询交给一台 Worker。启用时可设置 `2` 至 `8`，至少配置两台 Worker。所有 Worker 使用同一构建版本。按压缩字节估算，将 Parquet 文件和行组分配到扫描分区。接单 Worker 在原 PostgreSQL 只读事务中读取数据，并将 Join 需要的分区提交到共享存储。远端 Worker 可以读取已提交的 Shuffle 分区来执行 Join、局部聚合和排序，最终分页和全局归并由接单 Worker 执行。可下推的业务键校验和多表映射也使用同一路径。没有可拆分扫描的查询，以及含预执行路径扩展、循环、过程或相关 `CALL` 的查询，继续由接单 Worker 处理。
 
-Shuffle 使用压缩 Arrow IPC，先写 Worker 本机临时文件，再发布到共享存储。查询结束清理中间对象，异常终止遗留的对象由现有结果保留策略清理。`memory_mib` 为单次 Worker 执行的内存预算，支持 `16` 至 `256`，默认 `256`。`64 MiB` 及以下优先规划可溢写的排序归并 Join。单条查询的累计已提交 Shuffle 上限沿用引擎的 1 GiB 溢写预算。
+Shuffle 使用压缩 Arrow IPC，先写 Worker 本机临时文件，再发布到共享存储。查询结束清理中间对象，异常终止遗留的对象由现有结果保留策略清理。`memory_mib` 为单次 Worker 执行的内存预算，支持 `16` 至 `256`，默认 `256`。分布式阶段按分区构建 Hash Join，共享构建侧状态的 Join 留在单个 Worker 上执行。`64 MiB` 及以下优先规划可溢写的排序归并 Join。单条查询的累计已提交 Shuffle 上限沿用引擎的 1 GiB 溢写预算。
 
 每次分区尝试使用独立对象前缀。下游只读取已确认完成的输出。远端 Worker 断连后，未提交的分区可由其他 Worker 或接单 Worker 重试。Parquet 重试核对原对象版本，Shuffle 重试读取原已提交分区。对象已经变化时返回 `graph_sources_changed`。接单 Worker 丢失 PostgreSQL 事务时，沿用 `worker_lost` 语义。
 
@@ -85,6 +85,7 @@ Shuffle 使用压缩 Arrow IPC，先写 Worker 本机临时文件，再发布到
 - `pagerank` 接受 `damping`、`tolerance`、`max_iterations`。每轮合并各分区的贡献，并重新分配悬挂顶点的排名。 `wcc` 接受 `max_iterations`，使用无向邻接，返回分量内最低的类型化业务键。未收敛的 WCC 返回错误。 [分区迭代执行模型](https://dsf.berkeley.edu/cs286/papers/pregel-sigmod2010.pdf)
 - 请求固定清单中的 `graph_options` 和来源版本，省略外层 `query`、`language`、`parameters_json` 和 `graph_options`。刷新期间已经接单的查询继续读取旧代次，新查询读取最新代次。使用过期代次开始新查询返回 `409 csr_generation_conflict`。
 - PageRank 和 WCC 在各 Worker 上加载一个分区的顶点状态，并把下一轮状态和按目标分片分组的消息提交到共享存储。接单 Worker 归并每轮的标量收敛信息，并分批收集最终 Arrow 结果。分区重试使用前一轮的已提交状态。每个分片的状态仍受执行该分片的 Worker 内存预算约束。
+- 每个 Worker 按已发布代次保留一组校验过的邻接块，上限为 Worker 单查询预算的八分之一且最多 8 MiB。变长路径可复用同一起点遍历中的小型邻接列表。
 - 响应的 `csr_stats` 提供远端分区数、Worker、重试、对象读取、分区控制消息字节、状态交换文件字节和内存预留峰值。已发布 CSR 对象保存在独立的 `csr/` 前缀，目前由部署方按保留策略管理。清理前须确认代次已被替换且超过查询保留窗口。
 
 普通 Cypher 查询可在请求体中提交顶层 `csr_generation`，同时保留原 `language: "cypher"`、`query`、参数和结果选项。变长关系、`shortestPath()` 和 `allShortestPaths()` 使用该代次的正反邻接。刷新会生成第 5 版快照，按实体 ID 组织类型化属性块。列表表达式、`UNWIND` 和图预览按命中的节点或边 ID 批量读取。Worker 对当前邻接候选执行关系模式内联属性过滤，`csr_stats.filtered_arcs` 记录被过滤的邻接项。请求省略 `csr_generation` 时读取实时来源。第 3 版快照支持原有执行路径，刷新后启用索引和 Worker 过滤。第 2 版快照需要刷新才能用于普通 Cypher 和分布式 WCC。
@@ -288,7 +289,7 @@ Bolt 客户端使用 `bolt+s://graphlake.example:7687`，Gremlin 使用 `wss://g
 
 创建、保存、发布、回退、下线和归档修复支持 `Idempotency-Key: <UUID>`。请求前生成并保留 UUID。普通响应提供 `Idempotency-Key` 和 `Location` 响应头；查询 `GET /api/v1/mutations/{id}` 可确认是否已提交及对应的草稿、生效版本。相同请求标识和内容会返回原结果，不同请求内容返回 `409 idempotency_conflict`。回执保留 24 小时。 `404 uncommitted` 表示查询时还未观察到提交，遇连接中断或超时后应使用原 UUID 重试。验证出错或失权时不会提交候选状态。对象存储不可用返回 `503` 或 `504`。HAProxy 不会自行重放请求。未提供 UUID 时由服务生成，若连接中断前未收到响应头则无法补取标识。管理页面在发送前保存原请求及标识，连接恢复后可查询回执或重试原请求。
 
-S3 的 `control/catalog/` 中保留当前快照与历史回执使用的不可变快照。部署时监控该前缀占用，并将它纳入灾备。目前以完整目录为单位提交，上限 128 MiB，避免将数据文件或其他业务文件写入元数据前缀。清理历史对象时须保留当前快照和未过期回执指向的对象。
+S3 的 `control/catalog/` 保留不可变目录索引，`control/catalog-blobs/` 按内容摘要保存目录文件。目录提交只上传上一代没有引用的内容，写齐后由 etcd 更新生效指针。目录文件总量上限为 512 MiB，单文件上限为 8 MiB，索引上限为 32 MiB。清理前须保留当前快照和未过期回执引用的索引及其全部文件。新版本可读取旧的内联目录，旧版本无法读取新索引。切换前先升级备用 Coordinator 和备份工具，并保留切换前的便携检查点供回退。
 
 ### 入口协议探测
 

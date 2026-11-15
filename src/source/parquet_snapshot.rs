@@ -1,3 +1,5 @@
+mod manifest_parts;
+
 use std::{
     fs::File,
     io::{self, Read},
@@ -24,6 +26,7 @@ pub(crate) struct Snapshot {
     pub generation: Uuid,
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub base_parts: usize,
+    #[serde(with = "manifest_parts")]
     pub parts: Vec<Part>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pruning: Option<SnapshotPruning>,

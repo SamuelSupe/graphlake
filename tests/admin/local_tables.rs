@@ -1,6 +1,10 @@
 use super::*;
 use futures::TryStreamExt;
 use graphlake::{Catalog, Engine, Language, QueryOptions};
+use parquet::{
+    arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
+    file::{metadata::PageIndexPolicy, reader::ChunkReader},
+};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -267,6 +271,111 @@ async fn local_tables_atomic_incremental_restart_and_failure() -> Result<()> {
     assert_eq!(
         load(&server, "people", "incremental").await?["total_rows"],
         1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_tables_incremental_reuses_row_groups_and_preserves_the_footer() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let source = root.path().join("source.parquet");
+    let last = 8192 * 5 + 7;
+    parquet_rows(
+        &source,
+        &(1..=last)
+            .map(|id| (id, "original", id))
+            .collect::<Vec<_>>(),
+    )?;
+    fs::write(
+        root.path().join("payments.yaml"),
+        yaml(
+            "{type: parquet, tables: {items: [source.parquet]}}",
+            "input.items",
+        ),
+    )?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let definition = create(&server, "groups", "input.items").await?;
+    let path = definition["path"].as_str().unwrap();
+    let initial = load(&server, "groups", "full").await?;
+    assert_eq!(initial["status"], "succeeded", "{initial}");
+    assert_eq!(initial["total_rows"], last);
+
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+    let original = fs::File::open(path)?;
+    let old = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        original.try_clone()?,
+        options.clone(),
+    )?;
+    assert_eq!(old.metadata().num_row_groups(), 6);
+    let id = 8192 + 3;
+    parquet_rows(
+        &source,
+        &[
+            (id, "updated", last + 1),
+            (last, "original", last),
+            (last + 1, "inserted", last + 1),
+        ],
+    )?;
+    let updated = load(&server, "groups", "incremental").await?;
+    assert_eq!(updated["status"], "succeeded", "{updated}");
+    assert_eq!(updated["total_rows"], last + 1);
+
+    let output = fs::File::open(path)?;
+    let new = ParquetRecordBatchReaderBuilder::try_new_with_options(output.try_clone()?, options)?;
+    // The unchanged third group is kept after the second group moves. Its
+    // encoded bytes and the rebased page index both have to survive the move.
+    let before = old.metadata().row_group(2);
+    let after = new.metadata().row_group(1);
+    for (before, after) in before.columns().iter().zip(after.columns()) {
+        let (old_offset, old_size) = before.byte_range();
+        let (new_offset, new_size) = after.byte_range();
+        assert_ne!(old_offset, new_offset);
+        assert_eq!(
+            original.get_bytes(old_offset, old_size as usize)?,
+            output.get_bytes(new_offset, new_size as usize)?
+        );
+    }
+    let old_page = &old.metadata().offset_index().unwrap()[2][0].page_locations()[0];
+    let new_page = &new.metadata().offset_index().unwrap()[1][0].page_locations()[0];
+    assert_eq!(
+        old_page.offset - before.column(0).data_page_offset(),
+        new_page.offset - after.column(0).data_page_offset()
+    );
+
+    // A later incremental update must use the new footer's watermark and only
+    // replace matching rows even if the row groups now overlap in key range.
+    drop(server);
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    parquet_rows(
+        &source,
+        &[
+            (last + 1, "inserted", last + 1),
+            (id, "updated again", last + 2),
+        ],
+    )?;
+    let next = load(&server, "groups", "incremental").await?;
+    assert_eq!(next["status"], "succeeded", "{next}");
+    assert_eq!(next["loaded_rows"], 2);
+    assert_eq!(next["total_rows"], last + 1);
+    let result = rows(root.path(), path).await?;
+    assert_eq!(result.len(), (last + 1) as usize);
+    assert!(
+        result
+            .iter()
+            .enumerate()
+            .all(|(i, row)| row.0 == i as i64 + 1)
+    );
+    assert_eq!(
+        result[(id - 1) as usize],
+        (id, "updated again".into(), last + 2)
+    );
+    assert_eq!(
+        result.last(),
+        Some(&(last + 1, "inserted".into(), last + 1))
     );
     Ok(())
 }

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs::File, path::Path};
+use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use datafusion::{
@@ -10,7 +10,10 @@ use datafusion::{
 use futures::TryStreamExt;
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 
-use super::store::{Mode, Table};
+use super::{
+    row_groups,
+    store::{Mode, Table},
+};
 use crate::{
     Catalog, QueryOptions,
     catalog::ident,
@@ -27,7 +30,12 @@ pub(super) async fn run(
     scope.run(load(table, path, mode, &scope)).await
 }
 
-async fn load(table: &Table, path: &Path, mode: Mode, scope: &QueryScope) -> Result<(u64, u64)> {
+async fn load(
+    table: &Table,
+    path: &Path,
+    mode: Mode,
+    scope: &Arc<QueryScope>,
+) -> Result<(u64, u64)> {
     let config = &table.config;
     let context = scope.session();
     let previous = if path.is_file() {
@@ -146,10 +154,7 @@ async fn load(table: &Table, path: &Path, mode: Mode, scope: &QueryScope) -> Res
         }
     }
     let root = path.parent().context("missing local table directory")?;
-    let delta = tempfile::Builder::new()
-        .prefix(".sync-")
-        .suffix(".parquet")
-        .tempfile_in(root)?;
+    let delta = staging_file(root)?;
     let loaded = write(incoming, delta.as_file().try_clone()?, scope).await?;
     context
         .register_parquet(
@@ -227,29 +232,58 @@ async fn load(table: &Table, path: &Path, mode: Mode, scope: &QueryScope) -> Res
             scope.check()?;
             return Ok((loaded, total));
         }
-        let keys = config
-            .key_columns
-            .iter()
-            .map(|name| format!("p.{} = i.{}", ident(name), ident(name)))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let merged = context.sql(&format!("SELECT p.* FROM previous p LEFT ANTI JOIN incoming i ON {keys} UNION ALL SELECT * FROM incoming")).await?;
-        let output = tempfile::Builder::new()
-            .prefix(".sync-")
-            .suffix(".parquet")
-            .tempfile_in(root)?;
-        let total = write(merged, output.as_file().try_clone()?, scope).await?;
-        (output, total)
+        let selective = if loaded <= scope.options.batch_size as u64
+            && let [key] = config.key_columns.as_slice()
+            && incoming
+                .schema()
+                .field_with_unqualified_name(key)?
+                .data_type()
+                .is_signed_integer()
+        {
+            let previous = File::open(path)?;
+            let incoming = delta.reopen()?;
+            let root = root.to_owned();
+            let key = key.clone();
+            let scope = Arc::clone(scope);
+            tokio::task::spawn_blocking(move || {
+                row_groups::merge(previous, incoming, &root, &key, &scope)
+            })
+            .await??
+        } else {
+            None
+        };
+        if let Some(result) = selective {
+            result
+        } else {
+            let keys = config
+                .key_columns
+                .iter()
+                .map(|name| format!("p.{} = i.{}", ident(name), ident(name)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let merged = context.sql(&format!("SELECT p.* FROM previous p LEFT ANTI JOIN incoming i ON {keys} UNION ALL SELECT * FROM incoming")).await?;
+            let output = staging_file(root)?;
+            let total = write(merged, output.as_file().try_clone()?, scope).await?;
+            (output, total)
+        }
     } else {
         (delta, loaded)
     };
     scope.check()?;
     output.as_file().sync_all()?;
+    scope.check()?;
     // The checkpoint is MAX(watermark) in this same file. A restart can never
     // advance a separate checkpoint past the data that was atomically installed.
     output.persist(path)?;
     File::open(root)?.sync_all()?;
     Ok((loaded, total))
+}
+
+pub(super) fn staging_file(root: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(".sync-")
+        .suffix(".parquet")
+        .tempfile_in(root)
 }
 
 async fn unchanged(
@@ -314,10 +348,7 @@ async fn any(context: &SessionContext, sql: &str) -> Result<bool> {
 
 async fn write(frame: DataFrame, file: File, scope: &QueryScope) -> Result<u64> {
     let mut stream = frame.execute_stream().await?;
-    let properties = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(8192))
-        .build();
-    let mut writer = ArrowWriter::try_new(file, stream.schema(), Some(properties))?;
+    let mut writer = ArrowWriter::try_new(file, stream.schema(), Some(writer_properties()))?;
     let mut count = 0;
     while let Some(batch) = stream.try_next().await? {
         scope.check()?;
@@ -329,4 +360,10 @@ async fn write(frame: DataFrame, file: File, scope: &QueryScope) -> Result<u64> 
     }
     writer.close()?;
     Ok(count)
+}
+
+pub(super) fn writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_max_row_group_row_count(Some(8192))
+        .build()
 }

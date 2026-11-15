@@ -79,3 +79,5 @@ Use one `graphlake-admin` process for a standalone deployment. A distributed dep
 | [Technical reference](docs/reference.zh-CN.md) | Modeling, connectors, query behavior, algorithms, APIs, and bindings |
 | [MCP server](docs/mcp.md) | AI client connection, query and modeling tools, permissions, and protocol scope |
 | [Changelog](CHANGELOG.md) | The v1.0.0 release baseline and runtime boundaries |
+
+本地表可从外部源表加载、按主键增量更新及定时刷新，管理与存储约定见[本地表与数据同步](docs/local-tables.zh-CN.md)。

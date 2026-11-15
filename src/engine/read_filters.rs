@@ -138,10 +138,14 @@ fn extract(expr: &Expr, qualifier: &str, filters: &mut Vec<Predicate>) {
                 BinaryOperator::GtEq => Comparison::Ge,
                 _ => return,
             };
-            let Some(column) = column(left, qualifier) else {
-                return;
+            let pair = if let Some(column) = column(left, qualifier) {
+                literal(right).map(|value| (column, value))
+            } else if op == Comparison::Eq {
+                column(right, qualifier).zip(literal(left))
+            } else {
+                None
             };
-            let Some(value) = literal(right) else { return };
+            let Some((column, value)) = pair else { return };
             (column, op, value)
         }
         Expr::Function(function) if function.name.to_string() == "__graphlake_cypher_compare" => {

@@ -3,6 +3,7 @@ pub(crate) mod direct;
 pub(crate) mod iceberg;
 pub(crate) mod mysql;
 pub(crate) mod parquet;
+pub(crate) mod parquet_snapshot;
 pub(crate) mod postgres;
 pub(crate) mod snapshot;
 pub(crate) mod sqlite;

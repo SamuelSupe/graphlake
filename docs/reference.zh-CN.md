@@ -85,6 +85,8 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 「下载结果 Arrow」读取执行时保存的类型化结果。截断时默认可下载已显示的预览行，运行前勾选「保留本次执行的完整结果」可下载同次执行的全部结果。服务最多保留 4 份结果、合计 1 GiB，最多 30 分钟。「重新执行并导出」使用结果对应的语句、参数、范围和模型版本重新读取当前数据源。导出受查询超时、内存与溢写预算约束。未领取的导出文件最多保留 4 份、合计 1 GiB，票据最多有效 60 秒。网页不能指定服务端导出位置。Cypher 和 Gremlin 的图预览截断后可加载同一次执行的后续图批次，读取时沿用执行时的模型版本和图属性。达到 3,000 元素的画布容量时可切换到下一批。图快照最多采集 12,000 个元素，采集字节上限为 8 MiB 和查询内存预算八分之一中的较小值，并受结果保留期限约束。
 
+本地表可从外部源表加载选定字段，支持按主键和增量字段更新、定时刷新、后台任务与加载历史。入口为「图模型 → 本地表」或「数据源 → 本地表与同步」，加载成功后可将节点和边映射切换到副本。参见[本地表与数据同步](local-tables.zh-CN.md)。
+
 管理 API 位于 `/api/v1`。`GET /auth/session` 返回 `authenticated`、`enabled` 和 `username`。`POST /auth/login` 接收 JSON `username` 和 `password` 并设置会话 Cookie。登录失败返回 `401 invalid_credentials`，一分钟内累计五次失败后返回 `429` 和 `Retry-After`。`POST /auth/logout` 幂等撤销当前会话。其他管理请求（包括 `HEAD` 和结果下载）携带会话 Cookie，未登录或会话失效返回 `401 auth_required`。管理响应使用 `Cache-Control: no-store`。`Host` 必须匹配启动地址，写入和执行请求（包括登录、退出）需要同源 `Origin`。
 
 模型使用 `GET/POST /models` 和 `GET/PUT /models/{id}`；更新草稿时提交原草稿的 `ETag` 作为 `If-Match`。模型响应分别返回草稿 `revision` 与 `active_revision`。草稿校验用 `POST /models/validate`，传 `check_data: true` 执行数据校验，表结构浏览用 `POST /models/{id}/browse`（草稿 `yaml`、`source` 和可选 `schema`、`table`）。可定位的校验失败带可选的 `location`：`table` 给出来源表及可选物理列，`field` 给出标签、字段及从零开始的可选序号，`input_column` 给出标签、从零开始的来源序号和逻辑字段。查询页使用 `GET /models/{id}/schema/{revision}` 读取当前生效版本的节点和边结构，无需读取来源数据。读取版本历史用 `GET /models/{id}/history`，读取某个历史版本的 YAML 用 `GET /models/{id}/history/{revision}`。发布和回退用 `POST /models/{id}/publish`、`POST /models/{id}/rollback`，提交目标 `revision` 和页面看到的 `active_revision`。

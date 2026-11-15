@@ -5,6 +5,7 @@ import { api, ApiError, downloadText, errorText, type Column, type ModelSummary,
 import { newConnector } from './connectors';
 import { AddSource } from './AddSource';
 import { Catalogs, ConnectorGallery } from './Catalogs';
+import type { LocalTable } from './LocalTables';
 import { SourceBrowser, type TableSelection } from './SourceBrowser';
 import type { CanvasConnection } from './GraphCanvas';
 import { EdgeDraftDialog, type EdgeEnds } from './EdgeDraftDialog';
@@ -19,6 +20,7 @@ import { Modal, NameDialog, StatusLabel } from './ui';
 
 export type Workspace = 'graph' | 'catalogs' | 'query';
 const GraphCanvas = lazy(() => import('./GraphCanvas'));
+const LocalTables = lazy(() => import('./LocalTables'));
 
 export default function Editor({ id, initial, active, onDirty, close, created, changed, workspace, models, goTo, changeModel, allow, actor, mutations, recovered, canvasLayouts }: {
   id: string;
@@ -49,6 +51,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const [removing, setRemoving] = useState<Selection>();
   const [catalogSelection, setCatalogSelection] = useState<string>();
   const [browsing, setBrowsing] = useState<string>();
+  const [localTables, setLocalTables] = useState(false);
   const [newSourceType, setNewSourceType] = useState<string>();
   const [modal, setModal] = useState<Section | 'yaml' | 'title' | 'versions' | 'unpublish' | 'nodes-list' | 'edges-list'>();
   const [loading, setLoading] = useState(!initial);
@@ -147,6 +150,26 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       setNotice({ text: errorText(cause), error: true });
     }
   };
+
+  function attachLocal(table: LocalTable, switchMappings: boolean) {
+    const sourceName = 'local_' + table.name;
+    const reference = sourceName + '.data';
+    const existing = model?.sources[sourceName];
+    if (existing && (existing.type !== 'parquet' || JSON.stringify(existing.tables) !== JSON.stringify({ data: [table.path] }))) {
+      throw new Error('数据源名称 ' + sourceName + ' 已被占用，请先重命名该数据源。');
+    }
+    edit(doc => {
+      doc.setIn(['sources', sourceName], { type: 'parquet', tables: { data: [table.path] } });
+      if (switchMappings && model) for (const section of ['nodes', 'edges'] as const) {
+        for (const [name, mapping] of Object.entries(model[section])) {
+          if (mapping.source === table.source_table) doc.setIn([section, name, 'source'], reference);
+          if (Array.isArray(mapping.inputs)) mapping.inputs.forEach((input, index) => {
+            if (input.table === table.source_table) doc.setIn([section, name, 'inputs', index, 'table'], reference);
+          });
+        }
+      }
+    });
+  }
 
   async function save() {
     if (!saved || saving || !allow.edit) return;
@@ -391,6 +414,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     {workspace !== 'graph' && !(workspace === 'catalogs' && inspectorSelection) && notices}
     {workspace === 'catalogs' && model && saved && <div className="catalog-workspace">
       <div className="catalog-controls">
+        {allow.configure && <button className="button compact" disabled={!saved.revision} onClick={() => setLocalTables(true)}>本地表与同步</button>}
         <button className="button compact" disabled={!dirty || busy || !!incomplete} title={incomplete?.message} onClick={() => void save()}>{saving ? '保存中…' : '保存草稿'}</button>
         <button className="button primary compact" disabled={!canPublish} onClick={() => saved.revision && void activate(saved.revision, 'publish')}>校验并发布</button>
         {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span role="status"><StatusLabel status={status} text={statusText} /></span>}
@@ -438,6 +462,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
                 onClick={() => setConnection(connecting ? undefined : {})}><Waypoints size={20} aria-hidden="true" />连线建边</button>
             </div>}
             <div className="tool-group">
+              {allow.configure && <button className="tool-button" disabled={!saved.revision} onClick={() => setLocalTables(true)}><Database size={20} />本地表</button>}
               <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={20} />节点 <span className="tool-count">{Object.keys(model.nodes).length}</span></button>
               <button className="tool-button" onClick={() => setModal('edges-list')}><List size={20} />边 <span className="tool-count">{Object.keys(model.edges).length}</span></button>
             </div>
@@ -496,6 +521,9 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
           onClick={() => { setEdgeEnds(undefined); setModal(listSection); }}><Plus size={16} />添加{listSection === 'nodes' ? '节点' : '边'}</button></footer>}
       </div>
     </Modal>}
+    {localTables && saved && active && allow.configure && <Suspense fallback={<p role="status">正在打开本地表…</p>}>
+      <LocalTables saved={saved} clean={!dirty} close={() => setLocalTables(false)} attach={attachLocal} />
+    </Suspense>}
     {browsing && model && <SourceBrowser id={id} yaml={yaml} model={model} fixedSource={browsing} close={() => setBrowsing(undefined)} />}
     {removing && model && <Modal layout="center" title={{ sources: '删除数据源', nodes: '删除节点标签', edges: '删除边类型' }[removing.section]} close={() => setRemoving(undefined)}>
       <div className="dialog-form">

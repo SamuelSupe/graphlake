@@ -39,7 +39,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   const actor = identity.subject ?? identity.username ?? '@dev';
   const [grants, setGrants] = useState<Grants>();
   const [permissionError, setPermissionError] = useState('');
-  const [settingsTab, setSettingsTab] = useState<'health'>();
+  const [settingsTab, setSettingsTab] = useState<'health' | 'mcp'>();
   const [receipts, setReceipts] = useState(false);
   const [recovered, setRecovered] = useState<SavedModel>();
   const [path, setPath] = useState(window.location.pathname);
@@ -97,7 +97,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
     if (next === current.current) return;
     const leaving = current.current.replace(/\/$/, '');
     const unsaved = leaving === '/new' && dirty.current.has('')
-      || (leaving === '/settings' || leaving === '/ai') && dirty.current.has(leaving);
+      || leaving === '/settings' && (dirty.current.has('/settings') || dirty.current.has('/settings/mcp'));
     if (unsaved && !replace && !window.confirm('当前页面有未保存的修改。离开当前页面？')) {
       if (window.location.pathname !== current.current) window.history.pushState(null, '', current.current);
       return;
@@ -256,7 +256,9 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
       changeModel={key => navigate(modelPath(key, workspace))} changed={reloadModels} created={key => navigate(modelPath(key), true)} />}
     {accessPage && (administrator && identity.enabled ? <Access models={models ?? []} /> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
     {settingsPage && (administrator ? <Suspense fallback={<p className="empty" role="status">正在打开运行配置…</p>}><Settings initialTab={settingsTab} openModel={(id, page) => navigate(modelPath(id, page))} models={models ?? []} locked={locked} onDirty={onDirty} /></Suspense> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
-    {aiPage && <Suspense fallback={<p className="empty" role="status">正在打开 AI…</p>}><AI locked={locked} administrator={administrator} onDirty={onDirty} /></Suspense>}
+    {aiPage && <Suspense fallback={<p className="empty" role="status">正在打开 AI…</p>}>
+      <AI locked={locked} openServiceSettings={administrator ? () => { setSettingsTab('mcp'); navigate('/settings'); } : undefined} />
+    </Suspense>}
     {!accessPage && !settingsPage && !aiPage && !newModel && (!id || !canReadModel(id) && !canQuery(id)) &&
       <Models key={workspace} memory={directory.current[workspace]} models={id && !administrator && grants ? [] : workspace === 'query' ? availableModels?.filter(model => canQuery(model.id)) : availableModels?.filter(model => canReadModel(model.id))} error={permissionError || error}
         importError={workspace === 'graph' ? importError : ''} retry={reloadModels} workspace={workspace}

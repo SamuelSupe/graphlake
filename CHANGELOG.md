@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Add a configurable MCP server for read-only queries, source-scoped model creation, validation, draft updates and optional publication. Reuse user roles, tenant scopes, optimistic revisions, HA receipts and audit logging.
-- Add a standalone AI sidebar with a compact three-step Agent setup guide, copyable query/modeling prompts, personal MCP tokens bound to live user permissions, per-model capability previews and optional connection diagnostics. Reveal token management, JSON configuration and permission details on demand; keep global service settings administrator-only and collapsed by default.
+- Add independently configurable query and modeling MCP services. Query supports read-only graph queries. Modeling supports source-scoped model creation, validation, draft updates and optional publication. The original endpoint remains compatible. Reuse user roles, tenant scopes, optimistic revisions, HA receipts and audit logging.
+- Add a standalone AI sidebar with a three-step Agent setup guide, copyable query and modeling prompts, personal MCP tokens bound to live user permissions, model capability previews and optional connection diagnostics. The administrator-only MCP Service tab in Runtime Settings controls service availability, global capabilities and query limits.
 
 ## v1.0.0
 

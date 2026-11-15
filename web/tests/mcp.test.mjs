@@ -29,12 +29,12 @@ test('connection inspection negotiates the protocol and reads real model scope w
   const calls = server(t);
   const progress = [];
   const signal = new AbortController().signal;
-  const result = await inspectMcp('disposable-test-token', signal, message => progress.push(message));
+  const result = await inspectMcp('query', 'disposable-test-token', signal, message => progress.push(message));
   assert.deepEqual(calls.map(call => call.message.method), ['initialize', 'notifications/initialized', 'tools/list', 'tools/call']);
   assert.equal(calls[0].options.headers['MCP-Protocol-Version'], undefined);
   assert.equal(calls[1].message.id, undefined);
   for (const { url, options } of calls) {
-    assert.equal(url, '/mcp');
+    assert.equal(url, '/mcp/query');
     assert.equal(options.credentials, 'omit');
     assert.equal(options.redirect, 'error');
     assert.equal(options.signal, signal);
@@ -50,8 +50,9 @@ test('connection inspection negotiates the protocol and reads real model scope w
 });
 
 test('a valid account with no models is distinguished from a failed connection', async t => {
-  server(t, { 'tools/call': message => Response.json({ jsonrpc: '2.0', id: message.id, result: { structuredContent: { owner: 'analyst', models: [], modeling_targets: ['next-model'] } } }) });
-  const result = await inspectMcp('test-token', new AbortController().signal, () => {});
+  const calls = server(t, { 'tools/call': message => Response.json({ jsonrpc: '2.0', id: message.id, result: { structuredContent: { owner: 'analyst', models: [], modeling_targets: ['next-model'] } } }) });
+  const result = await inspectMcp('modeling', 'test-token', new AbortController().signal, () => {});
+  assert.ok(calls.every(call => call.url === '/mcp/modeling'));
   assert.deepEqual(result.models, []);
   assert.deepEqual(result.modelingTargets, ['next-model']);
 });
@@ -60,7 +61,7 @@ test('connection errors explain expired credentials and non-JSON proxy failures'
   for (const [status, expected] of [[401, /令牌/], [403, /权限和访问地址/], [404, /启用/], [502, /HTTP 502/]]) {
     await t.test(String(status), async t => {
       const calls = server(t, { initialize: () => new Response('<html>proxy error</html>', { status }) });
-      await assert.rejects(inspectMcp('test-token', new AbortController().signal, () => {}), expected);
+      await assert.rejects(inspectMcp('query', 'test-token', new AbortController().signal, () => {}), expected);
       assert.equal(calls.length, 1);
     });
   }
@@ -73,8 +74,8 @@ test('inspection rejects mismatched responses and tool failures instead of repor
     ['missing capabilities', message => ({ jsonrpc: '2.0', id: message.id, result: { structuredContent: { models: [{ id: 'graph', name: 'Graph' }], modeling_targets: [] } } }), /响应不完整/],
   ]) {
     await t.test(name, async t => {
-      server(t, { 'tools/call': message => Response.json(response(message)) });
-      await assert.rejects(inspectMcp('test-token', new AbortController().signal, () => {}), expected);
+      const calls = server(t, { 'tools/call': message => Response.json(response(message)) });
+      await assert.rejects(inspectMcp('query', 'test-token', new AbortController().signal, () => {}), expected);
     });
   }
 });
@@ -90,7 +91,7 @@ test('cancelling inspection aborts an in-flight tool request', async t => {
       started();
     }),
   });
-  const inspection = inspectMcp('test-token', controller.signal, () => {});
+  const inspection = inspectMcp('query', 'test-token', controller.signal, () => {});
   await waiting;
   controller.abort();
   await assert.rejects(inspection, { name: 'AbortError' });

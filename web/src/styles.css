@@ -780,7 +780,6 @@ button.graph-edge:hover, .graph-edge[aria-pressed="true"] { color: var(--blue); 
 
 .mcp-form { display: grid; gap: 18px; min-inline-size: 0; }
 .mcp-form h2 + p { margin-block-start: 6px; }
-.mcp-capabilities { display: grid; margin: 0; padding: 0; border: 0; min-inline-size: 0; }
 .mcp-capability { display: grid; grid-template-columns: 1.125rem minmax(0, 1fr); align-items: start; column-gap: 10px; padding-block: 10px 14px; border-block-end: 1px solid var(--line); }
 .mcp-capability:first-of-type { padding-block-start: 0; }
 .mcp-capability:last-child { border-block-end: 0; padding-block-end: 0; }
@@ -813,6 +812,7 @@ button.graph-edge:hover, .graph-edge[aria-pressed="true"] { color: var(--blue); 
 .mcp-intro { display: grid; gap: 8px; margin-block-end: 8px; }
 .mcp-intro h2 { font-size: 1.5rem; letter-spacing: -.02em; }
 .mcp-intro p { color: var(--muted); line-height: 1.7; }
+.mcp-service-notice { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; }
 .mcp-setup { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding-inline: 26px; min-inline-size: 0; }
 .mcp-step { display: grid; grid-template-columns: 10rem minmax(0, 1fr); align-items: start; gap: 24px; padding-block: 24px; }
 .mcp-step + .mcp-step { border-block-start: 1px solid var(--line); }
@@ -823,12 +823,17 @@ button.graph-edge:hover, .graph-edge[aria-pressed="true"] { color: var(--blue); 
 .mcp-step-body > .button { justify-self: start; }
 .mcp-step-body > .settings-hint { line-height: 1.65; }
 .mcp-step-body > .mcp-details + .mcp-details { margin-block-start: -10px; }
+.mcp-connection-fields { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.mcp-connection-fields > div { display: grid; gap: 3px; }
+.mcp-connection-fields dt { color: var(--muted); font-size: .8125rem; }
+.mcp-address { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.mcp-address code { flex: 1 1 14rem; min-inline-size: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); overflow-wrap: anywhere; }
 .mcp-token-value { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; }
 .mcp-token-value code { overflow-wrap: anywhere; padding-block: 10px; }
 .mcp-token-value .settings-actions { gap: 12px; }
 .mcp-guide :is(.button, .text-button) { min-block-size: 44px; }
 .mcp-guide .notice { overflow-wrap: anywhere; }
-.mcp-guide input:not([type=checkbox]) { inline-size: 100%; font-size: 1rem; min-block-size: 48px; }
+.mcp-guide input:not([type=checkbox], [type=radio]) { inline-size: 100%; font-size: 1rem; min-block-size: 48px; }
 .mcp-guide input:user-invalid { border-color: #a1322c; }
 .mcp-examples { display: grid; gap: 8px; }
 .mcp-example { display: flex; align-items: center; gap: 16px; padding: 12px 14px; background: var(--panel); border-radius: 6px; }

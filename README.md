@@ -16,7 +16,7 @@ Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremli
 | **Query** | Use Cypher, SQL, or Gremlin. Set a timeout, inspect the model and source versions, cancel a query, or export complete results as Arrow IPC. |
 | **Explore** | Inspect node and relationship properties, expand and page through neighbors, search across batches, and continue loading a truncated graph preview. |
 | **Analyze** | Run bounded traversals, shortest paths, PageRank, weakly connected components, community detection, and Node2Vec. Reuse persisted CSR indexes for supported workloads. |
-| **Connect AI** | Connect Agents through an in-app MCP guide. Personal AI tokens inherit the owner’s live model permissions and tenant scope; administrators set global capability limits. |
+| **Connect AI** | Connect Agents to separate query and modeling MCP services through an in-app guide. Personal AI tokens inherit the owner’s live model permissions and tenant scope; administrators set global capability limits. |
 | **Operate** | Manage users, service accounts, and model-level roles. Collect audit events, Prometheus metrics, and OTLP signals. Restore an off-site checkpoint and verify a known business query before enabling traffic. |
 
 ## Install on Linux

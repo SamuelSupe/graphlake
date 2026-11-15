@@ -4,9 +4,19 @@ const TOKEN: &str = "graphlake-mcp-integration-agent-token";
 const READER: &str = "graphlake-mcp-integration-reader-token";
 
 fn rpc(server: &Server, token: &str, method: &str, params: Value) -> reqwest::RequestBuilder {
+    rpc_at(server, "/mcp", token, method, params)
+}
+
+fn rpc_at(
+    server: &Server,
+    path: &str,
+    token: &str,
+    method: &str,
+    params: Value,
+) -> reqwest::RequestBuilder {
     server
         .http
-        .post(format!("{}/mcp", server.base))
+        .post(format!("{}{path}", server.base))
         .bearer_auth(token)
         .header("Accept", "application/json, text/event-stream")
         .header("MCP-Protocol-Version", "2025-11-25")
@@ -14,8 +24,19 @@ fn rpc(server: &Server, token: &str, method: &str, params: Value) -> reqwest::Re
 }
 
 async fn call(server: &Server, token: &str, name: &str, arguments: Value) -> Result<Value> {
-    let result: Value = rpc(
+    call_at(server, "/mcp", token, name, arguments).await
+}
+
+async fn call_at(
+    server: &Server,
+    path: &str,
+    token: &str,
+    name: &str,
+    arguments: Value,
+) -> Result<Value> {
+    let result: Value = rpc_at(
         server,
+        path,
         token,
         "tools/call",
         json!({"name":name,"arguments":arguments}),
@@ -118,6 +139,75 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
         json!({"enabled":true,"modeling":true,"max_rows":1}),
     )
     .await?;
+    let query_path = "/mcp/query";
+    let model_path = "/mcp/modeling";
+    for (path, service, expected_tools, unavailable_tool, arguments) in [
+        (
+            query_path,
+            "graphlake-query",
+            vec!["list_models", "get_schema", "query"],
+            "get_model",
+            json!({"model":"payments"}),
+        ),
+        (
+            model_path,
+            "graphlake-modeling",
+            vec![
+                "list_models",
+                "get_model",
+                "validate_model",
+                "create_model",
+                "save_model",
+            ],
+            "query",
+            json!({"model":"payments","language":"cypher","query":"RETURN 1"}),
+        ),
+    ] {
+        let init: Value = rpc_at(&server, path, TOKEN, "initialize", json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}})).send().await?.error_for_status()?.json().await?;
+        assert_eq!(init["result"]["serverInfo"]["name"], service);
+        let tools: Value = rpc_at(&server, path, TOKEN, "tools/list", json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let names = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected_tools);
+        let denied = call_at(&server, path, TOKEN, unavailable_tool, arguments).await?;
+        assert_eq!(denied["structuredContent"]["code"], "model_forbidden");
+        let scope = call_at(&server, path, TOKEN, "list_models", json!({})).await?;
+        let capabilities = &scope["structuredContent"]["models"][0]["capabilities"];
+        assert_eq!(capabilities["query"], path == query_path);
+        assert_eq!(capabilities["modeling"], path == model_path);
+        assert_eq!(
+            scope["structuredContent"]["modeling_targets"],
+            if path == model_path {
+                json!(["ai-model"])
+            } else {
+                json!([])
+            }
+        );
+        assert_eq!(
+            rpc_at(&server, path, TOKEN, "ping", json!({}))
+                .header("Origin", "https://untrusted.example")
+                .send()
+                .await?
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        rpc_at(&server, model_path, READER, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(
         server
             .request(Method::PUT, "mcp/settings")
@@ -249,7 +339,7 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
         schema["structuredContent"]["schema"]["nodes"]["Payment"]["key"],
         json!(["tenant_id", "payment_id"])
     );
-    let result = call(&server, READER, "query", json!({"model":"payments","language":"cypher","query":"MATCH (p:Payment) WHERE p.payment_id >= $minimum RETURN p.payment_id AS id ORDER BY id","parameters":{"minimum":9}})).await?;
+    let result = call_at(&server, query_path, READER, "query", json!({"model":"payments","language":"cypher","query":"MATCH (p:Payment) WHERE p.payment_id >= $minimum RETURN p.payment_id AS id ORDER BY id","parameters":{"minimum":9}})).await?;
     assert_eq!(result["isError"], false, "{result}");
     assert_eq!(result["structuredContent"]["rows"], json!([["9"]]));
     assert_eq!(result["structuredContent"]["truncated"], true);
@@ -296,7 +386,7 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
     let escape = call(&server, TOKEN, "create_model", json!({"model":"ai-model","template_model":"payments","yaml":draft.replace("./payments.parquet","../private.parquet"),"mutation_id":Uuid::new_v4()})).await?;
     assert_eq!(escape["isError"], true);
     assert_eq!(escape["structuredContent"]["code"], "source_scope");
-    let created = call(&server, TOKEN, "create_model", json!({"model":"ai-model","template_model":"payments","yaml":draft,"mutation_id":Uuid::new_v4()})).await?;
+    let created = call_at(&server, model_path, TOKEN, "create_model", json!({"model":"ai-model","template_model":"payments","yaml":draft,"mutation_id":Uuid::new_v4()})).await?;
     assert_eq!(created["isError"], false, "{created}");
     assert!(created["structuredContent"]["active_revision"].is_null());
     let scope = call(&server, TOKEN, "list_models", json!({})).await?;
@@ -342,7 +432,7 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
         true
     );
     configure(&server, json!({"publish":true})).await?;
-    let published = call(&server, TOKEN, "publish_model", publish_args).await?;
+    let published = call_at(&server, model_path, TOKEN, "publish_model", publish_args).await?;
     assert_eq!(published["isError"], false, "{published}");
     assert_eq!(published["structuredContent"]["active_revision"], revision);
     let scope = call(&server, TOKEN, "list_models", json!({})).await?;
@@ -375,7 +465,40 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
     .await?;
     assert_eq!(conflict["isError"], true);
     assert_eq!(conflict["structuredContent"]["code"], "revision_conflict");
-    let saved_config = configure(&server, json!({"query":false})).await?;
+    configure(&server, json!({"modeling":false,"publish":false})).await?;
+    assert_eq!(
+        rpc_at(&server, model_path, TOKEN, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        rpc_at(&server, query_path, READER, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let saved_config = configure(
+        &server,
+        json!({"query":false,"modeling":true,"publish":true}),
+    )
+    .await?;
+    assert_eq!(
+        rpc_at(&server, query_path, TOKEN, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        rpc_at(&server, model_path, TOKEN, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
     let scope = call(&server, TOKEN, "list_models", json!({})).await?;
     assert!(
         scope["structuredContent"]["models"]
@@ -589,6 +712,22 @@ async fn personal_ai_tokens_inherit_live_user_permissions_and_are_mcp_only() -> 
         .json()
         .await?;
     assert_eq!(access["owner"], "alice");
+    assert_eq!(access["services"]["query"]["allowed"], true);
+    assert_eq!(access["services"]["modeling"]["allowed"], false);
+    assert_eq!(
+        rpc_at(&server, "/mcp/modeling", &token, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        rpc_at(&server, "/mcp/query", &token, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
     assert_eq!(access["scope"]["models"].as_array().unwrap().len(), 1);
     let listed = call(&server, &token, "list_models", json!({})).await?;
     assert_eq!(listed["structuredContent"]["owner"], "alice");

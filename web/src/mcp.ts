@@ -4,16 +4,23 @@ export type McpConfig = { enabled: boolean; query: boolean; modeling: boolean; p
 export type McpSnapshot = { config: McpConfig; revision: string; endpoint: string; protocol_versions: string[]; server_timeout_ms: number };
 export type McpModel = ModelSummary & { capabilities: { query: boolean; read_model: boolean; modeling: boolean; publish: boolean } };
 export type McpInspection = { owner: string; protocolVersion: string; tools: { name: string; description: string }[]; models: McpModel[]; modelingTargets: string[] };
+export const mcpServices = ['query', 'modeling'] as const;
+export type McpService = typeof mcpServices[number];
+export const mcpServiceLabels: Record<McpService, string> = { query: '查询 MCP', modeling: '建模 MCP' };
+type McpServiceStatus = { endpoint: string; enabled: boolean; allowed: boolean };
 
-export type McpAccess = McpSnapshot & { owner: string; can_issue: boolean; scope: { models: McpModel[]; modeling_targets: string[] } };
+export type McpAccess = McpSnapshot & {
+  owner: string; can_issue: boolean; services: Record<McpService, McpServiceStatus>;
+  scope: { models: McpModel[]; modeling_targets: string[] };
+};
 
 const versions = ['2025-11-25', '2025-06-18', '2025-03-26'];
 
 // Keep MCP credentials separate from the browser session, including on redirects.
-export async function inspectMcp(token: string, signal: AbortSignal, progress: (message: string) => void): Promise<McpInspection> {
+export async function inspectMcp(service: McpService, token: string, signal: AbortSignal, progress: (message: string) => void): Promise<McpInspection> {
   let protocol: string | undefined;
   async function rpc(id: number | undefined, method: string, params?: object) {
-    const response = await fetch('/mcp', {
+    const response = await fetch('/mcp/' + service, {
       method: 'POST', credentials: 'omit', redirect: 'error', signal,
       headers: {
         Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',

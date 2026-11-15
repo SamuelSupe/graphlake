@@ -297,13 +297,7 @@ async fn load(
                     overlay::prepare(&anchor, previous, staged, &key, &worker_scope)
                 })
                 .await??
-                    && overlay::publish(
-                        path,
-                        next.compacted.as_ref().unwrap_or(&delta),
-                        snapshot.is_none(),
-                        &next.snapshot,
-                        scope,
-                    )?
+                    && overlay::publish(path, &delta, snapshot.is_none(), &next, scope)?
                 {
                     clean_parts(path);
                     return Ok((loaded, next.snapshot.rows()));

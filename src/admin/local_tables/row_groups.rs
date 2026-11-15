@@ -1,4 +1,4 @@
-mod splice;
+pub(super) mod splice;
 
 use std::{fs::File, path::Path};
 
@@ -137,8 +137,7 @@ pub(super) fn merge(
         &previous,
         old.metadata(),
         kept,
-        &staged,
-        &replacement,
+        Some((&staged, &replacement)),
         root,
         scope,
     )

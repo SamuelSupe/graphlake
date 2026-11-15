@@ -519,6 +519,86 @@ async fn local_tables_scattered_overlay_reads_recovers_and_compacts() -> Result<
 }
 
 #[tokio::test]
+async fn local_tables_reclaims_only_masked_base_partitions() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let source = root.path().join("source.parquet");
+    parquet_rows(
+        &source,
+        &[(65_536, "updated", 100_001), (65_537, "updated", 100_001)],
+    )?;
+    fs::write(
+        root.path().join("payments.yaml"),
+        yaml(
+            "{type: parquet, tables: {items: [source.parquet]}}",
+            "input.items",
+        ),
+    )?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let definition = create(&server, "partitions", "input.items").await?;
+    let path = definition["path"].as_str().unwrap();
+    let parts = Path::new(path).with_extension("parts");
+    fs::create_dir(&parts)?;
+    let hot = Uuid::new_v4();
+    let cold = Uuid::new_v4();
+    let delta = Uuid::new_v4();
+    let hot_file = parts.join(format!("{hot}.parquet"));
+    let cold_file = parts.join(format!("{cold}.parquet"));
+    parquet_rows(
+        &hot_file,
+        &(1..=70_000)
+            .map(|id| (id, "original", id))
+            .collect::<Vec<_>>(),
+    )?;
+    parquet_rows(&cold_file, &[(70_001, "cold", 70_001)])?;
+    parquet_rows(
+        &parts.join(format!("{delta}.parquet")),
+        &(1..=65_535)
+            .map(|id| (id, "delta", 100_000))
+            .collect::<Vec<_>>(),
+    )?;
+    let old = json!({"generation": Uuid::new_v4(), "base_parts": 2, "parts": [
+        {"id":hot,"rows":70_000,"deleted":(0..65_535).collect::<Vec<_>>()},
+        {"id":cold,"rows":1}, {"id":delta,"rows":65_535},
+    ]});
+    fs::write(path, format!("GLPQ1\n{old}"))?;
+    let cold_bytes = fs::read(&cold_file)?;
+
+    let updated = load(&server, "partitions", "incremental").await?;
+    assert_eq!(updated["status"], "succeeded", "{updated}");
+    assert_eq!(updated["total_rows"], 70_001);
+    let bytes = fs::read(path)?;
+    let manifest: Value = serde_json::from_slice(&bytes[6..])?;
+    assert_eq!(manifest["base_parts"], 2);
+    assert_ne!(manifest["parts"][0]["id"], old["parts"][0]["id"]);
+    assert_eq!(manifest["parts"][0]["rows"], 4_463);
+    assert_eq!(manifest["parts"][1], old["parts"][1]);
+    assert_eq!(fs::read(&cold_file)?, cold_bytes);
+    assert!(!hot_file.exists());
+
+    drop(server);
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let replay = load(&server, "partitions", "incremental").await?;
+    assert_eq!(replay["status"], "succeeded", "{replay}");
+    assert_eq!(fs::read(path)?, bytes);
+    let result = rows(root.path(), path).await?;
+    assert_eq!(result.len(), 70_001);
+    assert!(
+        result
+            .iter()
+            .enumerate()
+            .all(|(i, row)| row.0 == i as i64 + 1)
+    );
+    assert_eq!(result[65_534], (65_535, "delta".into(), 100_000));
+    assert_eq!(result[65_536], (65_537, "updated".into(), 100_001));
+    assert_eq!(result.last(), Some(&(70_001, "cold".into(), 70_001)));
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_tables_schedule_persists_and_pauses() -> Result<()> {
     let root = tempfile::tempdir()?;
     setup_assets(root.path())?;

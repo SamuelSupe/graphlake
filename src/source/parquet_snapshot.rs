@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub(crate) const MAGIC: &[u8] = b"GLPQ1\n";
-pub(crate) const MAX_PARTS: usize = 16;
+pub(crate) const MAX_DELTA_PARTS: usize = 15;
+pub(crate) const MAX_BASE_PARTS: usize = 16;
 pub(crate) const MAX_DELETED: usize = 65_536;
 const MAX_MANIFEST: u64 = 2 * 1024 * 1024;
 
@@ -20,7 +21,16 @@ const MAX_MANIFEST: u64 = 2 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Snapshot {
     pub generation: Uuid,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub base_parts: usize,
     pub parts: Vec<Part>,
+}
+
+fn one() -> usize {
+    1
+}
+fn is_one(value: &usize) -> bool {
+    *value == 1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,7 +104,10 @@ impl Snapshot {
     fn validate(&self) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         ensure!(
-            (2..=MAX_PARTS).contains(&self.parts.len()),
+            (1..=MAX_BASE_PARTS).contains(&self.base_parts)
+                && self.parts.len() >= self.base_parts
+                && self.parts.len() >= 2
+                && self.parts.len() - self.base_parts <= MAX_DELTA_PARTS,
             "invalid local Parquet snapshot part count"
         );
         let mut deleted = 0;

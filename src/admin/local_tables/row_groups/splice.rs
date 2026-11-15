@@ -16,26 +16,36 @@ use tempfile::NamedTempFile;
 use super::staging_file;
 use crate::engine::QueryScope;
 
-pub(super) fn assemble(
+pub(in crate::admin::local_tables) fn assemble(
     previous: &File,
     old: &ParquetMetaData,
     kept: impl Iterator<Item = usize>,
-    staged: &NamedTempFile,
-    replacement: &ParquetMetaData,
+    replacement: Option<(&NamedTempFile, &ParquetMetaData)>,
     root: &Path,
     scope: &QueryScope,
 ) -> Result<Option<(NamedTempFile, u64)>> {
-    let replacement_file = staged.reopen()?;
-    let old_spans = spans(old, kept, previous.metadata()?.len());
-    let new_spans = spans(
-        replacement,
-        0..replacement.num_row_groups(),
-        replacement_file.metadata()?.len(),
-    );
-    let (Some(old_spans), Some(new_spans)) = (old_spans, new_spans) else {
+    let Some(old_spans) = spans(old, kept, previous.metadata()?.len()) else {
         return Ok(None);
     };
-    if old_spans.len() + new_spans.len() > i16::MAX as usize {
+    let mut sources = vec![(previous, old, old_spans)];
+    let replacement_file;
+    if let Some((staged, replacement)) = replacement {
+        replacement_file = staged.reopen()?;
+        let Some(new_spans) = spans(
+            replacement,
+            0..replacement.num_row_groups(),
+            replacement_file.metadata()?.len(),
+        ) else {
+            return Ok(None);
+        };
+        sources.push((&replacement_file, replacement, new_spans));
+    }
+    if sources
+        .iter()
+        .map(|(_, _, spans)| spans.len())
+        .sum::<usize>()
+        > i16::MAX as usize
+    {
         return Ok(None);
     }
 
@@ -46,10 +56,7 @@ pub(super) fn assemble(
     let mut column_indexes = Some(ParquetColumnIndex::new());
     let mut offset_indexes = Some(ParquetOffsetIndex::new());
     let mut alignment = clone_alignment(file);
-    for (source, metadata, spans) in [
-        (previous, old, old_spans),
-        (&replacement_file, replacement, new_spans),
-    ] {
+    for (source, metadata, spans) in sources {
         let mut spans = spans.as_slice();
         while let Some((_, first)) = spans.first() {
             // Adjacent groups can share one copy or reflink, even when column chunks

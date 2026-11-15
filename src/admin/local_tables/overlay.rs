@@ -1,3 +1,5 @@
+mod maintenance;
+
 use std::{
     fs::{self, File},
     io::{self, Write},
@@ -23,16 +25,19 @@ use super::{
 };
 use crate::{
     engine::QueryScope,
-    source::parquet_snapshot::{MAX_DELETED, MAX_PARTS, Part, Snapshot, parts_dir, row_selection},
+    source::parquet_snapshot::{
+        MAX_BASE_PARTS, MAX_DELETED, MAX_DELTA_PARTS, Part, Snapshot, parts_dir, row_selection,
+    },
 };
 
 pub(super) const MAX_DELTA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_COMPACTED_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SEALED_BYTES: u64 = MAX_COMPACTED_BYTES + MAX_DELTA_BYTES * MAX_DELTA_PARTS as u64;
 const SCATTERED_GROUPS: usize = 8;
 
 pub(super) struct Prepared {
     pub snapshot: Snapshot,
-    pub compacted: Option<NamedTempFile>,
+    staged: Vec<(Uuid, NamedTempFile)>,
 }
 
 pub(super) fn prepare(
@@ -71,8 +76,8 @@ pub(super) fn prepare(
             deleted: Vec::new(),
         }]
     };
-    let mut total_deleted = 0;
-    for (index, part) in changed.iter_mut().enumerate() {
+    let mut base_parts = previous.as_ref().map_or(1, |snapshot| snapshot.base_parts);
+    for part in &mut changed {
         scope.check()?;
         let file = File::open(if previous.is_some() {
             part.path(anchor)
@@ -128,33 +133,59 @@ pub(super) fn prepare(
         }
         part.deleted.sort_unstable();
         part.deleted.dedup();
-        total_deleted += part.deleted.len();
-        if index == 0 && total_deleted > MAX_DELETED {
-            return Ok(None);
-        }
     }
 
-    let (rows, compacted) = if changed.len() >= MAX_PARTS || total_deleted > MAX_DELETED {
-        let Some((rows, file)) = compact_deltas(anchor, &changed[1..], delta, &delta_meta, scope)?
+    let mut staged = Vec::new();
+    let base_deleted = changed[..base_parts]
+        .iter()
+        .map(|part| part.deleted.len())
+        .sum::<usize>();
+    if base_deleted > MAX_DELETED {
+        let mut base = changed.drain(..base_parts).collect();
+        if !maintenance::reclaim(anchor, &mut base, base_deleted, &mut staged, scope)? {
+            return Ok(None);
+        }
+        base_parts = base.len();
+        changed.splice(..0, base);
+    }
+    let delta_count = changed.len() - base_parts;
+    let total_deleted = changed.iter().map(|part| part.deleted.len()).sum::<usize>();
+    let id = Uuid::new_v4();
+    let rows = if delta_count >= MAX_DELTA_PARTS
+        || total_deleted > MAX_DELETED
+        || base_deleted > MAX_DELETED
+    {
+        let Some((rows, file)) =
+            compact_deltas(anchor, &changed[base_parts..], delta, &delta_meta, scope)?
         else {
             return Ok(None);
         };
-        changed.truncate(1);
-        (rows, Some(file))
+        changed.truncate(base_parts);
+        if file.as_file().metadata()?.len() > MAX_COMPACTED_BYTES {
+            if base_parts == MAX_BASE_PARTS {
+                return Ok(None);
+            }
+            // The compacted delta contains only live rows. It can be sealed as
+            // an immutable base partition and still carries the latest watermark.
+            base_parts += 1;
+        }
+        staged.push((id, file));
+        rows
     } else {
-        (delta_rows, None)
+        delta_rows
     };
     changed.push(Part {
-        id: Uuid::new_v4(),
+        id,
         rows,
         deleted: Vec::new(),
     });
     Ok(Some(Prepared {
         snapshot: Snapshot {
             generation: Uuid::new_v4(),
+            base_parts,
             parts: changed,
         },
-        compacted,
+        staged,
     }))
 }
 
@@ -212,7 +243,7 @@ fn compact_deltas(
         "local Parquet delta compaction row count changed"
     );
     writer.close()?;
-    Ok((file.as_file().metadata()?.len() <= MAX_COMPACTED_BYTES).then_some((rows, file)))
+    Ok((file.as_file().metadata()?.len() <= MAX_SEALED_BYTES).then_some((rows, file)))
 }
 
 fn append_batches(
@@ -229,7 +260,7 @@ fn append_batches(
         if writer.memory_size() > scope.options.memory_bytes / 8 {
             writer.flush()?;
         }
-        if writer.bytes_written() as u64 > MAX_COMPACTED_BYTES {
+        if writer.bytes_written() as u64 > MAX_SEALED_BYTES {
             return Ok(false);
         }
     }
@@ -270,11 +301,12 @@ pub(super) fn publish(
     anchor: &Path,
     delta: &NamedTempFile,
     first: bool,
-    snapshot: &Snapshot,
+    prepared: &Prepared,
     scope: &QueryScope,
 ) -> Result<bool> {
     let root = anchor.parent().expect("managed local table path");
     let directory = parts_dir(anchor);
+    let snapshot = &prepared.snapshot;
     fs::create_dir_all(&directory)?;
     scope.check()?;
     if first {
@@ -284,15 +316,26 @@ pub(super) fn publish(
             Err(error) => return Err(error.into()),
         }
     }
-    delta.as_file().sync_all()?;
-    let part = snapshot.parts.last().expect("incoming part").path(anchor);
-    match fs::hard_link(delta.path(), &part) {
-        Ok(()) => {}
-        Err(error) if links_unavailable(&error) => {
-            fs::copy(delta.path(), &part)?;
-            File::open(part)?.sync_all()?;
+    let latest = snapshot.parts.last().expect("incoming part");
+    let incoming =
+        (!prepared.staged.iter().any(|(id, _)| *id == latest.id)).then_some((latest.id, delta));
+    for (id, file) in prepared
+        .staged
+        .iter()
+        .map(|(id, file)| (*id, file))
+        .chain(incoming)
+    {
+        scope.check()?;
+        file.as_file().sync_all()?;
+        let part = directory.join(format!("{id}.parquet"));
+        match fs::hard_link(file.path(), &part) {
+            Ok(()) => {}
+            Err(error) if links_unavailable(&error) => {
+                fs::copy(file.path(), &part)?;
+                File::open(part)?.sync_all()?;
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => return Err(error.into()),
     }
     File::open(directory)?.sync_all()?;
     File::open(root)?.sync_all()?;

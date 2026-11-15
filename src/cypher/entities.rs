@@ -57,6 +57,9 @@ pub(super) fn identity_list(
     expr: &Expr,
     aliases: &Aliases,
 ) -> Option<IdentityList> {
+    if !super::expression_step() {
+        return None;
+    }
     match &expr.kind {
         ExprKind::Variable(name) => match aliases.get(&name.0) {
             Some((_, Value::Identities(shape))) => Some(shape.clone()),

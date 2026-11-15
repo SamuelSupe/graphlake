@@ -391,13 +391,11 @@ nodes:
             .guest(Method::POST, "auth/login")
             .json(&json!({"username":format!("missing-{attempt}"),"password":"incorrect test password"}))
             .send().await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get("Retry-After").is_none());
         assert_eq!(
-            response.status(),
-            if attempt == 30 {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::UNAUTHORIZED
-            }
+            response.json::<Value>().await?["code"],
+            "invalid_credentials"
         );
     }
     member_login().await?;
@@ -419,7 +417,7 @@ nodes:
             .send()
             .await?
             .status(),
-        StatusCode::TOO_MANY_REQUESTS
+        StatusCode::UNAUTHORIZED
     );
     assert_eq!(
         server
@@ -2973,6 +2971,15 @@ edges:
     assert_ne!(first["execution_worker"], second["execution_worker"]);
     assert_eq!(first["rows"], second["rows"]);
     assert_eq!(first["graph"]["elements"].as_array().unwrap().len(), 4);
+    let outer = r#"SELECT p.payment_id, a.from_account_id FROM "Payment" p
+        LEFT JOIN "Account" a ON a.from_account_id < p.payment_id ORDER BY p.payment_id"#;
+    let preserved: Value = coordinator
+        .query(Uuid::new_v4(), "sql", outer)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(preserved["rows"], json!([["8", null], ["9", null]]));
     let aggregate = r#"SELECT count(*) AS n, sum(amount) AS total FROM "Payment""#;
     let distributed: Value = coordinator
         .query(Uuid::new_v4(), "sql", aggregate)

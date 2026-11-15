@@ -11,7 +11,7 @@ pub(crate) mod procedures;
 mod wildcard;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
 };
 
@@ -49,7 +49,56 @@ pub(crate) struct Plan {
 
 const MAX_EXPRESSION_SQL_BYTES: usize = 256 * 1024;
 
+pub(crate) fn disjoin(terms: &[String]) -> String {
+    match terms {
+        [] => "FALSE".into(),
+        [term] => term.clone(),
+        terms => {
+            // A flat OR becomes a left-deep physical expression.
+            let (left, right) = terms.split_at(terms.len() / 2);
+            format!("({} OR {})", disjoin(left), disjoin(right))
+        }
+    }
+}
+
+thread_local! {
+    static EXPRESSION_WORK: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+fn expression_step() -> bool {
+    EXPRESSION_WORK.with(|work| {
+        let left = work.get();
+        if left != usize::MAX {
+            work.set(left.saturating_sub(1));
+        }
+        left != 0
+    })
+}
+
 pub(crate) fn plan(
+    catalog: &Catalog,
+    query: &str,
+    partitioned_csr: bool,
+    indexed_csr: bool,
+) -> Result<Plan> {
+    // Planning is synchronous. Limit work even when speculative type probes
+    // discard their SQL and the output-size guard never sees it.
+    struct RestoreBudget(usize);
+    impl Drop for RestoreBudget {
+        fn drop(&mut self) {
+            EXPRESSION_WORK.set(self.0);
+        }
+    }
+    let _budget = RestoreBudget(EXPRESSION_WORK.replace(32_768));
+    let result = plan_query(catalog, query, partitioned_csr, indexed_csr);
+    ensure!(
+        expression_step(),
+        "Cypher expression planning exceeds its work limit"
+    );
+    result
+}
+
+fn plan_query(
     catalog: &Catalog,
     query: &str,
     partitioned_csr: bool,
@@ -192,32 +241,83 @@ impl OrderKey {
     }
 }
 
-// Bound recursive descent in the expression parser and subsequent AST walks.
+// Bound recursive structures separately from flat lists and projections.
 pub(crate) fn check_expression_complexity(input: &str, context: &str) -> Result<()> {
     let input = input.as_bytes();
-    let mut cost = 0;
+    let mut tokens = 0;
     let mut cursor = 0;
-    let mut word = false;
+    let mut operators = vec![0];
+    let mut cases = 0_usize;
     while cursor < input.len() {
         let ch = input[cursor];
         if let Some(end) = paths::skip_literal(input, cursor)? {
-            cost += usize::from(matches!(ch, b'\'' | b'"' | b'`'));
+            tokens += usize::from(matches!(ch, b'\'' | b'"' | b'`'));
             cursor = end;
-            word = false;
+        } else if ch.is_ascii_alphanumeric() || ch == b'_' || !ch.is_ascii() {
+            let start = cursor;
+            while input
+                .get(cursor)
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == b'_' || !ch.is_ascii())
+            {
+                cursor += 1;
+            }
+            let word = &input[start..cursor];
+            tokens += 1;
+            if word.eq_ignore_ascii_case(b"CASE") {
+                cases += 1;
+            } else if word.eq_ignore_ascii_case(b"END") {
+                cases = cases.saturating_sub(1);
+            } else if [
+                b"AND".as_slice(),
+                b"OR",
+                b"XOR",
+                b"NOT",
+                b"IN",
+                b"IS",
+                b"CONTAINS",
+                b"STARTS",
+                b"ENDS",
+            ]
+            .iter()
+            .any(|op| word.eq_ignore_ascii_case(op))
+            {
+                *operators.last_mut().unwrap() += 1;
+            } else if [
+                b"THEN".as_slice(),
+                b"WHEN",
+                b"ELSE",
+                b"RETURN",
+                b"WITH",
+                b"WHERE",
+            ]
+            .iter()
+            .any(|op| word.eq_ignore_ascii_case(op))
+            {
+                *operators.last_mut().unwrap() = 0;
+            }
         } else {
-            let next_word = ch.is_ascii_alphanumeric() || ch == b'_' || !ch.is_ascii();
-            cost += usize::from(
-                next_word && !word
-                    || matches!(
-                        ch,
-                        b'(' | b'[' | b'{' | b'+' | b'-' | b'^' | b'/' | b'*' | b'%' | b'.'
-                    ),
-            );
-            word = next_word;
+            tokens += usize::from(!ch.is_ascii_whitespace());
+            match ch {
+                b'[' => {
+                    // Repeated postfix subscripts build a deep AST without
+                    // increasing delimiter nesting.
+                    *operators.last_mut().unwrap() += 1;
+                    operators.push(0);
+                }
+                b'(' | b'{' => operators.push(0),
+                b')' | b']' | b'}' if operators.len() > 1 => {
+                    operators.pop();
+                }
+                b',' | b':' | b'|' => *operators.last_mut().unwrap() = 0,
+                b'+' | b'-' | b'^' | b'/' | b'*' | b'%' | b'.' | b'=' | b'<' | b'>' => {
+                    *operators.last_mut().unwrap() += 1
+                }
+                _ => {}
+            }
             cursor += 1;
         }
         ensure!(
-            cost <= 384,
+            tokens <= 8192 && operators.len() + cases <= 65 && *operators.last().unwrap() <= 128,
             "{context} exceeds the supported expression complexity"
         );
     }
@@ -484,6 +584,9 @@ impl<'a> MatchPlan<'a> {
     }
 
     fn entity_type(&self, expr: &Expr, aliases: &Aliases) -> Option<Binding> {
+        if !expression_step() {
+            return None;
+        }
         match &expr.kind {
             ExprKind::Variable(name) => match aliases.get(&name.0) {
                 Some((_, clauses::Value::Entity(binding))) => Some(binding.clone()),
@@ -510,6 +613,9 @@ impl<'a> MatchPlan<'a> {
     }
 
     fn entity_list(&self, expr: &Expr, aliases: &Aliases) -> Option<Binding> {
+        if !expression_step() {
+            return None;
+        }
         if let Some(shape) = entities::identity_list(self, expr, aliases)
             && !shape.labels.is_empty()
         {
@@ -531,11 +637,8 @@ impl<'a> MatchPlan<'a> {
                 self.entity_type(item, aliases)
             }
             ExprKind::List(items) => self.common_entity(items.iter(), aliases),
-            ExprKind::PatternComprehension { .. } => {
-                match clauses::pattern_list(self.catalog?, self, aliases, expr, false)
-                    .ok()?
-                    .1
-                {
+            ExprKind::PatternComprehension { .. } | ExprKind::ListComprehension { .. } => {
+                match self.list_item(expr, aliases) {
                     clauses::Value::Entity(binding) => Some(binding),
                     _ => None,
                 }
@@ -558,22 +661,6 @@ impl<'a> MatchPlan<'a> {
                     .filter(|value| !clauses::empty_list(value))
                     .map(|value| self.entity_list(value, aliases)),
             ),
-            ExprKind::ListComprehension {
-                variable,
-                list,
-                projection,
-                ..
-            } => {
-                let Some(projection) = projection else {
-                    return self.entity_list(list, aliases);
-                };
-                let mut scope = aliases.clone();
-                scope.insert(
-                    variable.0.clone(),
-                    (String::new(), self.list_item(list, aliases)),
-                );
-                self.entity_type(projection, &scope)
-            }
             _ => None,
         }
     }
@@ -600,6 +687,35 @@ impl<'a> MatchPlan<'a> {
     }
 
     fn list_item(&self, expr: &Expr, aliases: &Aliases) -> clauses::Value {
+        use clauses::Value;
+        if !expression_step() {
+            return Value::Scalar;
+        }
+        match &expr.kind {
+            ExprKind::ListComprehension {
+                variable,
+                list,
+                projection,
+                ..
+            } => {
+                let item = self.list_item(list, aliases);
+                let Some(projection) = projection else {
+                    return item;
+                };
+                let mut scope = aliases.clone();
+                scope.insert(variable.0.clone(), (String::new(), item));
+                return Value::inferred(self, projection, &scope);
+            }
+            ExprKind::PatternComprehension { .. } => {
+                return self
+                    .catalog
+                    .and_then(|catalog| {
+                        clauses::pattern_list(catalog, self, aliases, expr, false).ok()
+                    })
+                    .map_or(Value::Scalar, |(_, item)| item);
+            }
+            _ => {}
+        }
         clauses::Value::nested_item(self, expr, aliases)
             .or_else(|| self.entity_list(expr, aliases).map(clauses::Value::Entity))
             .unwrap_or(clauses::Value::Scalar)
@@ -629,6 +745,10 @@ impl<'a> MatchPlan<'a> {
     }
 
     fn expr_with_aliases(&self, expression: &Expr, aliases: &Aliases) -> Result<String> {
+        ensure!(
+            expression_step(),
+            "Cypher expression planning exceeds its work limit"
+        );
         bounded_expression(self.render_expression(expression, aliases)?)
     }
 
@@ -922,9 +1042,6 @@ impl<'a> MatchPlan<'a> {
                     BinaryOp::In => {
                         let left = self.comparison_value(lhs, aliases)?;
                         if let ExprKind::List(items) = &rhs.kind {
-                            if items.is_empty() {
-                                return Ok("FALSE".into());
-                            }
                             let items = items
                                 .iter()
                                 .map(|item| {
@@ -934,7 +1051,7 @@ impl<'a> MatchPlan<'a> {
                                     ))
                                 })
                                 .collect::<Result<Vec<_>>>()?;
-                            return Ok(format!("({})", items.join(" OR ")));
+                            return Ok(disjoin(&items));
                         }
                         Ok(format!(
                             "__graphlake_cypher_in({left}, {})",

@@ -496,6 +496,14 @@ impl Objects {
         Ok(())
     }
 
+    pub async fn exists(&self, key: &Key) -> Result<bool> {
+        match self.store.head(key).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn get(&self, key: &Key) -> Result<object_store::GetResult> {
         Ok(self.store.get(key).await?)
     }

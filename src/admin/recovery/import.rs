@@ -262,14 +262,14 @@ async fn guard(State(stage): State<Arc<Stage>>, request: Request, next: Next) ->
 
 async fn status(State(stage): State<Arc<Stage>>, headers: HeaderMap) -> ApiResult<Json<Status>> {
     authorize(&headers, &stage.token)?;
-    // Read the persisted job before releasing an idle slot so it cannot race a new start.
-    let idle = stage.job.try_lock().ok();
     let job = stage
         .leader
         .get::<Option<Job>>(JOB_KEY)
         .await?
         .and_then(|(job, _)| job);
-    let running = idle.is_none()
+    // Status is advisory. Starting a restore owns the slot and checks the
+    // persisted revision itself, so polling must not hold that slot over I/O.
+    let running = stage.job.try_lock().is_err()
         || job
             .as_ref()
             .is_some_and(|job| job.phase == Phase::Control && job.failure.is_none())

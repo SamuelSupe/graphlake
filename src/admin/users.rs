@@ -175,7 +175,10 @@ impl Users {
     pub(super) fn verifier(&self, name: &str) -> Option<(String, Principal)> {
         let live = self.live.lock().unwrap();
         let account = live.directory.accounts.get(name).filter(|entry| {
-            !entry.disabled && !entry.console_disabled && entry.token_sha256.is_none()
+            !entry.disabled
+                && !entry.console_disabled
+                && !entry.reset_required
+                && entry.token_sha256.is_none()
         })?;
         Some((
             account.password_hash.clone(),
@@ -544,8 +547,14 @@ pub(super) async fn update(
                 .ok_or_else(|| Error::invalid("token_required", "新服务账号需要初始令牌"))?;
             (String::new(), Some(token))
         } else {
+            // A replacement MCP token grants only MCP access. An old
+            // restored password must never become usable through a later edit.
             let password = hash
-                .or_else(|| existing.map(|entry| entry.password_hash.clone()))
+                .or_else(|| {
+                    existing
+                        .filter(|entry| !entry.reset_required || !edit.issue_mcp_token)
+                        .map(|entry| entry.password_hash.clone())
+                })
                 .unwrap_or_default();
             if console_access && password.is_empty() {
                 return Err(Error::invalid(

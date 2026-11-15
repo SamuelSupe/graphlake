@@ -105,6 +105,7 @@ impl ClickHouse {
         let selected = if columns.is_empty() {
             metadata_columns
                 .iter()
+                .filter(|column| column.default_type != "EPHEMERAL")
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>()
         } else {
@@ -332,4 +333,38 @@ struct Column {
     name: String,
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    default_type: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::prelude::SessionContext;
+
+    #[tokio::test]
+    #[ignore = "requires graphlake.nodes with an EPHEMERAL column and the ClickHouse readonly fixture"]
+    async fn preview_schema_excludes_ephemeral_columns() -> Result<()> {
+        let uri = std::env::var("GRAPHLAKE_TEST_CLICKHOUSE_URI")?.parse()?;
+        let source = Source::Clickhouse {
+            uri,
+            user: "readonly_reader".into(),
+            password_env: Some("GRAPHLAKE_TEST_CLICKHOUSE_PASSWORD".into()),
+        };
+        let context = SessionContext::new();
+        let runtime = context.runtime_env();
+        let mut connector = ClickHouse::new(
+            &source,
+            Duration::from_secs(10),
+            Arc::clone(&runtime.memory_pool),
+            Arc::new(ReadStats::default()),
+        )?;
+        let (table, _, _) = connector
+            .table("graphlake.nodes", &[], &[], 32, &runtime.disk_manager, true)
+            .await?;
+        let schema = table.schema();
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("only_insert").is_err());
+        Ok(())
+    }
 }

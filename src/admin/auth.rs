@@ -4,7 +4,10 @@ use std::{
     io::{self, IsTerminal},
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -335,6 +338,7 @@ struct SharedAuth {
     leader: Arc<super::cluster::control::Leadership>,
     password_version: Token,
     revision: tokio::sync::Mutex<Option<i64>>,
+    write_uncertain: AtomicBool,
 }
 
 pub(super) struct Auth {
@@ -407,6 +411,7 @@ impl Auth {
                 leader,
                 password_version,
                 revision: tokio::sync::Mutex::new(Some(revision)),
+                write_uncertain: AtomicBool::new(false),
             })
         } else {
             None
@@ -504,6 +509,14 @@ impl Auth {
             return Some(Principal::Admin);
         }
         let token = self.token(headers)?;
+        if let Some(shared) = &self.shared
+            && shared.write_uncertain.load(Ordering::Acquire)
+        {
+            let mut revision = shared.revision.lock().await;
+            if revision.is_none() {
+                self.reconcile(shared, &mut revision).await.ok()?;
+            }
+        }
         let now = SystemTime::now();
         let (principal, update) = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -532,6 +545,9 @@ impl Auth {
                 Ok(Ok(())) => {}
                 Ok(Err(error))
                     if error.status.is_server_error()
+                        && self.shared.as_ref().is_none_or(|shared| {
+                            !shared.write_uncertain.load(Ordering::Acquire)
+                        })
                         && self.sessions.lock().unwrap().check(token, now, false) => {}
                 _ => return None,
             }
@@ -573,6 +589,36 @@ impl Auth {
         )
     }
 
+    async fn reconcile(
+        &self,
+        shared: &SharedAuth,
+        revision: &mut Option<i64>,
+    ) -> super::ApiResult<i64> {
+        use super::cluster::control;
+        let saved = shared.leader.get::<SharedSessions>("sessions").await?;
+        let Some((sessions, current)) =
+            saved.filter(|(saved, _)| saved.password_version == shared.password_version)
+        else {
+            shared.leader.retire();
+            return Err(control::lost());
+        };
+        let current = if shared.write_uncertain.load(Ordering::Acquire) {
+            // Fencing the observed revision prevents a delayed logout or
+            // login CAS from changing authorization after reconciliation.
+            shared
+                .leader
+                .commit("sessions", current, &sessions, None::<(uuid::Uuid, &())>)
+                .await?
+                .ok_or_else(control::unavailable)?
+        } else {
+            current
+        };
+        self.sessions.lock().unwrap().tokens = sessions.active_tokens(SystemTime::now());
+        *revision = Some(current);
+        shared.write_uncertain.store(false, Ordering::Release);
+        Ok(current)
+    }
+
     async fn apply(&self, change: SessionChange) -> super::ApiResult<()> {
         if let Some(shared) = &self.shared {
             let touch = matches!(change, SessionChange::Touch(..));
@@ -580,21 +626,7 @@ impl Auth {
             let previous = if let Some(previous) = *revision {
                 previous
             } else {
-                // A failed touch may already have committed. Reconcile against
-                // the fenced, linearizable checkpoint before any further writes.
-                let saved = shared.leader.get::<SharedSessions>("sessions").await?;
-                let (tokens, current) = match saved {
-                    Some((saved, current)) if saved.password_version == shared.password_version => {
-                        (saved.active_tokens(SystemTime::now()), current)
-                    }
-                    _ => {
-                        shared.leader.retire();
-                        return Err(super::cluster::control::lost());
-                    }
-                };
-                self.sessions.lock().unwrap().tokens = tokens;
-                *revision = Some(current);
-                current
+                self.reconcile(shared, &mut revision).await?
             };
             let mut snapshot = Sessions {
                 tokens: self.sessions.lock().unwrap().tokens.clone(),
@@ -613,8 +645,8 @@ impl Auth {
                 tokens,
                 user_tokens,
             };
-            // A login or logout changes authorization. An ambiguous idle-time
-            // refresh can be reconciled without retiring this Coordinator.
+            // A failed authorization write must be reconciled before cookies
+            // are accepted again. An idle-time touch leaves authorization intact.
             let result = shared
                 .leader
                 .commit("sessions", previous, &data, None::<(uuid::Uuid, &())>)
@@ -624,25 +656,19 @@ impl Auth {
                     self.sessions.lock().unwrap().tokens = snapshot.tokens;
                     *revision = Some(next);
                 }
-                Err(error) if touch => {
-                    if error.code != super::cluster::control::UNCERTAIN {
-                        *revision = None;
-                    }
-                    return Err(error);
-                }
-                Ok(None) if touch => {
-                    *revision = None;
-                    return Err(super::cluster::control::unavailable());
-                }
                 Err(error) => {
                     if error.code != super::cluster::control::UNCERTAIN {
-                        shared.leader.retire();
+                        *revision = None;
+                        if !touch {
+                            shared.write_uncertain.store(true, Ordering::Release);
+                        }
                     }
                     return Err(error);
                 }
                 Ok(None) => {
-                    shared.leader.retire();
-                    return Err(super::cluster::control::lost());
+                    *revision = None;
+                    shared.write_uncertain.store(true, Ordering::Release);
+                    return Err(super::cluster::control::unavailable());
                 }
             }
         } else {
@@ -757,6 +783,15 @@ fn throttled(seconds: u64) -> Response {
     response
 }
 
+fn invalid_credentials() -> Response {
+    Error::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid_credentials",
+        "用户名或密码错误",
+    )
+    .into_response()
+}
+
 pub(super) async fn login(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -783,13 +818,18 @@ pub(super) async fn login(
         })
         .flatten()
         .map(|ip| ip.to_canonical());
-    let semaphore = if input.username == USERNAME {
+    let administrator = input.username == USERNAME;
+    let semaphore = if administrator {
         &auth.admin_password_slot
     } else {
         &auth.password_slot
     };
     let Ok(slot) = Arc::clone(semaphore).try_acquire_owned() else {
-        return throttled(1);
+        return if administrator {
+            throttled(1)
+        } else {
+            invalid_credentials()
+        };
     };
     let verifier = app.clone();
     let worker = tokio::task::spawn_blocking(move || {
@@ -797,7 +837,7 @@ pub(super) async fn login(
         let auth = &verifier.auth;
         let named = verifier.users.verifier(&input.username);
         let keys = login_keys(&input.username, source, named.is_some());
-        let shared_admin = input.username == USERNAME && source.is_none();
+        let shared_admin = administrator && source.is_none();
         let retry = {
             let now = Instant::now();
             let mut sessions = auth.sessions.lock().unwrap();
@@ -817,15 +857,17 @@ pub(super) async fn login(
                 })
                 .max();
             if let Some(seconds) = wait {
-                if !shared_admin {
-                    return Err(throttled(seconds));
+                if administrator {
+                    if !shared_admin {
+                        return Err(throttled(seconds));
+                    }
+                    if let Some(at) = sessions.admin_retry_at.filter(|at| *at > now) {
+                        return Err(throttled(at.duration_since(now).as_secs() + 1));
+                    }
+                    // Pace verification after a burst when there is no client
+                    // identity to separate an administrator from other attempts.
+                    sessions.admin_retry_at = Some(now + FAILURE_WINDOW / MAX_FAILURES as u32);
                 }
-                if let Some(at) = sessions.admin_retry_at.filter(|at| *at > now) {
-                    return Err(throttled(at.duration_since(now).as_secs() + 1));
-                }
-                // With no client identity, pace password verification after a
-                // burst so a shared failure bucket cannot reject every login.
-                sessions.admin_retry_at = Some(now + FAILURE_WINDOW / MAX_FAILURES as u32);
             }
             wait.is_some()
         };
@@ -838,7 +880,12 @@ pub(super) async fn login(
             && argon2()
                 .verify_password(input.password.as_bytes(), &hash)
                 .is_ok();
-        if !valid || (input.username != USERNAME && named.is_none()) {
+        // Keep Argon2 work inside the ordinary password slots even after a
+        // limit is reached. Skipping it would expose per-account buckets by timing.
+        if retry && !administrator {
+            return Err(invalid_credentials());
+        }
+        if !valid || (!administrator && named.is_none()) {
             let now = Instant::now();
             let mut sessions = auth.sessions.lock().unwrap();
             for (key, limit) in keys {
@@ -871,12 +918,7 @@ pub(super) async fn login(
             if retry {
                 return Err(throttled((FAILURE_WINDOW / MAX_FAILURES as u32).as_secs()));
             }
-            return Err(Error::new(
-                StatusCode::UNAUTHORIZED,
-                "invalid_credentials",
-                "用户名或密码错误",
-            )
-            .into_response());
+            return Err(invalid_credentials());
         }
         let principal = named.map_or(Principal::Admin, |(_, principal)| principal);
         random::<32>()

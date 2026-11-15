@@ -163,7 +163,7 @@ impl Traversers<'_> {
             .collect();
         let value = format!("__graphlake_numeric_input({})", inputs.join(", "));
         self.reduce(
-            &format!("sum({value})"),
+            &format!("__graphlake_cypher_sum({value})"),
             "__graphlake_gremlin_sum_zero(q.aggregate)",
             Kind::Sum(sources),
         );

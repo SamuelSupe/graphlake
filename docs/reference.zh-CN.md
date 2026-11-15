@@ -149,7 +149,7 @@ DuckDB 可利用行组的列最小值和最大值裁剪有序 `LIMIT` 的扫描�
 Parquet 表显式列出文件，YAML 中的相对路径以配置文件目录为准。同一表各文件的映射列须具有相同的 Arrow 类型。HTTP 服务须支持 HEAD、Range 和强 ETag。S3 使用 `AWS_REGION` 等标准 AWS 配置，也可通过 `AWS_ENDPOINT` 指定兼容服务。
 
 
-通过 Snowflake、Spanner、Trino、SAP HANA 和 SQL Server／Oracle 直连读取的时间戳统一映射为 Arrow 微秒时间戳，可保留 9999-12-31 等源端长时间范围的日期。超出微秒的尾数被截去。TIME 列仍按连接器映射保留其时间精度。
+通过 Snowflake、Spanner、SAP HANA 和 SQL Server／Oracle 直连读取的时间戳映射为 Arrow 微秒时间戳，可保留 9999-12-31 等源端长时间范围的日期。Trino 按声明精度选择微秒或纳秒。当值超出对应 Arrow 类型的时间范围或小数精度时，查询返回对应列的错误。可在源端视图中对该列使用文本表示，以保留原值。
 
 PostgreSQL 无穷日期、无穷时间戳和定点 `NaN` 在读取时报告具体值和类型。需要这些值或无精度约束的 `NUMERIC` 时，可在源端创建只读视图，将相应列转成 `text`，例如 `valid_until::text AS valid_until`。有限日期与定点数继续使用 Arrow 类型。
 
@@ -213,7 +213,7 @@ sources:
 
 边或节点的 `source` 写作 `lake.finance.transfers`。可省略 `warehouse`、`token_env` 和 `snapshots`。REST Catalog 可提供存储配置，客户端也读取 `AWS_REGION`、`AWS_ENDPOINT` 和 AWS 凭据环境变量。
 
-MySQL 8.x 使用 `source.database.table` 映射 InnoDB 表。连接串从 `dsn_env` 读取，默认验证 TLS 证书及主机名。私有 CA 可通过 `ca_file` 添加 PEM 证书，相对路径以 YAML 所在目录为准。隔离测试实例可显式配置 `tls: false`。同一来源的表在一个只读可重复读快照里分批读取，按查询内存和磁盘预算物化映射列，之后再做本机关联。映射保留有符号和无符号整数，支持精度最高 38 的 DECIMAL，并按 UTC 读取 TIMESTAMP。查询报告中的 MySQL 版本标识对应本次读取会话。
+MySQL 8.x 使用 `source.database.table` 映射 InnoDB 表。连接串从 `dsn_env` 读取，默认验证 TLS 证书及主机名。私有 CA 可通过 `ca_file` 添加 PEM 证书，相对路径以 YAML 所在目录为准。隔离测试实例可显式配置 `tls: false`。同一来源的表在一个只读可重复读快照里分批读取，按查询内存和磁盘预算物化映射列，之后再做本机关联。映射保留有符号和无符号整数，支持精度最高 38 的 DECIMAL，并按 UTC 读取 TIMESTAMP。日期包含零年、零月或零日时，查询报告对应列的错误。需要保留原值时，可映射 InnoDB 表中的文本列，例如以 `CAST(date_column AS CHAR)` 定义的生成列。查询报告中的 MySQL 版本标识对应本次读取会话。
 
 ```yaml
 sources:
@@ -280,9 +280,9 @@ SQL Server 和 Oracle 可使用 `type: sqlserver`、`type: oracle`，配置结�
 
 [MongoDB](https://trino.io/docs/current/connector/mongodb.html)、[Elasticsearch](https://trino.io/docs/current/connector/elasticsearch.html) 和 [Redshift](https://trino.io/docs/current/connector/redshift.html) 使用各自的 Trino 插件。先在协调器配置 Catalog，然后在 GraphLake 配置 `type: mongodb`、`type: elasticsearch` 或 `type: redshift`，并在 `catalog` 填入 Trino Catalog 名。三种类型共享 Trino 的 `uri`、`user`、`token_env` 和 `password_env`。节点或边引用分别使用 `docs.finance.accounts`（MongoDB 数据库和集合）、`search.default.accounts`（Elasticsearch schema 和索引）或 `warehouse.public.accounts`（Redshift schema 和表）。集合、索引或表名称可以包含点，例如 `search.default.transfers.2026.11`。嵌套字段通过 Trino 提供标量列后再映射。MongoDB ObjectId 读取为 12 字节的 Arrow Binary，可以直接作为业务键。MongoDB 的字段类型由 Trino 的 schema collection 管理。多个协调器并行访问新集合前，先写入该集合的字段定义，避免首次查询同时推断并写入定义。
 
-[Spanner](https://docs.cloud.google.com/spanner/docs/) 通过官方 Rust 客户端读取 GoogleSQL 数据库。生产连接使用 Application Default Credentials。可为本机模拟器指定 `uri: http://127.0.0.1:9010` 或使用 SDK 的 `SPANNER_EMULATOR_HOST`。节点或边引用使用 `global.Accounts` 或 `global.schema.Accounts`。同一个来源内的多表读取共享 Spanner 的只读事务并记录读时间戳。同一引擎在同一 Tokio 运行时复用数据库会话。支持标量列，`NUMERIC` 映射为 Decimal128(38,9)，时间戳以 UTC 纳秒读取。数组、结构和超出 Arrow 纳秒范围的时间戳返回错误。
+[Spanner](https://docs.cloud.google.com/spanner/docs/) 通过官方 Rust 客户端读取 GoogleSQL 数据库。生产连接使用 Application Default Credentials。可为本机模拟器指定 `uri: http://127.0.0.1:9010` 或使用 SDK 的 `SPANNER_EMULATOR_HOST`。节点或边引用使用 `global.Accounts` 或 `global.schema.Accounts`。同一个来源内的多表读取共享 Spanner 的只读事务并记录读时间戳。同一引擎在同一 Tokio 运行时复用数据库会话。支持标量列，`NUMERIC` 映射为 Decimal128(38,9)，时间戳以 UTC 微秒读取。数组、结构和含有非零亚微秒位的时间戳返回错误。
 
-SAP HANA 直连租户 SQL 端口，使用 `hana.SCHEMA.TABLE` 引用表。schema、表及列按映射中的精确大小写读取。TLS 默认启用并校验证书，可以使用 `ca_file` 增加私有 CA。明文仅用于回环测试。支持常用标量和定点十进制列，LOB、数组、空间类型和超出 Arrow 纳秒范围的时间戳需要在远端视图转换。每张表按独立语句读取，GraphLake 为该读取生成诊断 ID。
+SAP HANA 直连租户 SQL 端口，使用 `hana.SCHEMA.TABLE` 引用表。schema、表及列按映射中的精确大小写读取。TLS 默认启用并校验证书，可以使用 `ca_file` 增加私有 CA。明文仅用于回环测试。支持常用标量和定点十进制列，LOB、数组、空间类型和含有非零亚微秒位的时间戳需要在远端视图转换。每张表按独立语句读取，GraphLake 为该读取生成诊断 ID。
 
 ```yaml
 sources:

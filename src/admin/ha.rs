@@ -344,9 +344,9 @@ async fn mutate_inner(
         )
     };
     let base = capture(&local)?;
-    let candidate = tempfile::tempdir().map_err(|_| Error::storage())?;
+    let candidate = Arc::new(tempfile::tempdir().map_err(|_| Error::storage())?);
     restore(candidate.path(), &base)?;
-    let mut models = models::Models::with_sources(candidate.path().to_owned(), sources.clone());
+    let mut models = models::Models::in_snapshot(Arc::clone(&candidate), sources.clone());
     if let Mutation::Create {
         yaml,
         template_model,
@@ -378,7 +378,9 @@ async fn mutate_inner(
     let generation = if state.files == base.files {
         pointer.0.clone()
     } else {
-        ha.leader.store_catalog(&state, Some(&pointer.0)).await?
+        tokio::time::timeout_at(deadline, ha.leader.store_catalog(&state, Some(&pointer.0)))
+            .await
+            .map_err(|_| control::timeout())??
     };
     let mut receipt = Receipt {
         fingerprint,
@@ -418,14 +420,9 @@ async fn mutate_inner(
             return Err(error);
         }
     };
-    // Never await between successful CAS and installing the local candidate. Keep the old
-    // directory alive until every reader has finished using it under the model mutex.
-    {
-        let mut live = app.models.lock().unwrap();
-        *live = models;
-        let old = app.ha_cache.lock().unwrap().replace(candidate);
-        drop(old);
-    }
+    // Never await between successful CAS and installing the local candidate.
+    let old = std::mem::replace(&mut *app.models.lock().unwrap(), models);
+    tokio::task::spawn_blocking(move || drop(old));
     *ha.probe_generation.write().unwrap() = generation.clone();
     *pointer = (generation, revision);
     Ok((status, models::model_response(model)).into_response())

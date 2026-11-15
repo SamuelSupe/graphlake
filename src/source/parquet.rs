@@ -6,7 +6,7 @@ use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
     catalog::{Session, TableProvider},
-    common::DFSchema,
+    common::{DFSchema, DataFusionError, ScalarValue},
     datasource::physical_plan::{
         FileGroup, FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
     },
@@ -18,7 +18,7 @@ use datafusion::{
         Expr, Operator, TableProviderFilterPushDown, TableType,
         utils::{conjunction, split_conjunction},
     },
-    physical_plan::{ExecutionPlan, metrics::ExecutionPlanMetricsSet},
+    physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
 };
 use datafusion_datasource::{PartitionedFile, source::DataSourceExec};
 use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture};
@@ -388,6 +388,25 @@ impl ParquetFileReaderFactory for PinnedReaderFactory {
 #[derive(Debug)]
 pub(crate) struct ParquetTable {
     schema: SchemaRef,
+    input: ParquetInput,
+    parallel_ranges: bool,
+}
+
+type PartInput = (String, Option<Arc<Part>>);
+
+#[derive(Debug)]
+enum ParquetInput {
+    Open(OpenedParquet),
+    Snapshot {
+        key: String,
+        parts: Vec<PartInput>,
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+    },
+}
+
+#[derive(Debug)]
+struct OpenedParquet {
     readers: Arc<PinnedReaderFactory>,
     files: Vec<PartitionedFile>,
     metadata: Vec<Arc<ParquetMetaData>>,
@@ -421,24 +440,30 @@ impl ParquetTable {
     }
     #[cfg(feature = "admin")]
     pub(crate) fn for_exploration(mut self) -> Self {
-        for file in Arc::get_mut(&mut self.readers)
-            .expect("new Parquet table")
-            .0
-            .values_mut()
-        {
-            file.parallel_ranges = true;
+        self.parallel_ranges = true;
+        if let ParquetInput::Open(open) = &mut self.input {
+            for file in Arc::get_mut(&mut open.readers)
+                .expect("new Parquet table")
+                .0
+                .values_mut()
+            {
+                file.parallel_ranges = true;
+            }
         }
         self
     }
 
     pub(crate) fn integer_groups(&self, column: &str) -> Option<Vec<(i64, i64, usize)>> {
-        if self.files.iter().any(|file| {
+        let ParquetInput::Open(open) = &self.input else {
+            return None;
+        };
+        if open.files.iter().any(|file| {
             file.extension::<datafusion_datasource_parquet::ParquetRowSelection>()
                 .is_some()
         }) {
             return None;
         }
-        self.metadata
+        open.metadata
             .iter()
             .flat_map(|file| file.row_groups())
             .map(|group| {
@@ -463,6 +488,7 @@ impl ParquetTable {
         columns: &[String],
         pool: Arc<dyn MemoryPool>,
         stats: Arc<ReadStats>,
+        prune_snapshot: bool,
     ) -> Result<(Self, Vec<SourceVersion>)> {
         let mut versions = Vec::new();
         let mut inputs = Vec::new();
@@ -471,14 +497,43 @@ impl ParquetTable {
                 && let Some(snapshot) = Snapshot::read(&path)?
             {
                 versions.push(snapshot_version(location, &snapshot));
+                // A singleton managed snapshot carries a validated schema and can
+                // postpone pinning its parts until DataFusion passes scan filters.
+                let mut snapshot = snapshot;
+                if prune_snapshot
+                    && locations.len() == 1
+                    && let Some(pruning) = snapshot.pruning.take()
+                {
+                    return Ok((
+                        Self {
+                            schema: selected_schema(&pruning.schema, columns, location)?,
+                            input: ParquetInput::Snapshot {
+                                key: pruning.key,
+                                parts: snapshot_inputs(&path, snapshot),
+                                pool,
+                                stats,
+                            },
+                            parallel_ranges: false,
+                        },
+                        versions,
+                    ));
+                }
                 inputs.extend(snapshot_inputs(&path, snapshot));
             } else {
                 inputs.push((location.clone(), None));
             }
         }
-        let (table, physical_versions) = Self::open_inputs(inputs, columns, pool, stats).await?;
+        let (schema, open, physical_versions) =
+            OpenedParquet::open(inputs, columns, &pool, &stats, false).await?;
         versions.extend(physical_versions);
-        Ok((table, versions))
+        Ok((
+            Self {
+                schema,
+                input: ParquetInput::Open(open),
+                parallel_ranges: false,
+            },
+            versions,
+        ))
     }
 
     #[cfg(feature = "admin")]
@@ -488,19 +543,24 @@ impl ParquetTable {
         pool: Arc<dyn MemoryPool>,
         stats: Arc<ReadStats>,
     ) -> Result<Self> {
-        Ok(
-            Self::open_inputs(snapshot_inputs(path, snapshot), &[], pool, stats)
-                .await?
-                .0,
-        )
+        let inputs = snapshot_inputs(path, snapshot);
+        let (schema, open, _) = OpenedParquet::open(inputs, &[], &pool, &stats, false).await?;
+        Ok(Self {
+            schema,
+            input: ParquetInput::Open(open),
+            parallel_ranges: false,
+        })
     }
+}
 
-    async fn open_inputs(
-        inputs: Vec<(String, Option<Part>)>,
+impl OpenedParquet {
+    async fn open(
+        inputs: Vec<PartInput>,
         columns: &[String],
-        pool: Arc<dyn MemoryPool>,
-        stats: Arc<ReadStats>,
-    ) -> Result<(Self, Vec<SourceVersion>)> {
+        pool: &Arc<dyn MemoryPool>,
+        stats: &Arc<ReadStats>,
+        parallel_ranges: bool,
+    ) -> Result<(SchemaRef, Self, Vec<SourceVersion>)> {
         let mut versions = Vec::new();
         let mut schema = None;
         let mut readers = BTreeMap::new();
@@ -515,10 +575,11 @@ impl ParquetTable {
         };
         let mut inputs = futures::stream::iter(inputs.into_iter().enumerate().map(
             |(index, (location, mask))| {
-                let pool = Arc::clone(&pool);
-                let stats = Arc::clone(&stats);
+                let pool = Arc::clone(pool);
+                let stats = Arc::clone(stats);
                 async move {
-                    let file = PinnedFile::open(&location, pool, stats).await?;
+                    let mut file = PinnedFile::open(&location, pool, stats).await?;
+                    file.parallel_ranges = parallel_ranges;
                     let builder = ParquetRecordBatchStreamBuilder::new(file.clone())
                         .await
                         .with_context(|| format!("reading Parquet schema for {location}"))?;
@@ -546,9 +607,12 @@ impl ParquetTable {
                 version: file.version(&location).version,
                 size: file.meta.size,
                 mask: mask
-                    .as_ref()
+                    .as_deref()
                     .filter(|part| !part.deleted.is_empty())
-                    .cloned(),
+                    .map(|part| Part {
+                        key_range: None,
+                        ..part.clone()
+                    }),
                 row_groups: builder
                     .metadata()
                     .row_groups()
@@ -561,51 +625,11 @@ impl ParquetTable {
                     })
                     .collect(),
             });
-            let arrow_schema = builder.schema();
-            let fields = if columns.is_empty() {
-                arrow_schema
-                    .fields()
-                    .iter()
-                    .map(|field| field.as_ref().clone())
-                    .collect()
-            } else {
-                columns
-                    .iter()
-                    .map(|name| {
-                        arrow_schema
-                            .field_with_name(name)
-                            .cloned()
-                            .with_context(|| crate::catalog::ValidationSite::Column {
-                                column: name.clone(),
-                            })
-                            .with_context(|| format!("missing column {name} in {location}"))
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            };
+            let projected = selected_schema(builder.schema(), columns, &location)?;
             if let Some(expected) = &schema {
-                let expected: &SchemaRef = expected;
-                ensure!(
-                    fields.len() == expected.fields().len(),
-                    "Parquet files have different field counts"
-                );
-                for (field, required) in fields.iter().zip(expected.fields()) {
-                    ensure!(
-                        field.name() == required.name()
-                            && field.data_type() == required.data_type(),
-                        "Parquet column {} has inconsistent types across files",
-                        field.name()
-                    );
-                }
+                check_schema(expected, &projected)?;
             } else {
-                schema = Some(Arc::new(Schema::new(
-                    fields
-                        .into_iter()
-                        .map(|field| {
-                            // Nullability may differ across files with the same logical field types.
-                            field.with_nullable(true)
-                        })
-                        .collect::<Vec<_>>(),
-                )));
+                schema = Some(projected);
             }
             let mut meta = file.meta.clone();
             // The same object path can occur in different buckets or on different hosts.
@@ -618,8 +642,8 @@ impl ParquetTable {
             files.push(file);
         }
         Ok((
+            schema.context("no Parquet files")?,
             Self {
-                schema: schema.context("no Parquet files")?,
                 readers: Arc::new(PinnedReaderFactory(readers)),
                 files,
                 metadata,
@@ -631,12 +655,86 @@ impl ParquetTable {
     }
 }
 
-fn snapshot_inputs(path: &Path, snapshot: Snapshot) -> Vec<(String, Option<Part>)> {
+fn selected_schema(schema: &Schema, columns: &[String], location: &str) -> Result<SchemaRef> {
+    let fields = if columns.is_empty() {
+        schema.fields().iter().map(AsRef::as_ref).collect()
+    } else {
+        columns
+            .iter()
+            .map(|name| {
+                schema
+                    .field_with_name(name)
+                    .with_context(|| crate::catalog::ValidationSite::Column {
+                        column: name.clone(),
+                    })
+                    .with_context(|| format!("missing column {name} in {location}"))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    // Files can differ in nullability while sharing the same logical field types.
+    Ok(Arc::new(Schema::new(
+        fields
+            .into_iter()
+            .map(|field| field.clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+    )))
+}
+
+fn check_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<()> {
+    ensure!(
+        expected.fields().len() == actual.fields().len(),
+        "Parquet files have different field counts"
+    );
+    for (field, required) in actual.fields().iter().zip(expected.fields()) {
+        ensure!(
+            field.name() == required.name() && field.data_type() == required.data_type(),
+            "Parquet column {} has inconsistent types across files",
+            field.name()
+        );
+    }
+    Ok(())
+}
+
+fn snapshot_inputs(path: &Path, snapshot: Snapshot) -> Vec<PartInput> {
     snapshot
         .parts
         .into_iter()
-        .map(|part| (part.path(path).to_string_lossy().into_owned(), Some(part)))
+        .map(|part| {
+            (
+                part.path(path).to_string_lossy().into_owned(),
+                Some(Arc::new(part)),
+            )
+        })
         .collect()
+}
+
+fn column_equality(expr: &Expr) -> Option<(&str, &ScalarValue)> {
+    let Expr::BinaryExpr(expr) = expr else {
+        return None;
+    };
+    if expr.op != Operator::Eq {
+        return None;
+    }
+    match (expr.left.as_ref(), expr.right.as_ref()) {
+        (Expr::Column(column), Expr::Literal(value, ..))
+        | (Expr::Literal(value, ..), Expr::Column(column)) => Some((&column.name, value)),
+        _ => None,
+    }
+}
+
+fn snapshot_point(filters: &[Expr], key: &str) -> Option<i64> {
+    filters
+        .iter()
+        .flat_map(split_conjunction)
+        .filter_map(column_equality)
+        .filter(|(column, _)| *column == key)
+        .find_map(|(_, value)| match value {
+            ScalarValue::Int8(value) => value.map(i64::from),
+            ScalarValue::Int16(value) => value.map(i64::from),
+            ScalarValue::Int32(value) => value.map(i64::from),
+            ScalarValue::Int64(value) => *value,
+            _ => None,
+        })
 }
 
 #[async_trait]
@@ -663,33 +761,73 @@ impl TableProvider for ParquetTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let opened;
+        let open = match &self.input {
+            ParquetInput::Open(open) => open,
+            ParquetInput::Snapshot {
+                key,
+                parts,
+                pool,
+                stats,
+            } => {
+                let point = snapshot_point(filters, key);
+                let candidates = parts
+                    .iter()
+                    .filter(|(_, part)| {
+                        let bounds = part.as_ref().and_then(|part| part.key_range);
+                        match (point, bounds) {
+                            (Some(key), Some([min, max])) => (min..=max).contains(&key),
+                            _ => true,
+                        }
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    let schema = match projection {
+                        Some(indices) => Arc::new(self.schema.project(indices)?),
+                        None => self.schema(),
+                    };
+                    return Ok(Arc::new(EmptyExec::new(schema)));
+                }
+                let columns = self
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect::<Vec<_>>();
+                let (schema, files, _) =
+                    OpenedParquet::open(candidates, &columns, pool, stats, self.parallel_ranges)
+                        .await
+                        .map_err(|error| DataFusionError::External(error.into()))?;
+                check_schema(&self.schema, &schema)
+                    .map_err(|error| DataFusionError::External(error.into()))?;
+                opened = files;
+                &opened
+            }
+        };
         let mut source = ParquetSource::new(self.schema())
-            .with_parquet_file_reader_factory(self.readers.clone());
+            .with_parquet_file_reader_factory(open.readers.clone());
         if let Some(predicate) = conjunction(filters.iter().cloned()) {
             let schema = DFSchema::try_from(self.schema())?;
-            let point_filter = split_conjunction(&predicate).into_iter().any(|filter| {
-                matches!(filter, Expr::BinaryExpr(expr) if expr.op == Operator::Eq
-                && matches!(
-                    (expr.left.as_ref(), expr.right.as_ref()),
-                    (Expr::Column(_), Expr::Literal(..)) | (Expr::Literal(..), Expr::Column(_))
-                ))
-            });
+            let point_filter = split_conjunction(&predicate)
+                .into_iter()
+                .any(|filter| column_equality(filter).is_some());
             // Full scans also carry the model's key null checks. A row filter
             // costs memory on those scans without avoiding payload pages.
-            if point_filter && self.readers.0.values().all(|file| file.footer.is_some()) {
+            if point_filter && open.readers.0.values().all(|file| file.footer.is_some()) {
                 source = source.with_pushdown_filters(true);
             }
             source = source.with_predicate(state.create_physical_expr(predicate, &schema)?);
         }
         #[cfg(feature = "admin")]
-        let files = self
+        let files = open
             .files
             .iter()
-            .zip(&self.scan_objects)
+            .zip(&open.scan_objects)
             .map(|(file, object)| file.clone().with_extension(object.clone()))
             .collect();
         #[cfg(not(feature = "admin"))]
-        let files = self.files.clone();
+        let files = open.files.clone();
         let config =
             FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
                 .with_file_group(FileGroup::new(files))

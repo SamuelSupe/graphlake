@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use datafusion::arrow::datatypes::Schema;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource_parquet::ParquetRowSelection;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
@@ -24,6 +25,15 @@ pub(crate) struct Snapshot {
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub base_parts: usize,
     pub parts: Vec<Part>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruning: Option<SnapshotPruning>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SnapshotPruning {
+    pub key: String,
+    pub schema: Schema,
 }
 
 fn one() -> usize {
@@ -40,6 +50,8 @@ pub(crate) struct Part {
     pub rows: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_range: Option<[i64; 2]>,
 }
 
 pub(crate) fn managed_location(location: &str) -> Option<PathBuf> {
@@ -111,11 +123,21 @@ impl Snapshot {
             "invalid local Parquet snapshot part count"
         );
         let mut deleted = 0;
+        if let Some(pruning) = &self.pruning {
+            ensure!(
+                pruning
+                    .schema
+                    .field_with_name(&pruning.key)
+                    .is_ok_and(|field| field.data_type().is_signed_integer()),
+                "invalid local Parquet snapshot key"
+            );
+        }
         for part in &self.parts {
             ensure!(
                 seen.insert(part.id)
                     && part.deleted.windows(2).all(|v| v[0] < v[1])
-                    && part.deleted.last().is_none_or(|&row| row < part.rows),
+                    && part.deleted.last().is_none_or(|&row| row < part.rows)
+                    && part.key_range.is_none_or(|[min, max]| min <= max),
                 "invalid local Parquet snapshot part"
             );
             deleted += part.deleted.len();
@@ -136,6 +158,14 @@ impl Snapshot {
         self.validate()?;
         let mut body = MAGIC.to_vec();
         serde_json::to_writer(&mut body, self)?;
+        if body.len() as u64 > MAX_MANIFEST && self.pruning.is_some() {
+            let mut unindexed = self.clone();
+            unindexed.pruning = None;
+            for part in &mut unindexed.parts {
+                part.key_range = None;
+            }
+            return unindexed.encode();
+        }
         ensure!(
             body.len() as u64 <= MAX_MANIFEST,
             "local Parquet snapshot manifest is too large"

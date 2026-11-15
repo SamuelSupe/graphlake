@@ -127,7 +127,8 @@ async fn read(
                 let files = tables
                     .get(table)
                     .ok_or_else(|| anyhow::anyhow!("unknown Parquet table"))?;
-                let (table, _) = ParquetTable::open(files, &[], Arc::clone(pool), stats).await?;
+                let (table, _) =
+                    ParquetTable::open(files, &[], Arc::clone(pool), stats, false).await?;
                 provider = Some(Arc::new(table));
             } else {
                 listing.tables = tables.keys().take(2001).cloned().collect();

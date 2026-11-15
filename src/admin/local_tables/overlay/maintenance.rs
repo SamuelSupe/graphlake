@@ -11,7 +11,7 @@ use parquet::{
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-use super::{staging_file, writer_properties};
+use super::{key_leaf, key_range, staging_file, writer_properties};
 use crate::{
     admin::local_tables::row_groups::splice,
     engine::QueryScope,
@@ -22,6 +22,7 @@ const TARGET_PART_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) fn reclaim(
     anchor: &Path,
+    key: &str,
     base: &mut Vec<Part>,
     mut deleted: usize,
     staged: &mut Vec<(Uuid, NamedTempFile)>,
@@ -45,7 +46,7 @@ pub(super) fn reclaim(
         }
         if let Some((index, size)) = largest {
             let count = available.min(size.div_ceil(TARGET_PART_BYTES) as usize);
-            let Some(parts) = split(anchor, &base[index], count, staged, scope)? else {
+            let Some(parts) = split(anchor, key, &base[index], count, staged, scope)? else {
                 return Ok(false);
             };
             base.splice(index..=index, parts);
@@ -90,7 +91,7 @@ pub(super) fn reclaim(
                 writer.flush()?;
             }
         }
-        writer.close()?;
+        let meta = writer.close()?;
         ensure!(
             rows == part.rows - part.deleted.len(),
             "local base partition row count changed"
@@ -100,6 +101,8 @@ pub(super) fn reclaim(
         part.id = Uuid::new_v4();
         part.rows = rows;
         part.deleted.clear();
+        part.key_range = key_leaf(meta.file_metadata().schema_descr(), key)
+            .and_then(|leaf| key_range(meta.row_groups(), leaf));
         staged.push((part.id, output));
     }
     ensure!(
@@ -111,6 +114,7 @@ pub(super) fn reclaim(
 
 fn split(
     anchor: &Path,
+    key: &str,
     part: &Part,
     count: usize,
     staged: &mut Vec<(Uuid, NamedTempFile)>,
@@ -122,6 +126,7 @@ fn split(
         ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
     )?;
     let groups = meta.metadata().num_row_groups();
+    let leaf = key_leaf(meta.parquet_schema(), key);
     if groups < 2 {
         return Ok(Some(vec![part.clone()]));
     }
@@ -142,7 +147,13 @@ fn split(
         let b = part.deleted.partition_point(|row| *row < offset + rows);
         let deleted = part.deleted[a..b].iter().map(|row| row - offset).collect();
         let id = Uuid::new_v4();
-        result.push(Part { id, rows, deleted });
+        result.push(Part {
+            id,
+            rows,
+            deleted,
+            key_range: leaf
+                .and_then(|leaf| key_range(&meta.metadata().row_groups()[start..end], leaf)),
+        });
         staged.push((id, slice));
         offset += rows;
     }

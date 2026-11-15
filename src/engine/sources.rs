@@ -388,6 +388,7 @@ pub(super) async fn prepare<'a>(
                     &fields,
                     Arc::clone(&scope.runtime.memory_pool),
                     Arc::clone(&scope.reads),
+                    read.probe_source.is_none(),
                 )
                 .await
                 .with_context(|| crate::catalog::MappedTable(reference.to_owned()))?;

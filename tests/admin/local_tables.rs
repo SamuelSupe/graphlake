@@ -596,6 +596,9 @@ async fn local_tables_reclaims_only_masked_base_partitions() -> Result<()> {
     ]});
     fs::write(path, format!("GLPQ1\n{old}"))?;
     let cold_bytes = fs::read(&cold_file)?;
+    let legacy = rows(root.path(), path).await?;
+    assert_eq!(legacy.len(), 70_001);
+    assert_eq!(legacy[0], (1, "delta".into(), 100_000));
 
     let updated = load(&server, "partitions", "incremental").await?;
     assert_eq!(updated["status"], "succeeded", "{updated}");
@@ -605,9 +608,42 @@ async fn local_tables_reclaims_only_masked_base_partitions() -> Result<()> {
     assert_eq!(manifest["base_parts"], 2);
     assert_ne!(manifest["parts"][0]["id"], old["parts"][0]["id"]);
     assert_eq!(manifest["parts"][0]["rows"], 4_463);
-    assert_eq!(manifest["parts"][1], old["parts"][1]);
+    assert_eq!(manifest["parts"][1]["id"], old["parts"][1]["id"]);
+    assert_eq!(manifest["parts"][1]["key_range"], json!([70_001, 70_001]));
     assert_eq!(fs::read(&cold_file)?, cold_bytes);
     assert!(!hot_file.exists());
+
+    let engine = Engine::new(Catalog::load(root.path().join("verify.yaml"))?)?;
+    let query = |sql: &'static str| async {
+        let result = engine
+            .query(Language::Sql, sql, QueryOptions::default())
+            .await?;
+        let batches = result.batches.try_collect::<Vec<_>>().await?;
+        Ok::<_, anyhow::Error>(batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+    };
+    let hidden = cold_file.with_extension("hidden");
+    fs::rename(&cold_file, &hidden)?;
+    let hit = query("SELECT name FROM \"Person\" WHERE 65537 = id").await;
+    let required = query("SELECT name FROM \"Person\" WHERE id = 70001").await;
+    fs::rename(&hidden, &cold_file)?;
+    assert_eq!(
+        hit.context("commuted point lookup should skip the cold file")?,
+        1
+    );
+    assert!(required.is_err());
+
+    let hidden = parts.with_extension("hidden");
+    fs::rename(&parts, &hidden)?;
+    let miss = query("SELECT name FROM \"Person\" WHERE id = -1").await;
+    fs::rename(&hidden, &parts)?;
+    assert_eq!(
+        miss.context("out-of-range lookup should skip all files")?,
+        0
+    );
+    assert_eq!(
+        query("SELECT name FROM \"Person\" WHERE id = -1 OR id = 70001").await?,
+        1
+    );
 
     drop(server);
     let mut server = Server::start(root.path(), "", 0)?;

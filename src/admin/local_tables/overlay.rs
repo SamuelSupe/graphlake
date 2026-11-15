@@ -12,9 +12,13 @@ use datafusion::arrow::{
     compute::cast,
     datatypes::{DataType, Schema},
 };
-use parquet::arrow::{
-    ArrowWriter, ProjectionMask,
-    arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
+use parquet::{
+    arrow::{
+        ArrowWriter, ProjectionMask,
+        arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
+    },
+    file::metadata::{ParquetMetaData, RowGroupMetaData},
+    schema::types::SchemaDescriptor,
 };
 use tempfile::NamedTempFile;
 use uuid::Uuid;
@@ -26,7 +30,8 @@ use super::{
 use crate::{
     engine::QueryScope,
     source::parquet_snapshot::{
-        MAX_BASE_PARTS, MAX_DELETED, MAX_DELTA_PARTS, Part, Snapshot, parts_dir, row_selection,
+        MAX_BASE_PARTS, MAX_DELETED, MAX_DELTA_PARTS, Part, Snapshot, SnapshotPruning, parts_dir,
+        row_selection,
     },
 };
 
@@ -49,7 +54,7 @@ pub(super) fn prepare(
 ) -> Result<Option<Prepared>> {
     scope.check()?;
     let delta_meta = metadata(&delta)?;
-    let Some(leaf) = key_leaf(&delta_meta, key) else {
+    let Some(leaf) = key_leaf(delta_meta.parquet_schema(), key) else {
         return Ok(None);
     };
     let delta_rows = row_count(&delta_meta)?;
@@ -74,6 +79,7 @@ pub(super) fn prepare(
             id: Uuid::new_v4(),
             rows: 0,
             deleted: Vec::new(),
+            key_range: None,
         }]
     };
     let mut base_parts = previous.as_ref().map_or(1, |snapshot| snapshot.base_parts);
@@ -88,7 +94,7 @@ pub(super) fn prepare(
         if !same_columns(&meta, &delta_meta) {
             return Ok(None);
         }
-        let Some(leaf) = key_leaf(&meta, key) else {
+        let Some(leaf) = key_leaf(meta.parquet_schema(), key) else {
             return Ok(None);
         };
         let rows = row_count(&meta)?;
@@ -97,6 +103,7 @@ pub(super) fn prepare(
             "local Parquet snapshot part row count changed"
         );
         part.rows = rows;
+        part.key_range = key_range(meta.metadata().row_groups(), leaf);
 
         let mut offset = 0;
         let mut candidates = Vec::new();
@@ -142,7 +149,7 @@ pub(super) fn prepare(
         .sum::<usize>();
     if base_deleted > MAX_DELETED {
         let mut base = changed.drain(..base_parts).collect();
-        if !maintenance::reclaim(anchor, &mut base, base_deleted, &mut staged, scope)? {
+        if !maintenance::reclaim(anchor, key, &mut base, base_deleted, &mut staged, scope)? {
             return Ok(None);
         }
         base_parts = base.len();
@@ -151,11 +158,11 @@ pub(super) fn prepare(
     let delta_count = changed.len() - base_parts;
     let total_deleted = changed.iter().map(|part| part.deleted.len()).sum::<usize>();
     let id = Uuid::new_v4();
-    let rows = if delta_count >= MAX_DELTA_PARTS
+    let (rows, key_range) = if delta_count >= MAX_DELTA_PARTS
         || total_deleted > MAX_DELETED
         || base_deleted > MAX_DELETED
     {
-        let Some((rows, file)) =
+        let Some((file, meta)) =
             compact_deltas(anchor, &changed[base_parts..], delta, &delta_meta, scope)?
         else {
             return Ok(None);
@@ -169,21 +176,32 @@ pub(super) fn prepare(
             // an immutable base partition and still carries the latest watermark.
             base_parts += 1;
         }
+        let rows = usize::try_from(meta.file_metadata().num_rows())?;
+        let bounds = key_leaf(meta.file_metadata().schema_descr(), key)
+            .and_then(|leaf| key_range(meta.row_groups(), leaf));
         staged.push((id, file));
-        rows
+        (rows, bounds)
     } else {
-        delta_rows
+        (
+            delta_rows,
+            key_range(delta_meta.metadata().row_groups(), leaf),
+        )
     };
     changed.push(Part {
         id,
         rows,
         deleted: Vec::new(),
+        key_range,
     });
     Ok(Some(Prepared {
         snapshot: Snapshot {
             generation: Uuid::new_v4(),
             base_parts,
             parts: changed,
+            pruning: Some(SnapshotPruning {
+                key: key.to_owned(),
+                schema: Schema::new(delta_meta.schema().fields().clone()),
+            }),
         },
         staged,
     }))
@@ -195,7 +213,7 @@ fn compact_deltas(
     incoming: File,
     incoming_meta: &ArrowReaderMetadata,
     scope: &QueryScope,
-) -> Result<Option<(usize, NamedTempFile)>> {
+) -> Result<Option<(NamedTempFile, ParquetMetaData)>> {
     let file = staging_file(anchor.parent().expect("managed local table path"))?;
     // A previous delta may allow nulls in a field that the latest source
     // declares non-null. The logical field types have already been checked.
@@ -242,8 +260,8 @@ fn compact_deltas(
         rows == expected,
         "local Parquet delta compaction row count changed"
     );
-    writer.close()?;
-    Ok((file.as_file().metadata()?.len() <= MAX_SEALED_BYTES).then_some((rows, file)))
+    let meta = writer.close()?;
+    Ok((file.as_file().metadata()?.len() <= MAX_SEALED_BYTES).then_some((file, meta)))
 }
 
 fn append_batches(
@@ -275,11 +293,21 @@ fn row_count(meta: &ArrowReaderMetadata) -> Result<usize> {
     Ok(usize::try_from(meta.metadata().file_metadata().num_rows())?)
 }
 
-fn key_leaf(meta: &ArrowReaderMetadata, key: &str) -> Option<usize> {
-    meta.parquet_schema()
+fn key_leaf(schema: &SchemaDescriptor, key: &str) -> Option<usize> {
+    schema
         .columns()
         .iter()
         .position(|column| column.path().parts() == [key])
+}
+
+fn key_range(groups: &[RowGroupMetaData], leaf: usize) -> Option<[i64; 2]> {
+    // Bounds cover physical rows, so updating a deletion mask cannot narrow them.
+    let (first, rest) = groups.split_first()?;
+    let (min, max) = signed_bounds(first, leaf)?;
+    rest.iter().try_fold([min, max], |[min, max], group| {
+        let (lo, hi) = signed_bounds(group, leaf)?;
+        Some([min.min(lo), max.max(hi)])
+    })
 }
 
 fn same_columns(left: &ArrowReaderMetadata, right: &ArrowReaderMetadata) -> bool {

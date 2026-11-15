@@ -198,6 +198,7 @@ async fn load(
             &[],
             Arc::clone(&scope.runtime.memory_pool),
             Arc::clone(&scope.reads),
+            false,
         )
         .await?;
         context.register_table("incoming", Arc::new(table))?;

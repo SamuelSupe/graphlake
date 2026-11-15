@@ -6,7 +6,7 @@ Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremli
 
 [**Download v1.1.0**](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.0) · [Quickstart](docs/quickstart.md) · [Deployment](docs/deployment.md) · [中文技术参考](docs/reference.zh-CN.md)
 
-![GraphLake query workbench showing three accounts and four transfers from the Parquet demo](docs/workbench.png)
+![GraphLake 1.1.0 query workbench showing three accounts and four transfers from the Parquet demo](docs/workbench.jpg)
 
 ## What you can do
 
@@ -19,6 +19,14 @@ Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremli
 | **Connect AI** | Connect Agents to separate query and modeling MCP services through an in-app guide. Personal AI tokens inherit the owner’s live model permissions and tenant scope; administrators set global capability limits. |
 | **Sync locally** | Load selected source fields into managed Parquet tables, refresh incrementally by key and watermark, and schedule refreshes. |
 | **Operate** | Manage users, service accounts, and model-level roles. Collect audit events, Prometheus metrics, and OTLP signals. Restore an off-site checkpoint and verify a known business query before enabling traffic. |
+
+## Local tables and data sync
+
+In GraphLake 1.1.0, open **Local Tables** (本地表) from a graph model to load selected source columns into a managed Parquet copy. Run full or incremental refreshes on demand or on a schedule. Incremental refresh uses a primary key and watermark. The panel shows which copies are ready, when they last refreshed, and when the next run is due. Load history records each run’s outcome and row counts.
+
+![GraphLake 1.1.0 local table sync panel showing a successful refresh and a five-minute schedule for transfers_local](docs/local-tables.jpg)
+
+A refresh publishes the new snapshot atomically. If a load fails before publication, the last committed copy stays available. Use a full reload to reflect rows deleted at the source. [Local tables and data sync guide](docs/local-tables.zh-CN.md)
 
 ## Install on Linux
 

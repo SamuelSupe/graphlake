@@ -470,15 +470,15 @@ pub async fn serve_clustered_with_status(
             .layer(DefaultBodyLimit::max(128 * 1024)))
         .route("/v1/service-accounts", axum::routing::put(ha::change_policy)
             .layer(DefaultBodyLimit::max(256 * 1024)));
+    let mcp_route = post(mcp::handle)
+        .get(mcp::no_stream)
+        .delete(mcp::no_stream)
+        .layer(DefaultBodyLimit::max(6 * CATALOG_LIMIT + 4096));
     let router = Router::new()
         .nest("/api", api)
-        .route(
-            "/mcp",
-            post(mcp::handle)
-                .get(mcp::no_stream)
-                .delete(mcp::no_stream)
-                .layer(DefaultBodyLimit::max(6 * CATALOG_LIMIT + 4096)),
-        )
+        .route("/mcp", mcp_route.clone())
+        .route("/mcp/query", mcp_route.clone())
+        .route("/mcp/modeling", mcp_route)
         .route("/healthz", get(ops::health))
         .route("/readyz", get(ops::ready))
         .route("/coordinator/active", get(ha::active))
@@ -555,7 +555,7 @@ async fn guard(State(app): State<Arc<App>>, request: Request, next: Next) -> Res
         "/recovery/check" => Some("recovery_check"),
         "/recovery/verify" => Some("recovery_verify"),
         "/gremlin" => Some("gremlin_upgrade"),
-        "/mcp" => Some("mcp"),
+        "/mcp" | "/mcp/query" | "/mcp/modeling" => Some("mcp"),
         _ => None,
     });
     let started = std::time::Instant::now();
@@ -608,7 +608,7 @@ async fn guard_request(
         "/healthz" | "/readyz" | "/metrics" | "/coordinator/active" | "/coordinator/recovery"
     );
     let is_gremlin = path == "/gremlin";
-    let is_mcp = path == "/mcp";
+    let is_mcp = mcp::Service::for_path(path).is_some();
     let recovery_rpc = matches!(
         (request.method(), path),
         (&Method::GET | &Method::HEAD, "/recovery/status")

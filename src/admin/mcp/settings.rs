@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::super::{ApiResult, App, Error, access::Principal, models, users};
+use super::Service;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -56,14 +57,13 @@ impl Config {
     }
 }
 
-fn snapshot(app: &App) -> Value {
-    let config = app.users.mcp_config();
+fn snapshot(app: &App, config: &Config) -> Value {
     json!({ "revision": config.revision(), "config": config, "endpoint": format!("{}/mcp", app.origin),
         "protocol_versions": super::VERSIONS, "server_timeout_ms": app.options.timeout.as_millis() as u64 })
 }
 
 pub(in crate::admin) async fn read(State(app): State<Arc<App>>) -> Json<Value> {
-    Json(snapshot(&app))
+    Json(snapshot(&app, &app.users.mcp_config()))
 }
 
 pub(in crate::admin) async fn save(
@@ -85,17 +85,33 @@ pub(in crate::admin) async fn save(
             )
         })?;
     users::save_mcp(app.clone(), config, expected.into()).await?;
-    Ok(Json(snapshot(&app)))
+    Ok(Json(snapshot(&app, &app.users.mcp_config())))
 }
 
 pub(in crate::admin) async fn access(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<Value>> {
-    let mut value = snapshot(&app);
+    let config = app.users.mcp_config();
+    let mut value = snapshot(&app, &config);
+    let service = |kind: Service, suffix: &str| {
+        json!({
+            "endpoint": format!("{}/mcp/{suffix}", app.origin),
+            "enabled": kind.enabled(&config),
+            "allowed": kind.allows(&app, &principal),
+        })
+    };
+    value["services"] = json!({
+        "query": service(Service::Query, "query"),
+        "modeling": service(Service::Modeling, "modeling"),
+    });
     value["owner"] = json!(principal.audit_name());
     value["can_issue"] =
         json!(super::can_use(&app, &principal) && app.auth.ai_owner_key().is_some());
-    value["scope"] = super::tools::scope(&app, &principal, &app.users.mcp_config())?;
+    let mut effective = config;
+    effective.query &= effective.enabled;
+    effective.modeling &= effective.enabled;
+    effective.publish &= effective.modeling;
+    value["scope"] = super::tools::scope(&app, &principal, &effective)?;
     Ok(Json(value))
 }

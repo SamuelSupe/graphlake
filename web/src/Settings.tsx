@@ -1,14 +1,16 @@
-import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { Download, Plus, RefreshCw, X } from 'lucide-react';
 import { api, ApiError, downloadText, errorText, type ModelSummary } from './api';
 import { ModelHealth } from './ModelHealth';
 import BackupStatus from './BackupStatus';
+import McpServiceSettings from './McpServiceSettings';
 
 const tabs = [
   ['telemetry', '日志与遥测'],
   ['alerts', '告警规则'],
   ['health', '健康检查'],
   ['backup', '备份与恢复'],
+  ['mcp', 'MCP 服务'],
 ] as const;
 type Tab = typeof tabs[number][0];
 
@@ -74,6 +76,11 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [attempt, reload] = useState(0);
+  const [mcpDirty, setMcpDirty] = useState(false);
+  const onMcpDirty = useCallback((value: boolean) => {
+    setMcpDirty(value);
+    onDirty('/settings/mcp', value);
+  }, [onDirty]);
 
   function adopt(next: Snapshot) {
     setSnapshot(next); setConfig(next.config); setAlerts(next.alerts);
@@ -93,7 +100,10 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     }, cause => { if (!controller.signal.aborted) setError(errorText(cause)); });
     return () => controller.abort();
   }, [attempt, locked, onDirty]);
-  useEffect(() => () => onDirty('/settings', false), [onDirty]);
+  useEffect(() => () => {
+    onDirty('/settings', false);
+    onDirty('/settings/mcp', false);
+  }, [onDirty]);
 
   function changed() {
     dirty.current = true; onDirty('/settings', true); setMessage(''); setError('');
@@ -146,7 +156,7 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     <header className="workspace-header">
       <div className="workspace-title"><h1>运行配置</h1></div>
       <div className="workspace-context">
-        {dirty.current && <span className="dirty"><i />未保存</span>}
+        {(dirty.current || mcpDirty) && <span className="dirty"><i />未保存</span>}
         {editableTab && snapshot && <>
         <button className="button compact" type="button" disabled={busy} onClick={reloadConfig}>重新加载配置</button>
         <button className="button primary compact" type="submit" form="runtime-settings" disabled={readOnly}>{busy ? '正在保存…' : '保存配置'}</button>
@@ -155,6 +165,7 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     </header>
     <div className="settings-tabs" role="tablist" aria-label="运行配置分类">
       {tabs.map(([key, label], index) => <button key={key} id={tabButton(key)} type="button" role="tab"
+        autoFocus={key === 'mcp' && initialTab === 'mcp'}
         aria-controls={tabPanel(key)} aria-selected={key === tab} tabIndex={key === tab ? 0 : -1} onClick={() => setTab(key)} onKeyDown={event => {
           const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length
             : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length
@@ -166,7 +177,7 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
           document.getElementById(tabButton(key))?.focus();
         }}>{label}</button>)}
     </div>
-    {tab !== 'backup' && error && <p ref={errorRef} tabIndex={-1} role="alert" className="notice error settings-feedback">{error}</p>}
+    {(editableTab || tab === 'health') && error && <p ref={errorRef} tabIndex={-1} role="alert" className="notice error settings-feedback">{error}</p>}
     {editableTab && message && <p role="status" className="notice settings-feedback">{message}</p>}
     {(!config || !snapshot) && (['telemetry', 'alerts'] as const).map(key => <section key={key} {...panel(key)} aria-busy={!error}>
       <div className="settings-workspace">
@@ -297,5 +308,8 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
       </div>
     </section>
     <section {...panel('backup')}><BackupStatus visible={tab === 'backup' && !locked} /></section>
+    <section {...panel('mcp')}><div className="settings-workspace">
+      <McpServiceSettings locked={locked} visible={tab === 'mcp'} onDirty={onMcpDirty} />
+    </div></section>
   </main>;
 }

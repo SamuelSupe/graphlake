@@ -85,6 +85,43 @@ Typical modeling sequence:
 
 Draft writes do not change the active model. On a revision conflict, re-read and reconcile the draft rather than automatically overwriting it. Source/physical-table expansion remains an administrator action. Model text and returned data are untrusted content for the AI client, not instructions.
 
+## End-to-end verification with Codex
+
+Codex CLI 0.169.0-alpha.11.1 with `gpt-6.1-sol` ran these checks against isolated GraphLake instances on OrbStack Linux. The test data came from the [Parquet demo](quickstart.md#build-and-query-the-demo), with three `Account` nodes and four `Transfer` edges. The fixtures had two published models over those files, `graph` and `ai-ui`. Each test account had a single role on `graph`, either query, modeler, or publisher. None had access to `ai-ui`.
+
+To reproduce the checks, use a fresh demo catalog for each run. Copy `graph.yaml` to `ai-ui.yaml` and give the copy a distinct display name before starting the workbench. Enable both services and publication under **运行配置 → MCP 服务**, then create the three accounts and issue one personal token per account. Use the corresponding Codex server entry for each run. Set `GRAPHLAKE_QUERY_TOKEN` to the query account's token. Set `GRAPHLAKE_MODELING_TOKEN` to the modeler's token for draft operations and to the publisher's token for publication. Substitute the instance's exact MCP address if it uses a different origin or port.
+
+```toml
+[mcp_servers.graphlake_query]
+url = "http://127.0.0.1:7337/mcp/query"
+bearer_token_env_var = "GRAPHLAKE_QUERY_TOKEN"
+
+[mcp_servers.graphlake_modeling]
+url = "http://127.0.0.1:7337/mcp/modeling"
+bearer_token_env_var = "GRAPHLAKE_MODELING_TOKEN"
+```
+
+These runs used Codex's per-tool approval setting for `save_model` or `publish_model` in the relevant disposable test process. If your Agent prompts for confirmation, approve the intended draft save or publication. See the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+### Query and save a draft
+
+1. Connect the query account to `/mcp/query`. Call `list_models` and `get_schema` for `graph`, then run the two Cypher statements below as separate `query` calls. The Agent saw only `graph` and received counts of **3 accounts** and **4 transfers**.
+
+   ```cypher
+   MATCH (n:Account) RETURN count(n) AS accounts
+   MATCH (:Account)-[r:Transfer]->(:Account) RETURN count(r) AS transfers
+   ```
+
+2. Connect the modeler to `/mcp/modeling`. Call `get_model` for `graph`, change only the top-level `graph` name, and pass the full YAML to `validate_model`. Send that YAML, the draft `revision` from `get_model`, and a new `mutation_id` to `save_model`. The Agent read the new name and revision back with `get_model`. The saved YAML on disk matched the update and `active_revision` remained unchanged.
+3. Have the query Agent call `query` on `ai-ui`. Have the modeling Agent call `save_model` on `ai-ui` with the same modified YAML, the target draft's current revision, and a new `mutation_id`. Both calls reached GraphLake and returned a tool error with `structuredContent.code = "model_forbidden"`. The server audit recorded `403` for each and `ai-ui` retained its original draft revision. A separate Codex run also tried to initialize `/mcp/modeling` with the query-only token and received HTTP `403` during the handshake.
+
+### Publish and query the new version
+
+1. Start with the original demo mapping. As the modeler, use `get_model`, then rename the node label `Account` to `AgentAccount` in `nodes` and both `Transfer` endpoints. Run `validate_model` with `check_data: true`, call `save_model`, and read back the new draft revision. Before publication, the query Agent still saw the old `Account` label and counted 3 accounts on the old active revision. Both this query and the later post-publication query omitted `model_revision`.
+2. Check that `tools/list` for the modeler includes `save_model` and omits `publish_model`. To test an actual publish request with only modeling permission, temporarily add the publisher role so Codex discovers the tool, then remove that role before forwarding its `publish_model` request to GraphLake. This tested the same personal token with its current role at the moment of invocation. The server returned `model_forbidden`, its audit recorded `403`, and both the saved draft and the old active revision remained in place.
+3. Connect the separate publisher-only account to `/mcp/modeling`. Call `publish_model` with `model: "graph"`, the saved draft `revision`, the current `active_revision`, and a new `mutation_id`. The call succeeded, and the server returned the saved draft revision as the new `active_revision`.
+4. Connect the query account to `/mcp/query` and call `get_schema` again. The Agent received the new `AgentAccount` label and the just-published schema revision. It then ran `MATCH (n:AgentAccount) RETURN count(n) AS accounts` and received **3** with `model_revision` equal to the version returned by `publish_model`. This verified the default query path switched to the new published version.
+
 ## Protocol and persistence
 
 The endpoint implements the JSON-response form of [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) for **2025-03-26, 2025-06-18 and 2025-11-25**. It supports `initialize`, `ping`, `tools/list`, and `tools/call`. Each POST contains one JSON-RPC message and advertises `Accept: application/json, text/event-stream`; post-initialization clients send `MCP-Protocol-Version`. Notifications are acknowledged with empty HTTP 202 responses. No session ID is allocated. GET/DELETE return 405 because there is no standalone SSE stream or protocol session. There is no stdio entry point, subscription stream, server-initiated sampling, OAuth flow, or 2026 protocol implementation. Queries terminate through the configured timeout; cancellation notifications do not control running calls.

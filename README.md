@@ -4,7 +4,7 @@
 
 Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremlin, and explore the results in a browser. GraphLake runs as an embedded Rust engine, a standalone Linux service, or a Coordinator with distributed Workers.
 
-[**Download v1.0.0**](https://github.com/SamuelSupe/graphlake/releases/tag/v1.0.0) · [Quickstart](docs/quickstart.md) · [Deployment](docs/deployment.md) · [中文技术参考](docs/reference.zh-CN.md)
+[**Download v1.1.0**](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.0) · [Quickstart](docs/quickstart.md) · [Deployment](docs/deployment.md) · [中文技术参考](docs/reference.zh-CN.md)
 
 ![GraphLake query workbench showing three accounts and four transfers from the Parquet demo](docs/workbench.png)
 
@@ -17,6 +17,7 @@ Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremli
 | **Explore** | Inspect node and relationship properties, expand and page through neighbors, search across batches, and continue loading a truncated graph preview. |
 | **Analyze** | Run bounded traversals, shortest paths, PageRank, weakly connected components, community detection, and Node2Vec. Reuse persisted CSR indexes for supported workloads. |
 | **Connect AI** | Connect Agents to separate query and modeling MCP services through an in-app guide. Personal AI tokens inherit the owner’s live model permissions and tenant scope; administrators set global capability limits. |
+| **Sync locally** | Load selected source fields into managed Parquet tables, refresh incrementally by key and watermark, and schedule refreshes. |
 | **Operate** | Manage users, service accounts, and model-level roles. Collect audit events, Prometheus metrics, and OTLP signals. Restore an off-site checkpoint and verify a known business query before enabling traffic. |
 
 ## Install on Linux
@@ -78,6 +79,5 @@ Use one `graphlake-admin` process for a standalone deployment. A distributed dep
 | [Monitoring reference](deploy/monitoring.md) | Service, source, ingress, telemetry, and backup probes |
 | [Technical reference](docs/reference.zh-CN.md) | Modeling, connectors, query behavior, algorithms, APIs, and bindings |
 | [MCP server](docs/mcp.md) | AI client connection, query and modeling tools, permissions, and protocol scope |
-| [Changelog](CHANGELOG.md) | The v1.0.0 release baseline and runtime boundaries |
-
-本地表可从外部源表加载、按主键增量更新及定时刷新，管理与存储约定见[本地表与数据同步](docs/local-tables.zh-CN.md)。
+| [Local tables and data sync](docs/local-tables.zh-CN.md) | Full loads, incremental refresh, scheduling, and snapshot recovery |
+| [Changelog](CHANGELOG.md) | Release highlights and runtime boundaries |

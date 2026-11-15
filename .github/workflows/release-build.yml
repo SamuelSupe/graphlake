@@ -16,7 +16,7 @@ jobs:
     name: Debian 12 / ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     container: debian:bookworm-slim
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +33,7 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config cmake
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config cmake lld
 
       - uses: actions/checkout@v6
         with:
@@ -57,6 +57,8 @@ jobs:
           npm --prefix web test
 
       - name: Build and check the deployment archive
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)

@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { api, errorText } from './api';
+import { ConnectorIcon } from './ConnectorIcon';
 import { setOptional } from './connectors';
 import type { Edit } from './Inspector';
 import { documentOf, record, strings, text } from './model';
@@ -22,10 +23,15 @@ export function StorageConfig({ item, path, edit, form, modelId }: {
     ...(provider === 'gcs' ? [] : [['endpoint', '服务端点', ['minio', 'oss', 'tos', 'cos'].includes(provider), provider === 'tos' ? 'https://tos-s3-cn-beijing.volces.com' : 'https://storage.example.com']] as [string, string, boolean, string][]),
   ];
   return <>
-    <label htmlFor={id + '-provider'}>存储服务<select id={id + '-provider'} form={form} value={provider} onChange={event => edit(doc => {
-      doc.setIn([...path, 'storage', 'provider'], event.target.value);
-      if (event.target.value === 'gcs' && doc.hasIn([...path, 'storage', 'endpoint'])) doc.deleteIn([...path, 'storage', 'endpoint']);
-    })}>{Object.entries(providers).map(([value, name]) => <option value={value} key={value}>{name}</option>)}</select></label>
+    <label htmlFor={id + '-provider'}>存储服务
+      <span className="storage-provider-select">
+        <ConnectorIcon type="object_storage" provider={provider} />
+        <select id={id + '-provider'} form={form} value={provider} onChange={event => edit(doc => {
+          doc.setIn([...path, 'storage', 'provider'], event.target.value);
+          if (event.target.value === 'gcs' && doc.hasIn([...path, 'storage', 'endpoint'])) doc.deleteIn([...path, 'storage', 'endpoint']);
+        })}>{Object.entries(providers).map(([value, name]) => <option value={value} key={value}>{name}</option>)}</select>
+      </span>
+    </label>
     <p className="muted small">对象路径相对于所配置的桶或容器。凭据填写服务端环境变量名，留空时使用服务端默认身份。</p>
     {provider === 'oss' && <p className="muted small">OSS 账号需启用 S3 兼容认证；使用所在区域的 OSS 服务端点。</p>}
     {provider === 'tos' && <p className="muted small">TOS 使用 tos-s3-区域.volces.com 端点，并填写对应区域。</p>}

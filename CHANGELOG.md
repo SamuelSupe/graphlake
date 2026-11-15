@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Show datasource brand SVGs on connector cards and object-storage provider settings.
+
 - Add independently configurable query and modeling MCP services. Query supports read-only graph queries. Modeling supports source-scoped model creation, validation, draft updates and optional publication. The original endpoint remains compatible. Reuse user roles, tenant scopes, optimistic revisions, HA receipts and audit logging.
 - Add a standalone AI sidebar with a three-step Agent setup guide, copyable query and modeling prompts, personal MCP tokens bound to live user permissions, model capability previews and optional connection diagnostics. The administrator-only MCP Service tab in Runtime Settings controls service availability, global capabilities and query limits.
 - Add an administrator Overview with service readiness, query and HTTP trends, model checks, telemetry and backup status.

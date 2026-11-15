@@ -2,7 +2,11 @@ pub(super) mod bolt;
 mod entities;
 pub(super) mod gremlin;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Result, ensure};
 use axum::http::StatusCode;
@@ -11,9 +15,10 @@ use boltr::{
     types::{BoltDict, BoltValue},
 };
 use futures::TryStreamExt;
+use opentelemetry::{Context, trace::FutureExt as _};
 use serde_json::Value;
 
-use super::{ApiResult, App, Error, access::Principal, models::Models, query};
+use super::{ApiResult, App, Error, access::Principal, models::Models, query, telemetry};
 use crate::{
     Engine, Language, QueryResult, ScalarValue,
     arrow::{
@@ -36,8 +41,8 @@ pub(super) struct Access {
 impl Access {
     pub(super) fn load(models: &Models, model: String) -> Result<Self> {
         ensure!(
-            models.active_revision(&model).ok().flatten().is_some(),
-            "--driver-model must name a published model"
+            models.has_driver_model(&model).unwrap_or(false),
+            "--driver-model must name a model with version history"
         );
         Ok(Self {
             model,
@@ -55,11 +60,9 @@ struct Target {
 
 impl Target {
     fn engine(&self, app: &App) -> ApiResult<(String, Engine)> {
-        app.access.check(&self.principal, &self.model)?;
+        super::access::check_query(app, &self.principal, &self.model)?;
         let mut models = app.models.lock().unwrap();
-        let revision = models
-            .active_revision(&self.model)?
-            .ok_or_else(Error::not_found)?;
+        let revision = models.require_published(&self.model)?;
         let engine = models.query_engine(&self.model, &revision, &self.principal)?;
         Ok((revision, engine))
     }
@@ -88,6 +91,9 @@ struct Rows {
     finished: bool,
     columns: Vec<String>,
     revision: String,
+    started: Instant,
+    span: Option<Context>,
+    leadership: Option<crate::CancellationToken>,
 }
 
 async fn execute(
@@ -99,13 +105,22 @@ async fn execute(
     timeout: Option<Duration>,
     transaction: Option<(&str, &Engine, &ReadTransaction)>,
 ) -> ApiResult<Rows> {
+    let started = Instant::now();
+    let span = telemetry::start_span("query", target.protocol, None);
     let mut abandoned = PendingQuery {
         app,
         target: &target,
         language,
         pending: true,
+        started,
+        span: span.as_ref(),
     };
-    let result = execute_inner(
+    let leadership = app
+        .ha
+        .as_ref()
+        .map(|ha| ha.leader.admission())
+        .transpose()?;
+    let query = execute_inner(
         app,
         &target,
         language,
@@ -113,14 +128,39 @@ async fn execute(
         parameters,
         timeout,
         transaction,
-    )
-    .await;
+        started,
+    );
+    let result = tokio::select! {
+        biased;
+        _ = super::await_leadership_pause(leadership.as_ref()) => Err(super::cluster::control::interrupted()),
+        result = async {
+            if let Some(span) = &span {
+                query.with_context(span.clone()).await
+            } else {
+                query.await
+            }
+        } => result,
+    };
     abandoned.pending = false;
+    drop(abandoned);
     if let Err(error) = &result {
-        app.metrics.driver(language, false);
-        target.audit(app, "query", "error", error.status.as_u16());
+        app.metrics
+            .query_error(super::ErrorCode::class(error.code).0);
+        finish_query(
+            app,
+            &target,
+            language,
+            started,
+            span.as_ref(),
+            "error",
+            error.status.as_u16(),
+        );
     }
-    result
+    result.map(|mut rows| {
+        rows.span = span;
+        rows.leadership = leadership;
+        rows
+    })
 }
 
 struct PendingQuery<'a> {
@@ -128,14 +168,42 @@ struct PendingQuery<'a> {
     target: &'a Target,
     language: Language,
     pending: bool,
+    started: Instant,
+    span: Option<&'a Context>,
 }
 
 impl Drop for PendingQuery<'_> {
     fn drop(&mut self) {
         if self.pending {
-            self.app.metrics.driver(self.language, false);
-            self.target.audit(self.app, "query", "abandoned", 499);
+            finish_query(
+                self.app,
+                self.target,
+                self.language,
+                self.started,
+                self.span,
+                "abandoned",
+                499,
+            );
         }
+    }
+}
+
+fn finish_query(
+    app: &App,
+    target: &Target,
+    language: Language,
+    started: Instant,
+    span: Option<&Context>,
+    outcome: &str,
+    status: u16,
+) {
+    app.metrics.driver(language, status == 200);
+    app.metrics
+        .observe(target.protocol, "query", status, started.elapsed());
+    let _current = span.map(|span| span.clone().attach());
+    target.audit(app, "query", outcome, status);
+    if let Some(span) = span {
+        telemetry::finish_span(span, status);
     }
 }
 
@@ -147,8 +215,9 @@ async fn execute_inner(
     parameters: BTreeMap<String, Value>,
     timeout: Option<Duration>,
     transaction: Option<(&str, &Engine, &ReadTransaction)>,
+    started: Instant,
 ) -> ApiResult<Rows> {
-    app.access.check(&target.principal, &target.model)?;
+    super::access::check_query(app, &target.principal, &target.model)?;
     if statement.trim().is_empty() || statement.len() > 64 * 1024 {
         return Err(Error::invalid(
             "invalid_query",
@@ -176,11 +245,18 @@ async fn execute_inner(
     )
     .await?;
     let (revision, engine, pinned) = if let Some((revision, engine, pinned)) = transaction {
+        app.models
+            .lock()
+            .unwrap()
+            .require_published(&target.model)?;
         (revision.to_owned(), engine.clone(), Some(pinned))
     } else {
         let (revision, engine) = target.engine(app)?;
         (revision, engine, None)
     };
+    if let Some(term) = super::access::partition(app, &target.principal, &target.model)? {
+        super::users::apply_partition(&engine.catalog, &mut options.graph, &term)?;
+    }
     let result = Box::pin(engine.driver_query(language, statement, options, pinned))
         .await
         .map_err(query::query_error)?;
@@ -203,6 +279,9 @@ async fn execute_inner(
         finished: false,
         columns,
         revision,
+        started,
+        span: None,
+        leadership: None,
     })
 }
 
@@ -210,13 +289,27 @@ impl Rows {
     fn finish(&mut self, outcome: &str, status: u16) {
         if !self.finished {
             self.finished = true;
-            self.app.metrics.driver(self.language, status == 200);
-            self.target.audit(&self.app, "query", outcome, status);
+            let _current = self.span.as_ref().map(|span| span.clone().attach());
+            super::ops::observe_query_io(&self.result);
+            finish_query(
+                &self.app,
+                &self.target,
+                self.language,
+                self.started,
+                self.span.as_ref(),
+                outcome,
+                status,
+            );
         }
     }
 
     async fn next(&mut self) -> ApiResult<Option<Vec<BoltValue>>> {
-        let result = self.next_inner().await;
+        let leadership = self.leadership.clone();
+        let result = tokio::select! {
+            biased;
+            _ = super::await_leadership_pause(leadership.as_ref()) => Err(super::cluster::control::interrupted()),
+            result = self.next_inner() => result,
+        };
         match &result {
             Ok(None) if matches!(self.language, Language::Cypher) => self.finish("ok", 200),
             Err(error) => self.finish("error", error.status.as_u16()),

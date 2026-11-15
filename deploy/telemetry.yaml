@@ -1,0 +1,15 @@
+# Copy to /etc/graphlake/telemetry.yaml and configure the Collector before enabling.
+enabled: false
+endpoint: http://127.0.0.1:4318
+service_name: graphlake
+metrics: true
+logs: true
+traces: true
+trace_sample_ratio: 0.1
+export_interval_ms: 15000
+timeout_ms: 1500
+log_format: text
+# instance_id: coordinator-a
+# For a collector that requires authentication, use an environment variable.
+# headers_env:
+#   authorization: GRAPHLAKE_OTLP_AUTHORIZATION

@@ -1,3 +1,5 @@
+mod binary;
+
 use std::{sync::Arc, time::Duration};
 
 use axum::{
@@ -57,6 +59,8 @@ struct Request {
     processor: String,
     op: String,
     args: serde_json::Map<String, Value>,
+    #[serde(skip)]
+    binary: bool,
 }
 
 fn request_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Uuid, D::Error> {
@@ -76,10 +80,13 @@ async fn receive(socket: &mut Input, wait: Duration) -> Option<Request> {
                 Message::Binary(bytes) => {
                     let (&len, content) = bytes.split_first()?;
                     let mime = content.get(..usize::from(len))?;
-                    if mime != MIME {
-                        return None;
+                    let body = content.get(usize::from(len)..)?;
+                    if mime == binary::MIME {
+                        return binary::request(body);
                     }
-                    return serde_json::from_slice(content.get(usize::from(len)..)?).ok();
+                    return (mime == MIME)
+                        .then(|| serde_json::from_slice(body).ok())
+                        .flatten();
                 }
                 Message::Text(text) => return serde_json::from_str(text.as_str()).ok(),
                 Message::Close(_) => return None,
@@ -95,23 +102,25 @@ async fn receive(socket: &mut Input, wait: Duration) -> Option<Request> {
 async fn serve(app: &Arc<App>, socket: WebSocket) {
     use futures::StreamExt;
     let (mut output, mut input) = socket.split();
-    let mut principal = None;
+    let mut credential: Option<super::super::access::Credential> = None;
     let mut queued = std::collections::VecDeque::new();
     loop {
         let request = if let Some(request) = queued.pop_front() {
             request
         } else {
-            let Some(request) = receive(
-                &mut input,
-                Duration::from_secs(if principal.is_some() { 60 } else { 5 }),
-            )
-            .await
-            else {
+            let mut live = credential
+                .as_ref()
+                .map(|credential| credential.live.clone());
+            let Some(request) = (tokio::select! {
+                biased;
+                () = super::super::access::revoked(&mut live) => return,
+                request = receive(&mut input, Duration::from_secs(if credential.is_some() { 60 } else { 5 })) => request,
+            }) else {
                 return;
             };
             request
         };
-        if principal.is_none() {
+        if credential.is_none() {
             if !send(
                 &mut output,
                 request.id,
@@ -119,15 +128,16 @@ async fn serve(app: &Arc<App>, socket: WebSocket) {
                 "SASL PLAIN authentication required",
                 Vec::new(),
                 json!({}),
+                request.binary,
             )
             .await
             {
                 return;
             }
-            principal = receive(&mut input, Duration::from_secs(5))
+            credential = receive(&mut input, Duration::from_secs(5))
                 .await
                 .and_then(|auth| {
-                    if auth.op != "authentication" {
+                    if auth.op != "authentication" || auth.binary != request.binary {
                         return None;
                     }
                     let sasl = auth.args.get("sasl")?.as_str()?;
@@ -138,20 +148,20 @@ async fn serve(app: &Arc<App>, socket: WebSocket) {
                     let mut parts = plain.split('\0');
                     match (parts.next(), parts.next(), parts.next(), parts.next()) {
                         (Some(""), Some(user), Some(token), None) => {
-                            app.access.authenticate(user, token, false)
+                            super::super::access::authenticate(&app, user, token, false)
                         }
                         _ => None,
                     }
                 });
             app.access.record(
-                principal.as_ref(),
+                credential.as_ref().map(|credential| &credential.principal),
                 "gremlin",
                 "login",
                 None,
-                if principal.is_some() { "ok" } else { "error" },
-                if principal.is_some() { 200 } else { 401 },
+                if credential.is_some() { "ok" } else { "error" },
+                if credential.is_some() { 200 } else { 401 },
             );
-            if principal.is_none() {
+            if credential.is_none() {
                 send(
                     &mut output,
                     request.id,
@@ -159,20 +169,28 @@ async fn serve(app: &Arc<App>, socket: WebSocket) {
                     "Invalid driver credentials",
                     Vec::new(),
                     json!({}),
+                    request.binary,
                 )
                 .await;
                 return;
             }
         }
-        let query = stream(
-            app,
-            principal.as_ref().unwrap().clone(),
-            &mut output,
-            &request,
-        );
+        if let Some(ha) = &app.ha
+            && ha.leader.confirm().await.is_err()
+        {
+            return;
+        }
+        let credential = credential.as_ref().unwrap();
+        let mut live = credential.live.clone();
+        if !app.access.refresh() || live.has_changed().is_err() {
+            return;
+        }
+        let query = stream(app, credential.principal.clone(), &mut output, &request);
         tokio::pin!(query);
         loop {
             tokio::select! {
+                biased;
+                _ = live.changed() => return,
                 result = &mut query => {
                     if !result { return; }
                     break;
@@ -195,7 +213,7 @@ async fn stream(
 ) -> bool {
     let mut result = match run(app, principal, request).await {
         Ok(rows) => rows,
-        Err(error) => return send_error(output, request.id, error).await,
+        Err(error) => return send_error(output, request, error).await,
     };
     let mut batch = Vec::new();
     let mut bytes = 0;
@@ -216,6 +234,7 @@ async fn stream(
                     "",
                     batch,
                     json!({"model_revision": result.revision}),
+                    request.binary,
                 )
                 .await;
                 if sent {
@@ -223,7 +242,7 @@ async fn stream(
                 }
                 return sent;
             }
-            Err(error) => return send_error(output, request.id, error).await,
+            Err(error) => return send_error(output, request, error).await,
         };
         let value = if values.len() == 1
             && (result.result.graph_output.row_entity.is_some() || result.columns == ["value"])
@@ -248,7 +267,7 @@ async fn stream(
             + 1;
         if size > 2 * super::ROW_BYTES {
             result.finish("error", 413);
-            return send_error(output, request.id, super::result_limit()).await;
+            return send_error(output, request, super::result_limit()).await;
         }
         if batch.len() >= 128 || bytes + size > 2 * super::ROW_BYTES {
             if !send(
@@ -258,6 +277,7 @@ async fn stream(
                 "",
                 std::mem::take(&mut batch),
                 json!({}),
+                request.binary,
             )
             .await
             {
@@ -271,7 +291,7 @@ async fn stream(
     }
 }
 
-async fn send_error(output: &mut Output, id: Uuid, error: Error) -> bool {
+async fn send_error(output: &mut Output, request: &Request, error: Error) -> bool {
     let code = match error.code {
         "timeout" => 598,
         "busy" | "draining" => 429,
@@ -280,7 +300,16 @@ async fn send_error(output: &mut Output, id: Uuid, error: Error) -> bool {
         "invalid_request" => 499,
         _ => 597,
     };
-    send(output, id, code, &error.message, Vec::new(), json!({})).await
+    send(
+        output,
+        request.id,
+        code,
+        &error.message,
+        Vec::new(),
+        json!({}),
+        request.binary,
+    )
+    .await
 }
 
 type Output = futures::stream::SplitSink<WebSocket, Message>;
@@ -293,13 +322,18 @@ async fn send(
     message: &str,
     data: Vec<Value>,
     attributes: Value,
+    binary: bool,
 ) -> bool {
     use futures::SinkExt;
-    let body = serde_json::to_vec(&json!({
-        "requestId": id, "status": {"code":code,"message":message,"attributes":attributes},
-        "result": {"data": typed("g:List", Value::Array(data)), "meta":{}}
-    }))
-    .expect("serializable GraphSON");
+    let body = if binary {
+        binary::response(id, code, message, data, attributes)
+    } else {
+        serde_json::to_vec(&json!({
+            "requestId": id, "status": {"code":code,"message":message,"attributes":attributes},
+            "result": {"data": typed("g:List", Value::Array(data)), "meta":{}}
+        }))
+        .expect("serializable GraphSON")
+    };
     matches!(
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -318,8 +352,7 @@ async fn run(
     let invalid = |message| Error::invalid("invalid_request", message);
     let configured = &app.wire.as_ref().expect("Gremlin configured").model;
     let default = || {
-        app.access
-            .default_model(&principal, configured)
+        super::super::access::default_model(app, &principal, configured)
             .unwrap_or_else(|| configured.clone())
     };
     let model = match request.args.get("aliases") {

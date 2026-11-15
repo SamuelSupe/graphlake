@@ -142,7 +142,10 @@ pub(super) fn bind_pattern(
                 continue;
             }
             if let Some((min, max)) = bounds
-                && (!heterogeneous || directed.is_none() || shortest.is_some())
+                && (!heterogeneous
+                    || directed.is_none()
+                    || shortest.is_some()
+                    || builder.partitioned_csr)
             {
                 let rank = ranking(pattern, part, relationship, shortest, min, max)?;
                 let incoming = relationship.direction == Direction::Incoming;
@@ -177,6 +180,24 @@ pub(super) fn bind_pattern(
                     );
                 }
                 let anchored = node_mapping.key.iter().all(|key| bound_keys.contains(key));
+                #[cfg(feature = "admin")]
+                let finishes = {
+                    let mapped = &catalog.nodes[&right_type];
+                    let fields = columns([&mapped.key, &mapped.properties]);
+                    let mut terms = property_terms("src", &fields, node.properties.as_ref())?;
+                    if let (Some(variable), Some(predicate)) =
+                        (&node.variable, &pattern.where_clause)
+                    {
+                        start_terms(
+                            predicate,
+                            &variable.0,
+                            &fields,
+                            &mut terms,
+                            &mut BTreeSet::new(),
+                        );
+                    }
+                    BTreeMap::from([(right_type.clone(), terms)])
+                };
                 let table = format!(
                     "__graphlake_expand_{}",
                     expansion_base + builder.expansions.len()
@@ -201,6 +222,8 @@ pub(super) fn bind_pattern(
                     filters,
                     starts,
                     anchored,
+                    #[cfg(feature = "admin")]
+                    finishes,
                 });
                 builder.edge_uniqueness(edge_type, edge, &alias, true);
                 for (prefix, node_alias, label) in

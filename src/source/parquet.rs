@@ -329,6 +329,16 @@ impl AsRef<[u8]> for ReservedBytes {
 #[derive(Debug)]
 struct PinnedReaderFactory(BTreeMap<ObjectPath, PinnedFile>);
 
+#[cfg(feature = "admin")]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ScanObject {
+    pub path: String,
+    pub location: String,
+    pub version: String,
+    pub size: u64,
+    pub row_groups: Vec<i64>,
+}
+
 impl ParquetFileReaderFactory for PinnedReaderFactory {
     fn create_reader(
         &self,
@@ -350,9 +360,34 @@ pub(crate) struct ParquetTable {
     readers: Arc<PinnedReaderFactory>,
     files: Vec<PartitionedFile>,
     metadata: Vec<Arc<ParquetMetaData>>,
+    #[cfg(feature = "admin")]
+    scan_objects: Vec<ScanObject>,
 }
 
 impl ParquetTable {
+    #[cfg(feature = "admin")]
+    pub(crate) async fn pinned_scan(
+        objects: &[ScanObject],
+        scope: &crate::engine::QueryScope,
+    ) -> Result<Arc<dyn ParquetFileReaderFactory>> {
+        let mut readers = BTreeMap::new();
+        for expected in objects {
+            let file = PinnedFile::open(
+                &expected.location,
+                Arc::clone(&scope.runtime.memory_pool),
+                Arc::clone(&scope.reads),
+            )
+            .await?;
+            ensure!(
+                file.version(&expected.location).version == expected.version
+                    && file.meta.size == expected.size,
+                "distributed Parquet snapshot changed: {}",
+                expected.location
+            );
+            readers.insert(ObjectPath::parse(&expected.path)?, file);
+        }
+        Ok(Arc::new(PinnedReaderFactory(readers)))
+    }
     #[cfg(feature = "admin")]
     pub(crate) fn for_exploration(mut self) -> Self {
         for file in Arc::get_mut(&mut self.readers)
@@ -397,12 +432,32 @@ impl ParquetTable {
         let mut readers = BTreeMap::new();
         let mut files = Vec::new();
         let mut metadata = Vec::new();
+        #[cfg(feature = "admin")]
+        let mut scan_objects = Vec::new();
         for (index, location) in locations.iter().enumerate() {
             let file = PinnedFile::open(location, Arc::clone(&pool), Arc::clone(&stats)).await?;
             let builder = ParquetRecordBatchStreamBuilder::new(file.clone())
                 .await
                 .with_context(|| format!("reading Parquet schema for {location}"))?;
             metadata.push(Arc::clone(builder.metadata()));
+            #[cfg(feature = "admin")]
+            scan_objects.push(ScanObject {
+                path: format!("object-{index}.parquet"),
+                location: location.clone(),
+                version: file.version(location).version,
+                size: file.meta.size,
+                row_groups: builder
+                    .metadata()
+                    .row_groups()
+                    .iter()
+                    .map(|group| {
+                        let column = group.column(0);
+                        column
+                            .dictionary_page_offset()
+                            .unwrap_or_else(|| column.data_page_offset())
+                    })
+                    .collect(),
+            });
             let arrow_schema = builder.schema();
             let fields = if columns.is_empty() {
                 arrow_schema
@@ -462,6 +517,8 @@ impl ParquetTable {
                 readers: Arc::new(PinnedReaderFactory(readers)),
                 files,
                 metadata,
+                #[cfg(feature = "admin")]
+                scan_objects,
             },
             versions,
         ))
@@ -498,9 +555,18 @@ impl TableProvider for ParquetTable {
             let schema = DFSchema::try_from(self.schema())?;
             source = source.with_predicate(state.create_physical_expr(predicate, &schema)?);
         }
+        #[cfg(feature = "admin")]
+        let files = self
+            .files
+            .iter()
+            .zip(&self.scan_objects)
+            .map(|(file, object)| file.clone().with_extension(object.clone()))
+            .collect();
+        #[cfg(not(feature = "admin"))]
+        let files = self.files.clone();
         let config =
             FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
-                .with_file_group(FileGroup::new(self.files.clone()))
+                .with_file_group(FileGroup::new(files))
                 .with_batch_size(Some(state.config().batch_size()))
                 .with_projection_indices(projection.cloned())?
                 .with_limit(limit)

@@ -44,6 +44,13 @@ impl Default for Sessions {
 }
 
 impl Sessions {
+    pub(in crate::admin) fn with_cursor_key(key: [u8; 32]) -> Self {
+        Self {
+            cursors: Cursors(key),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn search_index(&mut self, id: Uuid) -> Option<Arc<SearchIndex>> {
         self.searches
             .retain(|(_, index)| index.created.elapsed() < CHECKPOINT_TTL);

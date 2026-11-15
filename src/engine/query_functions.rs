@@ -23,7 +23,7 @@ use datafusion::{
     prelude::SessionContext,
 };
 
-pub(super) fn register(context: &SessionContext) {
+pub(crate) fn register(context: &SessionContext) {
     context.register_udf(ScalarUDF::from(Items(Signature::any(
         1,
         Volatility::Immutable,

@@ -1,0 +1,13 @@
+#!/bin/sh
+# Both checks traverse the local HAProxy. Keep the VIP only where the
+# configured TLS ingress can reach an eligible Coordinator over both routes.
+set -eu
+# Shell variable assignments only. This file must be owned by root and mode 0600.
+. /etc/graphlake/ingress.env
+: "${GRAPHLAKE_INGRESS_NODE:?set a distinct ingress node ID}"
+: "${GRAPHLAKE_CLUSTER_CONFIG:?set a cluster configuration path}"
+: "${GRAPHLAKE_ADMIN_BIN:=/opt/graphlake/current/bin/graphlake-admin}"
+base=http://127.0.0.1:19403
+curl -fsS --max-time 0.1 "$base/https" >/dev/null
+curl -fsS --max-time 0.1 "$base/bolt" >/dev/null
+exec "$GRAPHLAKE_ADMIN_BIN" --cluster-config "$GRAPHLAKE_CLUSTER_CONFIG" ingress --node "$GRAPHLAKE_INGRESS_NODE"

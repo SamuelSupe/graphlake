@@ -51,12 +51,37 @@ export function sourceLabel(value: unknown) {
   } as Record<string, string>)[source] ?? source;
 }
 
-export function rename(doc: YamlDocument, model: Model, section: 'nodes' | 'edges', before: string, after: string) {
+function sourceMappings(model: Model, source: string) {
+  const prefix = source + '.';
+  return (['nodes', 'edges'] as const).flatMap(section => Object.entries(model[section]).flatMap(([name, item]) => {
+    const tables: { path: (string | number)[]; table: string }[] = [];
+    const input = (table: unknown, path: (string | number)[]) => {
+      if (typeof table === 'string' && table.startsWith(prefix)) tables.push({ path: [section, name, ...path], table });
+    };
+    input(item.source, ['source']);
+    if (Array.isArray(item.inputs)) item.inputs.forEach((entry, index) => input(record(entry).table, ['inputs', index, 'table']));
+    return tables;
+  }));
+}
+
+export function sourceUsers(model: Model, source: string) {
+  return [...new Set(sourceMappings(model, source).map(({ path }) => String(path[1])))];
+}
+
+export function rename(doc: YamlDocument, model: Model, section: Section, before: string, after: string) {
   const map = doc.get(section, true);
   if (!isMap(map)) throw new Error('无法编辑此映射，请使用 YAML');
   const pair = map.items.find(item => isScalar(item.key) && item.key.value === before);
-  if (!pair) throw new Error('未找到待重命名的映射');
-  pair.key = doc.createNode(after);
+  if (!pair || !isScalar(pair.key)) throw new Error('未找到待重命名的映射');
+  pair.key.value = after;
+  if (section === 'sources') {
+    for (const { path, table } of sourceMappings(model, before)) {
+      const reference = doc.getIn(path, true);
+      if (isScalar(reference)) reference.value = after + table.slice(before.length);
+      else doc.setIn(path, after + table.slice(before.length));
+    }
+    return;
+  }
   if (section !== 'nodes') return;
   for (const [name, edge] of Object.entries(model.edges)) {
     for (const side of ['from', 'to']) {
@@ -70,13 +95,18 @@ export function incidentEdgeTypes(model: Model, node: string) {
     endpoint(edge.from).node === node || endpoint(edge.to).node === node).map(([name]) => name);
 }
 
-export function removeGraphType(doc: YamlDocument, model: Model, section: 'nodes' | 'edges', name: string) {
+export function removeGraphType(doc: YamlDocument, model: Model, section: Section, name: string) {
+  if (section === 'sources' && sourceUsers(model, name).length) throw new Error('请先替换引用此数据源的来源表');
   if (section === 'nodes') {
     if (Object.keys(model.nodes).length <= 1) throw new Error('图模型至少需要一个节点标签');
     for (const edge of incidentEdgeTypes(model, name)) doc.deleteIn(['edges', edge]);
   }
   doc.deleteIn([section, name]);
 }
+
+export const temporalFields = [
+  ['valid_from', '生效时间列'], ['valid_to', '失效时间列'], ['current_flag', '当前记录标记列'],
+] as const;
 
 export const validationControl = (...parts: (string | number)[]) => JSON.stringify(parts);
 
@@ -118,6 +148,7 @@ export function validationTargets(model: Model, location: ValidationSite): Valid
           else add('来源表 ' + (location.index + 1), 'table', location.index);
         }
         else if (field) add(field.title, field.key);
+        else if (location.field === 'scd2') add('时态建模', 'scd2');
         else add('数据映射', 'mapping');
         continue;
       }
@@ -129,6 +160,9 @@ export function validationTargets(model: Model, location: ValidationSite): Valid
             if (value === column) add(field.title + ' ' + (index + 1), field.key, index);
           });
         }
+        if (column !== null) for (const [key, caption] of temporalFields) {
+          if (record(item.scd2)[key] === column) add(caption, 'scd2', key);
+        }
         if (found.length === count) add('来源表', 'table');
       }
       if (Array.isArray(item.inputs)) item.inputs.map(record).forEach((input, index) => {
@@ -136,7 +170,7 @@ export function validationTargets(model: Model, location: ValidationSite): Valid
         const count = found.length;
         if (column !== null) {
           const maps = record(input.columns);
-          const logical = new Set([...fields.flatMap(field => field.columns), ...Object.keys(maps)]);
+          const logical = new Set([...fields.flatMap(field => field.columns), ...temporalFields.map(([key]) => text(record(item.scd2)[key])).filter(Boolean), ...Object.keys(maps)]);
           for (const key of logical) {
             if ((text(maps[key]) || key) === column) add('来源 ' + (index + 1) + ' · ' + key, 'column', index, key);
           }

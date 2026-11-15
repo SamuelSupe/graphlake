@@ -49,6 +49,8 @@ pub use projected::{
 pub(crate) use projected::{projection_table, route_table};
 use remote::Remote;
 use topology::{Neighbor, Topology, path_item, row_converter};
+#[cfg(feature = "admin")]
+pub(crate) use topology::{encode_key as graph_encode_key, row_converter as graph_row_converter};
 use walk::{Hit, Step, Target, Walk};
 
 pub(crate) const HOPS: &str = "__graphlake_hops";
@@ -56,7 +58,8 @@ pub(crate) const PATH: &str = "__graphlake_path";
 pub(crate) const PATH_NODES: &str = "__graphlake_path_nodes";
 const COOPERATIVE_INTERVAL: usize = 2048;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Direction {
     Outgoing,
     Incoming,

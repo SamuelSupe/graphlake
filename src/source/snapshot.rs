@@ -5,7 +5,11 @@ use datafusion::{
     arrow::{
         array::{ArrayData, RecordBatch},
         datatypes::SchemaRef,
-        ipc::{reader::StreamReader, writer::StreamWriter},
+        ipc::{
+            CompressionType,
+            reader::StreamReader,
+            writer::{IpcWriteOptions, StreamWriter},
+        },
     },
     catalog::{TableProvider, streaming::StreamingTable},
     datasource::MemTable,
@@ -28,6 +32,7 @@ pub(crate) struct Buffer {
     disk: Option<Arc<DiskManager>>,
     memory: Vec<RecordBatch>,
     file: Option<DiskBuffer>,
+    compression: Option<CompressionType>,
 }
 
 struct DiskBuffer {
@@ -45,7 +50,15 @@ impl Buffer {
                 .cloned(),
             memory: Vec::new(),
             file: None,
+            compression: None,
         }
+    }
+
+    #[cfg(feature = "admin")]
+    pub(crate) fn new_compressed(pool: &Arc<dyn MemoryPool>, disk: &Arc<DiskManager>) -> Self {
+        let mut buffer = Self::new(pool, Some(disk));
+        buffer.compression = Some(CompressionType::LZ4_FRAME);
+        buffer
     }
 
     pub(crate) fn memory(&self) -> &[RecordBatch] {
@@ -65,7 +78,11 @@ impl Buffer {
             && self.pool.reserved().saturating_add(bytes) > limit / 4
         {
             let file = disk.create_tmp_file("materializing a GraphLake source snapshot")?;
-            let mut writer = StreamWriter::try_new(file.open_writer()?, &batch.schema())?;
+            let mut writer = StreamWriter::try_new_with_options(
+                file.open_writer()?,
+                &batch.schema(),
+                IpcWriteOptions::default().try_with_compression(self.compression)?,
+            )?;
             for previous in self.memory.drain(..) {
                 writer.write(&previous)?;
             }

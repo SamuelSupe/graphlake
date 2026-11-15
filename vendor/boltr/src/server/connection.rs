@@ -135,6 +135,7 @@ pub struct Connection<R, W, B: BoltBackend> {
     /// independently of `state` before any message that needs an
     /// authenticated connection is dispatched.
     authenticated: bool,
+    credential: Option<tokio::sync::watch::Receiver<()>>,
     /// How long an unauthenticated connection may stay open.
     auth_timeout: Option<Duration>,
     /// When the current unauthenticated phase must end (see `auth_timeout`).
@@ -180,6 +181,7 @@ where
             auth_validator,
             state: ConnectionState::Negotiation,
             authenticated: false,
+            credential: None,
             auth_timeout: None,
             auth_deadline: None,
             session: None,
@@ -277,10 +279,29 @@ where
 
     async fn message_loop(&mut self) -> Result<(), BoltError> {
         while self.state != ConnectionState::Defunct {
-            let Some(msg_bytes) = self.next_message().await else {
+            let mut credential = self.credential.clone();
+            let Some(msg_bytes) = (tokio::select! {
+                biased;
+                () = revoked(&mut credential) => break,
+                message = self.next_message() => message,
+            }) else {
                 break;
             };
 
+            if self.authenticated
+                && let Some(validator) = &self.auth_validator
+            {
+                if !validator.session_allowed().await {
+                    break;
+                }
+                validator.refresh_credentials();
+                if credential
+                    .as_ref()
+                    .is_some_and(|grant| grant.has_changed().is_err())
+                {
+                    break;
+                }
+            }
             if let Some(ref session) = self.session {
                 // Detect if idle reaper closed our session.
                 if !self.session_manager.contains(&session.0) {
@@ -352,7 +373,12 @@ where
                 break;
             }
 
-            if let Err(e) = self.handle_message(&msg).await {
+            let result = tokio::select! {
+                biased;
+                () = revoked(&mut credential) => break,
+                result = self.handle_message(&msg) => result,
+            };
+            if let Err(e) = result {
                 tracing::debug!(%self.peer_addr, error = %e, "handler error");
                 self.results.clear();
                 if let (Some(session), Some(tx)) = (&self.session, self.transaction.take()) {
@@ -539,6 +565,7 @@ where
             .is_some_and(|info| info.credentials_expired);
 
         if let (Some(session), Some(info)) = (&self.session, auth_info) {
+            self.credential = info.credential.clone();
             self.backend.set_session_auth(session, info).await?;
         }
 
@@ -574,6 +601,7 @@ where
         })
         .await?;
         self.authenticated = false;
+        self.credential = None;
         self.apply_message_size_limit();
         // A new LOGON must arrive within the authentication timeout.
         self.auth_deadline = self.auth_timeout.map(|timeout| Instant::now() + timeout);
@@ -997,4 +1025,12 @@ fn send_timeout() -> BoltError {
         std::io::ErrorKind::TimedOut,
         "Bolt send timed out",
     ))
+}
+
+async fn revoked(credential: &mut Option<tokio::sync::watch::Receiver<()>>) {
+    if let Some(credential) = credential {
+        let _ = credential.changed().await;
+    } else {
+        std::future::pending().await
+    }
 }

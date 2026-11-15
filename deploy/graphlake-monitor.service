@@ -1,0 +1,22 @@
+[Unit]
+Description=GraphLake external client and availability probes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=graphlake
+Group=graphlake
+UMask=0077
+StateDirectory=graphlake-monitor
+StateDirectoryMode=0700
+EnvironmentFile=/etc/graphlake/monitor.env
+ExecStart=/opt/graphlake/current/graphlake-monitor --config /etc/graphlake/monitor.json --state-file /var/lib/graphlake-monitor/state.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

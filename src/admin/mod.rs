@@ -2,10 +2,16 @@
 mod access;
 mod assets;
 mod auth;
+mod backup;
 mod browse;
+pub(crate) mod cluster;
+mod ha;
 mod models;
 mod ops;
 mod query;
+mod recovery;
+mod telemetry;
+mod users;
 mod wire;
 
 use std::{
@@ -20,23 +26,34 @@ use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Request, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use serde::Serialize;
 use tokio::{net::TcpListener, sync::Semaphore};
 
 use crate::{CancellationToken, QueryOptions};
 pub use auth::setup as setup_auth;
+pub use backup::{check as check_backup, ingress as check_ingress, run as cluster_backup};
+pub use backup::{
+    check_checkpoint as verify_backup_checkpoint, record_status as record_backup_status,
+};
+pub use cluster::serve_worker;
+pub use recovery::fingerprint_postgres as recovery_fingerprint_postgres;
+pub use telemetry::{
+    DEFAULT_FILE as DEFAULT_TELEMETRY_FILE, init as init_telemetry,
+    report_exit as report_telemetry_exit, shutdown as shutdown_telemetry,
+};
 
 const CATALOG_LIMIT: usize = 1024 * 1024;
 
 struct App {
-    auth: auth::Auth,
+    auth: Arc<auth::Auth>,
+    users: users::Users,
     access: access::Policy,
-    assets: assets::Assets,
+    assets: Arc<assets::Assets>,
     models: Mutex<models::Models>,
     work: Arc<Semaphore>,
     query_waiters: Semaphore,
@@ -46,6 +63,7 @@ struct App {
     explore_recovery: Arc<Semaphore>,
     explorations: Mutex<query::Sessions>,
     metadata_work: Semaphore,
+    model_probes: Semaphore,
     export_work: Arc<Semaphore>,
     download_work: Arc<Semaphore>,
     download_waiters: Semaphore,
@@ -54,10 +72,16 @@ struct App {
     active: Mutex<HashMap<uuid::Uuid, query::ActiveQuery>>,
     options: QueryOptions,
     authority: String,
+    origin: String,
     shutdown: CancellationToken,
     metrics: ops::Metrics,
     readiness: Arc<Semaphore>,
     wire: Option<wire::Access>,
+    cluster: Option<cluster::Coordinator>,
+    ha: Option<ha::Ha>,
+    _ha_bootstrap: Option<tempfile::TempDir>,
+    ha_cache: Mutex<Option<tempfile::TempDir>>,
+    ha_ready: std::sync::atomic::AtomicBool,
 }
 
 /// Settings for the loopback service and its optional read-only driver endpoints.
@@ -69,6 +93,8 @@ pub struct ServiceOptions {
     pub bolt_port: Option<u16>,
     pub driver_model: Option<String>,
     pub driver_token_env: String,
+    pub public_url: Option<String>,
+    pub coordinator_failover: bool,
 }
 
 /// Serve the built UI and the catalog API on an IPv4 loopback address.
@@ -113,6 +139,8 @@ impl ServiceOptions {
             bolt_port: None,
             driver_model: None,
             driver_token_env: String::new(),
+            public_url: None,
+            coordinator_failover: false,
         }
     }
 }
@@ -123,6 +151,27 @@ pub async fn serve_configured(
     assets_dir: PathBuf,
     settings: ServiceOptions,
 ) -> Result<()> {
+    serve_clustered(catalog_dir, assets_dir, settings, None).await
+}
+
+/// Serve the administration API with an optional multi-worker configuration.
+pub async fn serve_clustered(
+    catalog_dir: PathBuf,
+    assets_dir: PathBuf,
+    settings: ServiceOptions,
+    cluster_config: Option<PathBuf>,
+) -> Result<()> {
+    serve_clustered_with_status(catalog_dir, assets_dir, settings, cluster_config, None).await
+}
+
+/// Start the service with an optional loopback status listener that also covers HA standby.
+pub async fn serve_clustered_with_status(
+    catalog_dir: PathBuf,
+    assets_dir: PathBuf,
+    settings: ServiceOptions,
+    cluster_config: Option<PathBuf>,
+    status_port: Option<u16>,
+) -> Result<()> {
     let ServiceOptions {
         port,
         timeout_ms,
@@ -131,6 +180,8 @@ pub async fn serve_configured(
         bolt_port,
         driver_model,
         driver_token_env,
+        public_url,
+        coordinator_failover,
     } = settings;
     ensure!((1..=60_000).contains(&timeout_ms), "invalid admin timeout");
     ensure!(
@@ -145,31 +196,150 @@ pub async fn serve_configured(
         .canonicalize()
         .context("opening catalog directory")?;
     ensure!(catalog_dir.is_dir(), "catalog directory is not a directory");
-    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
-    let port = listener.local_addr()?.port();
-    let auth = auth::Auth::load(&catalog_dir, port, insecure_dev)?;
+    ensure!(
+        !coordinator_failover || (cluster_config.is_some() && public_url.is_some()),
+        "--coordinator-failover requires --cluster-config and --public-url"
+    );
+    ensure!(
+        !insecure_dev || (cluster_config.is_none() && public_url.is_none()),
+        "cluster and HTTPS proxy modes require administrator authentication"
+    );
+    let public_url = public_url.as_deref().map(parse_public_url).transpose()?;
+    let shutdown = CancellationToken::new();
+    let _shutdown_on_exit = shutdown.clone().drop_guard();
+    let signal = tokio::spawn(ops::shutdown_signal(shutdown.clone()));
+    let elections = coordinator_failover
+        .then(|| {
+            cluster::control::ElectionMetrics::load(
+                std::env::var_os("GRAPHLAKE_HA_METRICS_FILE").map(PathBuf::from),
+            )
+            .map(Arc::new)
+        })
+        .transpose()?;
+    let status = if let Some(port) = status_port {
+        Some(
+            ops::serve_node_status(
+                port,
+                coordinator_failover,
+                elections.clone(),
+                shutdown.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let cluster = cluster_config
+        .as_deref()
+        .map(cluster::Coordinator::load)
+        .transpose()?;
+    let ha_cache = coordinator_failover.then(tempfile::tempdir).transpose()?;
+    let metadata_dir = ha_cache
+        .as_ref()
+        .map_or(catalog_dir.as_path(), |dir| dir.path());
     let assets_dir = assets_dir
         .canonicalize()
         .context("opening assets directory")?;
-    let assets = assets::Assets::load(&assets_dir, &catalog_dir)?;
-    let authority = if port == 80 {
-        Ipv4Addr::LOCALHOST.to_string()
+    let assets = Arc::new(assets::Assets::load(&assets_dir, &catalog_dir)?);
+    let mut listener = None;
+    let ha = if coordinator_failover {
+        let control = cluster.as_ref().unwrap().control()?;
+        // Wait until this host can access the shared source before contending.
+        loop {
+            ensure!(
+                !shutdown.is_cancelled(),
+                "Coordinator stopped before activation"
+            );
+            if ha::source_available(catalog_dir.clone()).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let leader = control.acquire_with_metrics(&shutdown, elections).await?;
+        ha::watch_source(catalog_dir.clone(), shutdown.clone());
+        if let Some(public_url) = &public_url
+            && std::env::var_os("GRAPHLAKE_RESTORE_INBOX").is_some()
+            && leader
+                .get::<String>("catalog")
+                .await
+                .map_err(|e| anyhow::anyhow!(e.message))?
+                .is_none()
+        {
+            let stage_listener =
+                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
+            let bound = stage_listener.local_addr()?;
+            if let Err(error) = recovery::import::serve(
+                stage_listener,
+                assets.clone(),
+                leader.clone(),
+                public_url.origin().ascii_serialization(),
+                catalog_dir.clone(),
+                shutdown.clone(),
+            )
+            .await
+            {
+                leader.release().await;
+                return Err(error);
+            }
+            listener = Some(TcpListener::bind(bound).await?);
+        }
+        let ha = ha::Ha::open(leader, &catalog_dir, metadata_dir).await?;
+        ha::credentials(&ha.leader, &catalog_dir, metadata_dir).await?;
+        Some(ha)
     } else {
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).to_string()
+        None
     };
+    // A standby must not expose a listener before obtaining etcd leadership.
+    let listener = match listener {
+        Some(listener) => listener,
+        None => TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?,
+    };
+    let cookie_port = match &public_url {
+        Some(url) => url.port_or_known_default().unwrap_or(443),
+        None => listener.local_addr()?.port(),
+    };
+    let auth = Arc::new(
+        auth::Auth::load(
+            metadata_dir,
+            cookie_port,
+            insecure_dev,
+            public_url.is_some(),
+            ha.as_ref().map(|ha| ha.leader.clone()),
+        )
+        .await?,
+    );
+    let users = users::Users::load(&catalog_dir, ha.as_ref()).await?;
+    let origin = match public_url {
+        Some(url) => url.origin().ascii_serialization(),
+        None => {
+            let addr = listener.local_addr()?;
+            if addr.port() == 80 {
+                format!("http://{}", addr.ip())
+            } else {
+                format!("http://{addr}")
+            }
+        }
+    };
+    let authority = origin.split_once("://").unwrap().1.to_owned();
     let access = access::Policy::load(
-        &catalog_dir,
+        metadata_dir,
         driver_model
             .as_deref()
             .map(|model| (model, driver_token_env.as_str())),
+        coordinator_failover,
     )?;
-    let models = models::Models::new(catalog_dir);
-    models
-        .adopt_existing()
-        .map_err(|error| anyhow::anyhow!("adopting existing models: {}", error.message))?;
-    models
+    let models = models::Models::with_sources(metadata_dir.to_owned(), catalog_dir);
+    if ha.is_none() {
+        models
+            .adopt_existing()
+            .map_err(|error| anyhow::anyhow!("adopting existing models: {}", error.message))?;
+    }
+    let (_, failed_models) = models
         .check_published()
         .map_err(|error| anyhow::anyhow!("checking published models: {}", error.message))?;
+    for (id, error) in failed_models {
+        eprintln!("GraphLake model {id} unavailable: {error}");
+    }
     let wire = driver_model
         .map(|id| wire::Access::load(&models, id))
         .transpose()?;
@@ -177,9 +347,17 @@ pub async fn serve_configured(
         Some(port) => Some(TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?),
         None => None,
     };
-    let shutdown = CancellationToken::new();
+    if let Some(cluster) = &cluster {
+        cluster.start_cleanup(shutdown.clone());
+    }
+    let explorations = cluster
+        .as_ref()
+        .map_or_else(query::Sessions::default, |cluster| {
+            query::Sessions::with_cursor_key(cluster.cursor_key())
+        });
     let app = Arc::new(App {
         auth,
+        users,
         access,
         assets,
         models: Mutex::new(models),
@@ -189,8 +367,9 @@ pub async fn serve_configured(
         explore_work: Semaphore::new(8),
         explore_producers: Arc::new(Semaphore::new(2)),
         explore_recovery: Arc::new(Semaphore::new(2)),
-        explorations: Mutex::default(),
+        explorations: Mutex::new(explorations),
         metadata_work: Semaphore::new(4),
+        model_probes: Semaphore::new(2),
         export_work: Arc::new(Semaphore::new(1)),
         download_work: Arc::new(Semaphore::new(1)),
         download_waiters: Semaphore::new(4),
@@ -202,18 +381,35 @@ pub async fn serve_configured(
             cancellation: shutdown.clone(),
             ..Default::default()
         },
-        authority: authority.clone(),
+        authority,
+        origin: origin.clone(),
         shutdown: shutdown.clone(),
         metrics: ops::Metrics::new(query_slots),
         readiness: Arc::new(Semaphore::new(1)),
         wire,
+        cluster,
+        ha,
+        _ha_bootstrap: ha_cache,
+        ha_cache: Mutex::new(None),
+        ha_ready: std::sync::atomic::AtomicBool::new(false),
     });
+    if let Some(status) = status {
+        *status.lock().unwrap() = Arc::downgrade(&app);
+    }
+    if app.ha.is_some() {
+        tokio::spawn(ha::watch_backend(Arc::downgrade(&app)));
+    }
+    tokio::spawn(access::Policy::watch(Arc::downgrade(&app)));
     let api = Router::new()
         .route("/v1/models", get(models::list).post(models::create))
         .route("/v1/models/validate", post(models::validate))
         .route("/v1/models/{id}", get(models::read).put(models::update))
         .route("/v1/models/{id}/schema/{revision}", get(models::schema))
         .route("/v1/models/{id}/query", post(query::run))
+        .route(
+            "/v1/models/{id}/csr",
+            get(cluster::csr::current).post(cluster::csr::refresh),
+        )
         .route("/v1/models/{id}/explore", post(query::explore))
         .route("/v1/models/{id}/export", post(query::export))
         .route("/v1/models/{id}/results/{result}", get(query::snapshot))
@@ -228,18 +424,26 @@ pub async fn serve_configured(
         .route("/v1/models/{id}/history", get(models::history))
         .route(
             "/v1/models/{id}/history/{revision}",
-            get(models::archived_yaml),
+            get(models::archived_yaml).put(models::restore_archive),
         )
         .route("/v1/models/{id}/publish", post(models::publish))
         .route("/v1/models/{id}/rollback", post(models::rollback))
+        .route("/v1/models/{id}/unpublish", post(models::unpublish))
+        .route("/v1/models/{id}/readiness", get(ops::model_ready))
         .route("/v1/models/{id}/browse", post(browse::browse))
+        .route("/v1/backups/status", get(backup::overview))
+        .route("/v1/settings", get(telemetry::settings::read).put(telemetry::settings::save)
+            .layer(DefaultBodyLimit::max(32 * 1024)))
         .route(
             "/v1/options",
             get(|State(app): State<Arc<App>>| async move {
-                Json(serde_json::json!({ "timeout_ms": app.options.timeout.as_millis() as u64 }))
+                Json(serde_json::json!({ "timeout_ms": app.options.timeout.as_millis() as u64, "query_recovery": app.cluster.is_some(), "mutation_receipts": app.ha.is_some() }))
             }),
         )
-        .route("/v1/queries/{id}", delete(query::cancel))
+        .route(
+            "/v1/queries/{id}",
+            get(cluster::resume).delete(query::cancel),
+        )
         .fallback(|| async { Error::not_found() })
         // JSON string escaping can expand a valid YAML document.
         .layer(DefaultBodyLimit::max(6 * CATALOG_LIMIT + 4096))
@@ -248,11 +452,27 @@ pub async fn serve_configured(
             "/v1/auth/login",
             post(auth::login).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
         )
-        .route("/v1/auth/logout", post(auth::logout));
+        .route("/v1/auth/logout", post(auth::logout))
+        .route("/v1/auth/sso", post(auth::sso))
+        .route("/v1/mutations/{id}", get(ha::receipt))
+        .route("/v1/my-roles", get(users::current_roles))
+        .route("/v1/users", get(users::list))
+        .route("/v1/roles", get(users::list_groups))
+        .route("/v1/roles/{role}", axum::routing::put(users::update_group).delete(users::delete_group)
+            .layer(DefaultBodyLimit::max(128 * 1024)))
+        .route("/v1/users/{username}", axum::routing::put(users::update).delete(users::delete)
+            .layer(DefaultBodyLimit::max(128 * 1024)))
+        .route("/v1/service-accounts", axum::routing::put(ha::change_policy)
+            .layer(DefaultBodyLimit::max(256 * 1024)));
     let router = Router::new()
         .nest("/api", api)
         .route("/healthz", get(ops::health))
         .route("/readyz", get(ops::ready))
+        .route("/coordinator/active", get(ha::active))
+        .route("/coordinator/recovery", get(recovery::probe))
+        .route("/recovery/status", get(recovery::status))
+        .route("/recovery/check", post(recovery::preflight))
+        .route("/recovery/verify", post(recovery::verify))
         .route("/metrics", get(ops::metrics))
         .route("/gremlin", get(wire::gremlin::upgrade))
         .route(
@@ -276,13 +496,20 @@ pub async fn serve_configured(
     } else {
         None
     };
-    eprintln!("GraphLake admin http://{authority}");
+    eprintln!("GraphLake admin {origin}");
+    ops::register_coordinator_metrics(&app);
+    telemetry::event(
+        opentelemetry::logs::Severity::Info,
+        "service_started",
+        serde_json::json!({
+            "distributed": app.cluster.is_some(), "failover": app.ha.is_some(), "query_slots": query_slots
+        }),
+    );
     if insecure_dev {
         eprintln!(
             "Warning: administrator authentication disabled for this test catalog (--insecure-dev)"
         );
     }
-    let signal = tokio::spawn(ops::shutdown_signal(shutdown.clone()));
     let server =
         axum::serve(listener, router).with_graceful_shutdown(shutdown.clone().cancelled_owned());
     let result = tokio::select! {
@@ -291,56 +518,170 @@ pub async fn serve_configured(
     };
     shutdown.cancel();
     signal.abort();
+    if let Some(ha) = &app.ha {
+        ha.leader.release().await;
+    }
     if let Some(bolt) = bolt {
         bolt.await??;
     }
     result?;
+    ensure!(!coordinator_failover, "Coordinator relinquished leadership");
     Ok(())
 }
 
-async fn guard(State(app): State<Arc<App>>, mut request: Request, next: Next) -> Response {
+async fn guard(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
+    use opentelemetry::trace::FutureExt as _;
+    let path = request.uri().path();
+    let api = (path == "/api" || path.starts_with("/api/"))
+        .then(|| access::operation(request.method(), path));
+    let operation = api.as_ref().map(|op| op.action).or_else(|| match path {
+        "/readyz" => Some("readiness"),
+        "/coordinator/active" => Some("coordinator_active"),
+        "/coordinator/recovery" => Some("recovery_probe"),
+        "/recovery/status" => Some("recovery_status"),
+        "/recovery/check" => Some("recovery_check"),
+        "/recovery/verify" => Some("recovery_verify"),
+        "/gremlin" => Some("gremlin_upgrade"),
+        _ => None,
+    });
+    let started = std::time::Instant::now();
+    let span = operation
+        .filter(|op| !matches!(*op, "readiness" | "coordinator_active" | "session"))
+        .and_then(|op| telemetry::start_span(op, "http", Some(request.headers())));
+    let future = guard_request(&app, request, next, api.as_ref());
+    let response = if let Some(span) = &span {
+        let response = future.with_context(span.clone()).await;
+        telemetry::finish_span(span, response.status().as_u16());
+        response
+    } else {
+        future.await
+    };
+    if let Some(operation) = operation {
+        let elapsed = started.elapsed();
+        app.metrics
+            .observe("http", operation, response.status().as_u16(), elapsed);
+        if api.is_some() {
+            app.metrics.http(response.status(), elapsed);
+        }
+        if matches!(operation, "query" | "export")
+            && let Some(code) = response.extensions().get::<ErrorCode>()
+        {
+            app.metrics.query_error(code.0);
+        }
+    }
+    response
+}
+
+async fn await_leadership_pause(token: Option<&CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn guard_request(
+    app: &Arc<App>,
+    mut request: Request,
+    next: Next,
+    operation: Option<&access::Operation>,
+) -> Response {
     use access::Principal;
     let headers = request.headers();
     let path = request.uri().path();
-    let is_api = path == "/api" || path.starts_with("/api/");
-    let is_probe = matches!(path, "/healthz" | "/readyz" | "/metrics");
+    let is_api = operation.is_some();
+    let is_probe = matches!(
+        path,
+        "/healthz" | "/readyz" | "/metrics" | "/coordinator/active" | "/coordinator/recovery"
+    );
     let is_gremlin = path == "/gremlin";
-    let started = std::time::Instant::now();
-    let operation = is_api.then(|| access::operation(request.method(), path));
-    let credential = headers.contains_key(header::AUTHORIZATION);
+    let recovery_rpc = matches!(
+        (request.method(), path),
+        (&Method::GET | &Method::HEAD, "/recovery/status")
+            | (&Method::POST, "/recovery/check" | "/recovery/verify")
+    );
+    let recovery_assets = matches!(*request.method(), Method::GET | Method::HEAD)
+        && (matches!(path, "/recovery" | "/recovery/") || path.starts_with("/assets/"));
     let origin = headers.contains_key(header::ORIGIN);
+    let valid_host = exact_header(headers, header::HOST, &app.authority);
+    let durable_mutation = operation.as_ref().is_some_and(|value| {
+        matches!(
+            value.action,
+            "create_model"
+                | "save_model"
+                | "publish"
+                | "rollback"
+                | "unpublish"
+                | "restore_archive"
+        )
+    });
     let public = auth::Auth::public(&request);
-    let principal = if is_api && !public {
-        if credential {
-            app.access.http(headers)
-        } else if app.auth.authenticated(headers, true) {
-            Some(Principal::Admin)
-        } else {
-            None
+    let basic = !public && headers.contains_key(header::AUTHORIZATION);
+    let leadership = if valid_host
+        && !is_probe
+        && let Some(ha) = &app.ha
+    {
+        match ha.leader.confirm().await {
+            Ok(leadership) => Some(leadership),
+            Err(error) => {
+                let mut response = error.into_response();
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                return response;
+            }
         }
-    } else if is_api && path == "/api/v1/auth/logout" && app.auth.authenticated(headers, false) {
-        Some(Principal::Admin)
     } else {
         None
     };
-    let mut response = if !exact_header(headers, header::HOST, &app.authority) {
+    if valid_host
+        && !is_probe
+        && !recovery_rpc
+        && !recovery_assets
+        && app.ha.as_ref().is_some_and(ha::Ha::recovery_pending)
+    {
+        let mut response = recovery::blocked().into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    let credential = (valid_host && is_api && basic)
+        .then(|| access::http(&app, headers))
+        .flatten();
+    let mut live = credential
+        .as_ref()
+        .map(|credential| credential.live.clone());
+    let same_origin = exact_header(headers, header::ORIGIN, &app.origin);
+    let read = matches!(*request.method(), Method::GET | Method::HEAD);
+    let principal = if let Some(credential) = credential {
+        Some(credential.principal)
+    } else if valid_host
+        && is_api
+        && (read || same_origin)
+        && !headers.contains_key(header::AUTHORIZATION)
+        && (!public || path == "/api/v1/auth/logout")
+    {
+        app.auth.principal(&app.users, headers, !public).await
+    } else {
+        None
+    };
+    let mut principal = principal;
+    if let Some(user @ Principal::User { .. }) = &principal {
+        live = app.users.watch(user);
+        if live.is_none() {
+            principal = None;
+        }
+    }
+    let mut response = if !valid_host {
         Error::new(
             StatusCode::FORBIDDEN,
             "invalid_host",
-            "使用服务启动时显示的本机地址",
+            "使用服务启动时显示的地址",
         )
         .into_response()
     } else if app.shutdown.is_cancelled() && !is_probe {
         Error::new(StatusCode::SERVICE_UNAVAILABLE, "draining", "服务正在停止").into_response()
-    } else if is_api
-        && !matches!(*request.method(), Method::GET | Method::HEAD)
-        && (origin || !matches!(principal, Some(Principal::Service(_))))
-        && !exact_header(
-            headers,
-            header::ORIGIN,
-            &format!("http://{}", app.authority),
-        )
-    {
+    } else if !same_origin && (is_api && !read && (origin || !basic) || recovery_rpc && origin) {
         Error::new(
             StatusCode::FORBIDDEN,
             "invalid_origin",
@@ -354,27 +695,54 @@ async fn guard(State(app): State<Arc<App>>, mut request: Request, next: Next) ->
             "请登录 GraphLake 管理后台",
         )
         .into_response()
-    } else if let (Some(principal @ Principal::Service(_)), Some(operation)) =
-        (&principal, &operation)
-        && (!operation.service
-            || operation
-                .model
-                .as_deref()
-                .is_some_and(|id| !app.access.permits(principal, id)))
+    } else if let (Some(principal), Some(operation)) = (&principal, &operation)
+        && !access::permits_operation(&app, principal, operation)
     {
         access::forbidden().into_response()
     } else {
         if let Some(principal) = &principal {
             request.extensions_mut().insert(principal.clone());
         }
-        next.run(request).await
+        let result = tokio::select! {
+            biased;
+            () = await_leadership_pause(leadership.as_ref()), if !durable_mutation => cluster::control::interrupted().into_response(),
+            () = app.shutdown.cancelled(), if app.ha.is_some() && !is_probe && !durable_mutation => cluster::control::lost().into_response(),
+            () = access::revoked(&mut live) => access::revocation_error().into_response(),
+            result = next.run(request) => result,
+        };
+        if (live.is_some() || leadership.is_some())
+            && result.status().is_success()
+            && result.status() != StatusCode::NO_CONTENT
+        {
+            use futures::StreamExt;
+            let (parts, body) = result.into_parts();
+            let body = axum::body::Body::from_stream(async_stream::stream! {
+                let mut chunks = body.into_data_stream();
+                loop {
+                    let chunk = tokio::select! {
+                        biased;
+                        _ = access::revoked(&mut live) => Some(Err(axum::Error::new(std::io::Error::other("credentials revoked")))),
+                        _ = await_leadership_pause(leadership.as_ref()), if !durable_mutation => Some(Err(axum::Error::new(std::io::Error::other("leadership interrupted")))),
+                        chunk = chunks.next() => chunk,
+                    };
+                    let Some(chunk) = chunk else { break };
+                    let failed = chunk.is_err();
+                    yield chunk;
+                    if failed { break; }
+                }
+            });
+            Response::from_parts(parts, body)
+        } else {
+            result
+        }
     };
     if let Some(operation) = operation
         && operation.action != "session"
     {
         let status = response.status();
-        let principal = if operation.action == "login" && status.is_success() {
-            Some(&Principal::Admin)
+        let principal = if matches!(operation.action, "login" | "sso_login") && status.is_success()
+        {
+            response.extensions().get::<Principal>()
         } else {
             principal.as_ref()
         };
@@ -383,19 +751,17 @@ async fn guard(State(app): State<Arc<App>>, mut request: Request, next: Next) ->
             .get::<access::AuditModel>()
             .map(|m| m.0.as_str())
             .or(operation.model.as_deref());
-        app.access.record(
+        app.access.record_target(
             principal,
             "http",
             operation.action,
             model,
             if status.is_success() { "ok" } else { "error" },
             status.as_u16(),
+            operation.target.as_deref(),
         );
     }
-    if is_api {
-        app.metrics.http(response.status(), started.elapsed());
-    }
-    if is_api || is_probe || is_gremlin {
+    if is_api || is_probe || is_gremlin || recovery_rpc {
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
@@ -407,6 +773,21 @@ async fn guard(State(app): State<Arc<App>>, mut request: Request, next: Next) ->
         .headers_mut()
         .insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
     response
+}
+
+fn parse_public_url(value: &str) -> Result<url::Url> {
+    let url = url::Url::parse(value).context("invalid --public-url")?;
+    ensure!(
+        url.scheme() == "https"
+            && url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "--public-url must be an HTTPS origin, for example https://graphlake.example"
+    );
+    Ok(url)
 }
 
 fn exact_header(headers: &HeaderMap, key: header::HeaderName, expected: &str) -> bool {
@@ -467,10 +848,24 @@ struct ErrorBody {
     location: Option<crate::catalog::ValidationSite>,
 }
 
+#[derive(Clone)]
+struct ErrorCode(&'static str);
+
+impl ErrorCode {
+    fn class(code: &str) -> Self {
+        Self(match code {
+            "source_unavailable" => "source_unavailable",
+            "query_failed" | "invalid_query" => "configuration",
+            _ => "other",
+        })
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         (
             self.status,
+            axum::Extension(ErrorCode::class(self.code)),
             Json(ErrorBody {
                 code: self.code,
                 message: self.message,

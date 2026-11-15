@@ -10,9 +10,10 @@ from urllib.request import Request, urlopen
 from gremlin_python.driver.client import Client
 from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection
 from gremlin_python.driver.protocol import GremlinServerError
-from gremlin_python.driver.serializer import GraphSONSerializersV3d0
+from gremlin_python.driver.serializer import GraphSONSerializersV3d0, GraphBinarySerializersV1
 from gremlin_python.process.anonymous_traversal import traversal
 from gremlin_python.process.graph_traversal import __
+from gremlin_python.process.traversal import P
 from neo4j import GraphDatabase, Query
 from neo4j.exceptions import Neo4jError
 from neo4j.graph import Node, Relationship, Path
@@ -46,6 +47,12 @@ def main(http, bolt, revision):
             assert result.consume().metadata["model_revision"] == revision
             assert session.run("RETURN $id AS id", id=9007199254740993).single()["id"] == 9007199254740993
             assert session.run("UNWIND range(1,3) AS n RETURN n ORDER BY n").value() == [1, 2, 3]
+            assert session.run("CALL dbms.components() YIELD name RETURN name").value() == ["GraphLake"]
+            fields = session.run(
+                "CALL db.schema.relTypeProperties() YIELD relType, propertyName, propertyTypes "
+                "WHERE relType = 'Payment' AND propertyName = 'amount' RETURN propertyTypes"
+            ).value()
+            assert fields == [["Decimal"]], fields
             mixed = session.run("UNWIND [1,'1'] AS n RETURN n").value()
             assert len(mixed) == 2 and 1 in mixed and "1" in mixed, mixed
             assert_rejected(lambda: session.run("CREATE (:Forbidden)").consume(), Neo4jError,
@@ -108,6 +115,20 @@ def main(http, bolt, revision):
         assert isinstance(paths[0], GremlinPath) and isinstance(paths[0].objects[1], Edge), paths
     finally:
         conn.close()
+
+    binary = DriverRemoteConnection(ws, "g", username=user, password=token,
+                                    message_serializer=GraphBinarySerializersV1())
+    try:
+        g = traversal().with_remote(binary)
+        assert g.V().limit(1).count().to_list() == [1]
+        paths = (g.V().has_label("CustomerAccount").out_e("Payment")
+                 .has("payment_id", P.eq(2000)).in_v().path().to_list())
+        assert len(paths) == 1 and isinstance(paths[0], GremlinPath), paths
+        first, edge, last = paths[0].objects
+        assert isinstance(first, Vertex) and isinstance(edge, Edge) and isinstance(last, Vertex)
+        assert edge.outV.id == first.id and edge.inV.id == last.id and edge.label == "Payment", paths
+    finally:
+        binary.close()
 
     request = Request(http + "/api/v1/models", headers={"Authorization": f"Bearer {token}"})
     assert_rejected(lambda: urlopen(request, timeout=5), HTTPError, lambda err: err.code == 401)

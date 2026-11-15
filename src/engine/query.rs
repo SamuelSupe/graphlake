@@ -115,6 +115,8 @@ pub struct QueryResult {
     pub(crate) graph_output: super::query_graph::GraphOutput,
     #[cfg(feature = "admin")]
     pub(crate) graph_context: Option<SessionContext>,
+    #[cfg(feature = "admin")]
+    pub(crate) graph_csr: Option<crate::admin::cluster::csr::CypherCsr>,
 }
 
 /// Aggregate limits for active queries, including their result streams.
@@ -247,6 +249,11 @@ impl QueryResult {
     #[cfg(feature = "admin")]
     pub(crate) fn graph_options(&self) -> &GraphOptions {
         &self.scope.options.graph
+    }
+
+    #[cfg(feature = "admin")]
+    pub(crate) fn graph_scope(&self) -> Arc<QueryScope> {
+        self.scope.clone()
     }
 
     /// Return the metrics accumulated so far. Consume the stream to completion for final counts.
@@ -386,16 +393,13 @@ impl QueryScope {
         SessionContext::new_with_state(state)
     }
 
-    pub(super) fn graph_session(&self) -> SessionContext {
+    pub(crate) fn graph_session(&self) -> SessionContext {
         let mut state = self.session().state();
         // The generated list comprehensions use SQL lambdas.
         state.config_mut().options_mut().sql_parser.dialect = datafusion::config::Dialect::DuckDB;
         if self.options.memory_bytes <= 32 * 1024 * 1024 && self.options.spill_bytes > 0 {
-            state
-                .config_mut()
-                .options_mut()
-                .optimizer
-                .enable_distinct_aggregation_soft_limit = false;
+            let optimizer = &mut state.config_mut().options_mut().optimizer;
+            optimizer.enable_distinct_aggregation_soft_limit = false;
         }
         // Several graph branches can hold sort reservations concurrently, even
         // on small inputs. Size each reservation against the shared query budget.
@@ -511,13 +515,15 @@ impl QueryScope {
             graph_output: Default::default(),
             #[cfg(feature = "admin")]
             graph_context: None,
+            #[cfg(feature = "admin")]
+            graph_csr: None,
             batches: Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
             scope: Arc::clone(self),
         })
     }
 }
 
-fn spilled_bytes(plan: &dyn ExecutionPlan) -> u64 {
+pub(crate) fn spilled_bytes(plan: &dyn ExecutionPlan) -> u64 {
     let own = plan
         .metrics()
         .and_then(|metrics| metrics.spilled_bytes())

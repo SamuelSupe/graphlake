@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Run role, ingress, published-model and backup checks from a monitoring host."""
+import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha1
+from http.client import HTTPResponse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import ssl
+import stat
+import sys
+import tempfile
+import threading
+import time
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
+import uuid
+
+ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+MAX_REPLY = 1024 * 1024 + 64 * 1024
+ROLES = {"starting", "candidate", "leader", "standalone", "leader_uncertain", "fenced", "draining"}
+
+
+def label(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def metric(name, value, **labels):
+    suffix = "{" + ",".join(key + "=" + label(val) for key, val in labels.items()) + "}" if labels else ""
+    return f"graphlake_monitor_{name}{suffix} {int(value)}\n"
+
+
+def checked_url(value, protocols):
+    url = urlsplit(value)
+    if (url.scheme not in protocols or not url.hostname or url.username is not None
+            or url.password is not None or url.query or url.fragment):
+        raise ValueError("probe URL contains unsupported parts")
+    if url.scheme in ("http", "bolt", "ws") and url.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("plaintext probe URLs must point to loopback")
+    return url
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+def protected_json(path, maximum):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise ValueError("status and config files must be regular files")
+        data = file.read(maximum + 1)
+    if len(data) > maximum:
+        raise ValueError("status or config file exceeds its size limit")
+    return json.loads(data)
+
+
+class Monitor:
+    def __init__(self, config, state_file=None):
+        self.interval = config.get("interval_seconds", 30)
+        self.timeout = config.get("timeout_seconds", 5)
+        if not 1 <= self.interval <= 3600 or not 1 <= self.timeout <= 15:
+            raise ValueError("invalid interval or timeout")
+        self.ingress = config.get("ingress", {})
+        self.nodes = config.get("coordinators", {})
+        self.workers = config.get("workers", {})
+        self.backups = config.get("backups", {})
+        self.canaries = config.get("canaries", {})
+        self.require_leader = config.get("require_leader", False)
+        for group in (self.nodes, self.workers, self.backups, self.canaries):
+            if len(group) > 64 or any(not ID.fullmatch(name) for name in group):
+                raise ValueError("expected at most 64 targets with valid identifiers per group")
+        self.tls = ssl.create_default_context(cafile=config.get("ca_file"))
+        self.http = build_opener(ProxyHandler({}), NoRedirect(), HTTPSHandler(context=self.tls))
+        self.base = self.ingress.get("https", "").rstrip("/")
+        for field, schemas in (("https", ("https", "http")), ("bolt", ("bolt+s", "bolt")),
+                               ("gremlin", ("wss", "ws"))):
+            if field in self.ingress:
+                checked_url(self.ingress[field], schemas)
+        if self.require_leader and not self.nodes:
+            raise ValueError("require_leader requires Coordinator status targets")
+        if self.base and urlsplit(self.base).path:
+            raise ValueError("HTTPS ingress must be its public origin")
+        if self.canaries and not self.base:
+            raise ValueError("model canaries require an HTTPS ingress")
+        self.model_headers = {}
+        if self.base and config.get("service_account"):
+            account = config["service_account"]
+            name = account["username"]
+            if not name.startswith("svc/") or ":" in name:
+                raise ValueError("expected a service-account username")
+            auth = base64.b64encode((name + ":" + os.environ[account["token_env"]]).encode()).decode()
+            self.model_headers = {"Authorization": "Basic " + auth}
+        if self.canaries and not self.model_headers:
+            raise ValueError("model canaries require a service account")
+        for url in self.nodes.values():
+            checked_url(url, ("https", "http"))
+        self.worker_keys = {}
+        for name, worker in self.workers.items():
+            checked_url(worker["url"], ("https", "http"))
+            self.worker_keys[name] = os.environ[worker["token_env"]]
+        for backup in self.backups.values():
+            if backup["kind"] not in ("export", "verify") or not 1 <= backup["max_age_seconds"] <= 366 * 86400:
+                raise ValueError("invalid backup kind or maximum age")
+        for canary in self.canaries.values():
+            rows = canary["expected_rows"]
+            if (canary.get("language", "cypher") not in ("cypher", "sql", "gremlin")
+                    or not 1 <= len(canary["query"].strip()) <= 64 * 1024
+                    or not isinstance(rows, list) or len(rows) > 50
+                    or any(not isinstance(row, list) or len(row) > 64
+                           or any(value is not None and not isinstance(value, str) for value in row) for row in rows)):
+                raise ValueError("invalid canary query or expected result")
+        self.lock = threading.Lock()
+        self.last_cycle = 0
+        self.body = ""
+        self.state_file = state_file
+        self.failed = {}
+        if state_file:
+            try:
+                saved = protected_json(state_file, 4 * 1024 * 1024)
+            except FileNotFoundError:
+                saved = {}
+            self.failed = {name: {tuple(pair) for pair in problems} for name, problems in saved.items()}
+
+    def json(self, url, headers=None, body=None):
+        request = Request(url, data=None if body is None else json.dumps(body).encode(), headers={
+            **(headers or {}), **({"Content-Type": "application/json"} if body is not None else {}),
+        })
+        try:
+            response = self.http.open(request, timeout=self.timeout)
+        except HTTPError as error:
+            response = error
+        with response:
+            data = response.read(MAX_REPLY + 1)
+            if len(data) > MAX_REPLY:
+                raise ValueError("probe reply exceeds limit")
+            if data:
+                return response.code, json.loads(data)
+            return response.code, None
+
+    def connect(self, value, default_port):
+        url = urlsplit(value)
+        sock = socket.create_connection((url.hostname, url.port or default_port), timeout=self.timeout)
+        if url.scheme in ("wss", "bolt+s"):
+            try:
+                return self.tls.wrap_socket(sock, server_hostname=url.hostname)
+            except OSError:
+                sock.close()
+                raise
+        return sock
+
+    def bolt(self, url):
+        with self.connect(url, 7687) as sock, sock.makefile("rb") as wire:
+            sock.sendall(bytes.fromhex("6060b017 00000405 00000000 00000000 00000000"))
+            return wire.read(4) == bytes.fromhex("00000405")
+
+    def gremlin(self, value):
+        url = urlsplit(value)
+        nonce = base64.b64encode(os.urandom(16)).decode()
+        target = url.path or "/gremlin"
+        with self.connect(value, 443 if url.scheme == "wss" else 80) as sock:
+            sock.sendall((f"GET {target} HTTP/1.1\r\nHost: {url.netloc}\r\nUpgrade: websocket\r\n"
+                          f"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {nonce}\r\n\r\n").encode("ascii"))
+            response = HTTPResponse(sock)
+            try:
+                response.begin()
+                accept = base64.b64encode(sha1((nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+                return (response.status == 101 and response.getheader("Upgrade", "").lower() == "websocket"
+                        and response.getheader("Sec-WebSocket-Accept") == accept)
+            finally:
+                response.close()
+
+    @staticmethod
+    def checked(call, fallback=None):
+        try:
+            return call()
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return fallback
+
+    def node(self, url):
+        code, body = self.json(url)
+        if code != 200 or body["role"] not in ROLES or type(body["ready"]) is not bool:
+            raise ValueError("invalid Coordinator status")
+        return body
+
+    def worker(self, name, url):
+        code, identity = self.json(url, {"Authorization": "Bearer " + self.worker_keys[name]})
+        return code == 200 and str(uuid.UUID(identity)) == identity
+
+    def https(self):
+        status, body = self.json(self.base + "/healthz")
+        return status == 200 and body["status"] == "alive"
+
+    def model(self, name, revision):
+        prefix = self.base + "/api/v1/models/" + name
+        try:
+            code, body = self.json(prefix + "/readiness", self.model_headers)
+        except (OSError, ValueError, TypeError):
+            return {("", "probe_unreachable")}
+        if code != 200 or not isinstance(body, dict) or body.get("status") != "ready":
+            if code in (401, 403):
+                return {("", "probe_authorization")}
+            if not isinstance(body, dict):
+                return {("", "probe_failed")}
+            status = body.get("status")
+            sources = dict(body.get("sources", {}))
+            for worker in body.get("workers") or []:
+                for source, ok in (worker.get("probe") or {}).get("sources", {}).items():
+                    if not ok:
+                        sources[source] = False
+            problems = {(source, "source_unavailable") for source, ready in sources.items() if not ready}
+            if status in ("mapping_invalid", "worker_unavailable"):
+                problems.add(("", status))
+            return problems or {("", "probe_failed")}
+        if body.get("model_revision") != revision:
+            return {("", "revision_changed")}
+        check = self.canaries.get(name)
+        if check is None:
+            return {("", "canary_unconfigured")}
+        try:
+            code, result = self.json(prefix + "/query", self.model_headers, {
+                "request_id": str(uuid.uuid4()), "language": check.get("language", "cypher"),
+                "query": check["query"], "model_revision": revision,
+                "timeout_ms": min(5000, int(self.timeout * 1000)),
+            })
+        except (OSError, ValueError, TypeError):
+            return {("", "canary_unreachable")}
+        if code != 200 or not isinstance(result, dict):
+            error = (result or {}).get("code") if isinstance(result, dict) else None
+            return {("", {"source_unavailable": "source_unavailable", "query_failed": "canary_configuration",
+                          "invalid_query": "canary_configuration"}.get(error, "canary_failed"))}
+        if result.get("truncated") or result.get("model_revision") != revision or result.get("rows") != check["expected_rows"]:
+            return {("", "canary_result_mismatch")}
+        return set()
+
+    def persist_failures(self):
+        if not self.state_file:
+            return
+        directory = self.state_file.parent
+        with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as temp:
+            path = Path(temp.name)
+            try:
+                json.dump({name: sorted(failures) for name, failures in self.failed.items()}, temp)
+                temp.flush()
+                os.fsync(temp.fileno())
+                os.replace(path, self.state_file)
+            finally:
+                path.unlink(missing_ok=True)
+
+    def published(self, pool):
+        if not self.model_headers:
+            return ""
+        try:
+            code, models = self.json(self.base + "/api/v1/models", self.model_headers)
+            if code != 200 or not isinstance(models, list) or len(models) > 256:
+                raise ValueError("invalid model listing")
+            active = {model["id"]: model["active_revision"] for model in models
+                      if ID.fullmatch(model["id"]) and model.get("active_revision")}
+        except (OSError, ValueError, TypeError, KeyError):
+            discovered = False
+        else:
+            discovered = True
+            previous = {name: problems.copy() for name, problems in self.failed.items()}
+            jobs = {name: pool.submit(self.checked, lambda name=name, revision=revision: self.model(name, revision),
+                                      {("", "probe_failed")}) for name, revision in active.items()}
+            for name, job in jobs.items():
+                problems = job.result()
+                if problems:
+                    # A reachable source is only a recovery once the known-result query passes.
+                    self.failed.setdefault(name, set()).update(problems)
+                else:
+                    self.failed.pop(name, None)
+            for missing in self.canaries.keys() - active.keys():
+                self.failed.setdefault(missing, set()).add(("", "published_model_missing"))
+            for retired in self.failed.keys() - (active.keys() | self.canaries.keys()):
+                del self.failed[retired]
+            if previous != self.failed:
+                self.persist_failures()
+        return metric("model_discovery_up", discovered) + "".join(
+            metric("model_check_failed", True, model=model, source=source, reason=reason)
+            for model, failures in sorted(self.failed.items()) for source, reason in sorted(failures))
+
+    def backup(self, name, config):
+        stamp = self.checked(lambda: protected_json(config["status_file"], 4096))
+        if not isinstance(stamp, dict):
+            stamp = {}
+        now = int(time.time())
+        success = stamp.get("last_success_ms")
+        checkpoint = stamp.get("checkpoint_ms")
+        stamp_valid = lambda value: type(value) is int and 0 < value // 1000 <= now + 60
+        success = success // 1000 if stamp_valid(success) else 0
+        checkpoint = checkpoint // 1000 if stamp_valid(checkpoint) else 0
+        kind = config["kind"]
+        age_from = min(checkpoint, success) if kind == "verify" else success
+        labels = {"backup": name, "kind": kind}
+        return (metric("backup_failed", stamp.get("ok") is not True, **labels)
+                + metric("backup_stale", age_from == 0 or now - age_from > config["max_age_seconds"], **labels)
+                + metric("backup_last_success_timestamp_seconds", success, **labels)
+                + metric("backup_checkpoint_timestamp_seconds", checkpoint, **labels))
+
+    def cycle(self):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            nodes = {name: pool.submit(self.checked, lambda url=url: self.node(url)) for name, url in self.nodes.items()}
+            workers = {name: pool.submit(self.checked, lambda name=name, worker=worker: self.worker(name, worker["url"]))
+                       for name, worker in self.workers.items()}
+            protocols = {"https": self.https, "bolt": lambda: self.bolt(self.ingress["bolt"]),
+                         "gremlin": lambda: self.gremlin(self.ingress["gremlin"])}
+            ingress = {name: pool.submit(self.checked, check) for name, check in protocols.items() if name in self.ingress}
+            rows = [self.published(pool)]
+            roles = [job.result() for job in nodes.values()]
+            for name, state in zip(nodes, roles):
+                rows.append(metric("candidate_up", bool(state), node=name))
+                if state:
+                    rows.append(metric("node_ready", state["ready"], node=name, role=state["role"]))
+            if self.require_leader:
+                rows.append(metric("leaders", sum(state is not None and state["role"] == "leader" for state in roles)))
+            rows.extend(metric("worker_up", bool(job.result()), worker=name) for name, job in workers.items())
+            rows.extend(metric("ingress_up", bool(job.result()), protocol=name) for name, job in ingress.items())
+            rows.extend(self.backup(name, config) for name, config in self.backups.items())
+            with self.lock:
+                self.body = "".join(rows)
+                self.last_cycle = time.time()
+
+    def metrics(self):
+        with self.lock:
+            stale_after = max(3 * self.interval, 3 * self.timeout)
+            return (self.body + metric("cycle_stale", time.time() - self.last_cycle > stale_after)
+                    + metric("last_cycle_timestamp_seconds", self.last_cycle)).encode()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--port", default=9337, type=int)
+    parser.add_argument("--once", action="store_true", help="write one set of metrics to stdout")
+    parser.add_argument("--state-file", type=Path)
+    args = parser.parse_args()
+    monitor = Monitor(protected_json(args.config, 1024 * 1024), args.state_file)
+    if args.once:
+        monitor.cycle()
+        print(monitor.metrics().decode(), end="")
+        return
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/metrics":
+                self.send_error(404)
+                return
+            body = monitor.metrics()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    def schedule():
+        while True:
+            try:
+                monitor.cycle()
+            except Exception as error:
+                # Keep the previous snapshot and stale metric without logging credentials or queries.
+                print("GraphLake monitor cycle failed: " + type(error).__name__, file=sys.stderr, flush=True)
+            time.sleep(monitor.interval)
+
+    threading.Thread(target=schedule, daemon=True).start()
+    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

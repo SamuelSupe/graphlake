@@ -1,4 +1,4 @@
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Write};
 
 use axum::{body::Body, http::header};
 use tokio::sync::OwnedSemaphorePermit;
@@ -28,6 +28,11 @@ pub(super) struct Capture {
     ipc: StreamWriter<Bounded>,
 }
 
+pub(in crate::admin) struct Captured {
+    pub file: tempfile::NamedTempFile,
+    pub length: u64,
+}
+
 impl Capture {
     pub(super) fn new(schema: &crate::arrow::datatypes::Schema, budget: u64) -> ApiResult<Self> {
         let file = tempfile::NamedTempFile::new().map_err(|_| write_error())?;
@@ -43,13 +48,7 @@ impl Capture {
         tokio::task::block_in_place(|| self.ipc.write(batch)).map_err(|_| write_error())
     }
 
-    pub(super) fn finish(
-        self,
-        id: Uuid,
-        model: String,
-        revision: String,
-        owner: Principal,
-    ) -> ApiResult<ResultSnapshot> {
+    pub(super) fn finish(self) -> ApiResult<Captured> {
         tokio::task::block_in_place(|| {
             self.ipc
                 .into_inner()
@@ -62,15 +61,9 @@ impl Capture {
                 .metadata()
                 .map_err(|_| write_error())?
                 .len();
-            Ok(ResultSnapshot {
-                id,
-                model,
-                revision,
-                owner,
-                file: Some(self.file),
+            Ok(Captured {
+                file: self.file,
                 length,
-                created: std::time::Instant::now(),
-                graph: None,
             })
         })
     }
@@ -82,21 +75,21 @@ pub(super) fn save_snapshot(
     model: String,
     revision: String,
     owner: Principal,
-    arrow: Option<ResultSnapshot>,
+    arrow: Option<Captured>,
     graph: Option<(Vec<graph::Fragment>, bool)>,
 ) {
-    let mut snapshot = arrow.unwrap_or(ResultSnapshot {
+    let length = arrow.as_ref().map_or(0, |arrow| arrow.length);
+    let snapshot = ResultSnapshot {
         id,
         model,
         revision,
         owner,
-        file: None,
-        length: 0,
+        file: arrow.map(|arrow| arrow.file),
+        length,
         created: std::time::Instant::now(),
-        graph: None,
-    });
-    snapshot.graph =
-        graph.map(|(pages, incomplete)| (pages.into_iter().map(Arc::new).collect(), incomplete));
+        graph: graph
+            .map(|(pages, incomplete)| (pages.into_iter().map(Arc::new).collect(), incomplete)),
+    };
     let mut results = app.results.lock().unwrap();
     results.retain(|saved| saved.created.elapsed() < SNAPSHOT_TTL);
     while results.len() >= 4
@@ -120,6 +113,11 @@ pub(in crate::admin) async fn snapshot(
     Extension(principal): Extension<Principal>,
     method: axum::http::Method,
 ) -> ApiResult<Response> {
+    if let Some(cluster) = &app.cluster {
+        return cluster
+            .arrow(&app, &principal, Some(&model), id, method)
+            .await;
+    }
     let (file, length, revision) = {
         let mut results = app.results.lock().unwrap();
         results.retain(|saved| saved.created.elapsed() < SNAPSHOT_TTL);
@@ -129,7 +127,7 @@ pub(in crate::admin) async fn snapshot(
                 saved.id == id
                     && saved.model == model
                     && saved.file.is_some()
-                    && access::owns(&principal, &saved.owner)
+                    && access::owns_query(&principal, &saved.owner)
             })
             .ok_or_else(|| {
                 Error::new(
@@ -167,7 +165,12 @@ pub(in crate::admin) async fn graph_page(
     State(app): State<Arc<App>>,
     Path((model, id, index)): Path<(String, Uuid, usize)>,
     Extension(principal): Extension<Principal>,
-) -> ApiResult<impl IntoResponse> {
+) -> ApiResult<Response> {
+    if let Some(cluster) = &app.cluster {
+        return cluster
+            .graph_page(&app, &principal, &model, id, index)
+            .await;
+    }
     let (graph, next, incomplete, revision) = {
         let results = app.results.lock().unwrap();
         let saved = results
@@ -176,7 +179,7 @@ pub(in crate::admin) async fn graph_page(
                 saved.id == id
                     && saved.model == model
                     && saved.created.elapsed() < SNAPSHOT_TTL
-                    && access::owns(&principal, &saved.owner)
+                    && access::owns_query(&principal, &saved.owner)
             })
             .ok_or_else(|| {
                 Error::new(
@@ -196,7 +199,7 @@ pub(in crate::admin) async fn graph_page(
     };
     Ok(Json(
         serde_json::json!({ "graph": graph.as_ref(), "next": next, "incomplete": incomplete, "model_revision": revision }),
-    ))
+    ).into_response())
 }
 
 pub(in crate::admin) struct Download {
@@ -216,40 +219,20 @@ pub(in crate::admin) async fn export(
     Extension(principal): Extension<Principal>,
     Json(request): Json<Request>,
 ) -> ApiResult<Response> {
-    let (active, mut result, _engine, download_permit) =
+    access::check_export(&app, &principal, &id)?;
+    if let Some(cluster) = &app.cluster {
+        return cluster.execute(&app, id, principal, request, true).await;
+    }
+    let (active, result, _engine, download_permit) =
         start(&app, &id, &request, &principal, false).await?;
     let _export_permit = download_permit.expect("export permit");
-    let file = tempfile::tempfile().map_err(|_| write_error())?;
     let budget = app.options.spill_bytes.min(SNAPSHOT_BUDGET);
-    let writer = Bounded {
-        file: BufWriter::new(file),
-        remaining: budget,
-    };
-    let mut ipc =
-        StreamWriter::try_new(writer, &result.batches.schema()).map_err(|_| write_error())?;
-    while let Some(batch) = result
-        .batches
-        .try_next()
-        .await
-        .map_err(|error| query_error(error.into()))?
-    {
-        tokio::task::block_in_place(|| ipc.write(&batch)).map_err(|_| write_error())?;
-    }
+    let captured = capture_all(result, budget).await?;
     if active.token.is_cancelled() {
         return Err(Error::new(StatusCode::CONFLICT, "cancelled", "查询已取消"));
     }
-    let file = tokio::task::block_in_place(|| -> std::io::Result<_> {
-        let writer = ipc.into_inner().map_err(std::io::Error::other)?;
-        let mut file = writer
-            .file
-            .into_inner()
-            .map_err(|error| error.into_error())?;
-        file.rewind()?;
-        Ok(file)
-    })
-    .map_err(|_| write_error())?;
-    let length = file.metadata().map_err(|_| write_error())?.len();
-    drop(result);
+    let length = captured.length;
+    let file = captured.file.into_file();
     drop(active);
     let ticket = Uuid::new_v4();
     {
@@ -291,11 +274,16 @@ pub(in crate::admin) async fn download(
     Path(ticket): Path<Uuid>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<Response> {
+    if let Some(cluster) = &app.cluster {
+        return cluster
+            .arrow(&app, &principal, None, ticket, axum::http::Method::GET)
+            .await;
+    }
     let matching = |download: &Download| {
         download.ticket == ticket
             && download.created.elapsed() < TICKET_TTL
-            && access::owns(&principal, &download.owner)
-            && app.access.permits(&principal, &download.model)
+            && access::owns_query(&principal, &download.owner)
+            && access::check_export(&app, &principal, &download.model).is_ok()
     };
     if !app.downloads.lock().unwrap().iter().any(&matching) {
         return Err(Error::not_found());
@@ -320,7 +308,7 @@ pub(in crate::admin) async fn download(
     Ok(response)
 }
 
-async fn download_slot(app: &App) -> ApiResult<OwnedSemaphorePermit> {
+pub(in crate::admin) async fn download_slot(app: &App) -> ApiResult<OwnedSemaphorePermit> {
     acquire(
         app,
         &app.download_work,
@@ -329,6 +317,23 @@ async fn download_slot(app: &App) -> ApiResult<OwnedSemaphorePermit> {
         &app.shutdown,
     )
     .await
+}
+
+pub(in crate::admin) async fn capture_all(
+    mut result: QueryResult,
+    budget: u64,
+) -> ApiResult<Captured> {
+    let mut capture = Capture::new(&result.batches.schema(), budget)?;
+    while let Some(batch) = result
+        .batches
+        .try_next()
+        .await
+        .map_err(|error| query_error(error.into()))?
+    {
+        capture.write(&batch)?;
+    }
+    crate::admin::ops::observe_query_io(&result);
+    capture.finish()
 }
 
 fn attachment(

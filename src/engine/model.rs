@@ -52,9 +52,15 @@ pub(super) struct ReadKind<'a> {
     pub lazy_validation: bool,
     pub check_data: bool,
     #[cfg(feature = "admin")]
+    pub probe_source: Option<&'a str>,
+    #[cfg(feature = "admin")]
     pub graph_versions: bool,
     #[cfg(feature = "admin")]
     pub transaction: Option<&'a super::ReadTransaction>,
+    #[cfg(feature = "admin")]
+    pub distributed: Option<&'a crate::admin::cluster::distributed::Distributed>,
+    #[cfg(feature = "admin")]
+    pub partitioned_topology: bool,
     #[cfg(feature = "admin")]
     pub exploration: Option<&'a Exploration<'a>>,
 }
@@ -486,11 +492,10 @@ async fn bind_label(
                 keys,
                 vec![datafusion::functions_aggregate::expr_fn::count(lit(1_i64)).alias(COUNT)],
             )?;
-            let mut duplicates = counts
+            let duplicate_keys = counts
                 .filter(column(COUNT).gt(lit(1_i64)))?
-                .limit(0, Some(1))?
-                .execute_stream()
-                .await?;
+                .limit(0, Some(1))?;
+            let mut duplicates = validation_stream(duplicate_keys, scope, read).await?;
             while let Some(batch) = duplicates.try_next().await? {
                 scope.check()?;
                 if batch.num_rows() != 0 {
@@ -521,6 +526,11 @@ async fn bind_label(
         } else {
             frame.select(fields.iter().map(|field| column(field)).collect::<Vec<_>>())?
         };
+        #[cfg(feature = "admin")]
+        if read.partitioned_topology {
+            return materialize_partitioned_mapping(context, base, scope, name, label, visible)
+                .await;
+        }
         let distinct = base.distinct()?;
         if read.explain_only {
             return Ok((distinct.select(visible)?, None));
@@ -530,7 +540,7 @@ async fn bind_label(
             let frame = verify_keys(check, label.keys, format!("conflicting records for {name}"))?;
             return Ok((frame.select(visible)?, None));
         }
-        let mut stream = check.execute_stream().await?;
+        let mut stream = validation_stream(check, scope, read).await?;
         let mut buffer = Buffer::new(
             &scope.runtime.memory_pool,
             Some(&scope.runtime.disk_manager),
@@ -581,6 +591,106 @@ async fn bind_label(
         retained = Some(budget);
     }
     Ok((frame.select(visible)?, retained))
+}
+
+#[cfg(feature = "admin")]
+async fn materialize_partitioned_mapping(
+    context: &SessionContext,
+    frame: DataFrame,
+    scope: &QueryScope,
+    name: &str,
+    label: &Label<'_>,
+    visible: Vec<Expr>,
+) -> Result<(DataFrame, Option<MemoryReservation>)> {
+    use datafusion::arrow::{
+        array::RecordBatch,
+        row::{RowConverter, SortField},
+    };
+    // Ordered keys make full-row deduplication streaming, including conflict
+    // detection across the boundary between two Arrow batches.
+    let schema = Arc::clone(frame.schema().inner());
+    let keys = label
+        .keys
+        .iter()
+        .map(|key| schema.index_of(key))
+        .collect::<Result<Vec<_>, _>>()?;
+    let converter = RowConverter::new(
+        keys.iter()
+            .map(|&index| SortField::new(schema.field(index).data_type().clone()))
+            .collect(),
+    )?;
+    let mut rows = frame
+        .sort(
+            label
+                .keys
+                .iter()
+                .map(|key| column(key).sort(true, false))
+                .collect(),
+        )?
+        .execute_stream()
+        .await?;
+    let mut buffer = Buffer::new(
+        &scope.runtime.memory_pool,
+        Some(&scope.runtime.disk_manager),
+    );
+    let mut prior_key = Vec::new();
+    let mut prior_values = Vec::<ScalarValue>::new();
+    while let Some(batch) = rows.try_next().await? {
+        scope.check()?;
+        let encoded = converter.convert_columns(
+            &keys
+                .iter()
+                .map(|&i| batch.column(i).clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let mut retained = Vec::new();
+        for (i, key) in encoded.iter().enumerate() {
+            let values = || {
+                batch
+                    .columns()
+                    .iter()
+                    .map(|column| ScalarValue::try_from_array(column, i))
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            if prior_key.as_slice() == key.data() {
+                ensure!(prior_values == values()?, "conflicting records for {name}");
+            } else {
+                prior_key.clear();
+                prior_key.extend_from_slice(key.data());
+                prior_values = values()?;
+                retained.push(i as u32);
+            }
+        }
+        if !retained.is_empty() {
+            let rows = datafusion::arrow::array::UInt32Array::from(retained);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| datafusion::arrow::compute::take(column.as_ref(), &rows, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            buffer.push(RecordBatch::try_new(schema.clone(), columns)?)?;
+        }
+    }
+    let (table, reservation) = buffer.finish(schema, &scope.reads)?;
+    let frame = context.read_table(table)?;
+    Ok((frame.select(visible)?, Some(reservation)))
+}
+
+async fn validation_stream(
+    frame: DataFrame,
+    _scope: &QueryScope,
+    _read: ReadKind<'_>,
+) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+    #[cfg(feature = "admin")]
+    if let Some(distributed) = _read.distributed {
+        let ctx = Arc::new(frame.task_ctx());
+        let plan = frame.create_physical_plan().await?;
+        let plan = distributed
+            .execute(plan, _scope, ctx.clone(), false, false)
+            .await?;
+        return Ok(datafusion::physical_plan::execute_stream(plan, ctx)?);
+    }
+    Ok(frame.execute_stream().await?)
 }
 
 async fn has_rows(frame: DataFrame) -> Result<bool> {
@@ -696,8 +806,23 @@ fn verify_keys(frame: DataFrame, keys: &[String], error: String) -> Result<DataF
         .clone()
         .map(|field| data_type(&frame, field))
         .collect::<Result<Vec<_>>>()?;
-    let check = create_udf(
-        "__graphlake_verify_keys",
+    let check = key_validator(types, error);
+    Ok(frame.filter(check.call(fields.map(column).collect()))?)
+}
+
+pub(crate) const KEY_VALIDATOR: &str = "__graphlake_verify_keys_";
+
+pub(crate) fn key_validator(
+    types: Vec<DataType>,
+    error: String,
+) -> datafusion::logical_expr::ScalarUDF {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let name = format!(
+        "{KEY_VALIDATOR}{}",
+        URL_SAFE_NO_PAD.encode(error.as_bytes())
+    );
+    create_udf(
+        &name,
         types,
         DataType::Boolean,
         Volatility::Volatile,
@@ -716,8 +841,7 @@ fn verify_keys(frame: DataFrame, keys: &[String], error: String) -> Result<DataF
             }
             Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))
         }),
-    );
-    Ok(frame.filter(check.call(fields.map(column).collect()))?)
+    )
 }
 
 fn column(name: &str) -> Expr {

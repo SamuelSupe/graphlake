@@ -89,7 +89,7 @@ impl Engine {
 }
 
 impl GraphAlgorithm {
-    pub(super) fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         if let Self::PageRank {
             damping,
             tolerance,

@@ -14,7 +14,7 @@ use graphlake::{
 };
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, long_version = option_env!("GRAPHLAKE_BUILD_VERSION"), about)]
 struct Cli {
     #[arg(long)]
     catalog: PathBuf,

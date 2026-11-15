@@ -49,7 +49,7 @@ const EdgePaths = memo(function EdgePaths({ edges, dense, selected, matched, arr
 });
 
 export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy, reload, rerun, ref }: {
-  id: string; page: QueryResult; schema?: GraphSchema; activeRevision: string; timeout?: number; busy: boolean; reload: () => void; rerun: () => void;
+  id: string; page: QueryResult; schema?: GraphSchema; activeRevision: string; timeout?: number; busy: boolean; reload: () => void; rerun?: () => void;
   ref?: Ref<GraphExplorerHandle>;
 }) {
   const [elements, setElements] = useState(page.graph.elements);
@@ -110,7 +110,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
   const expansion = selected ? expansions.get(selected) : undefined;
   const viewingBatch = [...expansions.values()].find(value => value.batchMode);
   const held = expansion?.held ? expansion : [...expansions.values()].find(value => value.held);
-  const isStale = page.model_revision !== activeRevision;
+  const isStale = page.model_revision !== activeRevision && !page.csr_generation;
   const color = (label: string) => tones[Array.from(label).reduce((hash, char) => (hash * 31 + char.codePointAt(0)!) % tones.length, 0)];
   const labelFor = (element: GraphElement) => graphLabel(element, displayLabels.get(graphType(element)));
   const accessibleLabel = (element: GraphElement) => {
@@ -128,15 +128,15 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
 
   useImperativeHandle(ref, () => ({ append(result) {
     if (request.current || original) return '请先完成邻居展开或返回原画布，再追加查询结果。';
-    if (rerunReason || page.model_revision !== result.model_revision
+    if (rerunReason || page.model_revision !== result.model_revision || page.csr_generation !== result.csr_generation
       || JSON.stringify(page.graph_options) !== JSON.stringify(result.graph_options)) {
-      return '画布和查询结果的模型版本或图查询范围不同，无法追加。';
+      return '画布和查询结果的模型版本、CSR 代次或图查询范围不同，无法追加。';
     }
     const versions = combineVersions([...page.sources, ...addedFrom], result.sources);
     if (!versions) return '画布与本次查询的数据源版本不同，无法追加。';
     // Unkeyed edges carry execution-local row identifiers. Keep them distinct across runs.
     const prefix = crypto.randomUUID() + ':';
-    const incoming = result.graph.elements.map(element => element.transient && element.kind === 'edge'
+    const incoming = result.graph.elements.map(element => !result.csr_generation && element.transient && element.kind === 'edge'
       ? { ...element, id: prefix + element.id } : element);
     const next = appendGraph(elements, incoming);
     if (!next) return '追加结果会超过画布上限。移除部分元素后再试。';
@@ -255,7 +255,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
 
   async function explore(element: GraphElement, filter?: NeighborFilter, continuation = false,
     batch?: { cursor: string; replace: boolean; locate?: string }, loadAll = false) {
-    if (request.current || isStale || !!rerunReason || busy || element.transient) return;
+    if (request.current || isStale || !!rerunReason || busy || element.transient && !page.csr_generation) return;
     const previous = continuation ? expansions.get(element.id) : undefined;
     if (!batch && previous?.held) {
       applyPage(previous.held, filter);
@@ -279,6 +279,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
         const result = await api<GraphExploration>('/models/' + id + '/explore', {
           method: 'POST', signal: controller.signal, body: JSON.stringify({
             model_revision: page.model_revision,
+            csr_generation: page.csr_generation,
             element: { kind: element.kind, label: element.label, key: element.key },
             neighbors: !!filter, filter, cursor,
             timeout_ms: timeout, graph_options: page.graph_options, source_versions: Object.fromEntries(sourceVersions),
@@ -306,6 +307,8 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       if (!controller.signal.aborted) {
         if (cause instanceof ApiError && cause.code === 'graph_sources_changed') {
           setRerunReason('来源版本已变化。已暂停探索，当前画布仍显示原结果。');
+        } else if (cause instanceof ApiError && cause.code === 'csr_snapshot_expired') {
+          setRerunReason('原 CSR 代次已清理。可用当前已发布的代次重建画布。');
         } else if (cause instanceof ApiError && (cause.code === 'neighbor_session_expired'
           || cause.code === 'invalid_neighbor_cursor' && (batch?.cursor || previous?.cursor))) {
           setRerunReason('无法安全恢复此页。可重跑原查询并重建画布。');
@@ -349,7 +352,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       const response = current.loaded ?? await api<QueryGraphPage>('/models/' + id + '/results/' + current.snapshot + '/graph/' + current.next,
         { signal: controller.signal });
       if (controller.signal.aborted) return;
-      const incoming = response.graph.elements.map(element => current.prefix && element.transient && element.kind === 'edge'
+      const incoming = response.graph.elements.map(element => !page.csr_generation && current.prefix && element.transient && element.kind === 'edge'
         ? { ...element, id: current.prefix + element.id } : element);
       const next = appendGraph(replace ? [] : elements, incoming);
       if (!next) {
@@ -429,7 +432,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     try {
       const result = await api<ExplorationSearch>('/models/' + id + '/explore', {
         method: 'POST', signal: controller.signal, body: JSON.stringify({
-          model_revision: page.model_revision, neighbors: true, filter, cursor,
+          model_revision: page.model_revision, csr_generation: page.csr_generation, neighbors: true, filter, cursor,
           element: { kind: anchor.kind, label: anchor.label, key: anchor.key },
           timeout_ms: timeout, graph_options: page.graph_options,
           source_versions: Object.fromEntries([...page.sources, ...addedFrom].map(source => [source.source, source.version])),
@@ -445,6 +448,8 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       if (controller.signal.aborted) return;
       if (cause instanceof ApiError && cause.code === 'graph_sources_changed') {
         setRerunReason('来源版本已变化。已暂停探索，当前画布仍显示原结果。');
+      } else if (cause instanceof ApiError && cause.code === 'csr_snapshot_expired') {
+        setRerunReason('原 CSR 代次已清理。可用当前已发布的代次重建画布。');
       } else {
         setSearchError(errorText(cause));
       }
@@ -637,7 +642,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     {visibleCurves.some(curve => !curve.element) && <p className="explorer-help">虚线表示路径中相邻的节点。查询结果中未包含它们之间的边。</p>}
     {rerunReason && <div className="explorer-notice" role="alert">
       <span>{rerunReason}</span>
-      <button className="button compact" disabled={busy || isStale} onClick={rerun}>重跑原查询并重建画布</button>
+      {rerun && <button className="button compact" disabled={busy || isStale} onClick={rerun}>{page.csr_generation ? '用当前 CSR 重建画布' : '重跑原查询并重建画布'}</button>}
     </div>}
     {!!continuations.length && <div className="explorer-notice">
       <button className="button compact" disabled={!!pending || !!original || busy} onClick={() => void loadQueryGraph()}>
@@ -694,14 +699,14 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
             setSelected(undefined);
             detailsInvoker.current?.focus();
           }}><X size={17} /></button></div>
-        <dl><div><dt>{item.transient ? '临时标识' : '业务键'}</dt><dd><code>{JSON.stringify(item.key)}</code></dd></div>
+        <dl><div><dt>{item.transient ? page.csr_generation ? '快照标识' : '临时标识' : '业务键'}</dt><dd><code>{JSON.stringify(item.key)}</code></dd></div>
           {Object.entries(item.properties ?? {}).map(([name, value]) => <div key={name}><dt>{name}</dt><dd><code>{value ?? 'null'}</code></dd></div>)}
         </dl>
         {item.property_preview && <p className="muted small">部分属性已截断。</p>}
         {item.properties && !Object.keys(item.properties).length && <p className="muted small">此元素没有已映射的属性。</p>}
         {pending?.id === item.id && !pending.neighbors && <p role="status" className="muted small">正在读取属性…</p>}
-        {item.transient && !item.properties && <p className="muted small">此边没有业务键。返回该边可在查询结果中查看属性。</p>}
-        {(!item.properties || item.property_preview) && !item.transient && !pending && !isStale && !rerunReason && <button className="button compact" disabled={busy} onClick={() => void explore(item)}>读取属性</button>}
+        {item.transient && !page.csr_generation && !item.properties && <p className="muted small">此边没有业务键。返回该边可在查询结果中查看属性。</p>}
+        {(!item.properties || item.property_preview) && (!item.transient || !!page.csr_generation) && !pending && !isStale && !rerunReason && <button className="button compact" disabled={busy} onClick={() => void explore(item)}>读取属性</button>}
         {item.kind === 'node' && <NeighborControls key={item.id} label={item.label} schema={schema}
           activeFilter={expansion?.id === item.id ? expansion.filter : undefined}
           next={expansion?.id === item.id ? expansion.held ? 'pending' : expansion.cursor ? 'more' : 'done' : undefined}

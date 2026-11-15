@@ -46,7 +46,7 @@ pub(super) async fn browse(
     Json(request): Json<Request>,
 ) -> ApiResult<Json<Listing>> {
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let path = app.models.lock().unwrap().path(&id)?;
+    let path = app.models.lock().unwrap().source_path(&id)?;
     if request.yaml.len() > super::CATALOG_LIMIT {
         return Err(Error::invalid("catalog_limit", "YAML 文件超过 1 MiB"));
     }

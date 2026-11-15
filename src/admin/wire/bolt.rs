@@ -44,7 +44,7 @@ struct Backend {
 }
 
 struct Session {
-    principal: Option<Principal>,
+    credential: Option<super::super::access::Credential>,
     model: String,
     transaction: Option<Arc<Transaction>>,
 }
@@ -59,11 +59,24 @@ struct Transaction {
 }
 
 impl Session {
-    fn target(&self) -> Result<Target, BoltError> {
-        let principal = self
-            .principal
-            .clone()
+    fn target(&self, app: &App) -> Result<Target, BoltError> {
+        let credential = self
+            .credential
+            .as_ref()
             .ok_or_else(|| BoltError::Authentication("Missing authentication".into()))?;
+        if app.shutdown.is_cancelled()
+            || app
+                .ha
+                .as_ref()
+                .is_some_and(|ha| ha.recovery_pending() || !ha.leader.eligible())
+            || !app.access.refresh()
+            || credential.live.has_changed().is_err()
+        {
+            return Err(BoltError::Authentication(
+                "Driver credentials revoked".into(),
+            ));
+        }
+        let principal = credential.principal.clone();
         Ok(Target {
             principal,
             model: self.model.clone(),
@@ -101,11 +114,26 @@ fn mode(extra: &BoltDict) -> Result<(), BoltError> {
 
 #[async_trait::async_trait]
 impl AuthValidator for Backend {
+    async fn session_allowed(&self) -> bool {
+        match &self.app.ha {
+            Some(ha) => !ha.recovery_pending() && ha.leader.confirm().await.is_ok(),
+            None => !self.app.shutdown.is_cancelled(),
+        }
+    }
+
+    fn refresh_credentials(&self) {
+        self.app.access.refresh();
+    }
+
     async fn validate(&self, input: &AuthCredentials) -> Result<AuthInfo, BoltError> {
+        if let Some(ha) = &self.app.ha {
+            ha.leader.confirm().await.map_err(query_error)?;
+        }
         let name = input.principal.as_deref().unwrap_or_default();
-        let principal = (input.scheme == "basic")
+        let credential = (input.scheme == "basic")
             .then(|| {
-                self.app.access.authenticate(
+                super::super::access::authenticate(
+                    &self.app,
                     name,
                     input.credentials.as_deref().unwrap_or_default(),
                     false,
@@ -113,20 +141,21 @@ impl AuthValidator for Backend {
             })
             .flatten();
         self.app.access.record(
-            principal.as_ref(),
+            credential.as_ref().map(|credential| &credential.principal),
             "bolt",
             "login",
             None,
-            if principal.is_some() { "ok" } else { "error" },
-            if principal.is_some() { 200 } else { 401 },
+            if credential.is_some() { "ok" } else { "error" },
+            if credential.is_some() { 200 } else { 401 },
         );
-        if principal.is_none() {
-            return Err(BoltError::Authentication(
-                "Invalid driver credentials".into(),
-            ));
-        }
+        let credential = credential
+            .ok_or_else(|| BoltError::Authentication("Invalid driver credentials".into()))?;
         Ok(AuthInfo {
-            principal: name.into(),
+            // The Bolt backend receives this identity out of band. Include the
+            // authenticated grant version so LOGON can never pick up a newer grant.
+            principal: serde_json::to_string(&credential.principal)
+                .expect("serializable principal"),
+            credential: Some(credential.live),
             ..Default::default()
         })
     }
@@ -139,7 +168,7 @@ impl BoltBackend for Backend {
         self.sessions.lock().unwrap().insert(
             handle.clone(),
             Session {
-                principal: None,
+                credential: None,
                 model: self
                     .app
                     .wire
@@ -160,20 +189,30 @@ impl BoltBackend for Backend {
     ) -> Result<(), BoltError> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(handle).ok_or_else(closed)?;
-        let principal = Principal::Service(auth.principal);
+        let live = auth
+            .credential
+            .ok_or_else(|| BoltError::Authentication("Missing authentication".into()))?;
+        let principal = serde_json::from_str(&auth.principal)
+            .map_err(|_| BoltError::Authentication("Invalid authenticated identity".into()))?;
         session.model = self.default_model(Some(&principal));
-        session.principal = Some(principal);
+        session.credential = Some(super::super::access::Credential { principal, live });
         Ok(())
     }
 
     async fn close_session(&self, handle: &SessionHandle) -> Result<(), BoltError> {
         let session = self.sessions.lock().unwrap().remove(handle);
         if let Some(session) = session
-            && session.transaction.is_some()
+            && let Some(transaction) = session.transaction
+            && let Some(credential) = session.credential
         {
-            session
-                .target()?
-                .audit(&self.app, "rollback", "abandoned", 499);
+            self.app.access.record(
+                Some(&credential.principal),
+                "bolt",
+                "rollback",
+                Some(&transaction.model),
+                "abandoned",
+                499,
+            );
         }
         Ok(())
     }
@@ -186,7 +225,7 @@ impl BoltBackend for Backend {
         let SessionProperty::Database(model) = property;
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(handle).ok_or_else(closed)?;
-        let target = session.target()?;
+        let target = session.target(&self.app)?;
         if session
             .transaction
             .as_ref()
@@ -194,7 +233,7 @@ impl BoltBackend for Backend {
         {
             return Err(transaction_error());
         }
-        if !self.app.access.permits(&target.principal, &model) {
+        if !super::super::access::query_allowed(&self.app, &target.principal, &model) {
             self.app.access.record(
                 Some(&target.principal),
                 "bolt",
@@ -213,7 +252,12 @@ impl BoltBackend for Backend {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(handle).ok_or_else(closed)?;
         session.transaction = None;
-        session.model = self.default_model(session.principal.as_ref());
+        session.model = self.default_model(
+            session
+                .credential
+                .as_ref()
+                .map(|credential| &credential.principal),
+        );
         Ok(())
     }
 
@@ -238,7 +282,7 @@ impl BoltBackend for Backend {
                         .ok_or_else(transaction_error)?,
                 ),
             };
-            (session.target()?, transaction)
+            (session.target(&self.app)?, transaction)
         };
         mode(extra)?;
         if extra.contains_key("imp_user") {
@@ -290,7 +334,7 @@ impl BoltBackend for Backend {
                 .min(self.app.options.timeout);
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(handle).ok_or_else(closed)?;
-        let target = session.target()?;
+        let target = session.target(&self.app)?;
         let (revision, engine) = target
             .engine(&self.app)
             .inspect_err(|error| target.audit(&self.app, "begin", "error", error.status.as_u16()))
@@ -338,7 +382,9 @@ impl Backend {
     fn default_model(&self, principal: Option<&Principal>) -> String {
         let configured = &self.app.wire.as_ref().expect("Bolt configured").model;
         principal
-            .and_then(|principal| self.app.access.default_model(principal, configured))
+            .and_then(|principal| {
+                super::super::access::default_model(&self.app, principal, configured)
+            })
             .unwrap_or_else(|| configured.clone())
     }
 
@@ -355,7 +401,7 @@ impl Backend {
             .take()
             .filter(|tx| &tx.handle == transaction)
             .ok_or_else(transaction_error)?;
-        let target = session.target()?;
+        let target = session.target(&self.app)?;
         if commit && Instant::now() >= tx.deadline {
             target.audit(&self.app, "commit", "error", 504);
             return Err(query_error(Error::new(

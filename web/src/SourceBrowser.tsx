@@ -20,6 +20,8 @@ export function SourceBrowser({ id, yaml, model, current, fixedSource, close, ch
   const [source, setSource] = useState(fixedSource ?? names.find(name => current?.startsWith(name + '.')) ?? names[0] ?? '');
   const kind = model.sources[source]?.type;
   const namespaced = hasNamespace(kind);
+  const namespaceLabel = kind === 'iceberg' ? '命名空间' : kind === 'bigquery' ? '项目与数据集' : '模式';
+  const manualNamespace = ['snowflake', 'bigquery', 'sap_hana'].includes(String(kind));
   const initial = current?.startsWith(source + '.') ? current.slice(source.length + 1) : '';
   const [initialSchema, initialTable] = splitTable(kind, initial);
   const [schema, setSchema] = useState(initialSchema);
@@ -87,36 +89,42 @@ export function SourceBrowser({ id, yaml, model, current, fixedSource, close, ch
 
   return <Modal title="浏览来源表与字段" close={close}>
     <div className="dialog-form source-browser">
-      <label>数据源<select value={source} disabled={!!fixedSource} onChange={event => {
+      {fixedSource ? <p className="source-browser-context"><strong>{fixedSource}</strong><span>{sourceLabel(kind)}</span></p>
+        : <label>数据源<select value={source} onChange={event => {
         setSource(event.target.value); setCatalog(''); setSchema(''); changeTable(''); setTypedTable(''); setTypedSchema(''); setSchemas([]); setTables([]); setErrors({}); setLimits({}); setLoadingSchemas(false); setLoadingTables(false);
       }}><option value="">选择数据源</option>
         {names.map(name => <option key={name} value={name}>{name} · {sourceLabel(model.sources[name].type)}</option>)}
-      </select></label>
+      </select></label>}
       {kind === 'trino' && <label>目录<select value={catalog} aria-busy={loadingSchemas} onChange={event => {
         setCatalog(event.target.value); setSchema(''); changeTable(''); setTables([]); setTrinoSchemas([]); setLoadingTables(false);
       }}><option value="">{loadingSchemas ? '正在读取目录…' : '选择目录'}</option>{options(schemas, catalog)}</select></label>}
-      {source && namespaced && (kind !== 'trino' || catalog) && <label>模式<select value={schema} onChange={event => {
+      {source && namespaced && (kind !== 'trino' || catalog) && <label>{namespaceLabel}<select value={schema} onChange={event => {
         setSchema(event.target.value); changeTable(''); setTables([]); setLoadingTables(false); setErrors(old => ({ ...old, tables: '', columns: '' }));
-      }} aria-busy={kind === 'trino' ? loadingTables && !schema : loadingSchemas}><option value="">{(kind === 'trino' ? loadingTables && !schema : loadingSchemas) ? '正在读取模式…' : '选择模式'}</option>{options(kind === 'trino' ? trinoSchemas : schemas, schema)}</select></label>}
+      }} aria-busy={kind === 'trino' ? loadingTables && !schema : loadingSchemas}><option value="">{(kind === 'trino' ? loadingTables && !schema : loadingSchemas) ? '正在读取' + namespaceLabel + '…' : '选择' + namespaceLabel}</option>{options(kind === 'trino' ? trinoSchemas : schemas, schema)}</select></label>}
       {source && (!namespaced || schema) && <label>来源表<select value={table} aria-busy={loadingTables} onChange={event => changeTable(event.target.value)}>
         <option value="">{loadingTables ? '正在读取来源表…' : '选择来源表'}</option>{options(tables, table)}
       </select></label>}
-      {['snowflake', 'bigquery', 'sap_hana'].includes(String(kind)) && <form className="mapping-source" onSubmit={event => {
-        event.preventDefault(); setSchema(typedSchema.trim()); changeTable(''); setTables([]);
-      }}><label>限定模式<input value={typedSchema} onChange={event => setTypedSchema(event.target.value)} placeholder="database.schema" /></label>
-        <button className="button" disabled={!typedSchema.trim()}>列出表</button></form>}
-      {source && <form className="mapping-source" onSubmit={event => {
-        event.preventDefault();
-        const name = typedTable.trim();
-        if (!name) return;
-        if (namespaced) {
-          const [namespace, table] = splitTable(kind, name);
-          if (!namespace || !table) { setErrors(old => ({ ...old, columns: '请输入完整限定表名。' })); return; }
-          if (kind === 'trino') setCatalog(namespace.split('.')[0]);
-          setSchema(namespace); changeTable(table, true);
-        } else changeTable(name, true);
-      }}><label>手动输入表名<input value={typedTable} onChange={event => setTypedTable(event.target.value)} placeholder={namespaced ? 'schema.table' : '表名'} /></label>
-        <button className="button" disabled={!typedTable.trim()}>读取字段</button></form>}
+      {source && <details className="form-disclosure">
+        <summary>手动查找</summary>
+        <div className="form-fields">
+          {manualNamespace && <form className="mapping-source" onSubmit={event => {
+            event.preventDefault(); setSchema(typedSchema.trim()); changeTable(''); setTables([]);
+          }}><label>限定模式<input value={typedSchema} onChange={event => setTypedSchema(event.target.value)} placeholder="database.schema" /></label>
+            <button className="button" disabled={!typedSchema.trim()}>列出表</button></form>}
+          <form className="mapping-source" onSubmit={event => {
+            event.preventDefault();
+            const name = typedTable.trim();
+            if (!name) return;
+            if (namespaced) {
+              const [namespace, table] = splitTable(kind, name);
+              if (!namespace || !table) { setErrors(old => ({ ...old, columns: '请输入完整限定表名。' })); return; }
+              if (kind === 'trino') setCatalog(namespace.split('.')[0]);
+              setSchema(namespace); changeTable(table, true);
+            } else changeTable(name, true);
+          }}><label>完整表名<input value={typedTable} onChange={event => setTypedTable(event.target.value)} placeholder={namespaced ? 'schema.table' : '表名'} /></label>
+            <button className="button" disabled={!typedTable.trim()}>读取字段</button></form>
+        </div>
+      </details>}
       {!names.length && <p className="muted small">添加数据源后即可浏览。</p>}
       {(limits.schemas || limits.tables) && <p className="muted small">此列表最多显示 2000 项；其他表可手动输入。</p>}
       {Object.entries(errors).filter(([, error]) => error).map(([key, error]) => <p key={key} className="inline-error" role="alert">{error}</p>)}

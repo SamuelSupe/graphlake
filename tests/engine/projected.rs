@@ -1001,6 +1001,102 @@ nodes:
 }
 
 #[tokio::test]
+async fn cypher_calls_inside_row_subqueries_keep_their_input_scope() -> Result<()> {
+    let (_dir, engine, _) = fixture()?;
+    for (query, expected) in [
+        (
+            "MATCH (a:Account) RETURN a.id AS id, EXISTS { WITH 1 AS k CALL (a,k) { MATCH (a)-[:Transfer]->(b) RETURN b.id AS dst ORDER BY dst SKIP 1 LIMIT 1 } WITH dst WHERE dst > a.id+k-1 } AS hit ORDER BY id",
+            vec![
+                json!({"id":1,"hit":true}),
+                json!({"id":2,"hit":true}),
+                json!({"id":3,"hit":false}),
+            ],
+        ),
+        (
+            "UNWIND [1,1,2,3] AS id MATCH (a:Account) WHERE a.id=id RETURN id, COUNT { CALL (a) { MATCH (a)-[:Transfer]->(b) CALL (b) { WITH 0 AS unused RETURN b.id AS dst } RETURN dst ORDER BY dst SKIP 1 LIMIT 1 } RETURN dst } AS n ORDER BY id",
+            vec![
+                json!({"id":1,"n":1}),
+                json!({"id":1,"n":1}),
+                json!({"id":2,"n":1}),
+                json!({"id":3,"n":0}),
+            ],
+        ),
+        (
+            "MATCH (a:Account) RETURN a.id AS id, COUNT { CALL { WITH a MATCH (a)-[:Transfer]->(b) WITH count(DISTINCT b) AS total RETURN total } WITH total WHERE total=0 } AS empty, COUNT { CALL (a) { MATCH (a)-[:Transfer]->(b) RETURN DISTINCT b.id AS dst } RETURN dst } AS unique ORDER BY id",
+            vec![
+                json!({"id":1,"empty":0,"unique":2}),
+                json!({"id":2,"empty":0,"unique":2}),
+                json!({"id":3,"empty":1,"unique":0}),
+            ],
+        ),
+        (
+            "RETURN [x IN [0,1,1,2] | COUNT { CALL (x) { UNWIND [1,2] AS y WITH y WHERE y<=x RETURN y } RETURN y }] AS sizes, EXISTS { CALL () { RETURN 1 AS y LIMIT 0 } } AS empty",
+            vec![json!({"sizes":[0,1,1,2],"empty":false})],
+        ),
+        (
+            "RETURN [x IN [1,1.0,2] | COUNT { CALL (x) { RETURN x/2 AS y } WITH y WHERE y=0.5 }] AS sizes",
+            vec![json!({"sizes":[0,1,0]})],
+        ),
+        (
+            "MATCH (a:Account) RETURN a.id AS id, [x IN [a,a] | COUNT { CALL (x) { MATCH (x)-[:Transfer]->(b) RETURN b.id AS dst ORDER BY dst LIMIT 2 } RETURN dst }] AS sizes ORDER BY id",
+            vec![
+                json!({"id":1,"sizes":[2,2]}),
+                json!({"id":2,"sizes":[2,2]}),
+                json!({"id":3,"sizes":[0,0]}),
+            ],
+        ),
+        (
+            "UNWIND [1,2] AS x RETURN x, EXISTS { WITH x AS k WHERE EXISTS { CALL (k) { RETURN k AS y } WITH y WHERE y=1 } RETURN k } AS hit ORDER BY x",
+            vec![json!({"x":1,"hit":true}), json!({"x":2,"hit":false})],
+        ),
+        (
+            "MATCH (a:Account) WITH a, 2 AS k RETURN a.id AS id, EXISTS { MATCH (a)-[:Transfer]->(b) WHERE EXISTS { CALL (k,b) { RETURN b.id AS dst } WITH dst WHERE dst=k } } AS hit ORDER BY id",
+            vec![
+                json!({"id":1,"hit":true}),
+                json!({"id":2,"hit":false}),
+                json!({"id":3,"hit":false}),
+            ],
+        ),
+        (
+            "WITH 3 AS x RETURN COUNT { CALL (x) { RETURN x AS y LIMIT 0 } WITH count(*) AS total WHERE total=0 RETURN total } AS n",
+            vec![json!({"n":1})],
+        ),
+    ] {
+        let mut result = engine
+            .query(
+                Language::Cypher,
+                query,
+                QueryOptions {
+                    memory_bytes: 16 * 1024 * 1024,
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| query.to_owned())?;
+        assert_eq!(
+            rows(&mut result).await.with_context(|| query.to_owned())?,
+            expected,
+            "{query}"
+        );
+    }
+
+    for query in [
+        "WITH 1 AS x RETURN COUNT { CALL () { RETURN x AS leaked } } AS n",
+        "WITH 1 AS x RETURN EXISTS { CALL (x) { RETURN 2 AS x } } AS hit",
+        "WITH 1 AS x RETURN COUNT { CALL (missing) { RETURN 1 AS y } } AS n",
+    ] {
+        assert!(
+            engine
+                .query(Language::Cypher, query, Default::default())
+                .await
+                .is_err(),
+            "{query}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn cypher_lists_exists_and_polymorphic_fields_preserve_semantics() -> Result<()> {
     let (_dir, engine, _) = fixture()?;
     for (query, expected) in [
@@ -1039,6 +1135,46 @@ async fn cypher_lists_exists_and_polymorphic_fields_preserve_semantics() -> Resu
                 json!({"id":2,"owns":true}),
                 json!({"id":3,"owns":true}),
             ],
+        ),
+        (
+            "MATCH (a:Account) RETURN a.id AS id, EXISTS { MATCH (a)-[:Transfer]->(b:Account) WITH b ORDER BY b.id SKIP 1 LIMIT 1 WHERE a.id < b.id } AS hit, COUNT { (a)-[:Transfer]->(:Account) } AS hits ORDER BY id",
+            vec![
+                json!({"id":1,"hit":true,"hits":3}),
+                json!({"id":2,"hit":false,"hits":2}),
+                json!({"id":3,"hit":false,"hits":0}),
+            ],
+        ),
+        (
+            "MATCH (a:Account) RETURN a.id AS id, COUNT { MATCH (a)-[:Owns]->() WITH count(*) AS hits WHERE hits = 0 RETURN hits } AS empty, COUNT { MATCH (a)-[:Owns]->() RETURN 1 AS x UNION ALL RETURN 1 AS x } AS either ORDER BY id",
+            vec![
+                json!({"id":1,"empty":1,"either":1}),
+                json!({"id":2,"empty":0,"either":2}),
+                json!({"id":3,"empty":0,"either":2}),
+            ],
+        ),
+        (
+            "MATCH (a:Account) WITH a, [(a)-[:Owns]->(d:Device) | d] AS owners RETURN a.id AS id, [d IN owners | id(d)] AS owners ORDER BY id",
+            vec![
+                json!({"id":1,"owners":[]}),
+                json!({"id":2,"owners":["Device[1]"]}),
+                json!({"id":3,"owners":["Device[1]"]}),
+            ],
+        ),
+        (
+            "RETURN COUNT { UNWIND [0,1,2] AS x WITH x LIMIT 1 RETURN x } AS rows, [(a:Account {id:99})-[:Owns]->(d:Device) | d.id] AS missing, 'COUNT { }' AS text",
+            vec![json!({"rows":1,"missing":[],"text":"COUNT { }"})],
+        ),
+        (
+            "RETURN EXISTS { WITH 1 AS x WHERE x=1 RETURN x } AS hit, EXISTS { WITH 1 AS x WHERE x=0 RETURN x } AS miss, COUNT { RETURN 9 }, {n:COUNT {RETURN null}} AS m",
+            vec![json!({"hit":true,"miss":false,"COUNT { RETURN 9 }":1,"m":{"n":1}})],
+        ),
+        (
+            "RETURN [x IN [0,1,1,2] | COUNT { UNWIND [1,2] AS y WITH y WHERE y <= x RETURN y }] AS counts, [x IN [0,1,2] | EXISTS { WITH x AS k WHERE k = 1 RETURN k }] AS hits",
+            vec![json!({"counts":[0,1,1,2],"hits":[false,true,false]})],
+        ),
+        (
+            "MATCH (a:Account {id:2}) WITH [p = (a)-[:Owns]->(d:Device) | p] AS paths UNWIND paths AS p RETURN length(p) AS hops",
+            vec![json!({"hops":1})],
         ),
         (
             "MATCH (a:Account) OPTIONAL MATCH (a)-[r:Transfer]->(b) WHERE EXISTS { MATCH (b)-[:Owns]->() } RETURN a.id AS id, count(r) AS edges ORDER BY id",

@@ -50,6 +50,9 @@ pub(crate) enum Mode {
         sequence: String,
     },
     Batch(Batch),
+    Relation {
+        expanded: Option<(String, String)>,
+    },
 }
 
 pub(crate) async fn pin_tables(
@@ -90,6 +93,7 @@ impl Apply {
         match &self.mode {
             Mode::Row { sequence, .. } => std::slice::from_ref(sequence),
             Mode::Batch(batch) => &batch.order,
+            Mode::Relation { .. } => &[],
         }
     }
 
@@ -105,6 +109,11 @@ impl Apply {
                 !catalog.nodes.contains_key(name) && !catalog.edges.contains_key(name),
                 "graph label collides with internal CALL name"
             );
+        }
+        if let Mode::Relation { expanded } = &self.mode {
+            return self
+                .register_relation(catalog, context, scope, expanded.as_ref(), explain_only)
+                .await;
         }
         let outer = graph_frame(context, &self.outer).await?;
         let outer_schema = Arc::clone(outer.schema().inner());
@@ -130,6 +139,7 @@ impl Apply {
         self.remove_nested(context)?;
         let schema = match &self.mode {
             Mode::Batch(_) => Arc::clone(inner.schema().inner()),
+            Mode::Relation { .. } => unreachable!("expression relation registered separately"),
             Mode::Row { sequence, .. } => {
                 let fields = outer_schema
                     .fields()
@@ -309,6 +319,64 @@ impl Apply {
         };
         context.register_table(output, provider)?;
         Ok(budget)
+    }
+
+    async fn register_relation(
+        &self,
+        catalog: &Catalog,
+        context: &SessionContext,
+        scope: &QueryScope,
+        expanded: Option<&(String, String)>,
+        explain_only: bool,
+    ) -> Result<MemoryReservation> {
+        use datafusion::physical_plan::execute_stream;
+
+        async fn materialize(
+            context: &SessionContext,
+            scope: &QueryScope,
+            name: &str,
+            sql: &str,
+            explain_only: bool,
+        ) -> Result<MemoryReservation> {
+            let frame = graph_frame(context, sql).await?;
+            let schema = Arc::clone(frame.schema().inner());
+            let mut buffer = Buffer::new(
+                &scope.runtime.memory_pool,
+                Some(&scope.runtime.disk_manager),
+            );
+            let (table, budget) = if explain_only {
+                buffer.finish_schema(schema)?
+            } else {
+                let task = Arc::new(frame.task_ctx());
+                let physical = frame.create_physical_plan().await?;
+                let mut stream = execute_stream(Arc::clone(&physical), task)?;
+                while let Some(batch) = stream.try_next().await? {
+                    scope.check()?;
+                    buffer.push(batch)?;
+                }
+                scope.record_spill(physical.as_ref());
+                buffer.finish(schema, &scope.reads)?
+            };
+            context.register_table(TableReference::bare(name), table)?;
+            Ok(budget)
+        }
+
+        let _seed = materialize(context, scope, &self.seed, &self.outer, explain_only).await?;
+        let _expanded = if let Some((name, sql)) = expanded {
+            Some(materialize(context, scope, name, sql, explain_only).await?)
+        } else {
+            None
+        };
+        let _nested = self
+            .prepare_inner(catalog, context, scope, explain_only, false)
+            .await?;
+        let result = materialize(context, scope, &self.table, &self.inner, explain_only).await?;
+        self.remove_nested(context)?;
+        if let Some((name, _)) = expanded {
+            context.deregister_table(TableReference::bare(name.as_str()))?;
+        }
+        context.deregister_table(TableReference::bare(self.seed.as_str()))?;
+        Ok(result)
     }
 
     async fn prepare_inner(

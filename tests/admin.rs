@@ -13,7 +13,9 @@ use anyhow::{Context, Result, ensure};
 use argon2::{Argon2, Params, PasswordHasher, password_hash::SaltString};
 #[cfg(unix)]
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use graphlake::arrow::array::{Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use graphlake::arrow::array::{
+    Decimal128Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use parquet::arrow::ArrowWriter;
 use reqwest::{Client, Method, Response, StatusCode};
 use serde_json::{Value, json};
@@ -31,6 +33,10 @@ const PASSWORD: &str = "graphlake-test-password";
 
 impl Server {
     fn start(root: &Path, dsn: &str, port: u16) -> Result<Self> {
+        Self::start_with(root, dsn, port, &[])
+    }
+
+    fn start_with(root: &Path, dsn: &str, port: u16, extra: &[&str]) -> Result<Self> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_graphlake-admin"))
             .arg("--port")
             .arg(port.to_string())
@@ -38,6 +44,8 @@ impl Server {
             .arg(root)
             .arg("--assets-dir")
             .arg(root.join("assets"))
+            .args(extra)
+            .env("GRAPHLAKE_CLUSTER_TEST_TOKEN", PASSWORD.repeat(2))
             .env("GRAPHLAKE_ADMIN_TEST_PG_DSN", dsn)
             .env(
                 "GRAPHLAKE_ADMIN_OFFLINE",
@@ -46,7 +54,10 @@ impl Server {
             .stderr(Stdio::piped())
             .spawn()?;
         let mut message = String::new();
-        BufReader::new(child.stderr.take().unwrap()).read_line(&mut message)?;
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        while stderr.read_line(&mut message)? > 0 && message.starts_with("GraphLake model ") {
+            message.clear();
+        }
         let Some(base) = message.trim().strip_prefix("GraphLake admin ") else {
             let _ = child.kill();
             let _ = child.wait();
@@ -141,12 +152,564 @@ impl Server {
     }
 }
 
+#[tokio::test]
+async fn roles_scope_management_and_revoke_existing_sessions() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let yaml = r#"
+graph: Payments
+sources:
+  src:
+    type: parquet
+    tables: { rows: [./rows.parquet] }
+nodes:
+  Account: { source: src.rows, key: [id] }
+"#;
+    fs::write(root.path().join("payments.yaml"), yaml)?;
+    fs::write(root.path().join("private.yaml"), yaml)?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let user = server
+        .request(Method::PUT, "users/analyst")
+        .json(&json!({"password": PASSWORD, "disabled": false}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert!(user.get("password_hash").is_none());
+    let group = server
+        .request(Method::PUT, "roles/payments-operator")
+        .json(&json!({"members":["analyst"], "grants":{"payments":["query"]}}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    server
+        .request(Method::PUT, "roles/payments-editor")
+        .json(&json!({"members":["analyst"], "grants":{"payments":["modeler"]}}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let token = "graphlake-role-member-service-token";
+    let service = server
+        .request(Method::PUT, "users/automated")
+        .json(&json!({"service": true, "token": token, "disabled": false}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(service["service"], true);
+    assert!(service.get("token_sha256").is_none());
+    server
+        .request(Method::PUT, "roles/automated-readers")
+        .json(&json!({"members":["automated"], "grants":{"payments":["query"]}}))
+        .send()
+        .await?
+        .error_for_status()?;
+    for (method, path, status) in [
+        (Method::GET, "models", StatusCode::OK),
+        (
+            Method::POST,
+            "models/payments/export",
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Method::HEAD,
+            "models/private/schema/revision",
+            StatusCode::FORBIDDEN,
+        ),
+        (Method::GET, "users", StatusCode::FORBIDDEN),
+        (Method::GET, "settings", StatusCode::FORBIDDEN),
+        (Method::PUT, "settings", StatusCode::FORBIDDEN),
+    ] {
+        assert_eq!(
+            server
+                .guest(method, path)
+                .basic_auth("svc/automated", Some(token))
+                .send()
+                .await?
+                .status(),
+            status,
+            "{path}"
+        );
+    }
+    let accounts = server
+        .request(Method::GET, "users")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<Value>>()
+        .await?;
+    let current = accounts
+        .iter()
+        .find(|entry| entry["username"] == "automated")
+        .context("service member missing after role assignment")?;
+    server
+        .request(Method::PUT, "users/automated")
+        .json(&json!({"version": current["version"], "service": true, "disabled": true}))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        server
+            .guest(Method::GET, "models")
+            .basic_auth("svc/automated", Some(token))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let member_login = || async {
+        let response = server
+            .guest(Method::POST, "auth/login")
+            .json(&json!({"username":"analyst", "password":PASSWORD}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let cookie = response.headers()["Set-Cookie"]
+            .to_str()?
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let status = response.json::<Value>().await?;
+        assert_eq!(status["administrator"], false);
+        assert_eq!(status["username"], "analyst");
+        anyhow::Ok(cookie)
+    };
+    let first_cookie = member_login().await?;
+    for _ in 0..5 {
+        member_login().await?;
+    }
+    assert_eq!(
+        server
+            .guest(Method::GET, "models")
+            .header("Cookie", first_cookie)
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        server.request(Method::GET, "models").send().await?.status(),
+        StatusCode::OK
+    );
+    let cookie = member_login().await?;
+    let member = |method, path| server.guest(method, path).header("Cookie", &cookie);
+    let grants = member(Method::GET, "my-roles")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(grants, json!({"payments":["query", "modeler"]}));
+    let models = member(Method::GET, "models")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(models.as_array().unwrap().len(), 1);
+    assert_eq!(models[0]["id"], "payments");
+    for (method, path) in [
+        (Method::GET, "users"),
+        (Method::HEAD, "models/private"),
+        (Method::POST, "models/payments/publish"),
+        (Method::GET, "roles"),
+    ] {
+        assert_eq!(
+            member(method, path).send().await?.status(),
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+    }
+    for (method, path) in [
+        (Method::POST, "models/payments/export"),
+        (
+            Method::HEAD,
+            "models/payments/results/00000000-0000-0000-0000-000000000000",
+        ),
+    ] {
+        assert_eq!(
+            member(method, path).send().await?.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let model = member(Method::GET, "models/payments")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let etag = format!("\"{}\"", model["revision"].as_str().unwrap());
+    let save = |yaml: String| {
+        member(Method::PUT, "models/payments")
+            .header("If-Match", &etag)
+            .json(&json!({"yaml":yaml}))
+    };
+    let escaped_source = save(yaml.replace("./rows.parquet", "/etc/passwd"))
+        .send()
+        .await?;
+    assert_eq!(escaped_source.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        escaped_source.json::<Value>().await?["code"],
+        "source_scope"
+    );
+    save(yaml.replace("graph: Payments", "graph: Edited"))
+        .send()
+        .await?
+        .error_for_status()?;
+    server
+        .request(Method::DELETE, "roles/payments-operator")
+        .json(&group["version"])
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        member(Method::GET, "models").send().await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let cookie = member_login().await?;
+    let grants = server
+        .guest(Method::GET, "my-roles")
+        .header("Cookie", &cookie)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(grants, json!({"payments":["modeler"]}));
+    for _ in 0..5 {
+        assert_eq!(
+            server
+                .guest(Method::POST, "auth/login")
+                .json(&json!({"username":"analyst","password":"incorrect test password"}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        server
+            .guest(Method::POST, "auth/login")
+            .json(&json!({"username":"analyst","password":PASSWORD}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        server
+            .guest(Method::POST, "auth/login")
+            .json(&json!({"username":"admin","password":PASSWORD}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let audit = fs::read_to_string(root.path().join(".graphlake-auth/audit.jsonl"))?;
+    assert!(
+        audit
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| event["subject"] == "analyst"
+                && event["action"] == "save_model"
+                && event["outcome"] == "ok")
+    );
+    Ok(())
+}
+
 fn setup_assets(root: &Path) -> Result<()> {
     fs::create_dir(root.join("assets"))?;
     fs::write(
         root.join("assets/index.html"),
         "<!doctype html><title>GraphLake</title>",
     )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn operational_settings_are_admin_only_versioned_and_applied_on_restart() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    assert_eq!(
+        server
+            .http
+            .get(format!("{}/settings", server.base))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    for method in [Method::GET, Method::HEAD, Method::PUT] {
+        assert_eq!(
+            server.guest(method, "settings").send().await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    server.login().await?;
+    let state: Value = server
+        .request(Method::GET, "settings")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(state["revision"], "unset");
+    assert_eq!(state["active"]["log_format"], "text");
+    let mut config = state["config"].clone();
+    config["enabled"] = json!(true);
+    config["endpoint"] = json!("http://127.0.0.1:1");
+    config["log_format"] = json!("json");
+    config["alerts"]["GraphLakeRequestFailures"] =
+        state["alerts"]["GraphLakeRequestFailures"].clone();
+    config["alerts"]["GraphLakeRequestFailures"]["threshold"] = json!(0.25);
+    config["alerts"]["GraphLakeRequestFailures"]["window_seconds"] = json!(240);
+    assert_eq!(
+        server
+            .request(Method::PUT, "settings")
+            .header("Origin", "https://foreign.example")
+            .json(&config)
+            .send()
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut unsafe_config = config.clone();
+    unsafe_config["headers_env"] = json!({"authorization":"GRAPHLAKE_CLUSTER_TEST_TOKEN"});
+    assert_eq!(
+        server
+            .request(Method::PUT, "settings")
+            .header("If-Match", "\"unset\"")
+            .json(&unsafe_config)
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let request = server
+        .request(Method::PUT, "settings")
+        .header("If-Match", "\"unset\"")
+        .json(&config);
+    let saved: Value = request
+        .try_clone()
+        .unwrap()
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(saved["active"]["enabled"], false);
+    assert_eq!(saved["restart_required"], true);
+    let yaml: Value = serde_saphyr::from_str(saved["rules_yaml"].as_str().unwrap())?;
+    assert!(
+        yaml["groups"][0]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                rule["alert"] == "GraphLakeRequestFailures"
+                    && rule["expr"]
+                        .as_str()
+                        .is_some_and(|expr| expr.contains("[240s]") && expr.ends_with("> 0.25"))
+            })
+    );
+    assert_eq!(
+        request.send().await?.status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    drop(server);
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let after: Value = server
+        .request(Method::GET, "settings")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(after["active"]["enabled"], true);
+    assert_eq!(after["active"]["log_format"], "json");
+    assert_eq!(after["restart_required"], false);
+    assert_eq!(after["rules_yaml"], saved["rules_yaml"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn telemetry_exports_three_signals_and_isolates_collector_failure() -> Result<()> {
+    use axum::{Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let behavior = Arc::new(AtomicU8::new(0));
+    let (sent, mut received) = tokio::sync::mpsc::channel(32);
+    let router = Router::new()
+        .route(
+            "/ingest/v1/{signal}",
+            post(
+                |State((sent, behavior)): State<(
+                    tokio::sync::mpsc::Sender<(String, Bytes)>,
+                    Arc<AtomicU8>,
+                )>,
+                 axum::extract::Path(signal): axum::extract::Path<String>,
+                 headers: HeaderMap,
+                 body: Bytes| async move {
+                    let expected_token = PASSWORD.repeat(2);
+                    if headers
+                        .get("content-type")
+                        .is_none_or(|v| v != "application/x-protobuf")
+                        || headers
+                            .get("x-test-token")
+                            .is_none_or(|v| v != expected_token.as_str())
+                    {
+                        return (StatusCode::UNAUTHORIZED, Bytes::new());
+                    }
+                    match behavior.load(Relaxed) {
+                        1 => (StatusCode::SERVICE_UNAVAILABLE, Bytes::new()),
+                        2 => (
+                            StatusCode::OK,
+                            Bytes::from_static(&[0x0a, 0x02, 0x08, 0x01]),
+                        ),
+                        _ => {
+                            let _ = sent.try_send((signal, body));
+                            (StatusCode::OK, Bytes::new())
+                        }
+                    }
+                },
+            ),
+        )
+        .with_state((sent, behavior.clone()));
+    let collector = tokio::spawn(async move { axum::serve(listener, router).await });
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    fs::write(
+        root.path().join("payments.yaml"),
+        include_str!("../examples/finance.yaml"),
+    )?;
+    let config = root.path().join(".telemetry.yaml");
+    fs::write(
+        &config,
+        format!(
+            "enabled: true\nendpoint: http://{address}/ingest\ntrace_sample_ratio: 1\nexport_interval_ms: 1000\ntimeout_ms: 200\nheaders_env:\n  x-test-token: GRAPHLAKE_CLUSTER_TEST_TOKEN\n"
+        ),
+    )?;
+    let mut server = Server::start_with(
+        root.path(),
+        "",
+        0,
+        &["--telemetry-config", config.to_str().unwrap()],
+    )?;
+    server.login().await?;
+    let query_marker = "graphlake-query-text-must-stay-local";
+    let response = server
+        .query(
+            Uuid::new_v4(),
+            "cypher",
+            &format!("RETURN '{query_marker}' AS x"),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let contains = |bytes: &[u8], value: &str| {
+        bytes
+            .windows(value.len())
+            .any(|chunk| chunk == value.as_bytes())
+    };
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let (mut metrics, mut logs, mut traces) = (false, false, false);
+        while !(metrics && logs && traces) {
+            let (signal, body) = received.recv().await.context("collector terminated")?;
+            assert!(!contains(&body, query_marker));
+            assert!(!contains(&body, PASSWORD));
+            match signal.as_str() {
+                "metrics" => metrics |= contains(&body, "graphlake.request.duration"),
+                "logs" => logs |= contains(&body, "graphlake.audit"),
+                "traces" => traces |= contains(&body, "query"),
+                _ => anyhow::bail!("unknown OTLP signal"),
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+
+    behavior.store(1, Relaxed);
+    let response = server
+        .query(Uuid::new_v4(), "cypher", "RETURN 42 AS n")
+        .await?;
+    assert_eq!(response.json::<Value>().await?["rows"], json!([["42"]]));
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let metrics = server.http.get(format!("{}/metrics", server.base)).send().await?.error_for_status()?.text().await?;
+            if metrics.lines().any(|line| line.strip_prefix("graphlake_otlp_export_failures_total{signal=\"metrics\"} ").is_some_and(|n| n != "0")) {
+                assert!(metrics.contains("graphlake_request_duration_seconds_bucket{protocol=\"http\",operation=\"query\""));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::Ok(())
+    }).await??;
+    let signal = |body: &str, name: &str| -> f64 {
+        body.lines()
+            .find_map(|line| {
+                line.strip_prefix(&format!("{name}{{signal=\"metrics\"}} "))
+                    .and_then(|x| x.parse().ok())
+            })
+            .unwrap()
+    };
+    let snapshot = || async {
+        server
+            .http
+            .get(format!("{}/metrics", server.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await
+    };
+    let before = signal(
+        &snapshot().await?,
+        "graphlake_otlp_last_success_timestamp_seconds",
+    );
+    assert!(before > 0.0);
+    behavior.store(2, Relaxed);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let metrics = snapshot().await?;
+            if signal(&metrics, "graphlake_otlp_last_rejected") > 0.0 {
+                assert!(signal(&metrics, "graphlake_otlp_rejected_total") > 0.0);
+                assert_eq!(
+                    signal(&metrics, "graphlake_otlp_last_success_timestamp_seconds"),
+                    before
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    behavior.store(0, Relaxed);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let metrics = snapshot().await?;
+            if signal(&metrics, "graphlake_otlp_last_success_timestamp_seconds") > before {
+                assert_eq!(signal(&metrics, "graphlake_otlp_last_rejected"), 0.0);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    collector.abort();
     Ok(())
 }
 
@@ -174,6 +737,79 @@ fn setup_credentials(root: &Path) -> Result<()> {
             .open(dir.join("password.phc"))?,
         "{hash}"
     )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn admin_https_proxy_uses_public_host_origin_and_secure_cookie() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    setup_assets(root)?;
+    setup_credentials(root)?;
+
+    let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = socket.local_addr()?.port();
+    drop(socket);
+    let public = "https://graphlake.example:8443";
+    let server = Server::start_with(root, "", port, &["--public-url", public])?;
+    let endpoint = format!("http://127.0.0.1:{port}/api/v1/auth");
+    let login = || {
+        server
+            .http
+            .post(format!("{endpoint}/login"))
+            .header("Host", "graphlake.example:8443")
+            .json(&json!({"username":"admin","password":PASSWORD}))
+    };
+    let denied = login()
+        .header("Origin", "http://graphlake.example:8443")
+        .header("X-Forwarded-Proto", "https")
+        .send()
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied = server
+        .http
+        .post(format!("{endpoint}/login"))
+        .header("X-Forwarded-Host", "graphlake.example:8443")
+        .header("Origin", public)
+        .send()
+        .await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let logged_in = login()
+        .header("Origin", public)
+        .send()
+        .await?
+        .error_for_status()?;
+    let set_cookie = logged_in.headers()["Set-Cookie"].to_str()?;
+    assert!(set_cookie.starts_with("graphlake_admin_8443="));
+    assert!(set_cookie.split("; ").any(|item| item == "Secure"));
+    let cookie = set_cookie.split_once(';').unwrap().0;
+    let logout = server
+        .http
+        .post(format!("{endpoint}/logout"))
+        .header("Host", "graphlake.example:8443")
+        .header("Origin", public)
+        .header("Cookie", cookie)
+        .send()
+        .await?;
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    assert!(
+        logout.headers()["Set-Cookie"]
+            .to_str()?
+            .split("; ")
+            .any(|item| item == "Secure")
+    );
+    let session = server
+        .http
+        .get(format!("{endpoint}/session"))
+        .header("Host", "graphlake.example:8443")
+        .header("Cookie", cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(session["authenticated"], false);
     Ok(())
 }
 
@@ -211,12 +847,58 @@ async fn admin_auth_gates_management_and_revokes_sessions() -> Result<()> {
             .request(method, format!("{}/api/v1/{path}", server.base))
             .basic_auth("analytics", Some(token))
     };
+    for method in [Method::GET, Method::HEAD] {
+        assert_eq!(
+            server
+                .guest(method.clone(), "backups/status")
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            account(method, "backups/status").send().await?.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
     let response = account(Method::GET, "models")
         .send()
         .await?
         .error_for_status()?;
     assert_eq!(response.json::<Value>().await?, json!([]));
     let dropped_in = include_str!("../examples/finance.yaml");
+    let next_token = "graphlake-rotated-service-test-token";
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(next_token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let replacement = tempfile::NamedTempFile::new_in(config.parent().unwrap())?;
+    fs::write(
+        replacement.path(),
+        json!({
+            "analytics":{"token_sha256": digest, "models":["payments"]}
+        })
+        .to_string(),
+    )?;
+    replacement.persist(&config)?;
+    assert_eq!(
+        account(Method::GET, "models").send().await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let rotated = server
+        .http
+        .get(format!("{}/api/v1/models", server.base))
+        .basic_auth("analytics", Some(next_token))
+        .send()
+        .await?;
+    assert_eq!(rotated.status(), StatusCode::OK);
+    // Keep checking the pre-existing access boundaries using the rotated credential.
+    let account = |method, path: &str| {
+        server
+            .http
+            .request(method, format!("{}/api/v1/{path}", server.base))
+            .basic_auth("analytics", Some(next_token))
+    };
     fs::write(root.join("payments.yaml"), dropped_in)?;
     let revision = URL_SAFE_NO_PAD.encode(<sha2::Sha256 as sha2::Digest>::digest(dropped_in));
     assert_eq!(
@@ -443,11 +1125,8 @@ async fn admin_auth_gates_management_and_revokes_sessions() -> Result<()> {
         StatusCode::UNAUTHORIZED
     );
 
-    for (username, password) in [("missing", PASSWORD), ("admin", "incorrect test password")]
-        .into_iter()
-        .cycle()
-        .take(5)
-    {
+    for _ in 0..5 {
+        let (username, password) = ("admin", "incorrect test password");
         let response = server
             .guest(Method::POST, "auth/login")
             .json(&json!({"username": username, "password": password}))
@@ -495,6 +1174,19 @@ fn payments_file(path: &Path, narrow_endpoint: bool, ids: &[i64]) -> Result<()> 
             Arc::new(Int64Array::from(vec![9_007_199_254_740_993; count])) as _,
         ),
         ("to_merchant_id", target),
+        (
+            "score",
+            Arc::new(Float64Array::from_iter_values(
+                ids.iter().map(|&id| if id == 8 { -0.0 } else { 1.5 }),
+            )) as _,
+        ),
+        (
+            "channel",
+            Arc::new(StringArray::from_iter_values(
+                ids.iter()
+                    .map(|&id| if id == 8 { "web-long-字符串" } else { "1" }),
+            )) as _,
+        ),
         (
             "amount",
             Arc::new(
@@ -1474,6 +2166,73 @@ edges: {}
         "path traversal was accepted"
     );
 
+    let probe_payload: Value = server
+        .request(Method::GET, "models/payments/readiness")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(probe_payload["model_revision"], rev1);
+    assert_eq!(probe_payload["sources"], json!({"ledger":true,"lake":true}));
+    let payment_file = root.path().join("payments.parquet");
+    let offline_file = root.path().join("payments.offline");
+    fs::rename(&payment_file, &offline_file)?;
+    fs::copy(root.path().join("wrong.parquet"), &payment_file)?;
+    let drift = server
+        .request(Method::GET, "models/payments/readiness")
+        .send()
+        .await?;
+    assert_eq!(drift.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let drift = drift.json::<Value>().await?;
+    assert_eq!(drift["status"], "mapping_invalid", "{drift}");
+    assert_eq!(drift["location"]["label"], "Payment", "{drift}");
+    fs::remove_file(&payment_file)?;
+    fs::rename(&offline_file, &payment_file)?;
+    fs::rename(&payment_file, &offline_file)?;
+    let offline_probe = server
+        .request(Method::GET, "models/payments/readiness")
+        .send()
+        .await?;
+    assert_eq!(offline_probe.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        offline_probe.json::<Value>().await?["sources"],
+        json!({"ledger":true,"lake":false})
+    );
+    fs::rename(&offline_file, &payment_file)?;
+    assert_eq!(
+        server
+            .request(Method::GET, "models/payments/readiness")
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    let raced = server
+        .request(Method::POST, "models/payments/unpublish")
+        .json(&json!({"active_revision": rev2}))
+        .send()
+        .await?;
+    assert_eq!(raced.status(), StatusCode::CONFLICT);
+    let offline: Value = server
+        .request(Method::POST, "models/payments/unpublish")
+        .json(&json!({"active_revision": rev1}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(offline["active_revision"].is_null());
+    assert_eq!(offline["yaml"], changed);
+    for operation in ["query", "export"] {
+        let rejected = server
+            .execute(operation, Uuid::new_v4(), "sql", "SELECT 1", &rev1, None)
+            .await?;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert_eq!(rejected.json::<Value>().await?["code"], "unpublished");
+    }
+
     drop(server);
     let mut restarted = Server::start(root.path(), &dsn, 0)?;
     restarted.login().await?;
@@ -1484,7 +2243,67 @@ edges: {}
         .json()
         .await?;
     assert_eq!(loaded["yaml"], changed);
-    assert_eq!(loaded["active_revision"], rev1);
+    assert!(loaded["active_revision"].is_null());
+    let archived: Value = restarted
+        .request(
+            Method::GET,
+            &format!("models/payments/history/{}", rev1.as_str().unwrap()),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(archived["yaml"], yaml);
+    let reactivated: Value = restarted
+        .request(Method::POST, "models/payments/rollback")
+        .json(&json!({"revision": rev1, "active_revision": null}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(reactivated["active_revision"], rev1);
+    let active_archive = root.path().join(format!(
+        ".graphlake-payments.{}.yaml",
+        rev1.as_str().unwrap()
+    ));
+    fs::write(&active_archive, "damaged archive")?;
+    let blocked = restarted
+        .query(Uuid::new_v4(), "cypher", "RETURN 1")
+        .await?;
+    assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        blocked.json::<Value>().await?["code"],
+        "model_archive_unavailable"
+    );
+    drop(restarted);
+    let mut restarted = Server::start(root.path(), &dsn, 0)?;
+    restarted.login().await?;
+    assert!(restarted.model("payments").await?["archive_error"].is_string());
+    let healthy = restarted.request(Method::POST, "models/legacy/query")
+        .json(&json!({"request_id":Uuid::new_v4(),"model_revision":legacy["revision"],"language":"cypher","query":"RETURN 1 AS n"}))
+        .send().await?.error_for_status()?.json::<Value>().await?;
+    assert_eq!(healthy["rows"], json!([["1"]]));
+    let restore = format!("models/payments/history/{}", rev1.as_str().unwrap());
+    let mismatch = restarted
+        .request(Method::PUT, &restore)
+        .json(&json!({"yaml": changed}))
+        .send()
+        .await?;
+    assert_eq!(mismatch.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(fs::read_to_string(&active_archive)?, "damaged archive");
+    let recovered = restarted
+        .request(Method::PUT, &restore)
+        .json(&json!({"yaml": yaml}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    assert_eq!(recovered["active_revision"], rev1);
+    assert!(recovered["archive_error"].is_null());
+    assert_eq!(fs::read_to_string(&active_archive)?, yaml);
 
     let payments = root.path().join("payments.parquet");
     let replacement = root.path().join("new-payments.parquet");
@@ -2016,5 +2835,566 @@ edges: {}
     pg.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await?;
     connection.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a loopback etcd v3 gateway in GRAPHLAKE_TEST_ETCD"]
+async fn cluster_queries_survive_coordinator_restart_and_worker_loss() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    parquet_file(&root.path().join("payments.parquet"), false)?;
+    payments_file(&root.path().join("payments-extra.parquet"), false, &[9])?;
+    fs::write(
+        root.path().join("payments.yaml"),
+        r#"
+graph: payments
+sources:
+  lake: {type: parquet, tables: {finance.nodes: [payments.parquet], finance.payments: [payments.parquet, payments-extra.parquet]}}
+nodes:
+  Account: {source: lake.finance.nodes, key: [tenant_id, from_account_id]}
+  Merchant: {source: lake.finance.nodes, key: [tenant_id, to_merchant_id]}
+edges:
+  Payment:
+    source: lake.finance.payments
+    key: [tenant_id, payment_id]
+    from: {node: Account, columns: [tenant_id, from_account_id]}
+    to: {node: Merchant, columns: [tenant_id, to_merchant_id]}
+    properties: [amount, payment_id, score, channel]
+"#,
+    )?;
+    let config = root.path().join("cluster.yaml");
+    let keyless = fs::read_to_string(root.path().join("payments.yaml"))?
+        .replace("    key: [tenant_id, payment_id]\n", "")
+        .replace(
+            "  Account: {source: lake.finance.nodes, key: [tenant_id, from_account_id]}",
+            "  Account:\n    key: [tenant_id, from_account_id]\n    inputs: [{table: lake.finance.nodes}, {table: lake.finance.payments}]",
+        );
+    fs::write(root.path().join("keyless.yaml"), keyless)?;
+    let store = root.path().join("store");
+    fs::create_dir(&store)?;
+    let etcd = std::env::var("GRAPHLAKE_TEST_ETCD")?;
+    let name = format!("test-{}", Uuid::new_v4().simple());
+    let config_text = |workers: &[&str]| {
+        format!(
+            "name: {name}\nmetadata: {etcd}\nstorage: {}\ntoken_env: GRAPHLAKE_CLUSTER_TEST_TOKEN\nworkers: {}\ndistributed_partitions: 2\nmemory_mib: 32\n",
+            store.display(),
+            serde_json::to_string(workers).unwrap()
+        )
+    };
+    let listeners = (0..2)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let addresses = listeners
+        .iter()
+        .map(|listener| Ok(format!("http://{}", listener.local_addr()?)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    fs::write(
+        &config,
+        config_text(&addresses.iter().map(String::as_str).collect::<Vec<_>>()),
+    )?;
+    let mut workers = Vec::new();
+    for listener in listeners {
+        let port = listener.local_addr()?.port().to_string();
+        drop(listener);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_graphlake-admin"))
+            .args([
+                "--cluster-config",
+                config.to_str().unwrap(),
+                "--port",
+                &port,
+                "worker",
+                "--source-dir",
+            ])
+            .arg(root.path())
+            .env("GRAPHLAKE_CLUSTER_TEST_TOKEN", PASSWORD.repeat(2))
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut ready = String::new();
+        BufReader::new(child.stderr.take().unwrap()).read_line(&mut ready)?;
+        let address = ready
+            .trim()
+            .strip_prefix("GraphLake worker ")
+            .context("worker startup failed")?;
+        workers.push(Server {
+            child,
+            base: address.into(),
+            http: Client::new(),
+            cookie: None,
+        });
+    }
+    let arguments = ["--cluster-config", config.to_str().unwrap()];
+    let mut coordinator = Server::start_with(root.path(), "", 0, &arguments)?;
+    coordinator.login().await?;
+    let readiness = || coordinator.request(Method::GET, "models/payments/readiness");
+    assert_eq!(readiness().send().await?.status(), StatusCode::OK);
+    let query = "MATCH (a:Account)-[r:Payment]->(b:Merchant) RETURN a,r,b ORDER BY r.payment_id";
+    let first_id = Uuid::new_v4();
+    let first: Value = coordinator
+        .query(first_id, "cypher", query)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let second: Value = coordinator
+        .query(Uuid::new_v4(), "cypher", query)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_ne!(first["execution_worker"], second["execution_worker"]);
+    assert_eq!(first["rows"], second["rows"]);
+    assert_eq!(first["graph"]["elements"].as_array().unwrap().len(), 4);
+    let aggregate = r#"SELECT count(*) AS n, sum(amount) AS total FROM "Payment""#;
+    let distributed: Value = coordinator
+        .query(Uuid::new_v4(), "sql", aggregate)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(distributed["rows"], json!([["2", "24.259"]]));
+    assert_eq!(
+        distributed["distributed"]["workers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        distributed["distributed"]["remote_partitions"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let csr = |kind: Value, generation: &Value, revision: &Value| {
+        json!({
+            "request_id": Uuid::new_v4(),
+            "model_revision": revision,
+            "language": "cypher",
+            "csr": {"generation": generation, "operation": kind}
+        })
+    };
+    let revision = coordinator.model("payments").await?["active_revision"].clone();
+    let publish = |server: &Server| {
+        server
+            .request(Method::POST, "models/payments/csr")
+            .json(&json!({"model_revision": revision}))
+    };
+    let keyed_csr: Value = publish(&coordinator)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for cypher in [
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant) RETURN length(p) AS hops ORDER BY hops",
+        "MATCH (a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant) RETURN count(*) AS hits",
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*0..0]-(b:Account {tenant_id:1,from_account_id:9007199254740993}) RETURN length(p) AS hops, [e IN relationships(p) | id(e)] AS edges, [n IN nodes(p) | id(n)] AS vertices",
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[r:Payment*1..2]-(m:Merchant) RETURN length(p) AS hops, [e IN relationships(p) | e.amount] AS amounts ORDER BY amounts",
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*0..2]-(b:Account {tenant_id:1,from_account_id:9007199254740993}) RETURN length(p) AS hops ORDER BY hops",
+        "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[r:Payment*1..2]->(m:Merchant {tenant_id:1,to_merchant_id:7})) RETURN length(p) AS hops, [e IN relationships(p) | e.amount] AS amounts ORDER BY amounts",
+        "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2 {amount: 12.25}]->(m:Merchant {tenant_id:1,to_merchant_id:7})) RETURN [e IN relationships(p) | id(e)] AS ids, [n IN nodes(p) | n.tenant_id] AS tenants",
+        "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2 {score: 0.0, channel: 'web-long-字符串'}]->(m:Merchant {tenant_id:1,to_merchant_id:7})) UNWIND relationships(p) AS e RETURN id(e), e.score, e.channel",
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant) UNWIND relationships(p) AS e RETURN id(e) AS rid, e.amount AS amount ORDER BY id(e) LIMIT 1",
+        "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[*1..2]->(m:Merchant {tenant_id:1,to_merchant_id:7})) UNWIND relationships(p) AS e RETURN elementId(e) AS rid, e.channel AS channel ORDER BY rid DESC SKIP 1 LIMIT 1",
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant) UNWIND relationships(p) AS e WITH e, e.amount AS amount ORDER BY amount DESC, id(e) SKIP 1 LIMIT 1 WHERE amount > 12.0 RETURN id(e) AS rid, amount, e.channel AS channel",
+        "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[*1..2]->(m:Merchant {tenant_id:1,to_merchant_id:7})) UNWIND relationships(p) AS e WITH e AS r, e.channel AS channel RETURN id(r) AS rid, r.amount AS amount, channel ORDER BY amount, rid DESC LIMIT 1",
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]-(m:Merchant) UNWIND relationships(p) AS e RETURN DISTINCT id(e) AS rid, e.amount AS amount, e.channel AS channel ORDER BY amount, rid DESC SKIP 1 LIMIT 1",
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]-(m:Merchant) UNWIND relationships(p) AS e WITH e AS r, count(*) AS hits, sum(e.amount) AS total, e.channel AS channel ORDER BY total DESC, id(r) LIMIT 1 WHERE hits > 0 RETURN id(r) AS rid, total, channel, r.score AS score",
+        "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[*1..2]->(m:Merchant {tenant_id:1,to_merchant_id:7})) UNWIND relationships(p) AS e WITH DISTINCT e RETURN id(e) AS rid, count(*) AS hits, e.channel AS channel ORDER BY hits DESC, rid LIMIT 2",
+        "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]-(m:Merchant) UNWIND relationships(p) AS e RETURN e.amount AS amount, count(DISTINCT e) AS hits ORDER BY amount, hits DESC LIMIT 2",
+        "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2 {amount: -1}]->(m:Merchant {tenant_id:1,to_merchant_id:7})) RETURN length(p) AS hops",
+        "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[*1..2 {amount: '12.250'}]->(m:Merchant {tenant_id:1,to_merchant_id:7})) RETURN length(p) AS hops",
+        "MATCH p=shortestPath((a:Account {tenant_id:1,from_account_id:9007199254740993})-[*1..2]->(m:Merchant)) RETURN length(p) AS hops",
+    ] {
+        let live: Value = coordinator
+            .query(Uuid::new_v4(), "cypher", cypher)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let response = coordinator
+            .request(Method::POST, "models/payments/query")
+            .json(&json!({
+                "request_id": Uuid::new_v4(), "language":"cypher", "query":cypher,
+                "model_revision":revision,"csr_generation":keyed_csr["generation"]
+            }))
+            .send()
+            .await?;
+        assert!(
+            response.status().is_success(),
+            "{cypher}: {}",
+            response.text().await?
+        );
+        let result: Value = response.json().await?;
+        assert_eq!(result["rows"], live["rows"], "{cypher}");
+        if cypher.contains("*0..0") {
+            assert_eq!(result["csr_stats"]["rounds"], 0);
+        } else {
+            assert!(
+                result["csr_stats"]["remote_partitions"].as_u64().unwrap() > 0,
+                "{result}"
+            );
+        }
+        if cypher.contains("{amount:") {
+            assert!(
+                result["csr_stats"]["filtered_arcs"].as_u64().unwrap() > 0,
+                "{result}"
+            );
+        }
+        if cypher.contains("ORDER BY amount,")
+            || cypher.contains("ORDER BY amount DESC,")
+            || cypher.contains("ORDER BY total DESC,")
+        {
+            assert!(
+                result["csr_stats"]["sort_column_bytes"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0,
+                "{result}"
+            );
+        }
+        if cypher.contains("{amount: 12.25}") {
+            assert!(
+                result["csr_stats"]["filter_column_pages"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    > 0,
+                "{result}"
+            );
+        }
+        if cypher.contains("channel: 'web-long-字符串'") {
+            assert!(
+                result["csr_stats"]["filter_column_pages"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    >= 2,
+                "{result}"
+            );
+        }
+        if cypher.contains("{amount: -1}") {
+            assert!(
+                result["csr_stats"]["skipped_property_blocks"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    > 0,
+                "{result}"
+            );
+        }
+    }
+    let empty_page: Value = coordinator
+        .request(Method::POST, "models/payments/query")
+        .json(&json!({
+            "request_id": Uuid::new_v4(), "language":"cypher",
+            "query": "MATCH p=(:Account)-[:Payment*1..2]->(:Merchant) UNWIND relationships(p) AS e RETURN e.amount ORDER BY id(e) LIMIT 0",
+            "model_revision":revision,"csr_generation":keyed_csr["generation"]
+        }))
+        .send().await?.error_for_status()?.json().await?;
+    assert_eq!(empty_page["rows"], json!([]));
+    assert_eq!(empty_page["csr_stats"]["remote_partitions"], 0);
+    for operation in [
+        json!({"kind":"pagerank","damping":0.85,"tolerance":0.000000001,"max_iterations":4}),
+        json!({"kind":"wcc","max_iterations":4}),
+    ] {
+        let response: Value = coordinator
+            .request(Method::POST, "models/payments/query")
+            .json(&csr(operation, &keyed_csr["generation"], &revision))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(response["rows"].as_array().unwrap().len(), 2);
+        assert!(response["csr_stats"]["remote_partitions"].as_u64().unwrap() > 0);
+        assert!(
+            response["csr_stats"]["state_exchange_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+    let keyless_revision = coordinator.model("keyless").await?["active_revision"].clone();
+    let first_csr: Value = coordinator
+        .request(Method::POST, "models/keyless/csr")
+        .json(&json!({"model_revision":keyless_revision}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let internal = coordinator
+        .http
+        .post(format!("{}/internal/v1/jobs", workers[0].base))
+        .send()
+        .await?;
+    assert_eq!(internal.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        coordinator
+            .guest(Method::GET, &format!("queries/{first_id}"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    drop(coordinator);
+    let mut coordinator = Server::start_with(root.path(), "", 0, &arguments)?;
+    coordinator.login().await?;
+    let resumed: Value = coordinator
+        .request(Method::GET, &format!("queries/{first_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(first, resumed);
+    let arrow = coordinator
+        .request(
+            Method::GET,
+            &format!("models/payments/results/{}", first_id),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert!(!arrow.is_empty());
+    workers.remove(0);
+    let degraded = coordinator
+        .request(Method::GET, "models/payments/readiness")
+        .send()
+        .await?;
+    assert_eq!(degraded.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let degraded = degraded.json::<Value>().await?;
+    assert!(degraded["workers"][0]["probe"].is_null(), "{degraded}");
+    assert_eq!(degraded["workers"][1]["probe"]["status"], "ready");
+    let third: Value = coordinator
+        .query(Uuid::new_v4(), "cypher", query)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(third["execution_worker"], second["execution_worker"]);
+    assert_eq!(third["graph"], first["graph"]);
+    assert_eq!(first_csr["vertices"], 2);
+    assert_eq!(first_csr["edges"], 2);
+    let op = json!({
+        "kind": "all_shortest",
+        "start": {"label":"Account", "key":["1", "9007199254740993"]},
+        "target": {"label":"Merchant", "key":["1", "7"]},
+        "max_hops": 1, "max_paths": 2
+    });
+    let response: Value = coordinator
+        .request(Method::POST, "models/keyless/query")
+        .json(&csr(
+            op.clone(),
+            &first_csr["generation"],
+            &keyless_revision,
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(response["csr_generation"], first_csr["generation"]);
+    let rows = response["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let keys = rows
+        .iter()
+        .map(|row| -> Result<Value> {
+            let edges: Value = serde_json::from_str(row[2].as_str().context("missing edges")?)?;
+            Ok(edges[0]["identity"]["key"].clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(keys, [json!(["1"]), json!(["2"])]);
+    assert!(response["csr_stats"]["retries"].as_u64().unwrap() > 0);
+    let keyless_paths: Value = coordinator
+        .request(Method::POST, "models/keyless/query")
+        .json(&json!({
+            "request_id": Uuid::new_v4(),
+            "model_revision": keyless_revision,
+            "language": "cypher",
+            "csr_generation": first_csr["generation"],
+            "query": "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant {tenant_id:1,to_merchant_id:7})) UNWIND relationships(p) AS edge RETURN count(DISTINCT id(edge)) AS edges, sum(edge.amount) AS amount"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(keyless_paths["rows"], json!([["2", "24.259"]]));
+    let explore_keyless = |element: Value, neighbors: bool| {
+        coordinator
+            .request(Method::POST, "models/keyless/explore")
+            .json(&json!({
+                "model_revision": keyless_revision, "csr_generation": first_csr["generation"],
+                "graph_options": {}, "neighbors": neighbors, "element": element,
+            }))
+    };
+    let neighbors: Value = explore_keyless(
+        json!({"kind": "node", "label": "Account", "key": ["1", "9007199254740993"]}),
+        true,
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    let edges = neighbors["graph"]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|element| element["kind"] == "edge")
+        .collect::<Vec<_>>();
+    assert_eq!(edges.len(), 2);
+    assert_ne!(edges[0]["key"], edges[1]["key"]);
+    for edge in edges {
+        let detail: Value = explore_keyless(
+            json!({"kind": "edge", "label": "Payment", "key": edge["key"]}),
+            false,
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+        assert_eq!(detail["selected"]["id"], edge["id"]);
+        assert_eq!(detail["selected"]["properties"], edge["properties"]);
+        assert_eq!(detail["selected"]["transient"], true);
+    }
+    let refreshed: Value = publish(&coordinator)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_ne!(keyed_csr["generation"], refreshed["generation"]);
+    let explore =
+        |cursor: Option<&Value>| {
+            coordinator.request(Method::POST, "models/payments/explore").json(&json!({
+            "model_revision": revision, "csr_generation": keyed_csr["generation"],
+            "graph_options": {}, "neighbors": true,
+            "element": {"kind": "node", "label": "Account", "key": ["1", "9007199254740993"]},
+            "filter": {"direction": "out", "edge_label": "Payment"},
+            "cursor": cursor
+        }))
+        };
+    let old_graph: Value = explore(None)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(old_graph["selected"]["label"], "Account");
+    assert!(
+        old_graph["graph"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|element| element["kind"] == "edge" && element["label"] == "Payment")
+    );
+    let replay_graph: Value = explore(Some(&old_graph["page_cursor"]))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(old_graph["graph"], replay_graph["graph"]);
+    let missing = coordinator
+        .request(Method::POST, "models/payments/explore")
+        .json(&json!({
+            "model_revision": revision, "csr_generation": Uuid::new_v4(),
+            "graph_options": {}, "neighbors": false,
+            "element": {"kind": "node", "label": "Account", "key": ["1", "9007199254740993"]}
+        }))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::CONFLICT);
+    let missing: Value = missing.json().await?;
+    assert_eq!(missing["code"], "csr_snapshot_expired");
+    assert_eq!(
+        coordinator
+            .request(Method::POST, "models/payments/query")
+            .json(&csr(op, &keyed_csr["generation"], &revision))
+            .send()
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let replay: Value = coordinator
+        .query(Uuid::new_v4(), "sql", aggregate)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(replay["rows"], distributed["rows"]);
+    assert!(replay["distributed"]["partition_retries"].as_u64().unwrap() > 0);
+    let pinned_cypher = || {
+        json!({
+            "request_id": Uuid::new_v4(),
+            "model_revision": revision,
+            "language": "cypher",
+            "csr_generation": refreshed["generation"],
+            "query": "MATCH p=allShortestPaths((a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant)) RETURN [e IN relationships(p) | id(e)] AS ids ORDER BY ids"
+        })
+    };
+    let before: Value = coordinator
+        .request(Method::POST, "models/payments/query")
+        .json(&pinned_cypher())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(before["rows"].as_array().unwrap().len(), 2);
+    payments_file(&root.path().join("payments-extra.parquet"), false, &[8])?;
+    let after: Value = coordinator
+        .request(Method::POST, "models/payments/query")
+        .json(&pinned_cypher())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(after["rows"], before["rows"]);
+    assert_eq!(after["sources"], before["sources"]);
+    let after_source_change: Value = explore(Some(&old_graph["page_cursor"]))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(old_graph["graph"], after_source_change["graph"]);
+    let configuration_errors = || async {
+        let metrics = coordinator
+            .http
+            .get(format!("{}/metrics", coordinator.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let count = metrics
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("graphlake_query_errors_total{category=\"configuration\"} ")
+            })
+            .context("configuration counter")?;
+        anyhow::Ok(count.parse::<u64>()?)
+    };
+    let count = configuration_errors().await?;
+    let invalid = coordinator
+        .query(Uuid::new_v4(), "cypher", "RETURN (")
+        .await?;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(configuration_errors().await?, count + 1);
+    let conflict = coordinator
+        .query(
+            Uuid::new_v4(),
+            "sql",
+            r#"SELECT payment_id FROM "Payment" LIMIT 1"#,
+        )
+        .await?;
+    assert_eq!(conflict.status(), StatusCode::UNPROCESSABLE_ENTITY);
     Ok(())
 }

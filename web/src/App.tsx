@@ -1,12 +1,18 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ArrowRight, Database, LogOut, Network, Plus, Search, Terminal, Upload } from 'lucide-react';
+import { ArrowRight, Database, LogOut, Network, Plus, Search, Settings2, ShieldCheck, Terminal, Upload } from 'lucide-react';
 import { api, errorText, type ModelSummary, type SavedModel } from './api';
-import { AuthGate } from './Auth';
+import { AuthGate, type Session } from './Auth';
+import { Access, type Grants } from './Access';
+import { Query } from './Query';
+import { useMutations } from './Mutations';
 import { Editor, type Workspace } from './Editor';
 import { documentOf, emptyModel, modelOf } from './model';
 import { Mark, Modal, NameDialog, StatusLabel } from './ui';
 import './styles.css';
+
+const Settings = lazy(() => import('./Settings'));
+const RecoveryConsole = lazy(() => import('./RecoveryConsole'));
 
 const nav = [
   { key: 'graph', label: '图模型', Icon: Network },
@@ -25,18 +31,18 @@ function route(path: string): { id?: string; workspace: Workspace } {
   return { id, workspace };
 }
 
-function Models({ models, error, importError, workspace, open, create, importModel, retry }: {
-  models?: ModelSummary[]; error: string; importError: string; workspace: Workspace;
+function Models({ models, error, importError, workspace, open, create, importModel, retry, administrator }: {
+  administrator: boolean; models?: ModelSummary[]; error: string; importError: string; workspace: Workspace;
   open: (id: string) => void; create: () => void; importModel: (file: File) => void; retry: () => void;
 }) {
   const [search, setSearch] = useState('');
   const needle = search.trim().toLowerCase();
-  const available = models?.filter(model => workspace !== 'query' || model.active_revision);
+  const available = models?.filter(model => workspace !== 'query' || model.active_revision && !model.archive_error);
   const filtered = available?.filter(model => model.name.toLowerCase().includes(needle) || model.id.toLowerCase().includes(needle)) ?? [];
   const title = nav.find(item => item.key === workspace)!.label;
   return <main className="workbench">
     <header className="workspace-header"><div className="workspace-title"><h1>{title}</h1></div>
-      {workspace === 'graph' && <div className="workspace-context">
+      {workspace === 'graph' && administrator && <div className="workspace-context">
         <label className="button compact"><Upload size={16} />导入模型 YAML<input className="sr-only" type="file" accept=".yaml,.yml" onChange={event => {
           const file = event.target.files?.[0]; event.target.value = '';
           if (file) importModel(file);
@@ -61,7 +67,7 @@ function Models({ models, error, importError, workspace, open, create, importMod
             <td role="cell" className="directory-count"><small aria-hidden="true">数据源</small>{model.sources}</td>
             <td role="cell" className="directory-count"><small aria-hidden="true">节点标签</small>{model.nodes}</td>
             <td role="cell" className="directory-count"><small aria-hidden="true">边类型</small>{model.edges}</td>
-            <td role="cell" className="directory-status"><StatusLabel status={model.status} /><small className="version-hint" title={model.active_revision ?? undefined}>{model.active_revision ? '生效 ' + model.active_revision.slice(0, 10) : '未发布'}</small></td>
+            <td role="cell" className="directory-status"><StatusLabel status={model.status} /><small className="version-hint" title={model.archive_error ?? model.active_revision ?? undefined}>{model.archive_error ? '版本存储异常' : model.active_revision ? '生效 ' + model.active_revision.slice(0, 10) : '未发布'}</small></td>
             <td role="cell" className="directory-actions"><button className="text-button" aria-label={'打开 ' + model.name} onClick={() => open(model.id)}>打开 <ArrowRight size={16} /></button></td>
           </tr>)}
           {!filtered.length && <tr><td colSpan={7}><div className="empty">{needle ? '没有匹配的图模型' : workspace === 'query' ? '暂无已发布的图模型' : '暂无图模型'}</div></td></tr>}
@@ -71,7 +77,13 @@ function Models({ models, error, importError, workspace, open, create, importMod
   </main>;
 }
 
-function App({ logout, locked }: { logout?: () => Promise<void>; locked: boolean }) {
+function App({ logout, locked, identity }: { logout?: () => Promise<void>; locked: boolean; identity: Session }) {
+  const administrator = identity.administrator;
+  const actor = identity.subject ?? identity.username ?? '@dev';
+  const [grants, setGrants] = useState<Grants>();
+  const [permissionError, setPermissionError] = useState('');
+  const [receipts, setReceipts] = useState(false);
+  const [recovered, setRecovered] = useState<SavedModel>();
   const [path, setPath] = useState(window.location.pathname);
   const [openModels, setOpenModels] = useState(() => {
     const id = route(window.location.pathname).id;
@@ -97,17 +109,33 @@ function App({ logout, locked }: { logout?: () => Promise<void>; locked: boolean
   const reloadModels = useCallback(() => retry(value => value + 1), []);
 
   useEffect(() => {
+    if (locked) return;
     const controller = new AbortController();
     setError('');
     api<ModelSummary[]>('/models', { signal: controller.signal }).then(setModels, cause => {
       if (!controller.signal.aborted) setError(errorText(cause));
     });
     return () => controller.abort();
-  }, [attempt]);
+  }, [attempt, locked]);
+
+  useEffect(() => {
+    if (locked) return;
+    const controller = new AbortController();
+    const options = { signal: controller.signal };
+    if (!administrator) api<Grants>('/my-roles', options).then(value => {
+      setGrants(value); setPermissionError('');
+    }, cause => {
+      if (!controller.signal.aborted) setPermissionError(errorText(cause));
+    });
+    api<{ mutation_receipts: boolean }>('/options', options).then(value => setReceipts(value.mutation_receipts), () => {});
+    return () => controller.abort();
+  }, [administrator, locked, attempt]);
 
   const navigate = useCallback((next: string, replace = false) => {
     if (next === current.current) return;
-    if (current.current === '/new' && !replace && dirty.current.has('') && !window.confirm('新模型有未保存的修改。离开当前页面？')) {
+    const leaving = current.current.replace(/\/$/, '');
+    const unsaved = leaving === '/new' && dirty.current.has('') || leaving === '/settings' && dirty.current.has('/settings');
+    if (unsaved && !replace && !window.confirm('当前页面有未保存的修改。离开当前页面？')) {
       if (window.location.pathname !== current.current) window.history.pushState(null, '', current.current);
       return;
     }
@@ -142,11 +170,27 @@ function App({ logout, locked }: { logout?: () => Promise<void>; locked: boolean
     };
   }, [locked, navigate]);
 
-  const { id, workspace } = route(path);
+  const location = route(path);
+  const accessPage = path.replace(/\/$/, '') === '/access';
+  const settingsPage = path.replace(/\/$/, '') === '/settings';
+  const id = location.id;
+  const availableModels = administrator ? models : grants && models?.filter(model => grantFor(model.id).length);
+  function grantFor(model: string) { return grants && Object.hasOwn(grants, model) ? grants[model] : []; }
+  function canReadModel(model: string) { return administrator || grantFor(model).some(role => role !== 'query' && role !== 'export'); }
+  function canQuery(model: string) { return administrator || grantFor(model).includes('query'); }
+  function canExport(model: string) { return administrator || canQuery(model) && grantFor(model).includes('export'); }
+  const hasModelAccess = administrator || Object.values(grants ?? {}).some(roles => roles.some(role => role !== 'query' && role !== 'export'));
+  const canUseQuery = administrator || Object.values(grants ?? {}).some(roles => roles.includes('query'));
+  const workspace = location.workspace === 'graph' && !hasModelAccess && canUseQuery ? 'query' : location.workspace;
+  const mutations = useMutations(actor, receipts, model => {
+    setRecovered(model);
+    reloadModels();
+    if (model && path === '/new') navigate(modelPath(model.id), true);
+  });
   useEffect(() => { if (id) lastModel.current = id; }, [id]);
   useLayoutEffect(() => { window.scrollTo(0, 0); }, [path]);
-  useEffect(() => { if (!locked) document.title = 'GraphLake · ' + nav.find(item => item.key === workspace)!.label; }, [locked, workspace]);
-  const newModel = path === '/new' ? draft : undefined;
+  useEffect(() => { if (!locked) document.title = 'GraphLake · ' + (settingsPage ? '运行配置' : accessPage ? '权限管理' : nav.find(item => item.key === workspace)!.label); }, [accessPage, locked, settingsPage, workspace]);
+  const newModel = administrator && path === '/new' ? draft : undefined;
 
   async function importModel(file: File) {
     setImportError('');
@@ -167,8 +211,10 @@ function App({ logout, locked }: { logout?: () => Promise<void>; locked: boolean
       navigate(id ? modelPath(id) : '/');
       return;
     }
-    const target = id ?? models?.find(model => model.id === lastModel.current && (next !== 'query' || model.active_revision))?.id
-      ?? models?.find(model => next !== 'query' || model.active_revision)?.id;
+    const candidates = availableModels?.filter(model => next === 'query'
+      ? canQuery(model.id) && model.active_revision && !model.archive_error
+      : canReadModel(model.id));
+    const target = candidates?.find(model => model.id === (id ?? lastModel.current))?.id ?? candidates?.[0]?.id;
     navigate(target ? modelPath(target, next) : '/' + next);
   }
 
@@ -184,32 +230,67 @@ function App({ logout, locked }: { logout?: () => Promise<void>; locked: boolean
   return <div className="app-shell">
     <nav className="app-rail" aria-label="主导航">
       <button className="rail-brand" aria-label="GraphLake 首页" onClick={() => navigate('/')}><Mark size={26} /></button>
-      <div className="rail-items">{nav.map(({ key, label, Icon }) =>
-        <button key={key} className="rail-link" aria-current={workspace === key ? 'page' : undefined} onClick={() => openWorkspace(key)}>
-          <Icon size={20} aria-hidden="true" /><span>{label}</span>
-        </button>)}</div>
+      <div className="rail-items">{nav.filter(({ key }) => key === 'query' ? canUseQuery : key === 'catalogs' ? administrator : hasModelAccess)
+        .map(({ key, label, Icon }) =>
+          <button key={key} className="rail-link" aria-current={!accessPage && !settingsPage && workspace === key ? 'page' : undefined} onClick={() => openWorkspace(key)}>
+            <Icon size={20} aria-hidden="true" /><span>{label}</span>
+          </button>)}
+        {administrator && identity.enabled && <button className="rail-link" aria-current={accessPage ? 'page' : undefined} onClick={() => navigate('/access')}>
+          <ShieldCheck size={20} aria-hidden="true" /><span>权限管理</span>
+        </button>}
+        {administrator && <button className="rail-link" aria-current={settingsPage ? 'page' : undefined} onClick={() => navigate('/settings')}>
+          <Settings2 size={20} aria-hidden="true" /><span>运行配置</span>
+        </button>}
+      </div>
       {logout && <div className="rail-items rail-account">
         <button className="rail-link" onClick={() => dirty.current.size ? setConfirmLogout(true) : void signOut()} disabled={loggingOut}>
           <LogOut size={20} aria-hidden="true" /><span>退出登录</span>
         </button>
       </div>}
     </nav>
-    {openModels.map(model => <div className="model-workspace" key={model} data-inactive={model !== id || undefined}
-      inert={model !== id} aria-hidden={model !== id || undefined}>
-      <Editor id={model} active={model === id} onDirty={onDirty} workspace={model === id ? workspace : 'query'} models={models ?? []}
-          close={() => navigate('/')} goTo={next => navigate(modelPath(model, next))}
-          changeModel={key => navigate(modelPath(key, workspace))}
-          changed={reloadModels} created={key => navigate(modelPath(key), true)} />
-    </div>)}
+    <div className="app-content">
+    {mutations.banner && <div className="global-mutation">{mutations.banner}</div>}
+    {openModels.map(model => {
+      const modelers = administrator || grantFor(model).includes('modeler');
+      const publishers = administrator || grantFor(model).includes('publisher');
+      const page = !canReadModel(model) || workspace === 'query' && canQuery(model) ? 'query' : administrator && workspace === 'catalogs' ? 'catalogs' : 'graph';
+      const show = !accessPage && !settingsPage && model === id;
+      const summary = availableModels?.find(entry => entry.id === model);
+      if (!canReadModel(model) && (!canQuery(model) || !summary?.active_revision)) return null;
+      return <div className="model-workspace" key={model} data-inactive={!show || undefined}
+        inert={!show} aria-hidden={!show || undefined}>
+        {canReadModel(model)
+          ? <Editor id={model} active={show} onDirty={onDirty} workspace={show ? page : 'query'} models={availableModels ?? []}
+              allow={{ configure: administrator, edit: modelers, publish: publishers, query: canQuery(model), export: canExport(model) }}
+              actor={actor} mutations={mutations} recovered={recovered?.id === model ? recovered : undefined}
+              close={() => navigate('/')} goTo={next => navigate(modelPath(model, next))}
+              changeModel={key => navigate(modelPath(key, page))}
+              changed={reloadModels} created={key => navigate(modelPath(key), true)} />
+          : <main className="workbench">
+              <header className="workspace-header"><div className="workspace-title"><h1>{summary!.name}</h1></div>
+                <button className="button compact" onClick={() => navigate('/query')}>查询模型列表</button></header>
+              <Query id={model} actor={actor} revision={summary!.active_revision!} draftPending={false}
+                refresh={reloadModels} visible={show} canExport={canExport(model)} />
+            </main>}
+      </div>;
+    })}
     {newModel && <Editor key="draft" id={newModel.id} initial={newModel} active onDirty={onDirty}
+      allow={{ configure: true, edit: true, publish: true, query: true, export: true }} actor={actor} mutations={mutations} recovered={recovered?.id === newModel.id ? recovered : undefined}
       workspace={workspace} models={models ?? []} close={() => navigate('/')} goTo={next => navigate(modelPath(newModel.id, next))}
       changeModel={key => navigate(modelPath(key, workspace))} changed={reloadModels} created={key => navigate(modelPath(key), true)} />}
-    {!id && !newModel && <Models models={models} error={error} importError={workspace === 'graph' ? importError : ''} retry={reloadModels} workspace={workspace}
-      open={key => navigate(modelPath(key, workspace))} create={() => setCreating(true)} importModel={file => void importModel(file)} />}
+    {accessPage && (administrator && identity.enabled ? <Access models={models ?? []} /> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
+    {settingsPage && (administrator ? <Suspense fallback={<p className="empty" role="status">正在打开运行配置…</p>}><Settings models={models ?? []} locked={locked} onDirty={onDirty} /></Suspense> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
+    {!accessPage && !settingsPage && !newModel && (!id || !canReadModel(id) && !canQuery(id)) &&
+      <Models models={id && !administrator && grants ? [] : workspace === 'query' ? availableModels?.filter(model => canQuery(model.id)) : availableModels?.filter(model => canReadModel(model.id))} error={permissionError || error}
+        importError={workspace === 'graph' ? importError : ''} retry={reloadModels} workspace={workspace}
+        administrator={administrator}
+        open={key => navigate(modelPath(key, canReadModel(key) ? workspace : 'query'))}
+        create={() => setCreating(true)} importModel={file => void importModel(file)} />}
+    </div>
     {logoutError && <p className="notice error auth-logout-error" role="alert">{logoutError}</p>}
     {confirmLogout && !locked && <Modal title="退出登录" close={() => setConfirmLogout(false)}>
       <div className="dialog-form">
-        <p>模型有未保存的修改。退出登录会放弃这些修改。</p>
+        <p>有未保存的修改。退出登录会放弃这些修改。</p>
         <div className="dialog-actions">
           <button className="button" onClick={() => setConfirmLogout(false)} data-initial-focus>继续编辑</button>
           <button className="button primary" onClick={() => void signOut()}>放弃修改并退出</button>
@@ -236,6 +317,9 @@ function App({ logout, locked }: { logout?: () => Promise<void>; locked: boolean
   </div>;
 }
 
-createRoot(document.getElementById('root')!).render(
-  <AuthGate workspace={(logout, locked) => <App logout={logout} locked={locked} />} />,
+const recovery = /^\/recovery\/?$/.test(window.location.pathname);
+if (recovery) document.title = 'GraphLake · 灾备恢复验收';
+createRoot(document.getElementById('root')!).render(recovery
+  ? <Suspense fallback={<main className="empty" role="status">正在打开恢复验收台…</main>}><RecoveryConsole /></Suspense>
+  : <AuthGate workspace={(logout, locked, identity) => <App key={identity.authorization ?? identity.username ?? '@dev'} logout={logout} locked={locked} identity={identity} />} />,
 );

@@ -1,0 +1,43 @@
+{
+  "interval_seconds": 30,
+  "timeout_seconds": 5,
+  "require_leader": true,
+  "ingress": {
+    "https": "https://graphlake.example",
+    "bolt": "bolt+s://graphlake.example:7687",
+    "gremlin": "wss://graphlake.example/gremlin"
+  },
+  "service_account": {
+    "username": "svc/monitor",
+    "token_env": "GRAPHLAKE_MONITOR_TOKEN"
+  },
+  "coordinators": {
+    "coordinator-a": "http://127.0.0.1:17338/status",
+    "coordinator-b": "http://127.0.0.1:27338/status"
+  },
+  "workers": {
+    "worker-a": {
+      "url": "http://127.0.0.1:17437/internal/v1/identity",
+      "token_env": "GRAPHLAKE_MONITOR_WORKER_TOKEN"
+    }
+  },
+  "canaries": {
+    "payments": {
+      "language": "cypher",
+      "query": "MATCH (a:Account) WHERE a.id = 1 RETURN a.id",
+      "expected_rows": [["1"]]
+    }
+  },
+  "backups": {
+    "control-export": {
+      "kind": "export",
+      "status_file": "/var/lib/graphlake-backups/export-status.json",
+      "max_age_seconds": 7200
+    },
+    "offsite-verified": {
+      "kind": "verify",
+      "status_file": "/var/lib/graphlake-backups/verify-status.json",
+      "max_age_seconds": 14400
+    }
+  }
+}

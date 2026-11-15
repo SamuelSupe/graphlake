@@ -220,7 +220,7 @@ pub(super) fn path_item(identity: &Schema) -> FieldRef {
     ))
 }
 
-pub(super) fn row_converter(schema: &Schema) -> Result<RowConverter> {
+pub(crate) fn row_converter(schema: &Schema) -> Result<RowConverter> {
     Ok(RowConverter::new(
         schema
             .fields()
@@ -230,7 +230,7 @@ pub(super) fn row_converter(schema: &Schema) -> Result<RowConverter> {
     )?)
 }
 
-pub(super) fn encode_key(
+pub(crate) fn encode_key(
     key: &[ScalarValue],
     schema: &Schema,
     converter: &RowConverter,
@@ -246,7 +246,7 @@ pub(super) fn encode_key(
     Ok(converter.convert_columns(&arrays)?.row(0).data().to_vec())
 }
 
-pub(super) fn coerce_key(key: &[ScalarValue], schema: &Schema) -> Result<Vec<ScalarValue>> {
+pub(crate) fn coerce_key(key: &[ScalarValue], schema: &Schema) -> Result<Vec<ScalarValue>> {
     ensure!(
         key.len() == schema.fields().len(),
         "wrong number of business key values"

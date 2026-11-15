@@ -7,19 +7,22 @@ import { SourceBrowser, type TableSelection } from './SourceBrowser';
 import type { Column } from './api';
 import { MappingColumn, mappingControl } from './MappingColumn';
 
-const operations = [['eq', '='], ['ne', '≠'], ['lt', '<'], ['le', '≤'], ['gt', '>'], ['ge', '≥'], ['is_null', '为空'], ['is_not_null', '非空']];
+import { comparisons, nullCheck } from './scopeOptions';
 const literal = (value: unknown): string => typeof value === 'bigint' ? value.toString() : JSON.stringify(value) ?? 'null';
 
-function FilterValue({ name, value, save }: { name: string; value: unknown; save: (value: unknown) => void }) {
-  const before = literal(value);
+export function ScalarField({ name, value, save, optional = false }: { name: string; value: unknown; save: (value: unknown) => void; optional?: boolean }) {
+  const before = optional && value === undefined ? '' : literal(value);
   const [input, setInput] = useState(before);
   const [invalid, setInvalid] = useState(false);
-  return <label>值（YAML 标量）<input className="mono" aria-label={name} value={input} aria-invalid={invalid}
+  return <label>{name}<input className="mono" value={input} aria-invalid={invalid}
     onChange={event => { setInput(event.target.value); setInvalid(false); }} onBlur={() => {
       if (input === before) return;
+      if (optional && !input.trim()) { save(undefined); return; }
       const parsed = parseDocument(input, { intAsBigInt: true });
       if (parsed.errors.length || !isScalar(parsed.contents)) { setInvalid(true); return; }
-      save(parsed.contents.value);
+      const value = parsed.contents.value;
+      if (typeof value === 'number' && !Number.isFinite(value)) { setInvalid(true); return; }
+      save(value);
     }} />{invalid && <small className="inline-error">请使用数字、布尔值、null 或带引号的字符串。</small>}</label>;
 }
 
@@ -94,10 +97,16 @@ export function MappingInputs({ id, yaml, model, item, path, logical, edit, getC
           {filters.map((filter, j) => <div className="mapping-filter" key={j}>
             <label>来源列<MappingColumn label={'过滤列 ' + (j + 1)} columns={active} value={text(filter.column)}
               location={mappingControl(invalid, id, 'filter', i, j)} change={value => set([...here, 'where', j, 'column'], value)} /></label>
-            <label>条件<select value={text(filter.op)} onChange={event => set([...here, 'where', j, 'op'], event.target.value)}>
-              {operations.map(([op, label]) => <option key={op} value={op}>{label}</option>)}
+            <label>条件<select value={text(filter.op)} onChange={event => {
+              const op = event.target.value;
+              edit(doc => {
+                doc.setIn([...here, 'where', j, 'op'], op);
+                if (nullCheck(op)) doc.setIn([...here, 'where', j, 'value'], null);
+              });
+            }}>
+              {comparisons.map(([op, label]) => <option key={op} value={op}>{label}</option>)}
             </select></label>
-            {!['is_null', 'is_not_null'].includes(text(filter.op)) && <FilterValue key={literal(filter.value)} name={'过滤值 ' + (j + 1)}
+            {!nullCheck(text(filter.op)) && <ScalarField key={literal(filter.value)} name={'过滤值 ' + (j + 1)}
               value={filter.value} save={value => set([...here, 'where', j, 'value'], value)} />}
             <button className="icon-button" aria-label={'移除过滤 ' + (j + 1)} onClick={() => edit(doc => { doc.deleteIn([...here, 'where', j]); })}><X size={15} /></button>
           </div>)}

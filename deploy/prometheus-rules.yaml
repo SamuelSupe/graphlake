@@ -1,0 +1,109 @@
+groups:
+  - name: graphlake
+    rules:
+      - alert: GraphLakeMetricsUnavailable
+        expr: up{job="graphlake-active"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake Coordinator metrics are unavailable
+      - alert: GraphLakeRequestFailures
+        expr: sum by (instance) (rate(graphlake_http_requests_total{job=~"graphlake-active|graphlake-coordinator",status_class="5xx"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake is returning sustained server errors
+      - alert: GraphLakeAuditWriteFailures
+        expr: increase(graphlake_audit_write_failures_total{job=~"graphlake-active|graphlake-coordinator"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake could not append an operation to the audit log
+      - alert: GraphLakeCoordinatorNotReady
+        expr: graphlake_coordinator_ready{job=~"graphlake-active|graphlake-coordinator"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake Coordinator cannot accept new requests
+      - alert: GraphLakeOtlpExportFailed
+        expr: increase(graphlake_otlp_export_failures_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake is failing to send telemetry to the collector
+      - alert: GraphLakeOtlpPartialRejected
+        expr: graphlake_otlp_last_rejected > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake Collector rejected part of the {{ $labels.signal }} export
+      - alert: GraphLakeMonitorUnavailable
+        expr: up{job="graphlake-monitor"} == 0 or graphlake_monitor_cycle_stale == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: GraphLake monitoring checks are unavailable or stale
+      - alert: GraphLakeCandidateUnavailable
+        expr: graphlake_monitor_candidate_up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake Coordinator candidate {{ $labels.node }} is unreachable
+      - alert: GraphLakeLeaderUnavailable
+        expr: graphlake_monitor_leaders != 1 or graphlake_monitor_node_ready{role="leader"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: GraphLake Coordinator leadership or readiness is abnormal
+      - alert: GraphLakeWorkerUnavailable
+        expr: graphlake_monitor_worker_up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake Worker {{ $labels.worker }} is unreachable
+      - alert: GraphLakeIngressUnavailable
+        expr: graphlake_monitor_ingress_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: GraphLake {{ $labels.protocol }} client ingress is unavailable
+      - alert: GraphLakeModelDiscoveryFailed
+        expr: graphlake_monitor_model_discovery_up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake could not list published models using the monitoring account
+      - alert: GraphLakeModelUnavailable
+        expr: graphlake_monitor_model_check_failed == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: GraphLake model {{ $labels.model }} failed the {{ $labels.reason }} check
+          description: 'Source {{ $labels.source }}. Recovery requires the published model probe and the public ingress query to match the expected result.'
+      - alert: GraphLakeBackupFailed
+        expr: graphlake_monitor_backup_failed == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake backup {{ $labels.backup }} {{ $labels.kind }} failed or has no status
+      - alert: GraphLakeBackupStale
+        expr: graphlake_monitor_backup_stale == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: GraphLake backup {{ $labels.backup }} {{ $labels.kind }} is older than its recovery point budget

@@ -65,6 +65,8 @@ pub(super) fn bind<'a>(
                         mode: if rank.is_some() { None } else { mode },
                         track: part.variable.is_some(),
                         predicate: pattern.where_clause.as_ref(),
+                        #[cfg(feature = "admin")]
+                        finish: endpoints[1].0,
                     },
                 )?;
                 if let Some(consume_predicate) = rank {
@@ -367,6 +369,8 @@ struct Range<'a> {
     mode: Option<paths::Shortest>,
     track: bool,
     predicate: Option<&'a Expr>,
+    #[cfg(feature = "admin")]
+    finish: &'a Node<'a>,
 }
 
 fn ranged(
@@ -400,34 +404,39 @@ fn ranged(
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     let labels = edges.keys().cloned().collect::<BTreeSet<_>>();
-    let starts = start
-        .labels
-        .iter()
-        .map(|label| {
-            let node = &catalog.nodes[label];
-            let binding = Binding {
-                alias: "src".into(),
-                label: label.clone(),
-                keys: node.key.clone(),
-                properties: columns([&node.key, &node.properties]),
-                stored: None,
-                node: true,
-                dynamic: false,
-                lanes: Default::default(),
-            };
-            let mut terms = node_filters(start, &binding, start.labels.len() > 1)?;
-            if let (Some(name), Some(predicate)) = (&start.patterns[0].variable, range.predicate) {
-                start_terms(
-                    predicate,
-                    &name.0,
-                    &binding.properties,
-                    &mut terms,
-                    &mut BTreeSet::new(),
-                );
-            }
-            Ok((label.clone(), terms))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
+    let endpoints = |node: &Node<'_>| {
+        node.labels
+            .iter()
+            .map(|label| {
+                let mapping = &catalog.nodes[label];
+                let binding = Binding {
+                    alias: "src".into(),
+                    label: label.clone(),
+                    keys: mapping.key.clone(),
+                    properties: columns([&mapping.key, &mapping.properties]),
+                    stored: None,
+                    node: true,
+                    dynamic: false,
+                    lanes: Default::default(),
+                };
+                let mut terms = node_filters(node, &binding, node.labels.len() > 1)?;
+                if let (Some(name), Some(predicate)) = (&node.patterns[0].variable, range.predicate)
+                {
+                    start_terms(
+                        predicate,
+                        &name.0,
+                        &binding.properties,
+                        &mut terms,
+                        &mut BTreeSet::new(),
+                    );
+                }
+                Ok((label.clone(), terms))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+    };
+    let starts = endpoints(start)?;
+    #[cfg(feature = "admin")]
+    let finishes = endpoints(range.finish)?;
     let alias = plan.add_relation(&table);
     plan.expansions.push(Expansion {
         table,
@@ -442,6 +451,8 @@ fn ranged(
         filters: Vec::new(),
         starts: Vec::new(),
         anchored: false,
+        #[cfg(feature = "admin")]
+        finishes,
     });
     let edges = qualified(&alias, PATH);
     let hops = qualified(&alias, HOPS);

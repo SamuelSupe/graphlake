@@ -1,11 +1,13 @@
 import { useState } from 'react';
-import { ArrowDown, ArrowRight, ArrowUp, Braces, Pencil, Plus, Trash2, X } from 'lucide-react';
-import { endpoint, record, rename, sourceLabel, strings, text, type Model, type Selection, type YamlDocument } from './model';
+import { ArrowDown, ArrowRight, ArrowUp, Pencil, Plus, Trash2, X } from 'lucide-react';
+import { endpoint, record, rename, sourceLabel, sourceUsers, strings, temporalFields, text, type Model, type Selection, type YamlDocument } from './model';
 import { NameDialog } from './ui';
 import type { Column } from './api';
 import { MappingInputs } from './MappingInputs';
 import { SourceBrowser, type TableSelection } from './SourceBrowser';
 import { MappingColumn, mappingControl } from './MappingColumn';
+import { SourceConfig } from './SourceConfig';
+import { TemporalConfig } from './TemporalConfig';
 
 export type Edit = (change: (doc: YamlDocument) => void) => void;
 
@@ -24,7 +26,6 @@ export function ListField({ label, items, change, reorder = false, columns, cont
   }
   return <div className="list-field">
     <div className="field-title">{label}<button className="icon-button" {...controls?.()} aria-label={'添加' + label} onClick={() => change([...items, ''], [...items.keys(), -1])}><Plus size={16} /></button></div>
-    {!items.length && <p className="muted small">未配置</p>}
     {items.map((item, index) => <div className="list-field-row" key={index}>
       <MappingColumn label={label + ' ' + (index + 1)} value={item} columns={columns} location={controls?.(index)} change={value => {
         const next = items.slice();
@@ -69,7 +70,9 @@ export function Inspector({ model, selected, edit, select, openYaml, columns, id
   const [browseSource, setBrowseSource] = useState(false);
   const physical = getColumns(text(item.source));
   const multipleInputs = Array.isArray(item.inputs) && item.inputs.length > 0;
-  const logical = [...strings(item.key), ...strings(item.properties), ...endpoint(item.from).columns, ...endpoint(item.to).columns];
+  const logical = [...strings(item.key), ...strings(item.properties), ...endpoint(item.from).columns, ...endpoint(item.to).columns,
+    ...temporalFields.map(([key]) => text(record(item.scd2)[key]))];
+  const references = section === 'sources' ? sourceUsers(model, name) : [];
   const control = (key: string) => (index?: number) => index === undefined ? mappingControl(invalid, id, key) : mappingControl(invalid, id, key, index);
 
   function editKeys(keys: string[], previousIndexes: number[]) {
@@ -98,27 +101,27 @@ export function Inspector({ model, selected, edit, select, openYaml, columns, id
   }
 
   return <>
-    <div className="inspector-title"><small>{kind}</small>
-      <h2>{name}{section !== 'sources' && <button className="icon-button" aria-label={'重命名' + kind} onClick={() => setRenaming(true)}><Pencil size={16} /></button>}</h2>
+    <div className="inspector-title"><small>{section === 'sources' ? sourceLabel(source) : kind}</small>
+      <h2>{name}<button className="icon-button" aria-label={'重命名' + kind} onClick={() => setRenaming(true)}><Pencil size={16} /></button></h2>
     </div>
     {section === 'sources' ? <div className="inspector-section">
-      <label>连接器<input readOnly value={sourceLabel(item.type)} /></label>
-      {source === 'postgres' ? <label>连接串环境变量<input className="mono" value={text(item.dsn_env)} onChange={event => set('dsn_env', event.target.value)} placeholder="GRAPHLAKE_POSTGRES_DSN" /></label>
-        : source === 'parquet' ? <>
+      {source === 'parquet' ? <>
           <div className="field-title">表映射<button className="icon-button" aria-label="添加 Parquet 表" onClick={() => setAddingTable(true)}><Plus size={17} /></button></div>
-          {!Object.keys(tables).length && <p className="muted small">未配置表映射</p>}
           {Object.entries(tables).map(([table, paths]) => <div className="parquet-table" key={table}>
             <div className="field-title"><code>{table}</code><button className="icon-button" aria-label={'移除表 ' + table} onClick={() => edit(doc => { doc.deleteIn([...path, 'tables', table]); })}><X size={16} /></button></div>
             <ListField label="文件路径" items={strings(paths)} change={next => edit(doc => doc.setIn([...path, 'tables', table], next))} />
           </div>)}
-        </> : <button className="button" onClick={openYaml}><Braces size={17} />编辑数据源 YAML</button>}
+        </> : <SourceConfig type={source} item={item} path={path} edit={edit} openYaml={openYaml} />}
       <button className="button" onClick={() => setBrowseSource(true)}>浏览表与字段</button>
+      <details className="form-disclosure"><summary>数据源操作</summary><div className="form-fields">
+        <button className="button danger" disabled={references.length > 0} onClick={onRemove}><Trash2 size={16} />删除数据源</button>
+        {!!references.length && <p className="muted small">先替换以下类型的来源表：{references.join('、')}</p>}
+      </div></details>
       {browseSource && <SourceBrowser id={id} yaml={yaml} model={model} fixedSource={name} close={() => setBrowseSource(false)} />}
     </div> : <>
       <section className="inspector-section"><h3 tabIndex={-1} {...mappingControl(invalid, id, 'mapping')}>数据映射</h3>
         <MappingInputs id={id} yaml={yaml} model={model} item={item} path={path} logical={logical} edit={edit}
           getColumns={getColumns} onColumns={rememberColumns} invalid={invalid} />
-        {physical && !multipleInputs && <p className="muted small">已读取 {physical.length} 列。可在业务键、属性和端点映射中直接选择来源列。</p>}
         <datalist id={id + '-known-tables'}>{Object.entries(model.sources).flatMap(([alias, source]) => Object.keys(record(source.tables)).map(table =>
           <option key={alias + '.' + table} value={alias + '.' + table} />,
         ))}</datalist>
@@ -154,19 +157,25 @@ export function Inspector({ model, selected, edit, select, openYaml, columns, id
         </details>}
       </section>
       <section className="inspector-section">
+        <TemporalConfig id={id} item={item} path={path} columns={multipleInputs ? undefined : physical} edit={edit} invalid={invalid} />
         <button className="button danger" onClick={onRemove} disabled={section === 'nodes' && Object.keys(model.nodes).length <= 1}>
           <Trash2 size={16} />删除{kind}
         </button>
         {section === 'nodes' && Object.keys(model.nodes).length <= 1 && <p className="muted small">图模型至少需要一个节点标签。</p>}
       </section>
     </>}
-    {renaming && <NameDialog title={'重命名' + kind} initial={name} close={() => setRenaming(false)} submit={next => {
+    {renaming && <NameDialog title={'重命名' + kind} action="重命名" initial={name} close={() => setRenaming(false)} submit={next => {
       if (next === name) return;
-      if (Object.hasOwn(model.nodes, next) || Object.hasOwn(model.edges, next)) throw new Error('标签或边类型已存在');
-      if (section !== 'sources') edit(doc => rename(doc, model, section, name, next));
+      if (section === 'sources') {
+        if (next.includes('.') || next.includes('\0')) throw new Error('数据源名称不能包含点或空字符');
+        if (Object.hasOwn(model.sources, next)) throw new Error('数据源已存在');
+      } else if (Object.hasOwn(model.nodes, next) || Object.hasOwn(model.edges, next)) {
+        throw new Error('标签或边类型已存在');
+      }
+      edit(doc => rename(doc, model, section, name, next));
       select({ section, name: next });
     }} />}
-    {addingTable && <NameDialog title="添加 Parquet 表" close={() => setAddingTable(false)} submit={name => {
+    {addingTable && <NameDialog title="添加 Parquet 表" label="表名" placeholder="schema.table" action="添加" close={() => setAddingTable(false)} submit={name => {
       if (Object.hasOwn(tables, name)) throw new Error('表映射已存在');
       edit(doc => doc.setIn([...path, 'tables', name], ['']));
     }} />}

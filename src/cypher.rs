@@ -37,12 +37,22 @@ pub(crate) struct Plan {
     pub calls: Vec<apply::Apply>,
     pub(crate) call_lookups: Vec<apply::Lookup>,
     pub procedures: Vec<procedures::Procedure>,
+    pub schema_procedures: Vec<procedures::SchemaProcedure>,
     pub repeats: Vec<crate::gremlin::repeat::Repeat>,
+    pub(crate) indexed_csr: bool,
+    pub(crate) has_row_expressions: bool,
+    pub(crate) has_row_expression_lambda: bool,
+    pub(crate) expansion_base: usize,
     #[cfg(feature = "admin")]
     pub graph_output: crate::engine::query_graph::GraphOutput,
 }
 
-pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
+pub(crate) fn plan(
+    catalog: &Catalog,
+    query: &str,
+    partitioned_csr: bool,
+    indexed_csr: bool,
+) -> Result<Plan> {
     // Bound recursive AST depth in the third-party Cypher parser and renderer.
     let complexity = query
         .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
@@ -56,13 +66,17 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
         complexity <= 384,
         "Cypher statement exceeds the supported expression complexity"
     );
-    let (text, mut extensions) = paths::parse_wrappers(query)?;
+    let wrapped = paths::rewrite_count_subqueries(query)?;
+    let (text, mut extensions) = paths::parse_wrappers(&wrapped)?;
+    extensions.partitioned_csr = partitioned_csr;
+    extensions.indexed_csr = indexed_csr;
     let mut ast = opencypher::parse(&text).map_err(|e| anyhow!("invalid Cypher: {e}"))?;
+    paths::validate_call_scopes(&ast, &extensions)?;
     collect::fold_sizes(&mut ast);
     page::defer_properties(catalog, &mut ast, &mut extensions);
     let mut exists = clauses::HasExists(false);
     opencypher::Visitor::visit_query(&mut exists, &ast);
-    let result = if let [Clause::Match(pattern), Clause::Return(ret)] =
+    let mut result = if let [Clause::Match(pattern), Clause::Return(ret)] =
         ast.initial.clauses.as_slice()
         && ast.unions.is_empty()
         && extensions.shortest.is_empty()
@@ -81,6 +95,8 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
         && !alternatives::has_untyped(catalog, pattern)
     {
         let mut builder = MatchPlan::new(catalog);
+        builder.partitioned_csr = partitioned_csr;
+        builder.indexed_csr = indexed_csr;
         bind_pattern(
             catalog,
             pattern,
@@ -120,19 +136,22 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
         extensions.shortest.is_empty(),
         "shortest path function must wrap a MATCH path pattern"
     );
-    ensure!(
-        extensions.call_imports.is_empty(),
-        "CALL scope must precede a subquery"
-    );
+    result.has_row_expressions = exists.0;
+    result.has_row_expression_lambda = result.sql.contains("__graphlake_row_expression_")
+        && result.sql.contains("array_transform(");
     Ok(result)
 }
 
 #[derive(Default)]
 struct MatchPlan<'a> {
     catalog: Option<&'a Catalog>,
+    partitioned_csr: bool,
+    indexed_csr: bool,
     expression_labels: RefCell<BTreeSet<String>>,
     expression_expansions: RefCell<Vec<Expansion>>,
+    expression_calls: RefCell<Vec<apply::Apply>>,
     expression_joins: RefCell<Vec<clauses::ExpressionJoin>>,
+    call_imports: std::rc::Rc<BTreeMap<usize, Vec<String>>>,
     lambda_inputs: RefCell<Vec<(String, String)>>,
     labels: BTreeSet<String>,
     bindings: BTreeMap<String, Binding>,
@@ -221,24 +240,29 @@ impl<'a> MatchPlan<'a> {
         plan.labels.append(&mut self.expression_labels.borrow_mut());
         plan.expansions
             .append(&mut self.expression_expansions.borrow_mut());
+        plan.calls.append(&mut self.expression_calls.borrow_mut());
     }
 
     fn join_expressions(&self, from: &str) -> String {
-        let joins = self.expression_joins.borrow();
+        let mut joins = self.expression_joins.borrow_mut();
         let from = if from.is_empty() && !joins.is_empty() {
             " FROM (SELECT 1) AS __graphlake_expression_input"
         } else {
             from
         };
         let mut result = from.to_owned();
-        for (index, join) in joins.iter().enumerate() {
+        for index in 0..joins.len() {
             let depends_on_join = joins[..index].iter().any(|previous| {
                 let alias = format!("{}.", ident(&previous.alias));
-                join.captures
+                joins[index]
+                    .captures
                     .iter()
                     .any(|(_, value)| value.contains(&alias))
             });
-            let sql = join.sql(if depends_on_join { &result } else { from });
+            let sql = joins[index].sql(
+                if depends_on_join { &result } else { from },
+                &mut self.expression_calls.borrow_mut(),
+            );
             result.push_str(&sql);
         }
         result
@@ -473,6 +497,15 @@ impl<'a> MatchPlan<'a> {
                 self.entity_type(item, aliases)
             }
             ExprKind::List(items) => self.common_entity(items.iter(), aliases),
+            ExprKind::PatternComprehension { .. } => {
+                match clauses::pattern_list(self.catalog?, self, aliases, expr, false)
+                    .ok()?
+                    .1
+                {
+                    clauses::Value::Entity(binding) => Some(binding),
+                    _ => None,
+                }
+            }
             ExprKind::Slice { base, .. } => self.entity_list(base, aliases),
             ExprKind::Case { whens, default, .. } => Self::merge_entities(
                 whens
@@ -654,6 +687,15 @@ impl<'a> MatchPlan<'a> {
                 body,
                 expression.span,
             ),
+            ExprKind::PatternComprehension { .. } => Ok(clauses::pattern_list(
+                self.catalog
+                    .context("pattern comprehension requires a graph planning context")?,
+                self,
+                aliases,
+                expression,
+                true,
+            )?
+            .0),
             ExprKind::Quantifier {
                 kind: kind @ (QuantifierKind::Any | QuantifierKind::All | QuantifierKind::None),
                 variable,
@@ -876,6 +918,37 @@ impl<'a> MatchPlan<'a> {
                 args,
             } => {
                 let function = name.0.to_ascii_lowercase();
+                if function == paths::COUNT_SUBQUERY && !distinct {
+                    let [
+                        Expr {
+                            kind: ExprKind::Exists(body),
+                            ..
+                        },
+                    ] = args.as_slice()
+                    else {
+                        bail!("COUNT requires a braced subquery");
+                    };
+                    return clauses::row_subquery(
+                        self.catalog
+                            .context("COUNT requires a graph planning context")?,
+                        self,
+                        aliases,
+                        body,
+                        expression.span,
+                        clauses::RowExpression::Count,
+                    );
+                }
+                if matches!(function.as_str(), "date" | "datetime") && !distinct {
+                    return Ok(match (function.as_str(), args.as_slice()) {
+                        ("date", []) => "current_date()".into(),
+                        ("datetime", []) => "now()".into(),
+                        ("date", [arg]) => format!("CAST({} AS DATE)", render(arg)?),
+                        ("datetime", [arg]) => {
+                            format!("CAST({} AS TIMESTAMP WITH TIME ZONE)", render(arg)?)
+                        }
+                        _ => bail!("{function}() expects zero or one argument"),
+                    });
+                }
                 if function == "reduce" && !distinct {
                     let [acc, initial, item, list, body] = args.as_slice() else {
                         bail!("reduce() expects accumulator = initial, item IN list | expression");
@@ -1268,7 +1341,7 @@ impl<'a> MatchPlan<'a> {
                 .alias
                 .as_ref()
                 .map(|v| v.0.clone())
-                .unwrap_or_else(|| item.expr.to_string());
+                .unwrap_or_else(|| expression_name(&item.expr));
             ensure!(
                 output_names.insert(name.clone()),
                 "duplicate RETURN column {name}"
@@ -1319,6 +1392,9 @@ impl<'a> MatchPlan<'a> {
         if sort_requested {
             let mut projected = MatchPlan {
                 catalog: self.catalog,
+                call_imports: self.call_imports.clone(),
+                indexed_csr: self.indexed_csr,
+                partitioned_csr: self.partitioned_csr,
                 ..Default::default()
             };
             scope.bind("d", &mut projected);
@@ -1326,7 +1402,7 @@ impl<'a> MatchPlan<'a> {
                 let column = order_column(index, &mut output_names);
                 let mut aggregate = HasAggregate(false);
                 aggregate.visit_expr(&item.expr);
-                let spelling = item.expr.to_string();
+                let spelling = expression_name(&item.expr);
                 let projected_expression = if !aggregate.0 {
                     projected.expr(&item.expr).ok()
                 } else {
@@ -1335,7 +1411,7 @@ impl<'a> MatchPlan<'a> {
                 let projected_expression = projected_expression.or_else(|| {
                     body.items
                         .iter()
-                        .find(|item| item.expr.to_string() == spelling)
+                        .find(|item| expression_name(&item.expr) == spelling)
                         .map(|item| {
                             qualified(
                                 "d",
@@ -1414,9 +1490,11 @@ impl<'a> MatchPlan<'a> {
             );
         }
         if !hidden.is_empty() {
-            let projected_from = projected_order
-                .expect("projected ordering")
-                .join_expressions(&format!(" FROM ({sql}) AS d"));
+            let projected = projected_order.expect("projected ordering");
+            let projected_from = projected.join_expressions(&format!(" FROM ({sql}) AS d"));
+            self.expression_calls
+                .borrow_mut()
+                .append(&mut projected.expression_calls.borrow_mut());
             sql = format!("SELECT d.*, {}{projected_from}", hidden.join(", "));
         }
         if public || !keep_order && !order.is_empty() {
@@ -1570,6 +1648,12 @@ struct HasAggregate(bool);
 
 impl Visitor for HasAggregate {
     fn visit_expr(&mut self, expr: &Expr) {
+        if matches!(
+            expr.kind,
+            ExprKind::Exists(_) | ExprKind::PatternComprehension { .. }
+        ) {
+            return;
+        }
         if matches!(&expr.kind, ExprKind::CountStar)
             || matches!(&expr.kind, ExprKind::FunctionCall { name, .. }
             if matches!(name.0.to_ascii_lowercase().as_str(), "count" | "sum" | "avg" | "min" | "max" | "collect" | collect::COUNT_SIZE))
@@ -1579,6 +1663,22 @@ impl Visitor for HasAggregate {
             walk_expr(self, expr);
         }
     }
+}
+
+fn expression_name(expr: &Expr) -> String {
+    if let ExprKind::FunctionCall { name, args, .. } = &expr.kind
+        && name.0 == paths::COUNT_SUBQUERY
+        && let [
+            Expr {
+                kind: ExprKind::Exists(body),
+                ..
+            },
+        ] = args.as_slice()
+    {
+        let rendered = body.to_string();
+        return format!("COUNT{}", &rendered["EXISTS".len()..]);
+    }
+    expr.to_string()
 }
 
 pub(crate) fn string(value: &str) -> String {
@@ -1599,6 +1699,21 @@ pub(crate) fn escape_id_component(value: &str, output: &mut String) {
             _ => output.push(ch),
         }
     }
+}
+
+#[cfg(feature = "admin")]
+pub(crate) fn format_element_id(label: &str, key: &[String]) -> String {
+    let mut id = String::new();
+    escape_id_component(label, &mut id);
+    id.push('[');
+    for (i, value) in key.iter().enumerate() {
+        if i > 0 {
+            id.push(',');
+        }
+        escape_id_component(value, &mut id);
+    }
+    id.push(']');
+    id
 }
 
 pub(crate) fn extremum(value: &str, key: &str, maximum: bool) -> String {

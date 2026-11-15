@@ -37,10 +37,136 @@ pub(super) fn bounds(range: Option<RangeLiteral>) -> Result<(usize, usize)> {
 
 #[derive(Clone, Default)]
 pub(super) struct Extensions {
+    pub(super) partitioned_csr: bool,
+    pub(super) indexed_csr: bool,
     pub(super) shortest: BTreeMap<usize, Shortest>,
-    pub(super) call_imports: BTreeMap<usize, Vec<String>>,
+    pub(super) call_imports: std::rc::Rc<BTreeMap<usize, Vec<String>>>,
     pub(super) page_fields: BTreeMap<usize, (String, BTreeSet<String>)>,
     pub(super) page_outputs: BTreeMap<(usize, usize), BTreeSet<String>>,
+}
+
+#[derive(Default)]
+struct ScopedCalls(BTreeSet<usize>);
+
+impl opencypher::Visitor for ScopedCalls {
+    fn visit_clause(&mut self, clause: &opencypher::Clause) {
+        if let opencypher::Clause::Call(call) = clause
+            && matches!(call.kind, opencypher::CallKind::Subquery(_))
+        {
+            self.0.insert(call.span.start);
+        }
+        opencypher::walk_clause(self, clause);
+    }
+}
+
+pub(super) fn validate_call_scopes(
+    query: &opencypher::Query,
+    extensions: &Extensions,
+) -> Result<()> {
+    let mut calls = ScopedCalls::default();
+    opencypher::Visitor::visit_query(&mut calls, query);
+    ensure!(
+        extensions
+            .call_imports
+            .keys()
+            .all(|span| calls.0.contains(span)),
+        "CALL scope must precede a subquery"
+    );
+    Ok(())
+}
+
+pub(super) const COUNT_SUBQUERY: &str = "__graphlake_count_subquery";
+
+// The parser already understands both forms of EXISTS. Use its AST for the
+// same braced grammar, wrapped in an internal function to retain the result mode.
+pub(super) fn rewrite_count_subqueries(query: &str) -> Result<String> {
+    let bytes = query.as_bytes();
+    let mut output = String::with_capacity(query.len());
+    let mut copied = 0;
+    let mut cursor = 0;
+    let mut braces = Vec::new();
+    let mut previous = None;
+    while cursor < bytes.len() {
+        if let Some(end) = skip_literal(bytes, cursor)? {
+            if matches!(bytes[cursor], b'\'' | b'"' | b'`') {
+                previous = Some(bytes[cursor]);
+            }
+            cursor = end;
+            continue;
+        }
+        let byte = bytes[cursor];
+        if bytes
+            .get(cursor..cursor + 5)
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"count"))
+            && (cursor == 0 || !word_byte(bytes[cursor - 1]))
+            && !matches!(previous, Some(b'.' | b'$'))
+            && let open = next_token(bytes, cursor + 5)?
+            && bytes.get(open) == Some(&b'{')
+            && starts_subquery(bytes, next_token(bytes, open + 1)?)?
+        {
+            output.push_str(&query[copied..cursor]);
+            output.push_str(COUNT_SUBQUERY);
+            output.push_str("(EXISTS");
+            copied = cursor + 5;
+            cursor = open + 1;
+            previous = Some(b'{');
+            braces.push(true);
+            continue;
+        }
+        if byte == b'{' {
+            braces.push(false);
+        } else if byte == b'}' && braces.pop() == Some(true) {
+            output.push_str(&query[copied..=cursor]);
+            output.push(')');
+            copied = cursor + 1;
+        }
+        if !byte.is_ascii_whitespace() {
+            previous = Some(byte);
+        }
+        cursor += 1;
+    }
+    output.push_str(&query[copied..]);
+    Ok(output)
+}
+
+fn starts_subquery(bytes: &[u8], start: usize) -> Result<bool> {
+    if bytes.get(start) == Some(&b'(') {
+        return Ok(true);
+    }
+    let end = if bytes.get(start) == Some(&b'`') {
+        skip_literal(bytes, start)?.expect("quoted identifier")
+    } else {
+        start
+            + bytes[start..]
+                .iter()
+                .take_while(|&&byte| word_byte(byte))
+                .count()
+    };
+    let next = next_token(bytes, end)?;
+    match bytes.get(next) {
+        Some(b':') => return Ok(false),
+        Some(b'=') if end > start => {
+            return Ok(bytes.get(next_token(bytes, next + 1)?) == Some(&b'('));
+        }
+        _ => {}
+    }
+    Ok([
+        b"match".as_slice(),
+        b"optional",
+        b"with",
+        b"unwind",
+        b"return",
+        b"call",
+        b"create",
+        b"merge",
+        b"delete",
+        b"set",
+        b"remove",
+        b"foreach",
+        b"load",
+    ]
+    .iter()
+    .any(|word| bytes[start..end].eq_ignore_ascii_case(word)))
 }
 
 /// Adapt syntax absent from the parser while preserving its source spans.
@@ -86,7 +212,7 @@ pub(super) fn parse_wrappers(query: &str) -> Result<(String, Extensions)> {
             if bytes.get(brace) == Some(&b'{') {
                 let variables = imports(&query[open + 1..end - 1])?;
                 text[open..end].fill(b' ');
-                extensions.call_imports.insert(start, variables);
+                std::rc::Rc::make_mut(&mut extensions.call_imports).insert(start, variables);
                 cursor = end;
             }
             continue;

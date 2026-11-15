@@ -10,6 +10,7 @@ Group=graphlake
 WorkingDirectory=/var/lib/graphlake
 StateDirectory=graphlake
 StateDirectoryMode=0700
+Environment=GRAPHLAKE_HA_METRICS_FILE=/var/lib/graphlake/ha-metrics.json
 EnvironmentFile=-/etc/graphlake/graphlake.env
 ExecStart=/opt/graphlake/current/bin/graphlake-admin --catalog-dir /var/lib/graphlake/catalog --assets-dir /opt/graphlake/current/web --query-slots 4
 Restart=on-failure

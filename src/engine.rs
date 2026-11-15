@@ -3,13 +3,19 @@ mod exploration;
 mod export;
 #[cfg(feature = "admin")]
 pub(crate) use model::{Exploration, exploration_seek_type};
+#[cfg(feature = "admin")]
+pub(crate) use model::{KEY_VALIDATOR, key_validator};
 mod model;
 mod query;
 mod query_functions;
 #[cfg(feature = "admin")]
+pub(crate) use query_functions::register as register_graph_functions;
+#[cfg(feature = "admin")]
 pub(crate) mod query_graph;
 pub(crate) mod read_filters;
 
+#[cfg(feature = "admin")]
+pub(crate) use query::spilled_bytes as execution_spill;
 pub use query::{EngineLimits, QueryMetrics, QueryOptions, QueryResult};
 pub(crate) use query::{QueryScope, graph_frame};
 
@@ -118,6 +124,10 @@ impl Engine {
             false,
             #[cfg(feature = "admin")]
             None,
+            #[cfg(feature = "admin")]
+            None,
+            #[cfg(feature = "admin")]
+            None,
         )
         .await
     }
@@ -129,7 +139,7 @@ impl Engine {
         query: &str,
         options: QueryOptions,
     ) -> Result<QueryResult> {
-        self.query_inner(language, query, options, true, true, None)
+        self.query_inner(language, query, options, true, true, None, None, None)
             .await
     }
 
@@ -141,8 +151,41 @@ impl Engine {
         options: QueryOptions,
         transaction: Option<&ReadTransaction>,
     ) -> Result<QueryResult> {
-        self.query_inner(language, query, options, false, true, transaction)
-            .await
+        self.query_inner(
+            language,
+            query,
+            options,
+            false,
+            true,
+            transaction,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "admin")]
+    pub(crate) async fn cluster_query(
+        &self,
+        language: Language,
+        query: &str,
+        mut options: QueryOptions,
+        preview: bool,
+        distributed: &crate::admin::cluster::distributed::Distributed,
+        csr: Option<&crate::admin::cluster::csr::CypherCsr>,
+    ) -> Result<QueryResult> {
+        options.partitions = options.partitions.max(distributed.partitions);
+        self.query_inner(
+            language,
+            query,
+            options,
+            preview,
+            preview,
+            None,
+            Some(distributed),
+            csr,
+        )
+        .await
     }
 
     async fn query_inner(
@@ -153,6 +196,10 @@ impl Engine {
         _preview: bool,
         #[cfg(feature = "admin")] graph_context: bool,
         #[cfg(feature = "admin")] transaction: Option<&ReadTransaction>,
+        #[cfg(feature = "admin")] distributed: Option<
+            &crate::admin::cluster::distributed::Distributed,
+        >,
+        #[cfg(feature = "admin")] csr: Option<&crate::admin::cluster::csr::CypherCsr>,
     ) -> Result<QueryResult> {
         ensure!(query.len() <= 64 * 1024, "query exceeds 64 KiB");
         let (prefix, text) = explain_prefix(query);
@@ -170,6 +217,15 @@ impl Engine {
         let (destination, text) = export::parse(text, &self.catalog.export_locations)?;
         let exporting = destination.is_some();
         let destination = destination.filter(|_| prefix.is_empty());
+        #[cfg(feature = "admin")]
+        if let Some(csr) = csr {
+            let mut explicit = crate::GraphOptions::default();
+            ensure!(
+                crate::graph_options::using(text, &mut explicit)? == text,
+                "CSR queries use the generation's graph scope"
+            );
+            options.graph = csr.options();
+        }
         let text = if matches!(language, Language::Cypher) {
             crate::graph_options::using(text, &mut options.graph)?
         } else {
@@ -178,72 +234,150 @@ impl Engine {
         let scope = self.scope(options).await?;
         scope
             .run(async {
-                let context = if matches!(language, Language::Sql) {
+                let mut context = if matches!(language, Language::Sql) {
                     scope.session()
                 } else {
                     scope.graph_session()
                 };
-                let state = context.state();
+                let mut state = context.state();
                 #[cfg(feature = "admin")]
                 let mut graph_output = query_graph::GraphOutput::default();
-                let (statement, labels, validate_endpoints, expansions, calls, procedures, repeats) =
-                    match language {
-                        Language::Cypher => {
-                            let plan = cypher::plan(&self.catalog, text)?;
-                            #[cfg(feature = "admin")]
-                            { graph_output = plan.graph_output; }
-                            (
-                                query::graph_statement(&state, &format!("{prefix}{}", plan.sql))?,
-                                plan.labels,
-                                false,
-                                plan.expansions,
-                                plan.calls,
-                                plan.procedures,
-                                plan.repeats,
-                            )
-                        }
-                        Language::Gremlin => {
-                            let plan = crate::gremlin::plan(&self.catalog, text)?;
-                            #[cfg(feature = "admin")]
-                            { graph_output = plan.graph_output; }
-                            (
-                                query::graph_statement(&state, &format!("{prefix}{}", plan.sql))?,
-                                plan.labels,
-                                true,
-                                plan.expansions,
-                                plan.calls,
-                                plan.procedures,
-                                plan.repeats,
-                            )
-                        }
-                        Language::Sql => {
-                            let export_sql;
-                            let sql = if exporting {
-                                export_sql = format!("{prefix}{text}");
-                                &export_sql
-                            } else {
-                                query
-                            };
-                            let statement = state.sql_to_statement(
-                                sql,
-                                &state.config_options().sql_parser.dialect,
-                            )?;
-                            ensure!(
-                                select_statement(&statement),
-                                "SQL supports read-only SELECT and EXPLAIN"
-                            );
-                            let labels = state
-                                .resolve_table_references(&statement)?
-                                .into_iter()
-                                .map(|table| table.table().to_owned())
-                                .filter(|name| {
-                                    self.catalog.nodes.contains_key(name)
-                                        || self.catalog.edges.contains_key(name)
-                                })
+                let (
+                    statement,
+                    labels,
+                    validate_endpoints,
+                    expansions,
+                    calls,
+                    procedures,
+                    repeats,
+                    schema_procedures,
+                ) = match language {
+                    Language::Cypher => {
+                        #[cfg(feature = "admin")]
+                        let partitioned_csr = csr.is_some();
+                        #[cfg(not(feature = "admin"))]
+                        let partitioned_csr = false;
+                        #[cfg(feature = "admin")]
+                        let indexed_csr = csr.is_some_and(|csr| csr.indexed());
+                        #[cfg(not(feature = "admin"))]
+                        let indexed_csr = false;
+                        let plan = cypher::plan(&self.catalog, text, partitioned_csr, indexed_csr)?;
+                        if plan.has_row_expression_lambda {
+                            // DataFusion 55 can move a lambda's captured column
+                            // to the index already assigned to its parameter.
+                            let rules = state
+                                .physical_optimizers()
+                                .iter()
+                                .filter(|rule| rule.name() != "ProjectionPushdown")
+                                .cloned()
                                 .collect();
-                            (statement, labels, true, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                            state = datafusion::execution::SessionStateBuilder::new_from_existing(
+                                state,
+                            )
+                            .with_physical_optimizer_rules(rules)
+                            .build();
+                            context =
+                                datafusion::prelude::SessionContext::new_with_state(state.clone());
                         }
-                    };
+                        if plan.has_row_expressions
+                            && !partitioned_csr
+                            && scope.options.memory_bytes <= 32 * 1024 * 1024
+                            && scope.options.spill_bytes > 0
+                        {
+                            // A decorrelated expression can join large relations even
+                            // when the outer key restricts the final result to one row.
+                            // DataFusion only selects its spillable merge join with
+                            // more than one target partition.
+                            let config = state.config_mut().options_mut();
+                            config.execution.target_partitions = 2;
+                            config.execution.batch_size =
+                                datafusion::config::ConfigNonZeroUsize::try_new(
+                                    config.execution.batch_size.get().min(128),
+                                )?;
+                            config.execution.sort_spill_reservation_bytes = 64 * 1024;
+                            config.optimizer.prefer_hash_join = false;
+                            if !plan.calls.is_empty() {
+                                // Nested CALL can keep an upstream stream open while
+                                // preparing the next group. Avoid speculative scan
+                                // and round-robin partitions competing for its sort
+                                // reservations.
+                                config.optimizer.repartition_file_scans = false;
+                                config.optimizer.enable_round_robin_repartition = false;
+                                // The migration aggregate reserves a large hash
+                                // state even for a narrow page over a few groups.
+                                config.execution.enable_migration_aggregate = false;
+                                scope.runtime.disk_manager.set_max_spill_merge_fan_in(4);
+                            }
+                            context =
+                                datafusion::prelude::SessionContext::new_with_state(state.clone());
+                        }
+                        #[cfg(feature = "admin")]
+                        {
+                            graph_output = plan.graph_output;
+                        }
+                        (
+                            query::graph_statement(&state, &format!("{prefix}{}", plan.sql))?,
+                            plan.labels,
+                            false,
+                            plan.expansions,
+                            plan.calls,
+                            plan.procedures,
+                            plan.repeats,
+                            plan.schema_procedures,
+                        )
+                    }
+                    Language::Gremlin => {
+                        let plan = crate::gremlin::plan(&self.catalog, text)?;
+                        #[cfg(feature = "admin")]
+                        {
+                            graph_output = plan.graph_output;
+                        }
+                        (
+                            query::graph_statement(&state, &format!("{prefix}{}", plan.sql))?,
+                            plan.labels,
+                            true,
+                            plan.expansions,
+                            plan.calls,
+                            plan.procedures,
+                            plan.repeats,
+                            Vec::new(),
+                        )
+                    }
+                    Language::Sql => {
+                        let export_sql;
+                        let sql = if exporting {
+                            export_sql = format!("{prefix}{text}");
+                            &export_sql
+                        } else {
+                            query
+                        };
+                        let statement = state
+                            .sql_to_statement(sql, &state.config_options().sql_parser.dialect)?;
+                        ensure!(
+                            select_statement(&statement),
+                            "SQL supports read-only SELECT and EXPLAIN"
+                        );
+                        let labels = state
+                            .resolve_table_references(&statement)?
+                            .into_iter()
+                            .map(|table| table.table().to_owned())
+                            .filter(|name| {
+                                self.catalog.nodes.contains_key(name)
+                                    || self.catalog.edges.contains_key(name)
+                            })
+                            .collect();
+                        (
+                            statement,
+                            labels,
+                            true,
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    }
+                };
                 let explain_only =
                     matches!(&statement, Statement::Explain(explain) if !explain.options.analyze);
                 let schema_only = explain_only || zero_limit(&statement);
@@ -256,8 +390,32 @@ impl Engine {
                     Statement::Statement(stmt) => read_filters::query_filter(stmt, &self.catalog),
                     _ => None,
                 };
-                let mut prepared = self
-                    .prepare_query(
+                #[cfg(feature = "admin")]
+                let distributed = distributed.filter(|_| {
+                    csr.is_none()
+                        && !schema_only
+                        && prefix.is_empty()
+                        && calls.is_empty()
+                        && repeats.is_empty()
+                        && expansions.is_empty()
+                        && procedures.is_empty()
+                        && schema_procedures.is_empty()
+                });
+                #[cfg(feature = "admin")]
+                let snapshot = if let Some(csr) = csr {
+                    Some(
+                        csr.prepare(&context, &scope, &self.catalog, labels.clone())
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "admin"))]
+                let snapshot = None;
+                let mut prepared = if let Some(prepared) = snapshot {
+                    prepared
+                } else {
+                    self.prepare_query(
                         &scope,
                         &context,
                         labels,
@@ -265,26 +423,76 @@ impl Engine {
                             validate_endpoints,
                             #[cfg(feature = "admin")]
                             transaction,
+                            #[cfg(feature = "admin")]
+                            distributed,
                             explain_only: schema_only,
                             #[cfg(feature = "admin")]
-                            graph_versions: _preview && !schema_only
-                                && (!graph_output.columns.is_empty() || graph_output.row_entity.is_some()),
+                            graph_versions: _preview
+                                && !schema_only
+                                && (!graph_output.columns.is_empty()
+                                    || graph_output.row_entity.is_some()),
                             lazy_validation: !calls.is_empty()
                                 || filter.as_ref().is_some_and(|(_, keys)| !keys.is_empty()),
                             ..Default::default()
                         },
                         filter.as_ref(),
                     )
-                    .await?;
+                    .await?
+                };
                 if !pinned.is_empty() {
                     prepared
                         .reservations
                         .extend(cypher::apply::pin_tables(&context, &pinned, &scope).await?);
                     prepared.postgres.clear();
                 }
+                if !schema_procedures.is_empty() {
+                    let schema_context = scope.graph_session();
+                    let labels: BTreeSet<String> = schema_procedures
+                        .iter()
+                        .flat_map(|procedure| procedure.labels(&self.catalog))
+                        .collect();
+                    #[cfg(feature = "admin")]
+                    let schema_snapshot = if let Some(csr) = csr {
+                        Some(
+                            csr.prepare(&schema_context, &scope, &self.catalog, labels.clone())
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    #[cfg(not(feature = "admin"))]
+                    let schema_snapshot = None;
+                    let _schema = if let Some(snapshot) = schema_snapshot {
+                        snapshot
+                    } else {
+                        self.prepare_query(
+                            &scope,
+                            &schema_context,
+                            labels,
+                            model::ReadKind {
+                                explain_only: true,
+                                ..Default::default()
+                            },
+                            None,
+                        )
+                        .await?
+                    };
+                    for procedure in schema_procedures {
+                        procedure
+                            .register(&self.catalog, &schema_context, &context)
+                            .await?;
+                    }
+                }
                 for expansion in expansions {
                     expansion
-                        .register(&self.catalog, &context, &scope, &prepared)
+                        .register(
+                            &self.catalog,
+                            &context,
+                            &scope,
+                            &prepared,
+                            #[cfg(feature = "admin")]
+                            csr.filter(|_| !schema_only),
+                        )
                         .await?;
                 }
                 for procedure in procedures {
@@ -304,15 +512,27 @@ impl Engine {
                 }
                 for repeat in repeats {
                     prepared.reservations.push(
-                        repeat.register(&self.catalog, &context, &scope, schema_only).await?
+                        repeat
+                            .register(&self.catalog, &context, &scope, schema_only)
+                            .await?,
                     );
                 }
                 let mut state = context.state();
                 if ordered_call_output {
                     // Keep the ordered spill stream in one partition. A round-robin
                     // split would coalesce wide batches and merge them again.
-                    state.config_mut().options_mut().optimizer.enable_round_robin_repartition =
-                        false;
+                    state
+                        .config_mut()
+                        .options_mut()
+                        .optimizer
+                        .enable_round_robin_repartition = false;
+                }
+                #[cfg(feature = "admin")]
+                if distributed.is_some() {
+                    crate::admin::cluster::distributed::Distributed::configure(
+                        &mut state,
+                        scope.options.memory_bytes,
+                    );
                 }
                 let plan = query::graph_logical_plan(&state, statement).await?;
                 SQLOptions::new()
@@ -320,17 +540,44 @@ impl Engine {
                     .with_allow_dml(false)
                     .with_allow_statements(false)
                     .verify_plan(&plan)?;
-                let frame = if ordered_call_output {
+                #[cfg(feature = "admin")]
+                let distributed_planning = distributed.is_some();
+                #[cfg(not(feature = "admin"))]
+                let distributed_planning = false;
+                let frame = if ordered_call_output || distributed_planning {
                     DataFrame::new(state, plan)
                 } else {
                     context.execute_logical_plan(plan).await?
                 };
+                #[cfg(feature = "admin")]
+                let result = if let Some(distributed) = distributed {
+                    let ctx = Arc::new(frame.task_ctx());
+                    let plan = frame.create_physical_plan().await?;
+                    let plan = distributed
+                        .execute(
+                            plan,
+                            &scope,
+                            ctx.clone(),
+                            !matches!(language, Language::Sql),
+                            true,
+                        )
+                        .await?;
+                    scope.execute(&self.catalog.graph, &context, plan, prepared, destination)?
+                } else {
+                    scope
+                        .result(&self.catalog.graph, &context, frame, prepared, destination)
+                        .await?
+                };
+                #[cfg(not(feature = "admin"))]
                 let result = scope
                     .result(&self.catalog.graph, &context, frame, prepared, destination)
                     .await?;
                 #[cfg(feature = "admin")]
                 let result = QueryResult {
-                    graph_context: (graph_context && (!graph_output.columns.is_empty() || graph_output.row_entity.is_some())).then_some(context),
+                    graph_context: (graph_context
+                        && (!graph_output.columns.is_empty() || graph_output.row_entity.is_some()))
+                    .then_some(context),
+                    graph_csr: csr.filter(|csr| csr.indexed()).cloned(),
                     graph_output,
                     ..result
                 };
@@ -390,6 +637,79 @@ impl Engine {
     }
 
     #[cfg(feature = "admin")]
+    pub(crate) async fn probe_model_sources(
+        &self,
+        options: QueryOptions,
+    ) -> Result<(BTreeMap<String, bool>, Result<()>)> {
+        use futures::{StreamExt, stream};
+
+        let scope = self.scope(options).await?;
+        let mut labels: BTreeSet<_> = self
+            .catalog
+            .nodes
+            .keys()
+            .chain(self.catalog.edges.keys())
+            .cloned()
+            .collect();
+        let references = model::required(&self.catalog, &mut labels, &scope.options.graph, None)?;
+        let sources = references
+            .keys()
+            .map(|reference| {
+                self.catalog
+                    .source(reference)
+                    .map(|(name, _, _)| name.to_owned())
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        scope
+            .run(async {
+                let sources: BTreeMap<String, bool> = stream::iter(sources)
+                    .map(|source: String| {
+                        let context = scope.session();
+                        let scope = &scope;
+                        let labels = labels.clone();
+                        async move {
+                            let result = Box::pin(self.prepare_query(
+                                scope,
+                                &context,
+                                labels,
+                                model::ReadKind {
+                                    explain_only: true,
+                                    probe_source: Some(&source),
+                                    ..Default::default()
+                                },
+                                None,
+                            ))
+                            .await;
+                            (source, result.is_ok())
+                        }
+                    })
+                    .buffered(4)
+                    .collect()
+                    .await;
+                let mapping = if sources.values().all(|available| *available) {
+                    // Check the mapping across sources after collecting individual failures.
+                    Box::pin(self.prepare_query(
+                        &scope,
+                        &scope.session(),
+                        labels,
+                        model::ReadKind {
+                            explain_only: true,
+                            validate_endpoints: true,
+                            ..Default::default()
+                        },
+                        None,
+                    ))
+                    .await
+                    .map(|_| ())
+                } else {
+                    Ok(())
+                };
+                Ok((sources, mapping))
+            })
+            .await
+    }
+
+    #[cfg(feature = "admin")]
     pub(crate) async fn prepare_exploration(
         &self,
         scope: &QueryScope,
@@ -435,6 +755,31 @@ impl Engine {
         .await
     }
 
+    #[cfg(feature = "admin")]
+    pub(crate) async fn prepare_partitioned_topology(
+        &self,
+        scope: &QueryScope,
+        context: &SessionContext,
+    ) -> Result<Prepared> {
+        self.prepare_query(
+            scope,
+            context,
+            self.catalog
+                .nodes
+                .keys()
+                .chain(self.catalog.edges.keys())
+                .cloned()
+                .collect(),
+            model::ReadKind {
+                validate_endpoints: true,
+                partitioned_topology: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    }
+
     async fn prepare_query(
         &self,
         scope: &QueryScope,
@@ -450,7 +795,14 @@ impl Engine {
         }
         let filters = read_filters::for_labels(catalog, &labels, &scope.options.graph, filter);
         #[cfg(feature = "admin")]
-        let private = if read.exploration.is_some() {
+        let private = if read.distributed.is_some() {
+            let mut state = scope.session().state();
+            crate::admin::cluster::distributed::Distributed::configure(
+                &mut state,
+                scope.options.memory_bytes,
+            );
+            SessionContext::new_with_state(state)
+        } else if read.exploration.is_some() {
             scope.exploration_session()
         } else {
             scope.session()
@@ -472,6 +824,10 @@ impl Engine {
         let mut postgres = BTreeMap::new();
         for (reference, fields) in required {
             let (name, relation, source) = catalog.source(reference)?;
+            #[cfg(feature = "admin")]
+            if read.probe_source.is_some_and(|probe| probe != name) {
+                continue;
+            }
             #[cfg(feature = "admin")]
             if read.transaction.is_some() {
                 ensure!(
@@ -523,6 +879,11 @@ impl Engine {
                             .await
                             .with_context(|| crate::catalog::MappedTable(reference.to_owned()))?,
                     );
+                    #[cfg(feature = "admin")]
+                    if read.probe_source.is_some() {
+                        table.probe().await?;
+                        continue;
+                    }
                     #[cfg(feature = "admin")]
                     if read.graph_versions {
                         versions.insert(
@@ -843,6 +1204,10 @@ impl Engine {
                     Arc::new(table)
                 }
             };
+            #[cfg(feature = "admin")]
+            if read.probe_source.is_some() {
+                continue;
+            }
             let alias = format!("raw_{}", tables.len());
             let schema = table.schema();
             private.register_table(TableReference::bare(alias.as_str()), table)?;
@@ -850,6 +1215,14 @@ impl Engine {
         }
         for snapshot in mysql_snapshots.into_values() {
             snapshot.close().await?;
+        }
+        #[cfg(feature = "admin")]
+        if read.probe_source.is_some() {
+            return Ok(Prepared {
+                versions: versions.into_values().collect(),
+                reservations,
+                postgres,
+            });
         }
         reservations.extend(
             model::register(
@@ -1089,4 +1462,15 @@ fn select_statement(statement: &Statement) -> bool {
         ),
         _ => false,
     }
+}
+
+#[cfg(feature = "admin")]
+pub(crate) async fn stage_scope(options: QueryOptions) -> Result<Arc<QueryScope>> {
+    Ok(Arc::new(
+        QueryScope::new(
+            options,
+            &Arc::new(query::Admission::new(query::EngineLimits::default())?),
+        )
+        .await?,
+    ))
 }

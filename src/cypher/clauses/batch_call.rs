@@ -30,6 +30,7 @@ pub(super) fn plan(
     let lookups = plan.call_lookups.len();
     let expansions = plan.expansions.len();
     let procedures = plan.procedures.len();
+    let schema_procedures = plan.schema_procedures.len();
     let result = if query.unions.is_empty() {
         single(
             catalog,
@@ -58,6 +59,7 @@ pub(super) fn plan(
         plan.call_lookups.truncate(lookups);
         plan.expansions.truncate(expansions);
         plan.procedures.truncate(procedures);
+        plan.schema_procedures.truncate(schema_procedures);
     }
     Ok(result)
 }
@@ -118,27 +120,26 @@ fn single(
             item.alias
                 .as_ref()
                 .map(|name| name.0.clone())
-                .unwrap_or_else(|| item.expr.to_string())
+                .unwrap_or_else(|| crate::cypher::expression_name(&item.expr))
         })
         .collect::<Vec<_>>();
     let projected_order = if aggregated {
-        let Some(columns) = ret
-            .body
-            .order_by
-            .iter()
-            .map(|sort| {
-                let spelling = sort.expr.to_string();
-                outputs
-                    .iter()
-                    .position(|name| name == &spelling)
-                    .or_else(|| {
-                        ret.body
-                            .items
-                            .iter()
-                            .position(|item| item.expr.to_string() == spelling)
-                    })
-            })
-            .collect::<Option<Vec<_>>>()
+        let Some(columns) =
+            ret.body
+                .order_by
+                .iter()
+                .map(|sort| {
+                    let spelling = crate::cypher::expression_name(&sort.expr);
+                    outputs
+                        .iter()
+                        .position(|name| name == &spelling)
+                        .or_else(|| {
+                            ret.body.items.iter().position(|item| {
+                                crate::cypher::expression_name(&item.expr) == spelling
+                            })
+                        })
+                })
+                .collect::<Option<Vec<_>>>()
         else {
             return Ok(None);
         };
@@ -237,15 +238,17 @@ fn single(
                 &key,
                 &seed_stage,
                 outer_limit.is_some(),
+                extensions,
                 state,
             )?,
             Clause::Unwind(unwind) => {
                 let mut bindings = MatchPlan::new(catalog);
+                bindings.call_imports = extensions.call_imports.clone();
                 right.bind(&mut bindings);
-                super::unwind_stage(catalog, unwind, Some(right), bindings, state)?
+                super::unwind_stage(catalog, unwind, Some(right), bindings, state, None, None)?.0
             }
             Clause::Call(call) if let CallKind::Subquery(query) = &call.kind => {
-                let explicit = extensions.call_imports.remove(&call.span.start);
+                let explicit = extensions.call_imports.get(&call.span.start).cloned();
                 let correlated = explicit.as_ref().map_or_else(
                     || query_imports(query, &right.scope),
                     |names| !names.is_empty(),
@@ -288,6 +291,7 @@ fn single(
     }
 
     let mut bindings = MatchPlan::new(catalog);
+    bindings.call_imports = extensions.call_imports.clone();
     right.bind(&mut bindings);
     let mut fields = vec![qualified("l", &key)];
     let mut group = vec![qualified("l", &key)];
@@ -420,7 +424,11 @@ fn single(
     };
     let lookups = state.call_lookups.split_off(lookup_start);
     let nested = state.calls.split_off(nested_start);
-    let sql = if outer_limit.is_some() || !lookups.is_empty() || !nested.is_empty() {
+    let sql = if outer_limit.is_some()
+        || !outer.order.is_empty()
+        || !lookups.is_empty()
+        || !nested.is_empty()
+    {
         let groups = internal("groups");
         let mut sql = join_sql(&ident(&groups));
         if sequenced {
@@ -507,7 +515,7 @@ fn internal_names(
     }
 }
 
-fn import_key(scope: &Scope, alias: &str) -> String {
+pub(super) fn import_key(scope: &Scope, alias: &str) -> String {
     let fields = scope
         .columns
         .iter()
@@ -575,7 +583,7 @@ fn rank_column(alias: &str, key: &str, rank: &str, order: &[String]) -> String {
     )
 }
 
-fn project_with(
+pub(super) fn project_with(
     catalog: &Catalog,
     with: &opencypher::With,
     input: Stage,
@@ -583,9 +591,11 @@ fn project_with(
     key: &str,
     seed: &str,
     single_seed: bool,
+    extensions: &Extensions,
     plan: &mut Plan,
 ) -> Result<Stage> {
     let mut bindings = MatchPlan::new(catalog);
+    bindings.call_imports = extensions.call_imports.clone();
     input.bind(&mut bindings);
     let mut body = with.body.clone();
     let paged = body.skip.is_some() || body.limit.is_some();
@@ -602,6 +612,7 @@ fn project_with(
         let mut empty_body = body.clone();
         empty_body.order_by.clear();
         let mut empty_bindings = MatchPlan::new(catalog);
+        empty_bindings.call_imports = extensions.call_imports.clone();
         input.bind(&mut empty_bindings);
         let result = empty_bindings
             .project(

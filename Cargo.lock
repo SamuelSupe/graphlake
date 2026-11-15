@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "graphlake"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3236,6 +3236,7 @@ dependencies = [
  "clap",
  "datafusion",
  "datafusion-datasource",
+ "datafusion-proto",
  "deltalake-core",
  "futures",
  "google-cloud-spanner",
@@ -3249,7 +3250,12 @@ dependencies = [
  "mysql_async",
  "object_store",
  "opencypher",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "parquet 59.3.2",
+ "prost",
  "rand 0.9.5",
  "reqwest 0.13.5",
  "rpassword",
@@ -3268,11 +3274,12 @@ dependencies = [
  "tokio-util",
  "url",
  "uuid",
+ "zstd 0.13.4",
 ]
 
 [[package]]
 name = "graphlake-c"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.2",
@@ -3283,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "graphlake-python"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow-pyarrow",
@@ -4410,6 +4417,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
 name = "ntapi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4761,6 +4774,47 @@ dependencies = [
  "pin-project-lite",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "302249bd8ee804789faaa7b5b2cbf79bc61cb864714079c644e3828af5b7e811"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "opentelemetry",
+ "reqwest 0.13.5",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0756af24841e367128ef31c831999937b8b5c5197d47914590d8f4e2e88c2e1a"
+dependencies = [
+ "http",
+ "httpdate",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest 0.13.5",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
 ]
 
 [[package]]
@@ -5670,6 +5724,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -6018,11 +6073,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser",
+ "nohash-hasher",
  "num-traits",
  "serde_core",
  "smallvec",
+ "zmij",
 ]
 
 [[package]]

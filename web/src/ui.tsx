@@ -9,10 +9,10 @@ export function Mark({ size = 25 }: { size?: number }) {
   return <Share2 className="brand-mark" size={size} strokeWidth={2.25} aria-hidden="true" />;
 }
 
-export function StatusLabel({ status }: { status: Status }) {
+export function StatusLabel({ status, text }: { status: Status; text?: string }) {
   const [Icon, label] = status === 'passed' ? [CheckCircle2, '已通过']
     : status === 'failed' ? [AlertTriangle, '校验失败'] : [CircleMinus, '未校验'];
-  return <span className={'status ' + status}><Icon size={16} aria-hidden="true" />{label}</span>;
+  return <span className={'status ' + status}><Icon size={16} aria-hidden="true" />{text ?? label}</span>;
 }
 
 export function Modal({ title, close, children }: { title: string; close: () => void; children: ReactNode }) {
@@ -32,13 +32,16 @@ export function Modal({ title, close, children }: { title: string; close: () => 
   </dialog>;
 }
 
-export function NameDialog({ title, close, submit, initial = '', withId = false, choices }: {
+export function NameDialog({ title, close, submit, initial = '', withId = false, choices, label = '名称', placeholder, action = '继续' }: {
   title: string;
   close: () => void;
   submit: (name: string, extra: string) => void;
   initial?: string;
   withId?: boolean;
   choices?: [string, string][];
+  label?: string;
+  placeholder?: string;
+  action?: string;
 }) {
   const [name, setName] = useState(initial);
   const [extra, setExtra] = useState(choices?.[0]?.[0] ?? '');
@@ -55,14 +58,14 @@ export function NameDialog({ title, close, submit, initial = '', withId = false,
   }
   return <Modal title={title} close={close}>
     <form onSubmit={send} className="dialog-form">
-      <label>名称<input data-initial-focus required maxLength={128} value={name} onChange={event => setName(event.target.value)} /></label>
+      <label>{label}<input data-initial-focus required maxLength={128} placeholder={placeholder} value={name} onChange={event => { setName(event.target.value); setError(''); }} /></label>
       {withId && <label>模型标识<input className="mono" required pattern={modelIdPattern} maxLength={64}
         placeholder="payments" value={extra} onChange={event => setExtra(event.target.value)} /></label>}
       {choices && <label>连接器<select value={extra} onChange={event => setExtra(event.target.value)}>
         {choices.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
       </select></label>}
       {error && <p role="alert" className="inline-error">{error}</p>}
-      <div className="dialog-actions"><button type="button" className="button" onClick={close}>取消</button><button className="button primary" type="submit">继续</button></div>
+      <div className="dialog-actions"><button type="button" className="button" onClick={close}>取消</button><button className="button primary" type="submit">{action}</button></div>
     </form>
   </Modal>;
 }

@@ -78,7 +78,11 @@ impl Assets {
             .split('/')
             .collect::<Vec<_>>();
         let valid = match parts.as_slice() {
-            [""] | ["", "new" | "catalogs" | "query"] => true,
+            [""]
+            | [
+                "",
+                "new" | "catalogs" | "query" | "access" | "settings" | "recovery",
+            ] => true,
             ["", "models", id] | ["", "models", id, "catalogs" | "query"] => {
                 super::models::valid_id(id)
             }

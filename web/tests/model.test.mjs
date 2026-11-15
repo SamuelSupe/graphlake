@@ -103,3 +103,45 @@ nodes:
   assert.deepEqual(result.map(target => [target.selection.name, JSON.parse(target.control)]),
     [['Account', ['column', 0, 'id']], ['Account', ['filter', 1, 0]]]);
 });
+
+test('renaming a source rewrites direct and multi-table references without changing other YAML', () => {
+  const doc = documentOf(`sources:
+  ledger: {type: postgres, dsn_env: LEDGER_DSN}
+  ledger_archive: {type: postgres, dsn_env: ARCHIVE_DSN}
+nodes:
+  Account:
+    source: ledger.public.accounts # main table
+  Merchant:
+    inputs:
+      - {table: ledger.public.merchants, where: [{column: id, op: eq, value: 9007199254740993}]}
+      - {table: ledger_archive.public.merchants}
+edges:
+  Pay: {source: ledger.public.payments}`);
+  const before = modelOf(doc.toString());
+  assert.throws(() => removeGraphType(doc, before, 'sources', 'ledger'), /替换引用/);
+  rename(doc, before, 'sources', 'ledger', 'finance');
+  const output = doc.toString();
+  const after = modelOf(output);
+  assert.equal(after.sources.finance.dsn_env, 'LEDGER_DSN');
+  assert.equal(after.nodes.Account.source, 'finance.public.accounts');
+  assert.deepEqual(after.nodes.Merchant.inputs, [
+    { table: 'finance.public.merchants', where: [{ column: 'id', op: 'eq', value: 9007199254740993n }] },
+    { table: 'ledger_archive.public.merchants' },
+  ]);
+  assert.equal(after.edges.Pay.source, 'finance.public.payments');
+  assert.match(output, /# main table/);
+});
+
+test('a missing temporal column locates the model field or the mapped physical column', () => {
+  const model = modelOf(`nodes:
+  Current:
+    source: lake.finance.accounts
+    scd2: {current_flag: status}
+  Combined:
+    inputs:
+      - {table: lake.finance.accounts, columns: {active: status}}
+    scd2: {current_flag: active}`);
+  const found = validationTargets(model, { kind: 'table', table: 'lake.finance.accounts', column: 'status' });
+  assert.deepEqual(found.map(target => [target.selection.name, JSON.parse(target.control)]),
+    [['Current', ['scd2', 'current_flag']], ['Combined', ['column', 0, 'active']]]);
+});

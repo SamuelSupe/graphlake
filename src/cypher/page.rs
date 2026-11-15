@@ -102,8 +102,7 @@ pub(super) fn defer_properties(catalog: &Catalog, query: &mut Query, extensions:
     let fields = plan.fields.clone();
     let needed = output_dependencies(ret, &order, &fields);
     plan.rewrite(call, &keys, &fields, needed, span, extensions);
-    extensions
-        .call_imports
+    std::rc::Rc::make_mut(&mut extensions.call_imports)
         .insert(span.start, keys.values().map(|key| key.0.clone()).collect());
     let page = outer_page.then(|| {
         Clause::With(With {

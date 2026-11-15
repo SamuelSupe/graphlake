@@ -28,6 +28,94 @@ enum Algorithm {
     Route(Route, RouteStrategy),
 }
 
+pub(crate) struct SchemaProcedure {
+    table: String,
+    nodes: bool,
+}
+
+impl SchemaProcedure {
+    pub(crate) fn labels(&self, catalog: &Catalog) -> BTreeSet<String> {
+        if self.nodes {
+            catalog.nodes.keys().cloned().collect()
+        } else {
+            catalog.edges.keys().cloned().collect()
+        }
+    }
+
+    pub(crate) async fn register(
+        &self,
+        catalog: &Catalog,
+        schema_context: &SessionContext,
+        context: &SessionContext,
+    ) -> Result<()> {
+        let mut rows = Vec::new();
+        for label in self.labels(catalog) {
+            let table = schema_context
+                .table_provider(TableReference::bare(label.as_str()))
+                .await?;
+            let schema = table.schema();
+            let properties = if self.nodes {
+                &catalog.nodes[&label].properties
+            } else {
+                &catalog.edges[&label].properties
+            };
+            for name in properties {
+                let field = schema.field_with_name(name)?;
+                let label = string(&label);
+                let name = string(name);
+                let ty = string(&property_type(field.data_type()));
+                let mandatory = if field.is_nullable() { "FALSE" } else { "TRUE" };
+                rows.push(if self.nodes {
+                    format!("({label}, make_array({label}), {name}, make_array({ty}), {mandatory})")
+                } else {
+                    format!("({label}, {name}, make_array({ty}), {mandatory})")
+                });
+            }
+        }
+        let names = if self.nodes {
+            "\"nodeType\", \"nodeLabels\", \"propertyName\", \"propertyTypes\", mandatory"
+        } else {
+            "\"relType\", \"propertyName\", \"propertyTypes\", mandatory"
+        };
+        let empty = if self.nodes {
+            "CAST(NULL AS VARCHAR), make_array(CAST(NULL AS VARCHAR)), CAST(NULL AS VARCHAR), make_array(CAST(NULL AS VARCHAR)), FALSE"
+        } else {
+            "CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), make_array(CAST(NULL AS VARCHAR)), FALSE"
+        };
+        let sql = if rows.is_empty() {
+            format!("SELECT * FROM (VALUES ({empty})) AS fields({names}) WHERE FALSE")
+        } else {
+            format!(
+                "SELECT * FROM (VALUES {}) AS fields({names})",
+                rows.join(", ")
+            )
+        };
+        let frame = context.sql(&sql).await?;
+        context.register_table(TableReference::bare(self.table.as_str()), frame.into_view())?;
+        Ok(())
+    }
+}
+
+fn property_type(ty: &datafusion::arrow::datatypes::DataType) -> String {
+    use datafusion::arrow::datatypes::DataType::*;
+    match ty {
+        Boolean => "Boolean".into(),
+        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => "Integer".into(),
+        Float16 | Float32 | Float64 => "Float".into(),
+        Decimal32(..) | Decimal64(..) | Decimal128(..) | Decimal256(..) => "Decimal".into(),
+        Utf8 | LargeUtf8 | Utf8View => "String".into(),
+        Date32 | Date64 => "Date".into(),
+        Timestamp(_, None) => "LocalDateTime".into(),
+        Timestamp(_, Some(_)) => "DateTime".into(),
+        Time32(_) | Time64(_) => "LocalTime".into(),
+        Interval(_) | Duration(_) => "Duration".into(),
+        List(item) | LargeList(item) | FixedSizeList(item, _) => {
+            format!("List<{}>", property_type(item.data_type()))
+        }
+        _ => ty.to_string(),
+    }
+}
+
 impl Procedure {
     pub(crate) async fn register(
         &self,
@@ -139,6 +227,55 @@ pub(super) fn relation(
             schema_visualization(catalog),
             vec![("nodes", "nodes"), ("relationships", "relationships")],
         ));
+    }
+    if matches!(
+        name.as_str(),
+        "db.schema.nodetypeproperties" | "db.schema.reltypeproperties"
+    ) {
+        ensure!(args.is_empty(), "{name} does not take arguments");
+        let nodes = name == "db.schema.nodetypeproperties";
+        let mut table = format!(
+            "__graphlake_schema_properties_{}",
+            plan.schema_procedures.len()
+        );
+        while catalog.nodes.contains_key(&table) || catalog.edges.contains_key(&table) {
+            table.push('_');
+        }
+        let sql = format!("SELECT * FROM {}", ident(&table));
+        plan.schema_procedures
+            .push(SchemaProcedure { table, nodes });
+        let mut fields = if nodes {
+            vec![("nodeType", "nodeType"), ("nodeLabels", "nodeLabels")]
+        } else {
+            vec![("relType", "relType"), ("relationshipType", "relType")]
+        };
+        fields.extend([
+            ("propertyName", "propertyName"),
+            ("propertyTypes", "propertyTypes"),
+            ("mandatory", "mandatory"),
+        ]);
+        return Ok((sql, fields));
+    }
+    if name == "dbms.components" || name == "dbms.info" {
+        ensure!(args.is_empty(), "{name} does not take arguments");
+        return if name == "dbms.info" {
+            Ok((
+                format!("SELECT {} AS name", string(&catalog.graph)),
+                vec![("name", "name")],
+            ))
+        } else {
+            Ok((
+                format!(
+                    "SELECT 'GraphLake' AS name, make_array({}) AS versions, 'community' AS edition",
+                    string(env!("CARGO_PKG_VERSION"))
+                ),
+                vec![
+                    ("name", "name"),
+                    ("versions", "versions"),
+                    ("edition", "edition"),
+                ],
+            ))
+        };
     }
     ensure!(
         name.starts_with("algo."),

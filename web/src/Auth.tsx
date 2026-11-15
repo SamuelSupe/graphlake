@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { api, authRequired, errorText } from './api';
+import { clearPendingQueries } from './Query';
+import { clearPendingMutations } from './Mutations';
 import { Mark, WorkspaceLocked } from './ui';
 
-type Session = { authenticated: boolean; enabled: boolean; username: string | null };
+export type Session = { authenticated: boolean; enabled: boolean; username: string | null; administrator: boolean; subject?: string | null; authorization?: string | null; proxy_sign_in?: boolean };
 
-function Login({ expired, signedIn }: { expired: boolean; signedIn: (session: Session) => void }) {
+function Login({ expired, username, proxySignIn, signedIn }: { expired: boolean; username?: string; proxySignIn?: boolean; signedIn: (session: Session) => void }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   useEffect(() => { document.title = expired ? 'GraphLake · 会话已过期' : 'GraphLake · 登录'; }, [expired]);
@@ -28,13 +30,27 @@ function Login({ expired, signedIn }: { expired: boolean; signedIn: (session: Se
     }
   }
 
+  async function sso() {
+    setBusy(true);
+    setError('');
+    try {
+      signedIn(await api<Session>('/auth/sso', { method: 'POST' }));
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return <main className="auth-page">
     <section className="auth-card" aria-labelledby="login-heading">
       <div className="auth-brand"><span className="model-icon"><Mark size={22} /></span>GraphLake</div>
       <h1 id="login-heading">{expired ? '会话已过期' : '登录管理后台'}</h1>
       {expired && <p className="muted">重新登录后可继续编辑本页草稿。</p>}
+      {proxySignIn && <button className="button primary" type="button" disabled={busy} onClick={() => void sso()}>使用企业账号登录</button>}
       <form onSubmit={submit} aria-busy={busy}>
-        <label>用户名<input name="username" autoComplete="username" defaultValue="admin" maxLength={128} required /></label>
+        {proxySignIn && <p className="muted">管理员恢复登录</p>}
+        <label>用户名<input name="username" autoComplete="username" defaultValue={username ?? 'admin'} maxLength={128} required /></label>
         <label>密码<input name="password" autoComplete="current-password" type="password" maxLength={256} required autoFocus /></label>
         {error && <p className="notice error" role="alert">{error}</p>}
         <button className="button primary" type="submit" disabled={busy}>{busy ? '正在登录…' : '登录'}</button>
@@ -44,17 +60,18 @@ function Login({ expired, signedIn }: { expired: boolean; signedIn: (session: Se
 }
 
 export function AuthGate({ workspace }: {
-  workspace: (logout: (() => Promise<void>) | undefined, locked: boolean) => ReactNode;
+  workspace: (logout: (() => Promise<void>) | undefined, locked: boolean, identity: Session) => ReactNode;
 }) {
   const [session, setSession] = useState<Session>();
-  const [opened, setOpened] = useState(false);
+  const [identity, setIdentity] = useState<Session>();
+  const opened = !!identity;
   const [error, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
   const unlocked = session?.authenticated === true;
 
   const signedIn = useCallback((value: Session) => {
     setSession(value);
-    if (value.authenticated) setOpened(true);
+    if (value.authenticated) setIdentity(value);
   }, []);
 
   useEffect(() => {
@@ -69,14 +86,16 @@ export function AuthGate({ workspace }: {
     if (!unlocked) return;
     const controller = new AbortController();
     const lock = () => setSession(current => current?.authenticated
-      ? { enabled: true, authenticated: false, username: null } : current);
+      ? { enabled: true, authenticated: false, username: null, administrator: false } : current);
     let checking = false;
     async function check() {
       if (checking || document.visibilityState !== 'visible') return;
       checking = true;
       try {
         const value = await api<Session>('/auth/session', { signal: controller.signal });
-        if (!controller.signal.aborted && !value.authenticated) lock();
+        if (controller.signal.aborted) return;
+        if (!value.authenticated) lock();
+        else if (value.username !== identity?.username || value.authorization !== identity?.authorization || value.administrator !== identity?.administrator) signedIn(value);
       } catch { /* The next request or status check can confirm expiry. */ }
       finally { checking = false; }
     }
@@ -91,12 +110,14 @@ export function AuthGate({ workspace }: {
       window.removeEventListener('focus', check);
       document.removeEventListener('visibilitychange', check);
     };
-  }, [unlocked]);
+  }, [unlocked, identity, signedIn]);
 
   async function logout() {
     await api('/auth/logout', { method: 'POST' });
-    setOpened(false);
-    setSession({ authenticated: false, enabled: true, username: null });
+    clearPendingQueries();
+    clearPendingMutations();
+    setIdentity(undefined);
+    setSession({ authenticated: false, enabled: true, username: null, administrator: false });
   }
 
   if (!session) return <main className="auth-page"><section className="auth-card">
@@ -106,9 +127,9 @@ export function AuthGate({ workspace }: {
   </section></main>;
 
   return <>
-    {opened && <WorkspaceLocked.Provider value={!unlocked}>
-      <div hidden={!unlocked} inert={!unlocked}>{workspace(session.enabled ? logout : undefined, !unlocked)}</div>
+    {identity && <WorkspaceLocked.Provider value={!unlocked}>
+      <div hidden={!unlocked} inert={!unlocked}>{workspace(session.enabled ? logout : undefined, !unlocked, identity)}</div>
     </WorkspaceLocked.Provider>}
-    {!unlocked && <Login expired={opened} signedIn={signedIn} />}
+    {!unlocked && <Login expired={opened} username={identity?.username ?? undefined} proxySignIn={session.proxy_sign_in || identity?.proxy_sign_in} signedIn={signedIn} />}
   </>;
 }

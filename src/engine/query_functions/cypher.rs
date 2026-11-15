@@ -51,7 +51,12 @@ pub(super) fn register(context: &SessionContext) {
     map::register(context);
     numeric_distinct::register(context);
     range::register(context);
-    for mode in [KeyMode::Equivalence, KeyMode::Order, KeyMode::GremlinOrder] {
+    for mode in [
+        KeyMode::Equivalence,
+        KeyMode::Order,
+        KeyMode::GremlinOrder,
+        KeyMode::Capture,
+    ] {
         context.register_udf(ScalarUDF::from(ValueKey {
             mode,
             signature: Signature::any(1, Volatility::Immutable),
@@ -671,6 +676,7 @@ enum KeyMode {
     Equivalence,
     Order,
     GremlinOrder,
+    Capture,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -691,6 +697,7 @@ impl ScalarUDFImpl for ValueKey {
             KeyMode::Equivalence => "__graphlake_cypher_equivalence",
             KeyMode::Order => "__graphlake_cypher_order",
             KeyMode::GremlinOrder => "__graphlake_gremlin_order",
+            KeyMode::Capture => "__graphlake_cypher_capture_key",
         }
     }
     fn signature(&self) -> &Signature {
@@ -718,6 +725,17 @@ impl ScalarUDFImpl for ValueKey {
             return Ok(input);
         }
         let input = input.to_array(args.number_rows)?;
+        if self.mode == KeyMode::Capture {
+            // A reusable CALL input must preserve values that compare equal
+            // but behave differently in expressions, such as 1 and 1.0.
+            let converter = RowConverter::new(vec![SortField::new(input.data_type().clone())])?;
+            let rows = converter.convert_columns(&[input])?;
+            let mut keys = BinaryBuilder::new();
+            for row in rows.iter() {
+                keys.append_value(row.as_ref());
+            }
+            return Ok(ColumnarValue::Array(Arc::new(keys.finish())));
+        }
         let mut keys = BinaryBuilder::new();
         let mut key = Vec::new();
         for index in 0..input.len() {

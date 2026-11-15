@@ -1,6 +1,9 @@
 mod batch_call;
 mod existence;
+mod path_page;
+mod row_expression;
 pub(super) use existence::{exists, has_identifier, lambda_values, replace_identifiers};
+pub(super) use row_expression::{RowExpression, pattern_list, row_subquery};
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -208,6 +211,10 @@ impl Value {
                 None => plan.nested_lists.get(&name.0).cloned(),
             },
             ExprKind::Slice { base, .. } => Self::nested_item(plan, base, aliases),
+            ExprKind::PatternComprehension { .. } => {
+                let (_, item) = pattern_list(plan.catalog?, plan, aliases, expr, false).ok()?;
+                item.is_nested_item().then_some(item)
+            }
             ExprKind::List(items) => {
                 let value =
                     Self::common(items.iter().map(|item| Self::inferred(plan, item, aliases)))?;
@@ -376,32 +383,84 @@ pub(super) struct ExpressionJoin {
     pub(super) seed: String,
     pub(super) captures: Vec<(String, String)>,
     pub(super) query: String,
+    pub(super) expanded: Option<(String, String)>,
+    pub(super) calls: Option<Vec<super::apply::Apply>>,
 }
 
 impl ExpressionJoin {
-    pub(super) fn sql(&self, from: &str) -> String {
-        let projection = self
-            .captures
-            .iter()
-            .map(|(name, value)| format!("{value} AS {}", ident(name)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let keys = self
+    pub(super) fn sql(&mut self, from: &str, calls: &mut Vec<super::apply::Apply>) -> String {
+        let captures = self
             .captures
             .iter()
             .map(|(name, value)| {
-                format!(
-                    "({} IS NOT DISTINCT FROM ({value}))",
-                    qualified(&self.alias, name)
-                )
+                let key = format!("__graphlake_cypher_capture_key({value})");
+                (name, value, key)
             })
-            .collect::<Vec<_>>()
-            .join(" AND ");
+            .collect::<Vec<_>>();
+        let keys = if self.captures.is_empty() {
+            "TRUE".to_owned()
+        } else {
+            captures
+                .iter()
+                .map(|(name, _, key)| {
+                    format!(
+                        "(__graphlake_cypher_capture_key({}) IS NOT DISTINCT FROM {key})",
+                        qualified(&self.alias, name)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let seed_sql = if self.captures.is_empty() {
+            "SELECT 1 AS __graphlake_seed".to_owned()
+        } else {
+            let keys = captures
+                .iter()
+                .map(|(_, _, key)| key.as_str())
+                .collect::<Vec<_>>();
+            let projection = captures
+                .iter()
+                .map(|(name, value, _)| format!("first_value({value}) AS {}", ident(name)))
+                .collect::<Vec<_>>();
+            format!(
+                "SELECT {}{from} GROUP BY {}",
+                projection.join(", "),
+                keys.join(", ")
+            )
+        };
+        if let Some(nested) = self.calls.as_mut() {
+            // Nested CALL registers its own inputs and can read the captured
+            // rows through a query-local table during that registration.
+            if !nested.is_empty() {
+                calls.push(super::apply::Apply {
+                    table: self.alias.clone(),
+                    seed: self.seed.clone(),
+                    outer: seed_sql,
+                    inner: self.query.clone(),
+                    nested: std::mem::take(nested),
+                    lookups: Vec::new(),
+                    limit: None,
+                    mode: super::apply::Mode::Relation {
+                        expanded: self.expanded.clone(),
+                    },
+                });
+            }
+            return format!(" LEFT JOIN {} ON {keys}", ident(&self.alias));
+        }
+        let alias = ident(&self.alias);
+        if self.captures.is_empty() {
+            return format!(" LEFT JOIN ({}) AS {alias} ON TRUE", self.query);
+        }
+        let cte = self
+            .expanded
+            .as_ref()
+            .map_or_else(String::new, |(name, sql)| {
+                format!(", {} AS ({sql})", ident(name))
+            });
         format!(
-            " LEFT JOIN (WITH {} AS (SELECT DISTINCT {projection}{from}) {}) AS {} ON {keys}",
+            " LEFT JOIN (WITH {} AS ({seed_sql}){cte} {}) AS {alias} ON {keys}",
             ident(&self.seed),
             self.query,
-            ident(&self.alias)
         )
     }
 }
@@ -526,7 +585,10 @@ fn query_imports(query: &Query, outer: &Scope) -> bool {
 }
 
 pub(super) fn plan(catalog: &Catalog, query: &Query, extensions: &mut Extensions) -> Result<Plan> {
-    let mut plan = Plan::default();
+    let mut plan = Plan {
+        indexed_csr: extensions.indexed_csr,
+        ..Default::default()
+    };
     let saved = extensions.clone();
     let stage = branches(catalog, query, extensions, &mut plan, None, true)?;
     if plan.calls.iter().any(super::apply::Apply::has_lookup)
@@ -539,7 +601,10 @@ pub(super) fn plan(catalog: &Catalog, query: &Query, extensions: &mut Extensions
             .all(|kind| matches!(kind, Value::Scalar | Value::Null))
         && let Some(narrow) = super::apply::scalar_projection(catalog, query)
     {
-        let mut projected = Plan::default();
+        let mut projected = Plan {
+            indexed_csr: extensions.indexed_csr,
+            ..Default::default()
+        };
         *extensions = saved;
         projected.sql = branches(&narrow, query, extensions, &mut projected, None, true)?.sql;
         return Ok(projected);
@@ -731,6 +796,10 @@ fn single(
     imported: Option<Imports<'_>>,
     public: bool,
 ) -> Result<Stage> {
+    let grouped = (plan.indexed_csr && imported.is_none())
+        .then(|| path_page::Grouped::describe(query))
+        .flatten();
+    let query = grouped.as_ref().map_or(query, |grouped| &grouped.query);
     let (body, ret) = match query.clauses.as_slice() {
         [body @ .., Clause::Return(ret)] => (body, Some(ret)),
         body @ [.., Clause::Call(call)] if matches!(&call.kind, CallKind::Procedure(_)) => {
@@ -742,6 +811,7 @@ fn single(
         .and_then(|imports| imports.explicit.map(|names| imports.stage(names)))
         .transpose()?;
     let mut output_limited = false;
+    let mut path_page = None;
     let limit = ret.and_then(|ret| {
         let mut aggregate = super::HasAggregate(false);
         for item in &ret.body.items {
@@ -771,6 +841,9 @@ fn single(
 
     for (index, clause) in body.iter().enumerate() {
         let mut scope = MatchPlan::new(catalog);
+        scope.call_imports = extensions.call_imports.clone();
+        scope.partitioned_csr = extensions.partitioned_csr;
+        scope.indexed_csr = plan.indexed_csr;
         if let Some(stage) = &stage {
             stage.bind(&mut scope);
         }
@@ -836,6 +909,19 @@ fn single(
                         }
                     }
                 }
+                let replay = path_page
+                    .filter(|(start, end)| *start < index && index <= *end)
+                    .map(|(_, end)| {
+                        let mut replay = with.clone();
+                        replay.where_clause = None;
+                        if end == index {
+                            replay.body.order_by.clear();
+                            replay.body.skip = None;
+                            replay.body.limit = None;
+                        }
+                        replay
+                    });
+                let with = replay.as_ref().unwrap_or(with);
                 let mut body = with.body.clone();
                 let skip = body.skip.take();
                 let limit = body.limit.take();
@@ -862,125 +948,41 @@ fn single(
                         next.sql.push_str(&format!(" {clause} {value}"));
                     }
                 }
+                if let Some(grouped) = grouped.as_ref().filter(|grouped| grouped.page == index) {
+                    path_page::restore(&mut next, catalog, &grouped.edges);
+                }
                 stage = Some(next);
             }
             Clause::Unwind(unwind) => {
-                stage = Some(unwind_stage(catalog, unwind, stage, scope, plan)?);
+                let page = plan
+                    .indexed_csr
+                    .then(|| path_page::describe(&body[index + 1..], ret))
+                    .flatten();
+                let end = page.as_ref().map(|page| index + page.distance());
+                let projection = grouped.as_ref().filter(|grouped| grouped.unwind == index);
+                let (next, paged) = unwind_stage(
+                    catalog,
+                    unwind,
+                    stage,
+                    scope,
+                    plan,
+                    page,
+                    projection.map(|grouped| &grouped.fields),
+                )?;
+                stage = Some(next);
+                if paged {
+                    path_page = end.map(|end| (index, end));
+                }
             }
             Clause::Call(call) if let CallKind::Procedure(procedure) = &call.kind => {
-                stage = Some(call_procedure(catalog, procedure, stage, plan)?);
+                stage = Some(call_procedure(catalog, procedure, stage, extensions, plan)?);
             }
             Clause::Call(call) => {
-                let CallKind::Subquery(query) = &call.kind else {
-                    bail!("only read-only CALL subqueries are supported");
-                };
-                let previous = stage.take();
                 let call_limit = (index + 1 == body.len()).then_some(limit).flatten();
-                let explicit = extensions.call_imports.remove(&call.span.start);
-                let seed = format!("__graphlake_call_seed_{}", call.span.start);
-                let imports = match explicit.as_deref() {
-                    Some([]) => None,
-                    Some(names) => {
-                        let outer = &previous
-                            .as_ref()
-                            .context("CALL has no outer variables to import")?
-                            .scope;
-                        Some(Imports {
-                            outer,
-                            seed: &seed,
-                            explicit: Some(names),
-                        })
-                    }
-                    None => previous.as_ref().and_then(|stage| {
-                        query_imports(query, &stage.scope).then_some(Imports {
-                            outer: &stage.scope,
-                            seed: &seed,
-                            explicit: None,
-                        })
-                    }),
-                };
-                if let (Some(imports), Some(left)) = (imports, previous.as_ref())
-                    && let Some(result) = batch_call::plan(
-                        catalog, query, imports, left, extensions, plan, call_limit,
-                    )?
-                {
-                    stage = Some(result);
-                    output_limited = call_limit.is_some_and(|limit| limit != 0);
-                    continue;
-                }
-                let prior_calls = plan.calls.len();
-                let prior_lookups = plan.call_lookups.len();
-                let import_names = imports.map(|imports| {
-                    imports.explicit.map_or_else(
-                        || {
-                            std::iter::once(&query.initial)
-                                .chain(query.unions.iter().map(|branch| &branch.query))
-                                .filter_map(|query| match query.clauses.first() {
-                                    Some(Clause::With(with)) => Some(&with.body.items),
-                                    _ => None,
-                                })
-                                .flatten()
-                                .filter_map(|item| match &item.expr.kind {
-                                    ExprKind::Variable(var)
-                                        if imports.outer.columns.contains_key(&var.0) =>
-                                    {
-                                        Some(var.0.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<std::collections::BTreeSet<_>>()
-                                .into_iter()
-                                .collect()
-                        },
-                        |names| names.to_vec(),
-                    )
-                });
-                let mut right = branches(catalog, query, extensions, plan, imports, false)?;
-                if let Some(mut left) = previous {
-                    for name in right.scope.columns.keys() {
-                        ensure!(
-                            !left.scope.columns.contains_key(name),
-                            "CALL result {name} is already bound"
-                        );
-                    }
-                    left.discard_order_columns();
-                    right.scope.columns.extend(left.scope.columns);
-                    if let Some(imports) = import_names {
-                        let table = format!("__graphlake_call_{}", call.span.start);
-                        let mut sequence = format!("{table}_sequence");
-                        while right.scope.columns.contains_key(&sequence) {
-                            sequence.push('_');
-                        }
-                        let nested = plan.calls.split_off(prior_calls);
-                        let lookups = plan.call_lookups.split_off(prior_lookups);
-                        plan.calls.push(super::apply::Apply {
-                            table: table.clone(),
-                            seed,
-                            outer: left.sql,
-                            inner: right.sql,
-                            nested,
-                            lookups,
-                            limit: call_limit,
-                            mode: super::apply::Mode::Row {
-                                imports,
-                                sequence: sequence.clone(),
-                            },
-                        });
-                        output_limited = call_limit.is_some_and(|limit| limit != 0);
-                        right.sql = format!("SELECT * FROM {}", ident(&table));
-                        right.order = vec![OrderKey {
-                            column: sequence,
-                            descending: false,
-                            native: true,
-                        }];
-                    } else {
-                        right.sql = format!(
-                            "SELECT outer_row.*, subquery.* FROM ({}) AS outer_row CROSS JOIN ({}) AS subquery",
-                            left.sql, right.sql
-                        );
-                    }
-                }
-                stage = Some(right);
+                let (next, limited) =
+                    call_subquery(catalog, call, stage, extensions, plan, call_limit)?;
+                stage = Some(next);
+                output_limited = limited;
             }
             _ => bail!("unsupported Cypher clause in read-only query"),
         }
@@ -989,12 +991,20 @@ fn single(
         return stage.context("procedure did not produce a relation");
     };
     let mut scope = MatchPlan::new(catalog);
+    scope.call_imports = extensions.call_imports.clone();
+    scope.partitioned_csr = extensions.partitioned_csr;
+    scope.indexed_csr = plan.indexed_csr;
     if let Some(stage) = &stage {
         stage.bind(&mut scope);
     }
-    let body = if output_limited {
+    let unwind_paged = path_page.is_some_and(|(_, end)| end == body.len());
+    let body = if output_limited || unwind_paged {
         let mut body = ret.body.clone();
         body.limit = None;
+        if unwind_paged {
+            body.skip = None;
+            body.order_by.clear();
+        }
         Some(body)
     } else {
         None
@@ -1017,7 +1027,7 @@ fn single(
         item.alias
             .as_ref()
             .map(|name| name.0.clone())
-            .unwrap_or_else(|| item.expr.to_string())
+            .unwrap_or_else(|| crate::cypher::expression_name(&item.expr))
     }));
     Ok(Stage {
         sql,
@@ -1025,6 +1035,120 @@ fn single(
         output,
         order: Vec::new(),
     })
+}
+
+fn call_subquery(
+    catalog: &Catalog,
+    call: &opencypher::Call,
+    previous: Option<Stage>,
+    extensions: &mut Extensions,
+    plan: &mut Plan,
+    call_limit: Option<usize>,
+) -> Result<(Stage, bool)> {
+    let CallKind::Subquery(query) = &call.kind else {
+        bail!("only read-only CALL subqueries are supported");
+    };
+    let explicit = extensions.call_imports.get(&call.span.start).cloned();
+    let seed = format!("__graphlake_call_seed_{}", call.span.start);
+    let imports = match explicit.as_deref() {
+        Some([]) => None,
+        Some(names) => {
+            let outer = &previous
+                .as_ref()
+                .context("CALL has no outer variables to import")?
+                .scope;
+            Some(Imports {
+                outer,
+                seed: &seed,
+                explicit: Some(names),
+            })
+        }
+        None => previous.as_ref().and_then(|stage| {
+            query_imports(query, &stage.scope).then_some(Imports {
+                outer: &stage.scope,
+                seed: &seed,
+                explicit: None,
+            })
+        }),
+    };
+    if let (Some(imports), Some(left)) = (imports, previous.as_ref())
+        && let Some(result) =
+            batch_call::plan(catalog, query, imports, left, extensions, plan, call_limit)?
+    {
+        return Ok((result, call_limit.is_some_and(|limit| limit != 0)));
+    }
+    let prior_calls = plan.calls.len();
+    let prior_lookups = plan.call_lookups.len();
+    let import_names = imports.map(|imports| {
+        imports.explicit.map_or_else(
+            || {
+                std::iter::once(&query.initial)
+                    .chain(query.unions.iter().map(|branch| &branch.query))
+                    .filter_map(|query| match query.clauses.first() {
+                        Some(Clause::With(with)) => Some(&with.body.items),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter_map(|item| match &item.expr.kind {
+                        ExprKind::Variable(var) if imports.outer.columns.contains_key(&var.0) => {
+                            Some(var.0.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            },
+            |names| names.to_vec(),
+        )
+    });
+    let mut limited = false;
+    let mut right = branches(catalog, query, extensions, plan, imports, false)?;
+    if let Some(mut left) = previous {
+        for name in right.scope.columns.keys() {
+            ensure!(
+                !left.scope.columns.contains_key(name),
+                "CALL result {name} is already bound"
+            );
+        }
+        left.discard_order_columns();
+        right.scope.columns.extend(left.scope.columns);
+        if let Some(imports) = import_names {
+            let table = format!("__graphlake_call_{}", call.span.start);
+            let mut sequence = format!("{table}_sequence");
+            while right.scope.columns.contains_key(&sequence) {
+                sequence.push('_');
+            }
+            let nested = plan.calls.split_off(prior_calls);
+            let lookups = plan.call_lookups.split_off(prior_lookups);
+            plan.calls.push(super::apply::Apply {
+                table: table.clone(),
+                seed,
+                outer: left.sql,
+                inner: right.sql,
+                nested,
+                lookups,
+                limit: call_limit,
+                mode: super::apply::Mode::Row {
+                    imports,
+                    sequence: sequence.clone(),
+                },
+            });
+            limited = call_limit.is_some_and(|limit| limit != 0);
+            right.sql = format!("SELECT * FROM {}", ident(&table));
+            right.order = vec![OrderKey {
+                column: sequence,
+                descending: false,
+                native: true,
+            }];
+        } else {
+            right.sql = format!(
+                "SELECT outer_row.*, subquery.* FROM ({}) AS outer_row CROSS JOIN ({}) AS subquery",
+                left.sql, right.sql
+            );
+        }
+    }
+    Ok((right, limited))
 }
 
 fn project_with(
@@ -1064,6 +1188,9 @@ fn project_with(
     let mut sql = restore(sql, &mut scope, &order)?;
     if grouped && let Some(predicate) = &with.where_clause {
         let mut output = MatchPlan::new(catalog);
+        output.call_imports = input.call_imports.clone();
+        output.indexed_csr = plan.indexed_csr;
+        output.partitioned_csr = input.partitioned_csr;
         scope.bind("projected", &mut output);
         let predicate = output.expr(predicate)?;
         let from = output.join_expressions(&format!(" FROM ({sql}) AS projected"));
@@ -1084,13 +1211,14 @@ fn unwind_stage(
     mut stage: Option<Stage>,
     scope: MatchPlan,
     plan: &mut Plan,
-) -> Result<Stage> {
+    page: Option<path_page::Page<'_>>,
+    projection: Option<&std::collections::BTreeSet<String>>,
+) -> Result<(Stage, bool)> {
     let list = if matches!(unwind.expr.kind, ExprKind::Null) {
         "make_array()".into()
     } else {
         scope.expr(&unwind.expr)?
     };
-    scope.collect_expressions(plan);
     let mut columns = Scope::from_plan(&scope);
     ensure!(
         !columns.columns.contains_key(&unwind.variable.0),
@@ -1103,10 +1231,17 @@ fn unwind_stage(
         ""
     };
     let from = scope.join_expressions(&stage.as_ref().map_or_else(String::new, Stage::input));
-    let (sql, value) = if let Some(shape) =
+    scope.collect_expressions(plan);
+    let (sql, value, order) = if let Some(shape) =
         entities::identity_list(&scope, &unwind.expr, &Aliases::new())
         && !shape.labels.is_empty()
     {
+        // A direct path list references entities from this immutable snapshot. General
+        // list expressions still use the normal UNWIND and its missing-entity check.
+        let page = page.filter(|_| plan.indexed_csr && !shape.node
+            && matches!(&unwind.expr.kind, ExprKind::FunctionCall { name, args, distinct: false }
+                if name.0.eq_ignore_ascii_case("relationships")
+                && matches!(args.as_slice(), [Expr { kind: ExprKind::Variable(var), .. }] if scope.path_types.contains_key(&var.0))));
         unwind_identities(
             catalog,
             &columns,
@@ -1115,7 +1250,9 @@ fn unwind_stage(
             &from,
             &shape,
             plan,
-        )
+            page,
+            projection,
+        )?
     } else {
         (
             format!(
@@ -1129,15 +1266,20 @@ fn unwind_stage(
                         .map(Value::Entity)
                 })
                 .unwrap_or(Value::Scalar),
+            Vec::new(),
         )
     };
+    let paged = !order.is_empty();
     columns.columns.insert(unwind.variable.0.clone(), value);
-    Ok(Stage {
-        sql,
-        scope: columns,
-        output: Vec::new(),
-        order: Vec::new(),
-    })
+    Ok((
+        Stage {
+            sql,
+            scope: columns,
+            output: Vec::new(),
+            order,
+        },
+        paged,
+    ))
 }
 
 fn unwind_identities(
@@ -1148,7 +1290,9 @@ fn unwind_identities(
     from: &str,
     shape: &IdentityList,
     plan: &mut Plan,
-) -> (String, Value) {
+    page: Option<path_page::Page<'_>>,
+    projection: Option<&std::collections::BTreeSet<String>>,
+) -> Result<(String, Value, Vec<OrderKey>)> {
     let bindings = shape.bindings(catalog);
     let result = entities::merged(&bindings);
     plan.labels.extend(shape.labels.iter().cloned());
@@ -1162,10 +1306,56 @@ fn unwind_identities(
         .keys()
         .map(|name| format!("{}, ", qualified("u", name)))
         .collect::<String>();
-    let item = qualified("u", "__graphlake_unwind_edge");
-    let input = format!(
-        "SELECT {seed}unnest({list}) AS __graphlake_unwind_edge{from} WHERE {list} IS NOT NULL"
-    );
+    let mut item_column = "__graphlake_unwind_edge".to_owned();
+    while scope.columns.contains_key(&item_column) {
+        item_column.push('_');
+    }
+    let item = qualified("u", &item_column);
+    let column = ident(&item_column);
+    let input = format!("SELECT {seed}unnest({list}) AS {column}{from} WHERE {list} IS NOT NULL");
+    if plan.indexed_csr {
+        let id = shape
+            .item_id(catalog, &item)
+            .expect("identity list has a label");
+        let payload =
+            IdentityList::indexed_lookup(&bindings, &result, &format!("make_array({id})"));
+        let alias = ident(name);
+        if let Some(fields) = projection.filter(|_| !shape.node) {
+            let (bindings, result) = path_page::project_relationship(&bindings, &result, fields);
+            let value = path_page::relationship(
+                catalog,
+                shape,
+                &bindings,
+                &result,
+                &item,
+                &id,
+                fields.is_empty(),
+            );
+            let sql = format!(
+                "SELECT {prior}{value} AS {alias} FROM ({input}) AS u WHERE {item} IS NOT NULL"
+            );
+            return Ok((sql, Value::Entity(result), Vec::new()));
+        }
+        if let Some(page) = page
+            && let Some((selected, order)) = page.select(
+                catalog, scope, name, shape, &bindings, &result, &input, &item, &id,
+            )?
+        {
+            let keys = order
+                .iter()
+                .map(|key| qualified("u", &key.column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {prior}array_element({payload}, 1) AS {alias}, {keys} FROM ({selected}) AS u"
+            );
+            return Ok((sql, Value::Entity(result), order));
+        }
+        let sql = format!(
+            "SELECT * FROM (SELECT {prior}array_element({payload}, 1) AS {alias} FROM ({input}) AS u) AS csr_unwind WHERE {alias} IS NOT NULL"
+        );
+        return Ok((sql, Value::Entity(result), Vec::new()));
+    }
     if shape.tagged {
         let lookup = IdentityList::lookup(&bindings, &result);
         let id = shape
@@ -1175,7 +1365,7 @@ fn unwind_identities(
             "SELECT {prior}items.payload AS {} FROM ({input}) AS u JOIN ({lookup}) AS items ON items.__graphlake_lookup_id = {id}",
             ident(name)
         );
-        return (sql, Value::Entity(result));
+        return Ok((sql, Value::Entity(result), Vec::new()));
     }
     let branches = bindings
         .iter()
@@ -1189,13 +1379,18 @@ fn unwind_identities(
             )
         })
         .collect::<Vec<_>>();
-    (branches.join(" UNION ALL "), Value::Entity(result))
+    Ok((
+        branches.join(" UNION ALL "),
+        Value::Entity(result),
+        Vec::new(),
+    ))
 }
 
 fn call_procedure(
     catalog: &Catalog,
     call: &opencypher::ProcedureCall,
     mut previous: Option<Stage>,
+    extensions: &Extensions,
     plan: &mut Plan,
 ) -> Result<Stage> {
     let (relation, fields) = procedures::relation(catalog, call, plan)?;
@@ -1248,6 +1443,7 @@ fn call_procedure(
         .and_then(|yield_| yield_.where_clause.as_ref())
     {
         let mut bindings = MatchPlan::new(catalog);
+        bindings.call_imports = extensions.call_imports.clone();
         scope.bind("p", &mut bindings);
         let predicate = bindings.expr(predicate)?;
         let from = bindings.join_expressions(&format!(" FROM ({sql}) AS p"));
@@ -1282,7 +1478,9 @@ fn join_match(
         prior.columns.extend(left.scope.columns.clone());
         prior
     });
-    let base = outer.map_or(0, |_| 1_000_000 + pattern.span.start * 512) + plan.expansions.len();
+    let base = outer.map_or(plan.expansion_base, |_| {
+        1_000_000 + pattern.span.start * 512
+    }) + plan.expansions.len();
     let lookup = anchor
         .filter(|_| {
             pattern
@@ -1366,6 +1564,9 @@ fn join_match(
     }
     let mut filter = None;
     let mut predicate_scope = MatchPlan::new(catalog);
+    predicate_scope.call_imports = extensions.call_imports.clone();
+    predicate_scope.indexed_csr = plan.indexed_csr;
+    predicate_scope.partitioned_csr = extensions.partitioned_csr;
     if !consume_predicate && let Some(where_clause) = &pattern.where_clause {
         left.scope.bind("l", &mut predicate_scope);
         if let Some(anchor) = &bound_anchor {
@@ -1376,7 +1577,6 @@ fn join_match(
             right_columns.bind("r", &mut predicate_scope);
         }
         let expression = predicate_scope.expr(where_clause)?;
-        predicate_scope.collect_expressions(plan);
         let mut exists = HasExists(false);
         opencypher::Visitor::visit_expr(&mut exists, where_clause);
         if exists.0 || !predicate_scope.expression_joins.borrow().is_empty() {
@@ -1419,7 +1619,8 @@ fn join_match(
             project.push("1 AS __graphlake_seed".into());
         }
         let from = predicate_scope.join_expressions(&format!(
-            " FROM __graphlake_optional_input AS l JOIN ({right_sql}) AS r ON {join}"
+            " FROM (SELECT l.*, row_number() OVER (ORDER BY {order} ROWS UNBOUNDED PRECEDING) AS {row}{}) AS l JOIN ({right_sql}) AS r ON {join}",
+            left.input()
         ));
         format!(
             "WITH __graphlake_optional_input AS (
@@ -1448,6 +1649,7 @@ fn join_match(
         let filter = filter.map_or_else(String::new, |expression| format!(" WHERE {expression}"));
         format!("SELECT {}{from}{filter}", project.join(", "))
     };
+    predicate_scope.collect_expressions(plan);
     Ok(Stage {
         sql,
         scope,
@@ -1460,7 +1662,10 @@ pub(super) struct HasExists(pub(super) bool);
 
 impl opencypher::Visitor for HasExists {
     fn visit_expr(&mut self, expr: &Expr) {
-        if matches!(expr.kind, ExprKind::Exists(_)) {
+        if matches!(
+            expr.kind,
+            ExprKind::Exists(_) | ExprKind::PatternComprehension { .. }
+        ) {
             self.0 = true;
         } else {
             opencypher::walk_expr(self, expr);
@@ -1478,6 +1683,9 @@ fn typed_match_input(
     lookup: Option<&super::apply::Lookup>,
 ) -> Result<(String, Scope, bool)> {
     let mut right = MatchPlan::new(catalog);
+    right.call_imports = extensions.call_imports.clone();
+    right.partitioned_csr = extensions.partitioned_csr;
+    right.indexed_csr = extensions.indexed_csr;
     if let Some(lookup) = lookup {
         right.relation_overrides = lookup.aliases().clone();
         right.relation_order = lookup.relation_order();
@@ -1593,6 +1801,8 @@ fn match_input(
             lookup,
         );
     }
-    let right = super::wildcard::bind(catalog, pattern, &domains, &mut extensions.shortest, base)?;
+    let mut right =
+        super::wildcard::bind(catalog, pattern, &domains, &mut extensions.shortest, base)?;
+    right.call_imports = extensions.call_imports.clone();
     render_match_input(right, pattern, plan)
 }

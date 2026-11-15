@@ -51,6 +51,32 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     #[cfg(feature = "admin")]
+    pub(crate) async fn recovery_target_empty(&self) -> Result<bool> {
+        Ok(self
+            .client
+            .query_one(
+                "SELECT NOT EXISTS (
+                SELECT 1 FROM pg_namespace
+                WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN ('public', 'information_schema')
+                UNION ALL
+                SELECT 1 FROM pg_depend
+                WHERE refclassid = 'pg_namespace'::regclass AND refobjid = 'public'::regnamespace
+                UNION ALL
+                SELECT 1 FROM pg_extension WHERE extname <> 'plpgsql'
+                UNION ALL
+                SELECT 1 FROM pg_event_trigger
+                UNION ALL
+                SELECT 1 FROM pg_publication
+                UNION ALL
+                SELECT 1 FROM pg_foreign_server
+            )",
+                &[],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
+    #[cfg(feature = "admin")]
     pub(crate) async fn relation_reuses_snapshot(&self, relation: &str) -> Result<bool> {
         let (schema, table) = relation
             .split_once('.')
@@ -72,6 +98,59 @@ impl Snapshot {
             FROM relations JOIN pg_class AS tbl USING (oid)",
             &[&quoted_relation, &exclude_rls],
         ).await?.try_get(0)?)
+    }
+
+    #[cfg(feature = "admin")]
+    pub(crate) async fn recovery_digest(&self, relation: &str) -> Result<String> {
+        use sha2::{Digest, Sha256};
+
+        let (schema, table) = relation
+            .split_once('.')
+            .context("expected PostgreSQL schema.table")?;
+        let relation = format!("{}.{}", ident(schema), ident(table));
+        ensure!(
+            self.relation_is_local(&relation, true).await?,
+            "expected a local table without row-level security"
+        );
+        self.client
+            .batch_execute(
+                "SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO, MDY';
+             SET LOCAL IntervalStyle = 'postgres'; SET LOCAL extra_float_digits = 3;
+             SET LOCAL bytea_output = 'hex'; SET LOCAL client_encoding = 'UTF8';",
+            )
+            .await?;
+        let columns = self
+            .client
+            .query(
+                "SELECT attname::text, format_type(atttypid, atttypmod)
+             FROM pg_attribute WHERE attrelid = $1::text::regclass AND attnum > 0
+             AND NOT attisdropped ORDER BY attnum",
+                &[&relation],
+            )
+            .await?
+            .iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>();
+        // Ordering the canonical rows preserves duplicates and ignores heap order,
+        // which can change during a logical restore. COPY streams the sorted rows.
+        let sql = format!(
+            r#"COPY (
+            SELECT row_to_json(t)::text COLLATE "C" FROM {relation} AS t ORDER BY 1
+        ) TO STDOUT"#
+        );
+        let stream = self.client.copy_out(&sql).await?;
+        futures::pin_mut!(stream);
+        let mut hash = Sha256::new();
+        hash.update(serde_json::to_vec(&columns)?);
+        hash.update(b"\n");
+        while let Some(chunk) = stream.try_next().await? {
+            hash.update(chunk);
+        }
+        Ok(hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
     }
 
     #[cfg(feature = "admin")]
@@ -410,6 +489,26 @@ impl std::fmt::Debug for PgTable {
 }
 
 impl PgTable {
+    #[cfg(feature = "admin")]
+    pub(crate) async fn probe(&self) -> Result<()> {
+        let columns = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| ident(field.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.snapshot.stats.request();
+        self.snapshot
+            .client
+            .query(
+                &format!("SELECT {columns} FROM {} LIMIT 0", self.relation),
+                &[],
+            )
+            .await?;
+        Ok(())
+    }
+
     #[cfg(feature = "admin")]
     pub(crate) fn exploration_snapshot(&self) -> Option<&str> {
         self.snapshot.exploration_snapshot.as_deref()

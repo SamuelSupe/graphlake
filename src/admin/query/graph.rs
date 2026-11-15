@@ -41,7 +41,7 @@ impl Identity {
 pub(super) type Properties = BTreeMap<String, Option<String>>;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(super) struct Element {
+pub(in crate::admin) struct Element {
     pub id: String,
     #[serde(flatten)]
     pub identity: Identity,
@@ -80,7 +80,7 @@ impl Element {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub(super) struct Fragment {
+pub(in crate::admin) struct Fragment {
     pub elements: Vec<Element>,
     pub truncated: bool,
     pub steps: Vec<[String; 2]>,
@@ -227,6 +227,14 @@ impl Collector {
             }
         }
         edges
+    }
+
+    pub(super) fn unresolved_properties(&self) -> impl Iterator<Item = &Identity> {
+        self.items.values().filter_map(|(item, _)| {
+            (item.properties.is_none()
+                || item.identity.kind == Kind::Edge && item.directed != Some(true))
+            .then_some(&item.identity)
+        })
     }
 
     pub fn add_endpoints(

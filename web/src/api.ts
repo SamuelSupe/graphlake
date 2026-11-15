@@ -8,20 +8,31 @@ export type ModelSummary = {
   edges: number;
   status: Status;
   active_revision: string | null;
+  archive_error?: string;
 };
 
-export type SavedModel = { id: string; yaml: string; revision: string; active_revision: string | null; status: Status };
+export type SavedModel = { id: string; yaml: string; revision: string; active_revision: string | null; status: Status; archive_error?: string };
 export type Column = { name: string; data_type: string; nullable: boolean };
 export type ValidationSite = { kind: 'table'; table: string; column: string | null }
   | { kind: 'field'; label: string; field: string; index: number | null }
   | { kind: 'input_column'; label: string; input: number; column: string };
 export type Validation = { status: Status; check_data: boolean; labels: Record<string, Column[]>; error?: string; location?: ValidationSite };
-export type VersionHistory = { active_revision: string | null; versions: {
+export type VersionHistory = { active_revision: string | null; offline_at_ms: number | null; versions: {
   revision: string; action: 'adopt' | 'publish' | 'rollback'; at_ms: number;
 }[] };
+type SourceProbe = {
+  status: 'ready' | 'source_unavailable' | 'mapping_invalid';
+  sources: Record<string, boolean>;
+  location?: ValidationSite | null;
+};
+export type ModelReadiness = Omit<SourceProbe, 'status'> & {
+  status: SourceProbe['status'] | 'worker_unavailable';
+  workers?: { worker: number; probe: SourceProbe | null }[] | null;
+};
 export type Listing = { schemas: string[]; tables: string[]; columns: Column[]; truncated: boolean };
 export type PathPreview = { row: number; column: string; items: { kind: 'vertex' | 'edge'; label: string; key: string }[] };
 export type QueryResult = {
+  csr_generation?: string;
   model_revision: string;
   paths: PathPreview[];
   graph: GraphFragment;
@@ -32,13 +43,14 @@ export type QueryResult = {
   rows: (string | null)[][];
   sources: { source: string; version: string; consistency: string }[];
   elapsed_ms: number;
+  execution_worker?: string;
   truncated: boolean;
   snapshot: string | null;
   snapshot_complete: boolean;
 };
 
 export class ApiError extends Error {
-  constructor(message: string, readonly code?: string, readonly location?: ValidationSite) { super(message); }
+  constructor(message: string, readonly code?: string, readonly location?: ValidationSite, readonly status?: number, readonly readiness?: ModelReadiness, readonly response?: { status?: string }) { super(message); }
 }
 
 export const authRequired = 'graphlake:auth-required';
@@ -52,7 +64,7 @@ export async function request(path: string, options?: RequestInit): Promise<Resp
     const error = await response.json().catch(() => null);
     const code = error?.code ?? (response.status === 401 && !path.startsWith('/auth/') ? 'auth_required' : undefined);
     if (code === 'auth_required') window.dispatchEvent(new Event(authRequired));
-    throw new ApiError(error?.message ?? (code === 'auth_required' ? '请登录 GraphLake 管理后台' : '请求失败（' + response.status + '）'), code, error?.location);
+    throw new ApiError(error?.message ?? (code === 'auth_required' ? '请登录 GraphLake 管理后台' : '请求失败（' + response.status + '）'), code, error?.location, response.status, error?.sources ? error : undefined, error);
   }
   return response;
 }

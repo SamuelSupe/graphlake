@@ -35,6 +35,8 @@ pub(crate) struct Expansion {
     pub filters: Vec<String>,
     pub starts: Vec<String>,
     pub anchored: bool,
+    #[cfg(feature = "admin")]
+    pub finishes: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,8 +50,9 @@ impl Expansion {
         self,
         catalog: &Catalog,
         context: &SessionContext,
-        scope: &QueryScope,
+        scope: &Arc<QueryScope>,
         prepared: &Prepared,
+        #[cfg(feature = "admin")] csr: Option<&crate::admin::cluster::csr::CypherCsr>,
     ) -> Result<()> {
         ensure!(
             !catalog.nodes.contains_key(&self.table) && !catalog.edges.contains_key(&self.table),
@@ -81,6 +84,66 @@ impl Expansion {
             });
         }
         let name = self.table.clone();
+        #[cfg(feature = "admin")]
+        if let Some(csr) = csr {
+            if csr.indexed()
+                || (self.filters.is_empty()
+                    && self
+                        .mixed
+                        .as_ref()
+                        .is_none_or(|mixed| mixed.edges.values().all(Vec::is_empty)))
+            {
+                let starts = if let Some(starts) = &inputs.starts {
+                    starts.clone()
+                } else {
+                    node_plan(
+                        context,
+                        &self.start_node,
+                        &catalog.nodes[&self.start_node].key,
+                        &self.starts,
+                    )
+                    .await?
+                };
+                let plan = TraversalExec::new(
+                    Input::Live(inputs),
+                    Mode::Expand(self.clone()),
+                    Arc::clone(&scope.visits_by_depth),
+                );
+                let mut finishes = BTreeMap::new();
+                for (label, filters) in self
+                    .finishes
+                    .iter()
+                    .filter(|(_, filters)| !filters.is_empty())
+                {
+                    finishes.insert(
+                        label.clone(),
+                        node_plan(context, label, &catalog.nodes[label].key, filters).await?,
+                    );
+                }
+                let mut typed_starts = BTreeMap::new();
+                if let Some(mixed) = &self.mixed {
+                    for (label, filters) in &mixed.starts {
+                        typed_starts.insert(
+                            label.clone(),
+                            node_plan(context, label, &catalog.nodes[label].key, filters).await?,
+                        );
+                    }
+                }
+                context.register_table(
+                    TableReference::bare(name),
+                    csr.expansion(
+                        scope,
+                        catalog,
+                        self,
+                        plan.schema(),
+                        starts,
+                        typed_starts,
+                        finishes,
+                    )?,
+                )?;
+                return Ok(());
+            }
+        }
         let remote = if self.mixed.is_none()
             && self.anchored
             && self.filters.is_empty()

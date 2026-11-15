@@ -1,23 +1,14 @@
 use anyhow::{Context, Result, bail, ensure};
-use opencypher::{Clause, ExistsExpr, Expr, ExprKind, Match, Span};
+use opencypher::{Clause, ExistsExpr, Match, Span};
 
-use super::{ExpressionJoin, Scope, Value, entities, ident, join_match, match_input, qualified};
+use super::{
+    ExpressionJoin, Scope, Value, entities, ident, join_match, match_input, qualified,
+    row_expression::References,
+};
 use crate::{
     Catalog,
     cypher::{Aliases, MatchPlan, Plan, element_id, paths::Extensions},
 };
-
-#[derive(Default)]
-struct Variables(std::collections::BTreeSet<String>);
-
-impl opencypher::Visitor for Variables {
-    fn visit_expr(&mut self, expr: &Expr) {
-        if let ExprKind::Variable(name) = &expr.kind {
-            self.0.insert(name.0.clone());
-        }
-        opencypher::walk_expr(self, expr);
-    }
-}
 
 pub(in crate::cypher) fn exists(
     catalog: &Catalog,
@@ -26,6 +17,23 @@ pub(in crate::cypher) fn exists(
     body: &ExistsExpr,
     span: Span,
 ) -> Result<String> {
+    if let ExistsExpr::Subquery(query) = body
+        && (!query.unions.is_empty()
+            || query
+                .initial
+                .clauses
+                .iter()
+                .any(|clause| !matches!(clause, Clause::Match(pattern) if !pattern.optional)))
+    {
+        return super::row_subquery(
+            catalog,
+            outer,
+            aliases,
+            body,
+            span,
+            super::RowExpression::Exists,
+        );
+    }
     let patterns = match body {
         ExistsExpr::Pattern {
             patterns,
@@ -58,8 +66,16 @@ pub(in crate::cypher) fn exists(
     for (name, (_, kind)) in aliases {
         prior.columns.insert(name.clone(), kind.clone());
     }
-    let mut plan = Plan::default();
-    let mut extensions = Extensions::default();
+    let mut plan = Plan {
+        indexed_csr: outer.indexed_csr,
+        ..Default::default()
+    };
+    let mut extensions = Extensions {
+        partitioned_csr: outer.partitioned_csr,
+        indexed_csr: outer.indexed_csr,
+        call_imports: outer.call_imports.clone(),
+        ..Default::default()
+    };
     let predicates = patterns
         .iter()
         .filter_map(|pattern| pattern.where_clause.as_ref())
@@ -141,6 +157,7 @@ pub(in crate::cypher) fn exists(
     );
     let mut correlated_predicates = Vec::new();
     let mut matched = MatchPlan::new(catalog);
+    matched.call_imports = outer.call_imports.clone();
     columns.bind(&alias, &mut matched);
     for predicate in predicates {
         if let Ok(expression) = matched.expr(predicate) {
@@ -149,10 +166,13 @@ pub(in crate::cypher) fn exists(
             correlated_predicates.push(predicate);
         }
     }
-    matched.collect_expressions(&mut plan);
     let relation = ident(&alias);
     let candidate_from = matched.join_expressions(&format!(" FROM ({sql}) AS {relation}"));
-    let mut vars = Variables::default();
+    matched.collect_expressions(&mut plan);
+    let mut vars = References {
+        names: Default::default(),
+        call_imports: &outer.call_imports,
+    };
     for expr in &correlated_predicates {
         opencypher::Visitor::visit_expr(&mut vars, expr);
     }
@@ -162,7 +182,7 @@ pub(in crate::cypher) fn exists(
         .filter(|(name, (value, _))| {
             frames.iter().any(|(item, _)| item == value)
                 && (outer_keys.iter().any(|key| has_identifier(key, value))
-                    || vars.0.contains(*name) && !columns.columns.contains_key(*name))
+                    || vars.names.contains(*name) && !columns.columns.contains_key(*name))
         })
         .collect::<Vec<_>>();
     let filter = if terms.is_empty() {
@@ -185,7 +205,7 @@ pub(in crate::cypher) fn exists(
             })
             .map(|((name, _), value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
-        for name in vars.0 {
+        for name in vars.names {
             if columns.columns.contains_key(&name)
                 || referenced.iter().any(|(item, _)| *item == &name)
             {
@@ -270,6 +290,7 @@ pub(in crate::cypher) fn exists(
         // lexical frame borrow before rebinding the candidate predicates.
         drop(frames);
         let mut bindings = MatchPlan::new(catalog);
+        bindings.call_imports = outer.call_imports.clone();
         captured.bind(&seed, &mut bindings);
         columns.bind(&alias, &mut bindings);
         let mut tests = keys
@@ -290,7 +311,6 @@ pub(in crate::cypher) fn exists(
         for expr in &correlated_predicates {
             tests.push(bindings.expr(expr)?);
         }
-        bindings.collect_expressions(&mut plan);
         let candidate = format!("SELECT {relation}.*{candidate_from}{filter}");
         let seed_table = ident(&seed);
         let seed_from = if !inputs.is_empty() {
@@ -347,6 +367,7 @@ pub(in crate::cypher) fn exists(
                 tests.join(" AND ")
             )
         };
+        bindings.collect_expressions(&mut plan);
         let result_field = qualified(&result, &found);
         let (query, predicate) = if let Some(tuple) = tuple {
             let columns = captures
@@ -376,6 +397,8 @@ pub(in crate::cypher) fn exists(
             seed,
             captures,
             query,
+            expanded: None,
+            calls: (!plan.calls.is_empty()).then(|| std::mem::take(&mut plan.calls)),
         });
         predicate
     } else {
@@ -390,7 +413,25 @@ pub(in crate::cypher) fn exists(
         } else {
             format!(" WHERE {}", terms.join(" AND "))
         };
-        format!("((SELECT count(*){candidate_from}{filter}) > 0)")
+        if keys.is_empty() {
+            let field = "__graphlake_found";
+            let result = format!(
+                "__graphlake_exists_result_{}_{}",
+                span.start,
+                outer.expression_joins.borrow().len()
+            );
+            outer.expression_joins.borrow_mut().push(ExpressionJoin {
+                alias: result.clone(),
+                seed: String::new(),
+                captures: Vec::new(),
+                query: format!("SELECT TRUE AS {field}{candidate_from}{filter} LIMIT 1"),
+                expanded: None,
+                calls: Default::default(),
+            });
+            format!("{} IS NOT NULL", qualified(&result, field))
+        } else {
+            format!("(coalesce((SELECT count(*){candidate_from}{filter}), 0) > 0)")
+        }
     };
     outer
         .expression_labels
@@ -400,6 +441,7 @@ pub(in crate::cypher) fn exists(
         .expression_expansions
         .borrow_mut()
         .append(&mut plan.expansions);
+    outer.expression_calls.borrow_mut().append(&mut plan.calls);
     Ok(predicate)
 }
 

@@ -20,6 +20,23 @@ pub(super) struct IdentityList {
 }
 
 impl IdentityList {
+    pub(super) fn indexed_lookup(bindings: &[Binding], result: &Binding, ids: &str) -> String {
+        Self::hydrate("__graphlake_csr_hydrate", bindings, result, ids)
+    }
+
+    pub(super) fn indexed_order_columns(
+        bindings: &[Binding],
+        result: &Binding,
+        ids: &str,
+    ) -> String {
+        Self::hydrate("__graphlake_csr_order_columns", bindings, result, ids)
+    }
+
+    fn hydrate(function: &str, bindings: &[Binding], result: &Binding, ids: &str) -> String {
+        let types = Self::lookup(bindings, result);
+        let kind = if result.node { "node" } else { "relationship" };
+        format!("{function}({ids}, (SELECT payload FROM ({types}) AS csr_types LIMIT 0), '{kind}')")
+    }
     pub(super) fn single(label: &str) -> Self {
         Self {
             labels: BTreeSet::from([label.to_owned()]),
@@ -159,7 +176,7 @@ impl IdentityList {
         crate::catalog::union_all(&reads)
     }
 
-    fn tag_item(&self, catalog: &Catalog, item: &str) -> Option<(String, String)> {
+    pub(super) fn tag_item(&self, catalog: &Catalog, item: &str) -> Option<(String, String)> {
         if self.tagged {
             return Some(identity(item));
         }
@@ -322,17 +339,28 @@ impl MatchPlan<'_> {
                 ),
             };
             let captures = vec![("paths".into(), paths)];
-            let query = format!(
-                "SELECT u.paths, named_struct('ids', array_agg(u.id ORDER BY u.id),
-                            'values', array_agg(items.payload ORDER BY u.id)) AS payloads
-                 FROM (SELECT DISTINCT p.paths, unnest(p.ids) AS id FROM ({expand}) AS p) AS u
-                 LEFT JOIN ({lookup}) AS items ON u.id = items.__graphlake_lookup_id GROUP BY u.paths"
-            );
+            let query = if self.indexed_csr {
+                let payloads = IdentityList::indexed_lookup(&bindings, &result, "u.ids");
+                format!(
+                    "SELECT u.paths, named_struct('ids', u.ids, 'values', {payloads}) AS payloads FROM
+                    (SELECT d.paths, array_agg(d.id ORDER BY d.id) AS ids FROM
+                    (SELECT DISTINCT p.paths, unnest(p.ids) AS id FROM ({expand}) AS p) AS d GROUP BY d.paths) AS u"
+                )
+            } else {
+                format!(
+                    "SELECT u.paths, named_struct('ids', array_agg(u.id ORDER BY u.id),
+                    'values', array_agg(items.payload ORDER BY u.id)) AS payloads
+                    FROM (SELECT DISTINCT p.paths, unnest(p.ids) AS id FROM ({expand}) AS p) AS u
+                    LEFT JOIN ({lookup}) AS items ON u.id = items.__graphlake_lookup_id GROUP BY u.paths"
+                )
+            };
             joins.push(ExpressionJoin {
                 alias: alias.clone(),
                 seed,
                 captures,
                 query,
+                expanded: None,
+                calls: Default::default(),
             });
             return Ok(format!(
                 "__graphlake_cypher_hydrate({ids}, {})",
@@ -356,20 +384,27 @@ impl MatchPlan<'_> {
             while catalog.nodes.contains_key(&seed) || catalog.edges.contains_key(&seed) {
                 seed.push('_');
             }
-            let query = format!(
-                "SELECT u.ids, array_agg(items.payload ORDER BY u.position) AS values
+            let query = if self.indexed_csr {
+                let lookup = IdentityList::indexed_lookup(&bindings, &result, "ids");
+                format!("SELECT ids, {lookup} AS values FROM {}", ident(&seed))
+            } else {
+                format!(
+                    "SELECT u.ids, array_agg(items.payload ORDER BY u.position) AS values
                  FROM (SELECT ids, unnest(ids) AS id,
                        unnest(range(0, CAST(array_length(ids) AS BIGINT))) AS position
                        FROM {}) AS u
                  LEFT JOIN ({lookup}) AS items ON u.id = items.__graphlake_lookup_id
                  GROUP BY u.ids",
-                ident(&seed)
-            );
+                    ident(&seed)
+                )
+            };
             joins.push(ExpressionJoin {
                 alias: alias.clone(),
                 seed,
                 captures,
                 query,
+                expanded: None,
+                calls: Default::default(),
             });
             alias
         };
@@ -460,11 +495,15 @@ pub(super) fn shape(source: &Binding, target: &Binding, value: &str) -> String {
                     .iter()
                     .flat_map(|field| [string(field), qualified("__graphlake_empty_lane", field)])
                     .collect::<Vec<_>>();
-                format!(
-                    "(SELECT named_struct({}) FROM {} AS __graphlake_empty_lane LIMIT 0)",
-                    fields.join(", "),
-                    ident(name)
-                )
+                if fields.is_empty() {
+                    "(CASE WHEN FALSE THEN named_struct('_empty', NULL) END)".to_owned()
+                } else {
+                    format!(
+                        "(SELECT named_struct({}) FROM {} AS __graphlake_empty_lane LIMIT 0)",
+                        fields.join(", "),
+                        ident(name)
+                    )
+                }
             };
             [string(name), lane]
         })

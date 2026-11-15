@@ -52,6 +52,7 @@ struct NeighborFilter {
 #[serde(deny_unknown_fields)]
 pub(in crate::admin) struct ExploreRequest {
     model_revision: String,
+    csr_generation: Option<Uuid>,
     element: Identity,
     neighbors: bool,
     graph_options: crate::GraphOptions,
@@ -161,7 +162,7 @@ pub(in crate::admin) async fn explore(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<ExploreRequest>,
+    Json(mut request): Json<ExploreRequest>,
 ) -> ApiResult<Response> {
     let _permit = app.explore_work.try_acquire().map_err(|_| Error::busy())?;
     if request.search.as_ref().is_some_and(|search| {
@@ -176,11 +177,21 @@ pub(in crate::admin) async fn explore(
             "请选择邻域并输入 1 至 256 字节的搜索词",
         ));
     }
-    let engine =
-        app.models
-            .lock()
-            .unwrap()
-            .query_engine(&id, &request.model_revision, &principal)?;
+    crate::admin::access::check_query(&app, &principal, &id)?;
+    let engine = {
+        let mut models = app.models.lock().unwrap();
+        if request.csr_generation.is_some() {
+            models.snapshot_engine(&id, &request.model_revision)?
+        } else {
+            models.query_engine(&id, &request.model_revision, &principal)?
+        }
+    };
+    if let Some(term) = access::partition(&app, &principal, &id)? {
+        if request.csr_generation.is_some() {
+            return Err(access::forbidden());
+        }
+        crate::admin::users::apply_partition(&engine.catalog, &mut request.graph_options, &term)?;
+    }
     // Source identifiers come from prepared relations, never from request paths.
     let catalog = &engine.catalog;
     let target = &request.element;
@@ -199,7 +210,10 @@ pub(in crate::admin) async fn explore(
             "图元素或业务键无效",
         ));
     }
-    if target.kind == Kind::Edge && catalog.edges[&target.label].key.is_empty() {
+    if request.csr_generation.is_none()
+        && target.kind == Kind::Edge
+        && catalog.edges[&target.label].key.is_empty()
+    {
         return Err(Error::invalid(
             "transient_graph_edge",
             "此边没有业务键，无法从新数据快照重新定位",
@@ -211,7 +225,20 @@ pub(in crate::admin) async fn explore(
         .graph_options
         .validate()
         .map_err(|_| Error::invalid("invalid_graph_options", "图查询过滤条件无效"))?;
-    options.graph = request.graph_options.clone();
+    let snapshot = if let Some(generation) = request.csr_generation {
+        let snapshot = super::super::cluster::csr::ExplorationSnapshot::open(
+            &app,
+            &id,
+            &request.model_revision,
+            generation,
+        )
+        .await?;
+        options.graph = snapshot.options().clone();
+        Some(snapshot)
+    } else {
+        options.graph = request.graph_options.clone();
+        None
+    };
     let filter = &request.filter;
     if filter.properties.len() > 8
         || filter
@@ -245,17 +272,22 @@ pub(in crate::admin) async fn explore(
     }) {
         return Err(invalid_filter("筛选列必须是所选边类型的映射属性"));
     }
-    let signature = URL_SAFE_NO_PAD.encode(Sha256::digest(
+    let mut signature = Sha256::new();
+    signature.update(
         serde_json::to_vec(&(
-            principal.audit_name(),
+            &principal,
             &id,
             &request.model_revision,
             target,
             filter,
-            &request.graph_options,
+            &options.graph,
         ))
         .expect("serializing neighbor scope"),
-    ));
+    );
+    if let Some(generation) = request.csr_generation {
+        signature.update(generation.as_bytes());
+    }
+    let signature = URL_SAFE_NO_PAD.encode(signature.finalize());
     let cursors = app.explorations.lock().unwrap().cursors;
     let mut resume = request
         .cursor
@@ -318,7 +350,9 @@ pub(in crate::admin) async fn explore(
         }
     } else if request.neighbors {
         let existing = app.explorations.lock().unwrap().find(&signature);
-        if let Some((session, saved)) = existing.filter(|(_, saved)| can_replay(&saved.sources)) {
+        if let Some((session, saved)) =
+            existing.filter(|(_, saved)| snapshot.is_some() || can_replay(&saved.sources))
+        {
             // A new graph query may deliberately start over after a source change.
             if check_page_versions(&engine, options.clone(), &request, &saved)
                 .await
@@ -373,6 +407,7 @@ pub(in crate::admin) async fn explore(
             session,
             resume,
             options,
+            snapshot.as_ref(),
             |pages: Arc<pages::Pages>| {
                 published = Some(pages::Production(Arc::clone(&pages)));
                 let _ = send.send(pages);
@@ -503,6 +538,9 @@ async fn check_versions(
     snapshots: &std::sync::Mutex<BTreeMap<String, String>>,
 ) -> ApiResult<()> {
     check_expected(request, sources)?;
+    if request.csr_generation.is_some() {
+        return Ok(());
+    }
     let scope = engine.scope(options).await.map_err(query_error)?;
     let mut postgres = snapshots.lock().unwrap().clone();
     let unchanged = scope
@@ -547,6 +585,7 @@ async fn read(
     session: Uuid,
     resume: Option<pages::Cursor>,
     options: crate::QueryOptions,
+    snapshot: Option<&super::super::cluster::csr::ExplorationSnapshot>,
     publish: impl FnOnce(Arc<pages::Pages>),
 ) -> ApiResult<()> {
     let catalog = &engine.catalog;
@@ -584,19 +623,23 @@ async fn read(
                 key: &target.key,
                 start: anchor.map(|anchor| (anchor.label.as_str(), anchor.key.as_slice())),
             };
-            let prepared = engine
-                .prepare_exploration(
-                    &scope,
-                    &context,
-                    labels,
-                    request.neighbors.then_some(&exploration),
-                )
-                .await?;
+            let prepared = if let Some(snapshot) = snapshot {
+                snapshot.prepare(&context, &scope, catalog, labels).await?
+            } else {
+                engine
+                    .prepare_exploration(
+                        &scope,
+                        &context,
+                        labels,
+                        request.neighbors.then_some(&exploration),
+                    )
+                    .await?
+            };
             if let Err(error) = check_expected(request, &prepared.versions) {
                 return Ok(Err(error));
             }
             if let Some(cursor) = &resume {
-                if !can_replay(&prepared.versions) {
+                if snapshot.is_none() && !can_replay(&prepared.versions) {
                     return Ok(Err(Error::new(
                         StatusCode::CONFLICT,
                         "neighbor_session_expired",
@@ -678,6 +721,7 @@ async fn read(
                         target,
                         &request.filter,
                         start,
+                        snapshot.is_some(),
                     )
                     .await?
                     {
@@ -706,7 +750,7 @@ async fn read(
                                 writer.mark_truncated();
                                 continue;
                             };
-                            let mut relation = if edge.key.is_empty() {
+                            let mut relation = if edge.key.is_empty() && snapshot.is_none() {
                                 // Only indistinguishable parallel edges can swap positions
                                 // when replaying the sort over all mapped values.
                                 graph::from_identity(
@@ -759,6 +803,7 @@ async fn neighbor_sql(
     target: &Identity,
     filter: &NeighborFilter,
     start_at: Option<&pages::Anchor>,
+    frozen: bool,
 ) -> anyhow::Result<ApiResult<(String, Vec<ScalarValue>)>> {
     let schema = context.table(TableReference::bare(label)).await?;
     let mut values = Vec::new();
@@ -814,8 +859,11 @@ async fn neighbor_sql(
         values.push(value);
         predicates.push(format!("{column} {operator} ${}", values.len()));
     }
-    let source_columns = edge.source_columns();
-    let order = if edge.key.is_empty() {
+    let mut source_columns = edge.source_columns();
+    if frozen && edge.key.is_empty() {
+        source_columns.extend(identity.iter().cloned());
+    }
+    let order = if edge.key.is_empty() && !frozen {
         &source_columns
     } else {
         &identity
@@ -823,7 +871,8 @@ async fn neighbor_sql(
     let sort: Vec<_> = order.iter().map(|key| qualified("e", key)).collect();
     let mut offset = 0;
     if let Some(anchor) = start_at {
-        let seekable = !edge.key.is_empty()
+        let seekable = !frozen
+            && !edge.key.is_empty()
             && anchor.key.len() == edge.key.len()
             && edge.key.iter().all(|key| {
                 schema
@@ -869,13 +918,42 @@ pub(super) async fn connect_returned_edges(
     let Some(context) = result.graph_context.take() else {
         return;
     };
-    let lookups = graph.unresolved_edges();
-    if lookups.is_empty() {
+    let csr = result.graph_csr.take();
+    let indexed = csr.as_ref().map(|_| {
+        graph
+            .unresolved_properties()
+            .map(|id| crate::cypher::format_element_id(&id.label, &id.key))
+            .collect::<BTreeSet<_>>()
+    });
+    let lookups = if indexed.is_none() {
+        graph.unresolved_edges()
+    } else {
+        BTreeMap::new()
+    };
+    if indexed.as_ref().is_none_or(BTreeSet::is_empty) && lookups.is_empty() {
         return;
     }
+    let scope = result.graph_scope();
     // This uses the modeled relations of the original query and its source snapshots.
     // A slow optional graph enrichment must not turn a completed table query into an error.
     let hydrate = result.graph_read(async {
+        if let (Some(csr), Some(ids)) = (csr, indexed) {
+            csr.visit_properties(&scope, ids, |label, _, batch, row| {
+                if let Some(item) = graph::from_fields(
+                    catalog,
+                    label,
+                    catalog.nodes.contains_key(label),
+                    row,
+                    |name| batch.column_by_name(name),
+                ) {
+                    graph.add_endpoints(&item, catalog, batch, row);
+                    graph.insert(item);
+                }
+                Ok(())
+            })
+            .await?;
+            return Ok(());
+        }
         for (label, keys) in lookups {
             let Some(edge) = catalog.edges.get(&label) else {
                 continue;

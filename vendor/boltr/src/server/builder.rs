@@ -240,6 +240,7 @@ impl<B: BoltBackend> BoltServer<B> {
         let addr = listener.local_addr()?;
         let backend = Arc::new(self.backend);
         let session_manager = Arc::new(SessionManager::new(self.max_sessions));
+        let (closing, closed) = tokio::sync::watch::channel(());
         let context = ConnectionContext {
             backend: Arc::clone(&backend),
             session_manager: Arc::clone(&session_manager),
@@ -247,6 +248,7 @@ impl<B: BoltBackend> BoltServer<B> {
             max_message_size: self.max_message_size,
             max_unauthenticated_message_size: self.max_unauthenticated_message_size,
             handshake_timeout: self.handshake_timeout,
+            closed: Some(closed),
         };
 
         #[cfg(feature = "tls")]
@@ -300,6 +302,7 @@ impl<B: BoltBackend> BoltServer<B> {
             }
         }
 
+        drop(closing);
         if let Some(handle) = reaper_handle {
             handle.abort();
         }
@@ -325,6 +328,7 @@ pub(crate) struct ConnectionContext<B: BoltBackend> {
     pub(crate) max_message_size: Option<usize>,
     pub(crate) max_unauthenticated_message_size: usize,
     pub(crate) handshake_timeout: Option<Duration>,
+    pub(crate) closed: Option<tokio::sync::watch::Receiver<()>>,
 }
 
 impl<B: BoltBackend> Clone for ConnectionContext<B> {
@@ -336,6 +340,7 @@ impl<B: BoltBackend> Clone for ConnectionContext<B> {
             max_message_size: self.max_message_size,
             max_unauthenticated_message_size: self.max_unauthenticated_message_size,
             handshake_timeout: self.handshake_timeout,
+            closed: self.closed.clone(),
         }
     }
 }
@@ -444,6 +449,11 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
     B: BoltBackend,
 {
     let deadline = context.handshake_timeout.map(|t| started + t);
+    if let Some(validator) = &context.auth_validator
+        && with_deadline(deadline, validator.session_allowed()).await != Some(true)
+    {
+        return;
+    }
     let version = match with_deadline(deadline, server_handshake(&mut stream)).await {
         Some(Ok(version)) => version,
         Some(Err(e)) => {
@@ -479,9 +489,16 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
     if let (Some(timeout), Some(deadline)) = (context.handshake_timeout, deadline) {
         conn.set_auth_deadline(timeout, deadline);
     }
+    let mut closed = context.closed;
     if let Err(e) = conn
         .run_until(async {
-            let _ = disconnect.await;
+            tokio::select! {
+                _ = disconnect => {}
+                () = async {
+                    if let Some(signal) = &mut closed { let _ = signal.changed().await; }
+                    else { std::future::pending().await }
+                } => {}
+            }
         })
         .await
     {

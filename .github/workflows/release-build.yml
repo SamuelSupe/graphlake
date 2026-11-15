@@ -1,0 +1,77 @@
+name: Build Linux release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release version, including the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Debian 12 / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container: debian:bookworm-slim
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-24.04
+    env:
+      CARGO_BUILD_JOBS: 3
+      RUST_TOOLCHAIN: "1.97.1"
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config cmake
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.22.1"
+          package-manager-cache: false
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init.sh https://sh.rustup.rs
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build and test the browser UI
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
+          npm --prefix web test
+
+      - name: Build and check the deployment archive
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          test "$RELEASE_TAG" = "v$version"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          GRAPHLAKE_WEB_DIST=web/dist sh deploy/package.sh "$RELEASE_TAG" dist
+          (
+            cd dist
+            sha256sum -c ./*.sha256
+          )
+          target/release/graphlake --version
+          target/release/graphlake-admin --version
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error

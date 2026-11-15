@@ -445,6 +445,7 @@ impl Snapshot {
                 .map(|col| col.type_().clone())
                 .collect(),
             scan_filter: None,
+            top: None,
         })
     }
 }
@@ -478,6 +479,7 @@ pub(crate) struct PgTable {
     schema: SchemaRef,
     types: Vec<Type>,
     scan_filter: Option<String>,
+    top: Option<(String, usize)>,
 }
 
 impl std::fmt::Debug for PgTable {
@@ -489,6 +491,79 @@ impl std::fmt::Debug for PgTable {
 }
 
 impl PgTable {
+    pub(crate) async fn pushdown(
+        &mut self,
+        keys: &[String],
+        operation: &crate::engine::sql_read::Pushdown,
+    ) -> Result<Option<RecordBatch>> {
+        use crate::engine::sql_read::{Aggregate, Native};
+        let integer = |name: &str| {
+            self.schema
+                .field_with_name(name)
+                .is_ok_and(|field| field.data_type().is_integer())
+        };
+        if !keys.iter().all(|key| integer(key)) || !self.guarantees_unique_key(keys).await? {
+            return Ok(None);
+        }
+        let Some(mut terms) =
+            crate::engine::read_filters::exact_terms(&operation.filters, &self.schema, ident)
+        else {
+            return Ok(None);
+        };
+        terms.extend(keys.iter().map(|key| format!("{} IS NOT NULL", ident(key))));
+        let condition = terms.join(" AND ");
+        match &operation.operation {
+            Native::Top { order, limit } => {
+                let Ok(limit) = usize::try_from(*limit) else {
+                    return Ok(None);
+                };
+                let order = order
+                    .iter()
+                    .map(|(key, asc)| {
+                        format!("{} {}", ident(key), if *asc { "ASC" } else { "DESC" })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                *self = self.restricted(condition);
+                self.top = Some((order, limit));
+                Ok(None)
+            }
+            Native::Aggregate { function, column } => {
+                let (function, data_type) = match function {
+                    Aggregate::Count => ("COUNT", DataType::Int64),
+                    Aggregate::Min | Aggregate::Max if column.as_deref().is_some_and(integer) => (
+                        if matches!(function, Aggregate::Min) {
+                            "MIN"
+                        } else {
+                            "MAX"
+                        },
+                        self.schema
+                            .field_with_name(column.as_deref().unwrap())?
+                            .data_type()
+                            .clone(),
+                    ),
+                    _ => return Ok(None),
+                };
+                let input = column.as_deref().map(ident).unwrap_or_else(|| "*".into());
+                self.snapshot.stats.request();
+                let row = self
+                    .snapshot
+                    .client
+                    .query_one(
+                        &format!(
+                            "SELECT {function}({input}) FROM {} WHERE {condition}",
+                            self.relation
+                        ),
+                        &[],
+                    )
+                    .await?;
+                let schema = Arc::new(Schema::new(vec![Field::new("aggregate", data_type, true)]));
+                let batch = to_batch(schema, &[row])?;
+                self.snapshot.stats.batch(&batch);
+                Ok(Some(batch))
+            }
+        }
+    }
     #[cfg(feature = "admin")]
     pub(crate) async fn probe(&self) -> Result<()> {
         let columns = self
@@ -619,11 +694,16 @@ impl TableProvider for PgTable {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => Arc::clone(&self.schema),
         };
+        let limit = match (&self.top, limit) {
+            (Some((_, top)), limit) => Some(limit.map_or(*top, |limit| limit.min(*top))),
+            (None, limit) => limit,
+        };
         let partition = Arc::new(PgPartition {
             snapshot: Arc::clone(&self.snapshot),
             relation: self.relation.clone(),
             schema: Arc::clone(&schema),
             limit,
+            order: self.top.as_ref().map(|(order, _)| order.clone()),
             filter: filters
                 .iter()
                 .map(|expr| {
@@ -652,6 +732,7 @@ struct PgPartition {
     relation: String,
     schema: SchemaRef,
     limit: Option<usize>,
+    order: Option<String>,
     filter: String,
 }
 
@@ -665,6 +746,11 @@ impl PartitionStream for PgPartition {
         let schema = Arc::clone(&self.schema);
         let relation = self.relation.clone();
         let limit = self.limit;
+        let order = self
+            .order
+            .as_ref()
+            .map(|order| format!(" ORDER BY {order}"))
+            .unwrap_or_default();
         let filter = if self.filter.is_empty() {
             String::new()
         } else {
@@ -686,7 +772,7 @@ impl PartitionStream for PgPartition {
             let limit_sql = limit.map(|value| format!(" LIMIT {value}")).unwrap_or_default();
             snapshot.stats.request();
             snapshot.client.batch_execute(&format!(
-                "DECLARE {cursor} NO SCROLL CURSOR FOR SELECT {columns} FROM {relation}{filter}{limit_sql}"
+                "DECLARE {cursor} NO SCROLL CURSOR FOR SELECT {columns} FROM {relation}{filter}{order}{limit_sql}"
             )).await.map_err(external)?;
             // A Bolt transaction can keep the PostgreSQL snapshot alive after
             // DISCARD, LIMIT or a dropped result stream.

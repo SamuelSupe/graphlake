@@ -13,6 +13,7 @@ pub(crate) use query_functions::register as register_graph_functions;
 #[cfg(feature = "admin")]
 pub(crate) mod query_graph;
 pub(crate) mod read_filters;
+pub(crate) mod sql_read;
 
 #[cfg(feature = "admin")]
 pub(crate) use query::spilled_bytes as execution_spill;
@@ -390,6 +391,19 @@ impl Engine {
                     Statement::Statement(stmt) => read_filters::query_filter(stmt, &self.catalog),
                     _ => None,
                 };
+                let mut sql = match &statement {
+                    Statement::Statement(stmt)
+                        if matches!(language, Language::Sql) && !exporting && !schema_only =>
+                    {
+                        sql_read::hint(stmt, &self.catalog)
+                    }
+                    _ => None,
+                };
+                if !scope.options.graph.logical_partition.is_empty()
+                    && let Some(sql) = sql.as_mut()
+                {
+                    sql.native = None;
+                }
                 #[cfg(feature = "admin")]
                 let distributed = distributed.filter(|_| {
                     csr.is_none()
@@ -401,6 +415,12 @@ impl Engine {
                         && procedures.is_empty()
                         && schema_procedures.is_empty()
                 });
+                #[cfg(feature = "admin")]
+                if (distributed.is_some() || transaction.is_some())
+                    && let Some(sql) = sql.as_mut()
+                {
+                    sql.native = None;
+                }
                 #[cfg(feature = "admin")]
                 let snapshot = if let Some(csr) = csr {
                     Some(
@@ -426,6 +446,7 @@ impl Engine {
                             #[cfg(feature = "admin")]
                             distributed,
                             explain_only: schema_only,
+                            sql: sql.as_ref(),
                             #[cfg(feature = "admin")]
                             graph_versions: _preview
                                 && !schema_only
@@ -544,7 +565,15 @@ impl Engine {
                 let distributed_planning = distributed.is_some();
                 #[cfg(not(feature = "admin"))]
                 let distributed_planning = false;
-                let frame = if ordered_call_output || distributed_planning {
+                let frame = if let Some(batch) = prepared.aggregate.take() {
+                    let schema = Arc::clone(plan.schema().inner());
+                    ensure!(
+                        schema.fields().len() == 1
+                            && schema.field(0).data_type() == batch.column(0).data_type(),
+                        "source aggregate did not match the SQL result type"
+                    );
+                    context.read_batch(RecordBatch::try_new(schema, batch.columns().to_vec())?)?
+                } else if ordered_call_output || distributed_planning {
                     DataFrame::new(state, plan)
                 } else {
                     context.execute_logical_plan(plan).await?
@@ -651,7 +680,8 @@ impl Engine {
             .chain(self.catalog.edges.keys())
             .cloned()
             .collect();
-        let references = model::required(&self.catalog, &mut labels, &scope.options.graph, None)?;
+        let references =
+            model::required(&self.catalog, &mut labels, &scope.options.graph, None, None)?;
         let sources = references
             .keys()
             .map(|reference| {
@@ -789,7 +819,13 @@ impl Engine {
         filter: Option<&(String, Vec<crate::Predicate>)>,
     ) -> Result<Prepared> {
         let catalog = &self.catalog;
-        let required = model::required(catalog, &mut labels, &scope.options.graph, read.topology)?;
+        let required = model::required(
+            catalog,
+            &mut labels,
+            &scope.options.graph,
+            read.topology,
+            read.sql,
+        )?;
         if scope.options.graph.require_consistent_snapshot {
             verify_consistent_snapshot(catalog, required.keys().copied())?;
         }
@@ -811,6 +847,11 @@ impl Engine {
         let private = scope.session();
         let mut snapshots = BTreeMap::<&str, Arc<Snapshot>>::new();
         let mut mysql_snapshots = BTreeMap::new();
+        let mut direct = BTreeMap::new();
+        let mut aggregate = None;
+        let mut proven_key_label = None;
+        let mut databricks = BTreeMap::new();
+        let mut sqlite_snapshots = BTreeMap::new();
         let mut spanner_snapshots = BTreeMap::new();
         let mut hana = BTreeMap::new();
         let mut clickhouse = BTreeMap::new();
@@ -838,6 +879,190 @@ impl Engine {
             let fields = fields.into_iter().collect::<Vec<_>>();
             let predicates = &filters[reference];
             let table: Arc<dyn TableProvider> = match source {
+                Source::Duckdb { .. }
+                | Source::SqlserverNative { .. }
+                | Source::OracleNative { .. }
+                | Source::MongodbNative { .. } => {
+                    let driver = match direct.entry(name) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                            Box::pin(source::direct::Driver::open(
+                                source,
+                                scope.options.timeout,
+                                Arc::clone(&scope.runtime),
+                                Arc::clone(&scope.reads),
+                            ))
+                            .await?,
+                        ),
+                    };
+                    let native =
+                        read.sql
+                            .and_then(|sql| sql.native.as_ref())
+                            .filter(|(label, _)| {
+                                matches!(source, Source::Duckdb { .. })
+                                    && catalog.nodes[label].source == reference
+                            });
+                    let pushed = if let Some((label, operation)) = native {
+                        driver
+                            .pushdown(
+                                relation,
+                                &fields,
+                                &catalog.nodes[label].key,
+                                operation,
+                                scope.options.batch_size,
+                            )
+                            .await?
+                    } else {
+                        None
+                    };
+                    let (table, budget) = if let Some(pushed) = pushed {
+                        proven_key_label = native.map(|(label, _)| label.as_str());
+                        aggregate = pushed.aggregate;
+                        (pushed.table, pushed.budget)
+                    } else {
+                        driver
+                            .table(
+                                relation,
+                                &fields,
+                                predicates,
+                                scope.options.batch_size,
+                                read.explain_only,
+                            )
+                            .await?
+                    };
+                    let (key, consistency) = match source {
+                        Source::Duckdb { .. } => (name, "DuckDB read transaction"),
+                        Source::OracleNative { .. } => (name, "Oracle read-only transaction"),
+                        Source::SqlserverNative { .. } => (reference, "SQL Server statement"),
+                        _ => (reference, "MongoDB cursor"),
+                    };
+                    versions.entry(key.into()).or_insert_with(|| SourceVersion {
+                        source: key.into(),
+                        version: uuid::Uuid::new_v4().to_string(),
+                        consistency,
+                    });
+                    reservations.push(budget);
+                    table
+                }
+                Source::Databricks { .. } => {
+                    let driver = match databricks.entry(name) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(source::warehouse::databricks::Databricks::new(
+                                source,
+                                scope.options.timeout,
+                                Arc::clone(&scope.runtime.memory_pool),
+                                Arc::clone(&scope.reads),
+                            )?)
+                        }
+                    };
+                    let (table, budget) = driver
+                        .table(
+                            relation,
+                            &fields,
+                            predicates,
+                            scope.options.batch_size,
+                            &scope.runtime.disk_manager,
+                            read.explain_only,
+                        )
+                        .await?;
+                    versions.insert(
+                        reference.into(),
+                        SourceVersion {
+                            source: reference.into(),
+                            version: uuid::Uuid::new_v4().to_string(),
+                            consistency: "Databricks statement",
+                        },
+                    );
+                    reservations.push(budget);
+                    table
+                }
+                Source::ObjectStorage {
+                    storage,
+                    format,
+                    tables,
+                } => {
+                    let mapping = &tables[relation];
+                    let (table, objects): (Arc<dyn TableProvider>, _) =
+                        if matches!(format, crate::ObjectFormat::Parquet) {
+                            let (table, objects) = ParquetTable::open_storage(
+                                &mapping.files,
+                                &fields,
+                                Some(storage),
+                                Arc::clone(&scope.runtime.memory_pool),
+                                Arc::clone(&scope.reads),
+                            )
+                            .await?;
+                            (Arc::new(table), objects)
+                        } else {
+                            let (table, budget, objects) = source::text::open(
+                                mapping,
+                                matches!(format, crate::ObjectFormat::Csv),
+                                &fields,
+                                scope.options.batch_size,
+                                Arc::clone(&scope.runtime.memory_pool),
+                                &scope.runtime.disk_manager,
+                                Arc::clone(&scope.reads),
+                                read.explain_only,
+                                Some(storage),
+                            )
+                            .await?;
+                            reservations.push(budget);
+                            (table, objects)
+                        };
+                    for mut object in objects {
+                        object.source = format!(
+                            "{}:{}:{}:{}/{}",
+                            storage.provider,
+                            storage.endpoint.as_deref().unwrap_or("default"),
+                            storage.account.as_deref().unwrap_or("default"),
+                            storage.bucket,
+                            object.source
+                        );
+                        if let Some(previous) = versions.get(&object.source) {
+                            ensure!(
+                                previous.version == object.version,
+                                "storage object changed while preparing query"
+                            );
+                        }
+                        versions.insert(object.source.clone(), object);
+                    }
+                    table
+                }
+                Source::Sqlite { path } => {
+                    let snapshot = match sqlite_snapshots.entry(name) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            let snapshot = source::sqlite::Snapshot::open(
+                                path,
+                                scope.options.timeout,
+                                Arc::clone(&scope.reads),
+                            )
+                            .await?;
+                            versions.insert(
+                                name.into(),
+                                SourceVersion {
+                                    source: name.into(),
+                                    version: snapshot.version.clone(),
+                                    consistency: "SQLite read transaction",
+                                },
+                            );
+                            entry.insert(snapshot)
+                        }
+                    };
+                    let (table, budget) = snapshot
+                        .table(
+                            relation,
+                            &fields,
+                            predicates,
+                            &scope.runtime,
+                            scope.options.batch_size,
+                            read.explain_only,
+                        )
+                        .await?;
+                    reservations.push(budget);
+                    table
+                }
                 Source::Postgres { dsn_env } => {
                     let snapshot = match snapshots.entry(name) {
                         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -873,12 +1098,10 @@ impl Engine {
                             entry.insert(snapshot)
                         }
                     };
-                    let table = Arc::new(
-                        snapshot
-                            .table(relation, &fields)
-                            .await
-                            .with_context(|| crate::catalog::MappedTable(reference.to_owned()))?,
-                    );
+                    let mut table = snapshot
+                        .table(relation, &fields)
+                        .await
+                        .with_context(|| crate::catalog::MappedTable(reference.to_owned()))?;
                     #[cfg(feature = "admin")]
                     if read.probe_source.is_some() {
                         table.probe().await?;
@@ -898,34 +1121,41 @@ impl Engine {
                     if scope.options.graph.require_consistent_snapshot {
                         table.verify_local_snapshot().await?;
                     }
+                    if let Some((label, operation)) = read.sql.and_then(|sql| sql.native.as_ref())
+                        && catalog.nodes[label].source == reference
+                    {
+                        aggregate = table.pushdown(&catalog.nodes[label].key, operation).await?;
+                    }
+                    let table = Arc::new(table);
                     postgres.insert(reference.to_owned(), Arc::clone(&table));
                     table
                 }
-                Source::Mysql {
-                    dsn_env,
-                    tls,
-                    ca_file,
-                } => {
+                Source::Mysql { .. }
+                | Source::Doris(_)
+                | Source::Starrocks(_)
+                | Source::Tidb(_)
+                | Source::Oceanbase(_)
+                | Source::Mariadb(_) => {
                     let snapshot = match mysql_snapshots.entry(name) {
                         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::btree_map::Entry::Vacant(entry) => {
-                            let snapshot = source::mysql::Snapshot::open(
-                                dsn_env,
-                                *tls,
-                                ca_file.as_deref(),
+                            let snapshot = source::mysql::Snapshot::open_source(
+                                source,
                                 scope.options.timeout,
                                 Arc::clone(&scope.reads),
                             )
                             .await
                             .with_context(|| format!("opening MySQL source {name}"))?;
-                            versions.insert(
-                                name.into(),
-                                SourceVersion {
-                                    source: name.into(),
-                                    version: snapshot.version.clone(),
-                                    consistency: "MySQL InnoDB repeatable read",
-                                },
-                            );
+                            if matches!(source, Source::Mysql { .. } | Source::Mariadb(_)) {
+                                versions.insert(
+                                    name.into(),
+                                    SourceVersion {
+                                        source: name.into(),
+                                        version: snapshot.version.clone(),
+                                        consistency: "MySQL InnoDB repeatable read",
+                                    },
+                                );
+                            }
                             entry.insert(snapshot)
                         }
                     };
@@ -939,6 +1169,16 @@ impl Engine {
                             read.explain_only,
                         )
                         .await?;
+                    if !matches!(source, Source::Mysql { .. } | Source::Mariadb(_)) {
+                        versions.insert(
+                            reference.into(),
+                            SourceVersion {
+                                source: reference.into(),
+                                version: uuid::Uuid::new_v4().to_string(),
+                                consistency: "MySQL-compatible statement",
+                            },
+                        );
+                    }
                     reservations.push(budget);
                     table
                 }
@@ -969,6 +1209,7 @@ impl Engine {
                         .table(
                             relation,
                             &fields,
+                            predicates,
                             scope.options.batch_size,
                             &scope.runtime.disk_manager,
                             read.explain_only,
@@ -1015,7 +1256,9 @@ impl Engine {
                 Source::Trino { .. }
                 | Source::Mongodb(_)
                 | Source::Elasticsearch(_)
-                | Source::Redshift(_) => {
+                | Source::Redshift(_)
+                | Source::Sqlserver(_)
+                | Source::Oracle(_) => {
                     let driver = match trino.entry(name) {
                         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1165,12 +1408,40 @@ impl Engine {
                         reference,
                         relation,
                         &fields,
+                        predicates,
                         snapshots.get(relation).copied(),
                         Arc::clone(&scope.reads),
                     )
                     .await?;
                     versions.insert(reference.into(), version);
                     Arc::new(table)
+                }
+                Source::Csv { tables } | Source::Jsonl { tables } => {
+                    let (table, budget, objects) = source::text::open(
+                        &tables[relation],
+                        matches!(source, Source::Csv { .. }),
+                        &fields,
+                        scope.options.batch_size,
+                        Arc::clone(&scope.runtime.memory_pool),
+                        &scope.runtime.disk_manager,
+                        Arc::clone(&scope.reads),
+                        read.explain_only,
+                        None,
+                    )
+                    .await
+                    .with_context(|| crate::catalog::MappedTable(reference.to_owned()))?;
+                    for object in objects {
+                        if let Some(previous) = versions.get(&object.source) {
+                            ensure!(
+                                previous.version == object.version,
+                                "text object changed while preparing query: {}",
+                                object.source
+                            );
+                        }
+                        versions.insert(object.source.clone(), object);
+                    }
+                    reservations.push(budget);
+                    table
                 }
                 Source::Parquet { tables } => {
                     let (table, objects) = ParquetTable::open(
@@ -1222,6 +1493,7 @@ impl Engine {
                 versions: versions.into_values().collect(),
                 reservations,
                 postgres,
+                aggregate: None,
             });
         }
         reservations.extend(
@@ -1233,6 +1505,7 @@ impl Engine {
                 model::Tables {
                     raw: &tables,
                     postgres: &postgres,
+                    proven_key_label,
                 },
                 scope,
                 read,
@@ -1243,6 +1516,7 @@ impl Engine {
             versions: versions.into_values().collect(),
             reservations,
             postgres,
+            aggregate,
         })
     }
 }
@@ -1300,11 +1574,20 @@ fn verify_consistent_snapshot<'a>(
         let first = *first_source.get_or_insert(name);
         let supported = match source {
             Source::Postgres { .. }
+            | Source::Sqlite { .. }
+            | Source::Duckdb { .. }
+            | Source::OracleNative { .. }
+            | Source::Mariadb(_)
             | Source::Mysql { .. }
             | Source::Snowflake { .. }
             | Source::Bigquery { .. }
             | Source::Spanner { .. } => name == first,
+            Source::MongodbNative { .. } => false,
+            Source::ObjectStorage { tables, .. } => count == 1 && tables[relation].files.len() == 1,
             Source::Parquet { tables } => count == 1 && tables[relation].len() == 1,
+            Source::Csv { tables } | Source::Jsonl { tables } => {
+                count == 1 && tables[relation].files.len() == 1
+            }
             _ => count == 1,
         };
         ensure!(
@@ -1316,6 +1599,7 @@ fn verify_consistent_snapshot<'a>(
 }
 
 pub(crate) struct Prepared {
+    pub(crate) aggregate: Option<RecordBatch>,
     pub(crate) versions: Vec<SourceVersion>,
     pub(crate) reservations: Vec<MemoryReservation>,
     pub(crate) postgres: BTreeMap<String, Arc<PgTable>>,

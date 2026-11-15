@@ -5,8 +5,8 @@ use chrono::{NaiveDate, NaiveDateTime};
 use datafusion::{
     arrow::{
         array::{
-            ArrayRef, BinaryArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-            Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+            ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+            Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
             TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
         },
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
@@ -29,6 +29,7 @@ pub(crate) struct Snapshot {
     conn: Conn,
     stats: Arc<ReadStats>,
     pub(crate) version: String,
+    transactional: bool,
 }
 
 impl Snapshot {
@@ -36,10 +37,10 @@ impl Snapshot {
     pub(crate) async fn browse(&mut self, database: Option<&str>) -> Result<Vec<String>> {
         self.stats.request();
         Ok(if let Some(database) = database {
-            self.conn.exec(
-                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND ENGINE='InnoDB' ORDER BY TABLE_NAME LIMIT 2001",
-                (database,),
-            ).await?
+            self.conn.query(format!(
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA={}{} ORDER BY TABLE_NAME LIMIT 2001",
+                literal(database), if self.transactional { " AND ENGINE='InnoDB'" } else { "" },
+            )).await?
         } else {
             self.conn.query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME LIMIT 2001").await?
         })
@@ -51,21 +52,33 @@ impl Snapshot {
             .split_once('.')
             .context("expected MySQL database.table")?;
         self.stats.request();
-        let columns = self.conn.exec_map(
-            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION",
-            (database, table),
+        let columns = self.conn.query_map(
+            format!("SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA={} AND TABLE_NAME={} ORDER BY ORDINAL_POSITION", literal(database), literal(table)),
             |(name, kind, nullable): (String, String, String)| (name, kind, nullable == "YES"),
         ).await?;
         ensure!(!columns.is_empty(), "MySQL relation has no visible columns");
         Ok(columns)
     }
-    pub(crate) async fn open(
-        dsn_env: &str,
-        tls: bool,
-        ca_file: Option<&str>,
+    pub(crate) async fn open_source(
+        source: &crate::Source,
         timeout: Duration,
         stats: Arc<ReadStats>,
     ) -> Result<Self> {
+        use crate::Source;
+        let (dsn_env, tls, ca_file, dialect) = match source {
+            Source::Mysql {
+                dsn_env,
+                tls,
+                ca_file,
+            } => (dsn_env, *tls, ca_file.as_deref(), "mysql"),
+            Source::Doris(c) => (&c.dsn_env, c.tls, c.ca_file.as_deref(), "doris"),
+            Source::Starrocks(c) => (&c.dsn_env, c.tls, c.ca_file.as_deref(), "starrocks"),
+            Source::Tidb(c) => (&c.dsn_env, c.tls, c.ca_file.as_deref(), "tidb"),
+            Source::Oceanbase(c) => (&c.dsn_env, c.tls, c.ca_file.as_deref(), "oceanbase"),
+            Source::Mariadb(c) => (&c.dsn_env, c.tls, c.ca_file.as_deref(), "mariadb"),
+            _ => bail!("expected MySQL protocol source"),
+        };
+        let transactional = matches!(dialect, "mysql" | "mariadb");
         let dsn =
             std::env::var(dsn_env).with_context(|| format!("missing MySQL DSN in {dsn_env}"))?;
         let opts =
@@ -98,21 +111,35 @@ impl Snapshot {
             .await
             .context("opening MySQL connection")?;
         let timeout_ms = timeout.as_millis().clamp(1, u32::MAX as u128);
-        for sql in [
+        let mut setup = vec![
             "SET NAMES utf8mb4".to_owned(),
             "SET SESSION time_zone = '+00:00'".to_owned(),
-            format!("SET SESSION max_execution_time = {timeout_ms}"),
-            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_owned(),
-            "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY".to_owned(),
-        ] {
+        ];
+        setup.push(match dialect {
+            "mariadb" => format!(
+                "SET SESSION max_statement_time = {}",
+                timeout.as_secs_f64().max(0.001)
+            ),
+            "doris" | "starrocks" => format!("SET query_timeout = {}", timeout.as_secs().max(1)),
+            "oceanbase" => format!("SET ob_query_timeout = {}", timeout.as_micros().max(1)),
+            _ => format!("SET SESSION max_execution_time = {timeout_ms}"),
+        });
+        if transactional {
+            setup.extend([
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_owned(),
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY".to_owned(),
+            ]);
+        }
+        for sql in setup {
             stats.request();
             conn.query_drop(sql)
                 .await
-                .context("starting MySQL read-only snapshot")?;
+                .context("initializing read connection")?;
         }
         Ok(Self {
             conn,
             stats,
+            transactional,
             version: format!("session-{}", uuid::Uuid::new_v4()),
         })
     }
@@ -137,29 +164,33 @@ impl Snapshot {
             .join(", ");
         let scan = format!("SELECT {selected} FROM {relation}");
         self.stats.request();
-        // Keep a metadata lock on this relation until the snapshot closes.
+        // Transactional MySQL/MariaDB reads retain this metadata lock until rollback.
         self.conn
             .query_drop(format!("{scan} LIMIT 0"))
             .await
             .with_context(|| format!("binding MySQL relation {relation}"))?;
         self.stats.request();
-        let engine: Option<Option<String>> = self.conn.exec_first(
-            "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",
-            (database, table),
-        ).await?;
-        ensure!(
-            engine
-                .flatten()
-                .is_some_and(|engine| engine.eq_ignore_ascii_case("InnoDB")),
-            "MySQL relation {relation} must be an InnoDB table for a consistent snapshot"
-        );
+        if self.transactional {
+            let engine: Option<Option<String>> = self.conn.query_first(format!(
+                "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA={} AND TABLE_NAME={}", literal(database), literal(table),
+            )).await?;
+            ensure!(
+                engine
+                    .flatten()
+                    .is_some_and(|engine| engine.eq_ignore_ascii_case("InnoDB")),
+                "MySQL relation {relation} must be an InnoDB table for a consistent snapshot"
+            );
+        }
         self.stats.request();
         let metadata = self
             .conn
-            .exec_map(
-                "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
-             FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",
-                (database, table),
+            .query_map(
+                format!(
+                    "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
+             FROM information_schema.COLUMNS WHERE TABLE_SCHEMA={} AND TABLE_NAME={}",
+                    literal(database),
+                    literal(table)
+                ),
                 |(name, kind, declared, precision, scale): (
                     String,
                     String,
@@ -195,7 +226,7 @@ impl Snapshot {
         self.stats.request();
         let mut stream = self
             .conn
-            .exec_stream::<Row, _, _>(scan, ())
+            .query_stream::<Row, _>(scan)
             .await
             .with_context(|| format!("reading MySQL relation {relation}"))?;
         loop {
@@ -230,10 +261,16 @@ impl Snapshot {
 
     pub(crate) async fn close(mut self) -> Result<()> {
         self.stats.request();
-        self.conn.query_drop("ROLLBACK").await?;
+        if self.transactional {
+            self.conn.query_drop("ROLLBACK").await?;
+        }
         self.conn.disconnect().await?;
         Ok(())
     }
+}
+
+fn literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 fn ident(name: &str) -> String {
@@ -254,7 +291,11 @@ fn field(
     let unsigned = declared
         .split_ascii_whitespace()
         .any(|part| part == "unsigned" || part == "zerofill");
+    let normalized = kind.to_ascii_lowercase();
+    let kind = normalized.split('(').next().unwrap_or(&normalized);
     let data_type = match (kind, unsigned) {
+        ("boolean" | "bool", _) => DataType::Boolean,
+        ("largeint", _) => DataType::Decimal128(38, 0),
         ("tinyint", false) => DataType::Int8,
         ("tinyint", true) => DataType::UInt8,
         ("smallint", false) => DataType::Int16,
@@ -267,16 +308,16 @@ fn field(
         ("double", _) => DataType::Float64,
         (
             "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set"
-            | "json",
+            | "string" | "json",
             _,
         ) => DataType::Utf8,
         ("binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob", _) => {
             DataType::Binary
         }
-        ("date", _) => DataType::Date32,
-        ("datetime", _) => DataType::Timestamp(TimeUnit::Microsecond, None),
+        ("date" | "datev2", _) => DataType::Date32,
+        ("datetime" | "datetimev2", _) => DataType::Timestamp(TimeUnit::Microsecond, None),
         ("timestamp", _) => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        ("decimal", _) => {
+        ("decimal" | "decimalv2" | "decimalv3" | "decimal32" | "decimal64" | "decimal128", _) => {
             let (precision, scale) = precision
                 .zip(scale)
                 .context("missing MySQL DECIMAL precision or scale")?;
@@ -313,6 +354,7 @@ fn to_batch(schema: SchemaRef, rows: &mut [Row]) -> Result<RecordBatch> {
                 };
             }
             let array: ArrayRef = match field.data_type() {
+                DataType::Boolean => collect!(bool, BooleanArray),
                 DataType::Int8 => collect!(i8, Int8Array),
                 DataType::Int16 => collect!(i16, Int16Array),
                 DataType::Int32 => collect!(i32, Int32Array),

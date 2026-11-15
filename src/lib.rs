@@ -1,4 +1,4 @@
-//! Embedded, read-only graph analytics over PostgreSQL and Parquet.
+//! Embedded, read-only graph analytics over databases, text files and lakehouse tables.
 
 #[cfg(feature = "admin")]
 pub mod admin;
@@ -13,8 +13,9 @@ mod source;
 mod traversal;
 
 pub use catalog::{
-    Catalog, Comparison, ConflictPolicy, DeltaTable, Edge, Endpoint, GraphInput, Node, Predicate,
-    Scd2, Source, TrinoCatalog,
+    Catalog, Comparison, ConflictPolicy, DeltaTable, Edge, Endpoint, GraphInput, MysqlConnection,
+    Node, ObjectFormat, Predicate, Scd2, Source, StorageConfig, TextColumn, TextTable,
+    TrinoCatalog,
 };
 pub use datafusion::{arrow, common::ScalarValue, execution::SendableRecordBatchStream};
 pub use engine::{Engine, EngineLimits, Language, QueryMetrics, QueryOptions, QueryResult};

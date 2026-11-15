@@ -11,13 +11,15 @@ import { TemporalConfig } from './TemporalConfig';
 
 export type Edit = (change: (doc: YamlDocument) => void) => void;
 
-export function ListField({ label, items, change, reorder = false, columns, controls }: {
+export function ListField({ label, items, change, reorder = false, columns, controls, placeholder, form }: {
   label: string;
   items: string[];
   change: (next: string[], previousIndexes: number[]) => void;
   reorder?: boolean;
   columns?: Column[];
   controls?: (index?: number) => ReturnType<typeof mappingControl>;
+  placeholder?: string;
+  form?: string;
 }) {
   function move(from: number, to: number) {
     const order = items.map((_, index) => index);
@@ -27,7 +29,7 @@ export function ListField({ label, items, change, reorder = false, columns, cont
   return <div className="list-field">
     <div className="field-title">{label}<button className="icon-button" {...controls?.()} aria-label={'添加' + label} onClick={() => change([...items, ''], [...items.keys(), -1])}><Plus size={16} /></button></div>
     {items.map((item, index) => <div className="list-field-row" key={index}>
-      <MappingColumn label={label + ' ' + (index + 1)} value={item} columns={columns} location={controls?.(index)} change={value => {
+      <MappingColumn form={form} label={label + ' ' + (index + 1)} value={item} columns={columns} placeholder={placeholder} location={controls?.(index)} change={value => {
         const next = items.slice();
         next[index] = value;
         change(next, [...items.keys()]);
@@ -61,12 +63,10 @@ export function Inspector({ model, selected, edit, select, openYaml, columns, id
   const { section, name } = selected;
   const item = model[section][name];
   const [renaming, setRenaming] = useState(false);
-  const [addingTable, setAddingTable] = useState(false);
   const kind = section === 'sources' ? '数据源' : section === 'nodes' ? '节点标签' : '边类型';
   const path = [section, name];
   const set = (field: string, value: unknown) => edit(doc => doc.setIn([...path, field], value));
   const source = text(item.type);
-  const tables = record(item.tables);
   const [browseSource, setBrowseSource] = useState(false);
   const physical = getColumns(text(item.source));
   const multipleInputs = Array.isArray(item.inputs) && item.inputs.length > 0;
@@ -105,13 +105,7 @@ export function Inspector({ model, selected, edit, select, openYaml, columns, id
       <h2>{name}<button className="icon-button" aria-label={'重命名' + kind} onClick={() => setRenaming(true)}><Pencil size={16} /></button></h2>
     </div>
     {section === 'sources' ? <div className="inspector-section">
-      {source === 'parquet' ? <>
-          <div className="field-title">表映射<button className="icon-button" aria-label="添加 Parquet 表" onClick={() => setAddingTable(true)}><Plus size={17} /></button></div>
-          {Object.entries(tables).map(([table, paths]) => <div className="parquet-table" key={table}>
-            <div className="field-title"><code>{table}</code><button className="icon-button" aria-label={'移除表 ' + table} onClick={() => edit(doc => { doc.deleteIn([...path, 'tables', table]); })}><X size={16} /></button></div>
-            <ListField label="文件路径" items={strings(paths)} change={next => edit(doc => doc.setIn([...path, 'tables', table], next))} />
-          </div>)}
-        </> : <SourceConfig type={source} item={item} path={path} edit={edit} openYaml={openYaml} />}
+      <SourceConfig modelId={id} type={source} item={item} path={path} edit={edit} openYaml={openYaml} />
       <button className="button" onClick={() => setBrowseSource(true)}>浏览表与字段</button>
       <details className="form-disclosure"><summary>数据源操作</summary><div className="form-fields">
         <button className="button danger" disabled={references.length > 0} onClick={onRemove}><Trash2 size={16} />删除数据源</button>
@@ -175,9 +169,6 @@ export function Inspector({ model, selected, edit, select, openYaml, columns, id
       edit(doc => rename(doc, model, section, name, next));
       select({ section, name: next });
     }} />}
-    {addingTable && <NameDialog title="添加 Parquet 表" label="表名" placeholder="schema.table" action="添加" close={() => setAddingTable(false)} submit={name => {
-      if (Object.hasOwn(tables, name)) throw new Error('表映射已存在');
-      edit(doc => doc.setIn([...path, 'tables', name], ['']));
-    }} />}
+
   </>;
 }

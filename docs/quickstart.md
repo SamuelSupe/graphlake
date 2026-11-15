@@ -59,4 +59,27 @@ MATCH p = (:Account)-[:Transfer]->(:Account)
 RETURN p
 ```
 
+To add another source, open **Data Sources** (数据源), choose a connector card, and fill in its connection settings or file/table mapping. Click **Add to draft** (添加到草稿), then save, validate, and publish. Filter connector cards by category or keyword, and search existing sources by name or type. Existing source cards offer **Configure** (配置), with saving and status feedback inside the dialog, and **Browse tables and columns** (浏览表与字段). Closing configuration keeps unsaved edits in the current draft; cancelling a new source leaves the model unchanged. Credentials are referenced by server environment variable names.
+
 Use [Deployment](deployment.md) to move from a local demo to a Linux service.
+
+## Query CSV and JSON Lines
+
+The checked-in [text-file example](../examples/text/graph.yaml) needs no external service:
+
+```sh
+cargo run --locked -- --catalog examples/text/graph.yaml query \
+  'MATCH (a:Account)-[t:Transfer]->(b:Account)
+   RETURN a.name AS sender, b.name AS recipient, t.amount AS amount ORDER BY sender'
+```
+
+It returns Alice → Bob for `12.25` and Bob → Carol for `25.50`. Columns have explicit Arrow types; CSV column names and order must match the file header. See the [connector reference](reference.zh-CN.md#图映射与连接器) for SQLite, HTTP/S3 locations, and supported types.
+
+
+### 扩展数据源
+
+在数据源卡片中可直接选择 Doris、StarRocks、TiDB、OceanBase（MySQL 模式）、MariaDB、SQL Server（直连）、Oracle（直连）、MongoDB（直连）、DuckDB 和 Databricks SQL。SQL Server、Oracle、MongoDB 的 Trino 卡片保留，用于已有 Trino 部署。
+
+对象存储卡片支持 S3、MinIO、OSS、TOS、COS、Azure Blob 和 GCS。选择服务和文件格式，填写桶或容器以及凭据环境变量，再添加表映射；展开「浏览桶内对象」，按前缀读取列表并把文件加入映射。Parquet 自动读取列类型，CSV/JSON Lines 需声明列。配置使用服务端路径和服务端环境变量。Oracle 直连还需服务端安装 Oracle Instant Client。
+
+参见[连接器读取边界](reference.zh-CN.md#扩展数据库与对象存储)与[扩展配置示例](../examples/extended-sources.yaml)。Kafka 和 CDC 不在此轮接入范围。

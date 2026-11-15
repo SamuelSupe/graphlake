@@ -33,6 +33,12 @@ curl -fsS http://127.0.0.1:7337/readyz
 
 将模型和相对路径引用的本地数据文件迁入 `catalog/`，以服务用户身份读取。迁移已有后台时先停旧服务，保留整个目录和隐藏文件。已有 `.graphlake-auth` 的目录沿用原管理员密码。将 YAML 中 `*_env` 字段引用的源凭据写入 `/etc/graphlake/graphlake.env`，该文件由 root 持有，权限 `0600`。修改后重启服务。使用 `journalctl -u graphlake` 查看启动和退出状态。服务单元配置 4 个共享查询槽，可根据主机内存和可用临时磁盘通过 systemd drop-in 调整。
 
+## 扩展数据源运行依赖
+
+SQL Server 使用内置 TDS 驱动，MongoDB 使用内置 MongoDB 驱动，DuckDB 随程序构建；这些连接器无需额外网关。Oracle 直连使用 ODPI-C，在运行时加载 Oracle Instant Client。请按目标操作系统和架构安装官方客户端及其系统依赖，为 `graphlake` 服务配置可访问的客户端库搜索路径；Oracle 客户端不随发行包分发。旧的 SQL Server、Oracle、MongoDB Trino 入口仍然可用。
+
+每个数据源的 `*_env` 引用也适用于对象存储。显式配置的对象存储密钥不会与另一组默认环境凭据混用。云存储使用默认身份时，需在服务用户环境中提供相应凭据链；GCS 的 `service_account_env` 引用 JSON 内容，Azure 的 `account_key_env` 引用账号密钥。配置与边界见[连接器参考](../docs/reference.zh-CN.md#扩展数据库与对象存储)。
+
 ## HTTPS 入口
 
 使用 `--public-url https://graphlake.example` 配置浏览器实际访问的 HTTPS 来源，有自定义端口时将端口写入该 URL。反代负责 TLS，保留原始 `Host`、`Origin` 和 WebSocket 升级请求，后端监听本机回环地址。管理会话 Cookie 带 `Secure`、`HttpOnly` 和 `SameSite=Strict`。转发头不会改变允许的主机名或来源。入口可使用安装包附带的 [HAProxy 配置](haproxy.cfg)，单机时将主后端改为 `127.0.0.1:7337` 并移除备用后端。多 Coordinator 模式见 [故障接管](cluster.md#coordinator-故障接管)。

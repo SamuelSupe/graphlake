@@ -14,7 +14,10 @@ use datafusion::{
         memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
         object_store::ObjectStoreUrl,
     },
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType, utils::conjunction},
+    logical_expr::{
+        Expr, Operator, TableProviderFilterPushDown, TableType,
+        utils::{conjunction, split_conjunction},
+    },
     physical_plan::{ExecutionPlan, metrics::ExecutionPlanMetricsSet},
 };
 use datafusion_datasource::{PartitionedFile, source::DataSourceExec};
@@ -30,7 +33,7 @@ use parquet::{
     },
     errors::{ParquetError, Result as ParquetResult},
     file::{
-        metadata::{ParquetMetaData, ParquetMetaDataReader},
+        metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
         statistics::Statistics,
     },
 };
@@ -71,6 +74,7 @@ struct PinnedFile {
     parallel_ranges: bool,
     pool: Arc<dyn MemoryPool>,
     stats: Arc<ReadStats>,
+    footer: Option<Arc<ParquetMetaData>>,
 }
 
 impl PinnedFile {
@@ -141,6 +145,7 @@ impl PinnedFile {
             parallel_ranges: false,
             pool,
             stats,
+            footer: None,
         })
     }
     #[cfg(unix)]
@@ -317,6 +322,16 @@ impl AsyncFileReader for PinnedFile {
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
         async move {
+            // Managed parts keep their UUID for the lifetime of their contents.
+            // Reuse the pinned footer read while resolving the table schema.
+            if let Some(footer) = &self.footer
+                && options.is_none_or(|options| {
+                    options.column_index_policy() == PageIndexPolicy::Skip
+                        && options.offset_index_policy() == PageIndexPolicy::Skip
+                })
+            {
+                return Ok(Arc::clone(footer));
+            }
             let size = self.meta.size;
             let metadata = ParquetMetaDataReader::new()
                 .with_prefetch_hint(Some(64 * 1024))
@@ -493,17 +508,34 @@ impl ParquetTable {
         let mut metadata = Vec::new();
         #[cfg(feature = "admin")]
         let mut scan_objects = Vec::new();
-        for (index, (location, mask)) in inputs.into_iter().enumerate() {
-            let file = PinnedFile::open(&location, Arc::clone(&pool), Arc::clone(&stats)).await?;
-            let builder = ParquetRecordBatchStreamBuilder::new(file.clone())
-                .await
-                .with_context(|| format!("reading Parquet schema for {location}"))?;
-            metadata.push(Arc::clone(builder.metadata()));
+        let parallelism = if inputs.iter().all(|(_, part)| part.is_some()) {
+            8
+        } else {
+            1
+        };
+        let mut inputs = futures::stream::iter(inputs.into_iter().enumerate().map(
+            |(index, (location, mask))| {
+                let pool = Arc::clone(&pool);
+                let stats = Arc::clone(&stats);
+                async move {
+                    let file = PinnedFile::open(&location, pool, stats).await?;
+                    let builder = ParquetRecordBatchStreamBuilder::new(file.clone())
+                        .await
+                        .with_context(|| format!("reading Parquet schema for {location}"))?;
+                    Ok::<_, anyhow::Error>((index, location, mask, file, builder))
+                }
+            },
+        ))
+        .buffered(parallelism);
+        while let Some((index, location, mask, mut file, builder)) = inputs.try_next().await? {
+            let footer = builder.metadata();
+            metadata.push(Arc::clone(footer));
             if let Some(mask) = &mask {
                 ensure!(
-                    usize::try_from(builder.metadata().file_metadata().num_rows())? == mask.rows,
+                    usize::try_from(footer.file_metadata().num_rows())? == mask.rows,
                     "local Parquet snapshot part row count changed"
                 );
+                file.footer = Some(Arc::clone(footer));
             } else {
                 versions.push(file.version(&location));
             }
@@ -635,6 +667,18 @@ impl TableProvider for ParquetTable {
             .with_parquet_file_reader_factory(self.readers.clone());
         if let Some(predicate) = conjunction(filters.iter().cloned()) {
             let schema = DFSchema::try_from(self.schema())?;
+            let point_filter = split_conjunction(&predicate).into_iter().any(|filter| {
+                matches!(filter, Expr::BinaryExpr(expr) if expr.op == Operator::Eq
+                && matches!(
+                    (expr.left.as_ref(), expr.right.as_ref()),
+                    (Expr::Column(_), Expr::Literal(..)) | (Expr::Literal(..), Expr::Column(_))
+                ))
+            });
+            // Full scans also carry the model's key null checks. A row filter
+            // costs memory on those scans without avoiding payload pages.
+            if point_filter && self.readers.0.values().all(|file| file.footer.is_some()) {
+                source = source.with_pushdown_filters(true);
+            }
             source = source.with_predicate(state.create_physical_expr(predicate, &schema)?);
         }
         #[cfg(feature = "admin")]

@@ -442,6 +442,34 @@ async fn local_tables_scattered_overlay_reads_recovers_and_compacts() -> Result<
         assert_eq!(result[(id - 1) as usize], (id, value.into(), version));
     }
     let engine = Engine::new(Catalog::load(root.path().join("verify.yaml"))?)?;
+    let point = || async {
+        let result = engine
+            .query(
+                Language::Sql,
+                "SELECT version FROM \"Person\" WHERE id = 1",
+                QueryOptions::default(),
+            )
+            .await?;
+        let values = result
+            .batches
+            .try_collect::<Vec<_>>()
+            .await?
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>((result.versions, values))
+    };
+    let (first_versions, versions) = point().await?;
+    assert_eq!(versions, [last + 1]);
     let counts = engine
         .query(
             Language::Sql,
@@ -510,6 +538,9 @@ async fn local_tables_scattered_overlay_reads_recovers_and_compacts() -> Result<
     let replay = load(&server, "overlay", "incremental").await?;
     assert_eq!(replay["status"], "succeeded", "{replay}");
     assert_eq!(replay["loaded_rows"], 2);
+    let (latest_versions, versions) = point().await?;
+    assert_eq!(versions, [last + 16]);
+    assert_ne!(latest_versions[0].version, first_versions[0].version);
     let result = rows(root.path(), path).await?;
     assert_eq!(result.len(), (last + 2) as usize);
     assert_eq!(result[0], (1, "again".into(), last + 16));

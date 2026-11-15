@@ -11,7 +11,7 @@ use axum::{
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path as FilePath, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
@@ -100,7 +100,7 @@ pub(super) async fn create(
         Catalog::parse_paths(&model.yaml, &models.source_path(&id)?)
             .map_err(|_| Error::invalid("invalid_model", "模型配置无效"))?
     };
-    let (_, _, source) = catalog
+    let (_, relation, source) = catalog
         .source(&config.source_table)
         .map_err(|_| Error::invalid("invalid_source", "来源表不存在或表名无效"))?;
     let key = key(&id, &config.name)?;
@@ -114,12 +114,10 @@ pub(super) async fn create(
     // A local copy must not load from another managed copy: it would create an
     // implicit dependency whose refresh order is not part of the schedule.
     if let crate::Source::Parquet { tables } = source {
-        let (_, relation, _) = catalog
-            .source(&config.source_table)
-            .map_err(|_| Error::not_found())?;
+        let root = store.root.canonicalize().map_err(|_| Error::storage())?;
         if tables[relation]
             .iter()
-            .any(|path| std::path::Path::new(path).starts_with(&store.root))
+            .any(|path| is_local_source(path, &store.root, &root))
         {
             return Err(Error::invalid(
                 "local_source",
@@ -138,6 +136,27 @@ pub(super) async fn create(
     };
     store.put(key, table.clone())?;
     Ok((StatusCode::CREATED, Json(store.view(&table))))
+}
+
+fn is_local_source(location: &str, root: &FilePath, canonical_root: &FilePath) -> bool {
+    let path = if location.starts_with("file://") {
+        let Some(path) = url::Url::parse(location)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+        else {
+            return false;
+        };
+        path
+    } else if location.contains("://") {
+        return false;
+    } else {
+        PathBuf::from(location)
+    };
+    path.starts_with(root)
+        || path.starts_with(canonical_root)
+        || path
+            .canonicalize()
+            .is_ok_and(|resolved| resolved.starts_with(canonical_root))
 }
 
 pub(super) async fn schedule(

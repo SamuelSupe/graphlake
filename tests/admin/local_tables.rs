@@ -197,6 +197,31 @@ async fn local_tables_atomic_incremental_restart_and_failure() -> Result<()> {
     let first = load(&server, "people", "incremental").await?;
     assert_eq!(first["status"], "succeeded", "{first}");
     assert_eq!(first["total_rows"], 2);
+    let file_url = url::Url::from_file_path(path).unwrap();
+    let alias = server
+        .request(Method::POST, "models")
+        .json(&json!({
+            "id": "alias",
+            "yaml": yaml(
+                &format!("{{type: parquet, tables: {{items: ['{file_url}']}}}}"),
+                "input.items",
+            )
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let alias_load = server
+        .request(Method::POST, "models/alias/local-tables")
+        .json(&json!({
+            "model_revision": alias["revision"], "name": "chain", "source_table": "input.items",
+            "columns": ["id", "name", "version"], "mode": "full"
+        }))
+        .send()
+        .await?;
+    assert_eq!(alias_load.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(alias_load.json::<Value>().await?["code"], "local_source");
     parquet_rows(
         &source,
         &[(1, "updated", 30), (2, "two", 20), (3, "boundary", 20)],
@@ -662,6 +687,22 @@ async fn local_tables_reclaims_only_masked_base_partitions() -> Result<()> {
     assert_eq!(result[65_534], (65_535, "delta".into(), 100_000));
     assert_eq!(result[65_536], (65_537, "updated".into(), 100_001));
     assert_eq!(result.last(), Some(&(70_001, "cold".into(), 70_001)));
+
+    fs::remove_file(&cold_file)?;
+    assert_eq!(
+        load(&server, "partitions", "incremental").await?["status"],
+        "failed"
+    );
+    assert_eq!(fs::read(path)?, bytes);
+    let repaired = load(&server, "partitions", "full").await?;
+    assert_eq!(repaired["status"], "succeeded", "{repaired}");
+    assert_eq!(
+        rows(root.path(), path).await?,
+        vec![
+            (65_536, "updated".into(), 100_001),
+            (65_537, "updated".into(), 100_001)
+        ]
+    );
     Ok(())
 }
 

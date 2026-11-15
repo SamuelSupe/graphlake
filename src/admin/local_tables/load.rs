@@ -40,7 +40,19 @@ async fn load(
     let config = &table.config;
     let context = scope.session();
     let snapshot = Snapshot::read(path)?;
-    let previous = if let Some(snapshot) = &snapshot {
+    // A full refresh can repair missing parts using the committed logical
+    // schema. Incremental refresh still needs the previous generation intact.
+    let full_schema = if mode == Mode::Full {
+        snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.pruning.as_ref())
+            .map(|index| &index.schema)
+    } else {
+        None
+    };
+    let previous = if full_schema.is_some() {
+        None
+    } else if let Some(snapshot) = &snapshot {
         let table = ParquetTable::open_snapshot(
             path,
             snapshot.clone(),
@@ -212,15 +224,16 @@ async fn load(
             .await?;
     }
     let incoming = context.table("incoming").await?;
-    if let Some(previous) = &previous {
-        let same = previous
-            .schema()
-            .fields()
+    if let Some(expected) = full_schema
+        .map(|schema| schema.fields())
+        .or_else(|| previous.as_ref().map(|frame| frame.schema().fields()))
+    {
+        let same = expected
             .iter()
             .zip(incoming.schema().fields())
             .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type());
         ensure!(
-            same && previous.schema().fields().len() == incoming.schema().fields().len(),
+            same && expected.len() == incoming.schema().fields().len(),
             "来源字段类型已变化，请新建本地表"
         );
     }

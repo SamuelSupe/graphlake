@@ -3,6 +3,13 @@ export type Phase = 'validate' | 'parquet' | 'postgres' | 'control';
 export type RestoreJob = { bundle: string; phase: Phase; running: boolean; bound: boolean; failure: string | null };
 export type RestoreStatus = { mode: 'restore'; job: RestoreJob | null };
 export type RecoveryStatus = Gate | RestoreStatus;
+export type RecoveryPointCheck = {
+  bundle: string;
+  checkpoint_ms: number | null;
+  manifest_sha256: string;
+  postgres_relations: number;
+  parquet_files: number;
+};
 
 export async function recovery<T>(action: 'status' | 'check' | 'verify' | 'backups' | 'import', token: string, options?: RequestInit): Promise<T> {
   const response = await fetch('/recovery/' + action, {

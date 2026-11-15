@@ -591,6 +591,7 @@ pub(super) fn operation(method: &axum::http::Method, path: &str) -> Operation {
         (&Method::GET | &Method::HEAD, ["", "api", "v1", "backups", "status"]) => {
             ("backup_status", None, false)
         }
+        (&Method::POST, ["", "api", "v1", "backups", "export"]) => ("backup_export", None, false),
         (&Method::PUT, ["", "api", "v1", "settings"]) => ("save_settings", None, false),
         (&Method::GET | &Method::HEAD, ["", "api", "v1", "mcp", "settings"]) => {
             ("read_mcp_settings", None, false)

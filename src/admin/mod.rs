@@ -77,6 +77,8 @@ struct App {
     shutdown: CancellationToken,
     metrics: ops::Metrics,
     readiness: Arc<Semaphore>,
+    manual_backup_dir: Option<PathBuf>,
+    backup_work: Arc<Semaphore>,
     wire: Option<wire::Access>,
     cluster: Option<cluster::Coordinator>,
     ha: Option<ha::Ha>,
@@ -387,6 +389,10 @@ pub async fn serve_clustered_with_status(
         shutdown: shutdown.clone(),
         metrics: ops::Metrics::new(query_slots),
         readiness: Arc::new(Semaphore::new(1)),
+        manual_backup_dir: ha
+            .as_ref()
+            .and_then(|_| std::env::var_os("GRAPHLAKE_MANUAL_BACKUP_DIR").map(PathBuf::from)),
+        backup_work: Arc::new(Semaphore::new(1)),
         wire,
         cluster,
         ha,
@@ -433,6 +439,7 @@ pub async fn serve_clustered_with_status(
         .route("/v1/models/{id}/readiness", get(ops::model_ready))
         .route("/v1/models/{id}/browse", post(browse::browse))
         .route("/v1/backups/status", get(backup::overview))
+        .route("/v1/backups/export", post(backup::export))
         .route("/v1/mcp/access", get(mcp::settings::access))
         .route("/v1/mcp/token", get(users::delegation::status).post(users::delegation::issue).delete(users::delegation::revoke)
             .layer(DefaultBodyLimit::max(4096)))

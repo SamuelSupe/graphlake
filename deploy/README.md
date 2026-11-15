@@ -189,7 +189,9 @@ curl -fsS http://127.0.0.1:7337/readyz
 
 「健康检查」可单次检查已发布模型的来源、端点及 Worker，并显示遥测上报状态。切换页签会保留未保存的遥测配置。生产告警在部署侧维护 [prometheus-rules.yaml](prometheus-rules.yaml)，由 Prometheus 加载，通知渠道由 Alertmanager 管理。
 
-「备份与恢复」读取备份任务的状态文件，显示最近尝试、最近成功和数据检查点。定时备份默认写入 `/var/lib/graphlake-backups/export-status.json`。异地校验可指定 `--status-file /var/lib/graphlake-backups/verify-status.json`。如使用独立目录，在后台进程设置 `GRAPHLAKE_BACKUP_STATUS_DIR` 指向状态文件所在目录，并为服务用户授权读取。目标站的 [HTTPS 恢复页](cluster.md#绑定恢复点并开放入口) 可选择已同步的异地副本、恢复控制状态和数据、查看每个阶段的结果并验收切流。
+「备份与恢复」可发起[手动控制状态备份](cluster.md#在线控制状态备份与恢复)，也显示定时任务和异地校验的最近尝试、最近成功和数据检查点。定时备份默认写入 `/var/lib/graphlake-backups/export-status.json`。异地校验可指定 `--status-file /var/lib/graphlake-backups/verify-status.json`。如使用独立目录，在后台进程设置 `GRAPHLAKE_BACKUP_STATUS_DIR` 指向状态文件所在目录，并为服务用户授权读取。选择「恢复备份」可打开[目标站 HTTPS 恢复页](cluster.md#绑定恢复点并开放入口)，检查已同步的恢复点、确认恢复、查看各阶段结果并执行验收。
+
+单机部署可停止服务后以私有权限复制模型目录，包括隐藏的版本和认证文件。还原时同样先停止服务，并保留文件权限。PostgreSQL、Parquet 及配置引用的其他源数据需要另行备份。
 
 默认关闭 OTLP。复制随包提供的 [telemetry.yaml](telemetry.yaml)，在文件中设置 `enabled: true` 和接收端基址。设置 `GRAPHLAKE_TELEMETRY_CONFIG=/etc/graphlake/telemetry.yaml` 后重启服务，或传入 `--telemetry-config /etc/graphlake/telemetry.yaml`。命令行参数优先。单机、Coordinator、Worker 及备份导出和恢复命令都可加载配置。systemd 服务和备份单元从现有环境文件读取变量，保持原环境文件权限。
 

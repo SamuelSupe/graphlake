@@ -44,17 +44,20 @@ export default function QueryScope({ value, save, close }: { value: string; save
     } catch (cause) { report(cause); }
   }
 
-  return <Modal title="查询范围" close={close}>
-    <form className="dialog-form query-scope-form" onSubmit={apply}>
+  return <Modal title="查询范围" size="medium" description="限定本次查询读取的数据；应用后运行查询才会生效。" close={close}>
+    <form className="panel-layout query-scope-form" onSubmit={apply}>
+      <div className="panel-body dialog-form">
       {json ? <label>查询范围 JSON<textarea rows={8} className="mono" spellCheck={false}
         value={raw} onChange={event => { setRaw(event.target.value); setError(''); }} data-initial-focus /></label>
       : <>
+        <section className="scope-section"><h3>时间与一致性</h3>
         <label>业务时间<input value={draft.time} onChange={event => update({ time: event.target.value })}
           placeholder="例如 2025-01-01 或 current" data-initial-focus /></label>
         <label className="check-label"><input type="checkbox" checked={draft.consistent}
-          onChange={event => update({ consistent: event.target.checked })} />要求来源快照一致</label>
+          onChange={event => update({ consistent: event.target.checked })} />要求来源快照一致</label></section>
         <fieldset className="form-fields mapping-options">
           <legend>逻辑分区</legend>
+          {!draft.filters.length && <p className="muted small">未设置条件，将读取当前权限允许的全部分区。</p>}
           {draft.filters.map(({ column, op, value }, index) => <div className="scope-rule" key={index}>
             <label>列名<input value={column} required onChange={event => filter(index, { column: event.target.value })} /></label>
             <label>条件<select value={op} onChange={event => filter(index, { op: event.target.value })}>
@@ -71,11 +74,11 @@ export default function QueryScope({ value, save, close }: { value: string; save
         </fieldset>
       </>}
       {error && <p ref={feedback} tabIndex={-1} role="alert" className="inline-error">{error}</p>}
-      <div className="dialog-actions">
+      </div><footer className="panel-footer">
         <button type="button" className="text-button scope-mode" onClick={mode}>{json ? '使用表单' : '编辑 JSON'}</button>
         <button type="button" className="button" onClick={close}>取消</button>
         <button type="submit" className="button primary">应用</button>
-      </div>
+      </footer>
     </form>
   </Modal>;
 }

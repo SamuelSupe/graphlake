@@ -1,7 +1,7 @@
 import type { useMutations } from './Mutations';
-import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, X } from 'lucide-react';
-import { api, ApiError, downloadText, errorText, type Column, type ModelReadiness, type ModelSummary, type SavedModel, type Validation, type ValidationSite, type VersionHistory } from './api';
+import { api, ApiError, downloadText, errorText, type Column, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
 import { connectorChoices, newConnector } from './connectors';
 import { Catalogs } from './Catalogs';
 import { SourceBrowser, type TableSelection } from './SourceBrowser';
@@ -9,6 +9,9 @@ import { GraphCanvas } from './GraphCanvas';
 import { Inspector, type Edit } from './Inspector';
 import { documentOf, incidentEdgeTypes, modelOf, removeGraphType, sourceLabel, sourceSignature, text, validationTargets, type Section, type Selection, type ValidationTarget } from './model';
 import { Query } from './Query';
+import { Versions } from './ModelVersions';
+import { ModelSetup } from './ModelSetup';
+import { setupIssue } from './modelWorkflow';
 import { Modal, NameDialog, StatusLabel } from './ui';
 
 export type Workspace = 'graph' | 'catalogs' | 'query';
@@ -93,6 +96,7 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
     }
   }, [yaml]);
   const model = draft.model;
+  const incomplete = model && setupIssue(model);
   function getColumns(table: string) {
     const cached = tableColumns.get(table);
     return model && cached && cached.signature === sourceSignature(model, table) ? cached.columns : undefined;
@@ -138,6 +142,7 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
 
   async function save() {
     if (!saved || saving || !allow.edit) return;
+    if (incomplete) { setNotice({ text: incomplete.message, error: true, yaml }); return; }
     setSaving(true);
     setNotice(undefined);
     try {
@@ -320,12 +325,12 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
     {workspace !== 'graph' && notices}
     {workspace === 'catalogs' && model && saved && <div className="catalog-workspace">
       <div className="catalog-controls">
-        <button className="button compact" disabled={busy} onClick={() => void validate()}>{checking ? '正在校验…' : '校验结构'}</button>
-        <button className="button compact" disabled={busy} onClick={() => void validate(true)}>校验数据</button>
-        <button className="button compact" disabled={!dirty || busy} onClick={() => void save()}>{saving ? '保存中…' : '保存草稿'}</button>
+        <button className="button compact" disabled={!dirty || busy || !!incomplete} title={incomplete?.message} onClick={() => void save()}>{saving ? '保存中…' : '保存草稿'}</button>
         <button className="button primary compact" disabled={!canPublish} onClick={() => saved.revision && void activate(saved.revision, 'publish')}>校验并发布</button>
         {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span role="status"><StatusLabel status={status} text={statusText} /></span>}
-        <details className="workspace-tools"><summary>更多</summary><div>
+        <details className="workspace-tools"><summary>更多工具</summary><div>
+          <button className="button compact" disabled={busy} onClick={() => void validate()}>{checking ? '正在校验…' : '校验结构'}</button>
+          <button className="button compact" disabled={busy} onClick={() => void validate(true)}>校验数据</button>
           <button className="button compact" onClick={() => setModal('yaml')}><Braces size={15} />查看 YAML</button>
           <button className="button compact" disabled={busy || !saved.revision} onClick={refresh}><RefreshCw size={15} />重新加载</button>
         </div></details>
@@ -347,28 +352,31 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
     </div>}
     {loading ? <p className="empty" role="status">正在读取配置…</p>
       : model && saved && workspace === 'graph' ? <div className="graph-workspace">
+        {!saved.active_revision && allow.edit && <ModelSetup configure={allow.configure} publishAllowed={allow.publish} model={model} issue={incomplete} dirty={dirty} busy={!!busy} canPublish={canPublish}
+          add={section => setModal(section)} select={setSelection} save={() => void save()} publish={() => void activate(saved.revision, 'publish')} />}
+        {saved.active_revision && incomplete && <p className="notice">{incomplete.message}</p>}
         <div className="graph-command-bar">
           <div className="graph-toolbar" role="group" aria-label="建模工具栏">
-            {allow.publish && <button className="tool-button tool-primary" disabled={!canPublish} onClick={() => void activate(saved.revision, 'publish')}>
+            {allow.publish && (saved.active_revision || !allow.edit) && <button className="tool-button tool-primary" disabled={!canPublish} onClick={() => void activate(saved.revision, 'publish')}>
               <Upload size={20} aria-hidden="true" />{activating ? '正在切换…' : '校验并发布'}
             </button>}
-            <div className="tool-group">
-              {allow.edit && <button className="tool-button" disabled={!dirty || busy} onClick={() => void save()}><Save size={20} />{saving ? '保存中…' : '保存草稿'}</button>}
-            </div>
+            {allow.edit && saved.active_revision && <div className="tool-group">
+              <button className="tool-button" disabled={!dirty || busy || !!incomplete} title={incomplete?.message} onClick={() => void save()}><Save size={20} />{saving ? '保存中…' : '保存草稿'}</button>
+            </div>}
             {allow.edit && <div className="tool-group">
               <button ref={addNodeButton} className="tool-button" disabled={busy} onClick={() => setModal('nodes')}><Plus size={20} />添加节点</button>
               <button className="tool-button" disabled={busy} onClick={() => setModal('edges')}><GitCommitHorizontal size={20} />添加边</button>
             </div>}
             <div className="tool-group">
-              <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={20} />节点</button>
-              <button className="tool-button" onClick={() => setModal('edges-list')}><List size={20} />边</button>
-              {allow.configure && <button className="tool-button" onClick={() => initial ? setModal('sources') : goTo('catalogs')}>
-                <Database size={20} />{initial ? '添加数据源' : '数据源'}
-              </button>}
-              {allow.edit && <button className="tool-button" disabled={busy} onClick={() => void validate()}><ShieldCheck size={20} />{checking ? '正在校验…' : '校验结构'}</button>}
-              {allow.edit && <button className="tool-button" disabled={busy} onClick={() => void validate(true)}><ShieldCheck size={20} />校验数据</button>}
+              <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={20} />节点 <span className="tool-count">{Object.keys(model.nodes).length}</span></button>
+              <button className="tool-button" onClick={() => setModal('edges-list')}><List size={20} />边 <span className="tool-count">{Object.keys(model.edges).length}</span></button>
             </div>
-            <details className="workspace-tools"><summary>更多</summary><div>
+            <details className="workspace-tools"><summary>更多工具</summary><div>
+              {allow.configure && <button className="button compact" onClick={() => initial ? setModal('sources') : goTo('catalogs')}>
+                <Database size={16} />{initial ? '添加数据源' : '数据源'}
+              </button>}
+              {allow.edit && <button className="button compact" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} />{checking ? '正在校验…' : '校验结构'}</button>}
+              {allow.edit && <button className="button compact" disabled={busy} onClick={() => void validate(true)}><ShieldCheck size={16} />校验数据</button>}
               <button className="button compact" disabled={!saved.revision || activating} onClick={() => setModal('versions')}><History size={16} />版本历史</button>
               <button className="button compact" onClick={() => setModal('yaml')}><Braces size={16} />查看 YAML</button>
             </div></details>
@@ -385,17 +393,18 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
         </div>
       </div> : !saved ? <div className="empty" role="alert">{workspace === 'graph' && notice?.text}<button className="button" onClick={refresh}>重试读取配置</button></div>
       : !model && workspace !== 'query' && <div className="empty" role="alert">{draft.error}<button className="button" onClick={() => setModal('yaml')}>编辑 YAML</button></div>}
-    {active && <>{listSection && model && <Modal title={listSection === 'nodes' ? '节点标签' : '边类型'} close={() => setModal(undefined)}>
-      <div className="dialog-form">
+    {active && <>{listSection && model && <Modal title={listSection === 'nodes' ? '节点标签' : '边类型'} description="选择标签，返回画布继续配置映射。" close={() => setModal(undefined)}>
+      <div className="panel-layout"><div className="panel-body form-fields">
         {!Object.keys(model[listSection]).length && <p className="muted">暂无{listSection === 'nodes' ? '节点标签' : '边类型'}</p>}
         {Object.keys(model[listSection]).map(name => <button className="sidebar-item" key={name} onClick={() => {
           setSelection({ section: listSection, name }); setModal(undefined);
         }}>{listSection === 'nodes' ? <Box size={17} /> : <GitCommitHorizontal size={17} />}<code>{name}</code></button>)}
-        {allow.edit && <div className="dialog-actions"><button className="button primary" onClick={() => setModal(listSection)}><Plus size={16} />添加{listSection === 'nodes' ? '节点' : '边'}</button></div>}
+        </div>
+        {allow.edit && <footer className="panel-footer"><button className="button primary" onClick={() => setModal(listSection)}><Plus size={16} />添加{listSection === 'nodes' ? '节点' : '边'}</button></footer>}
       </div>
     </Modal>}
     {browsing && model && <SourceBrowser id={id} yaml={yaml} model={model} fixedSource={browsing} close={() => setBrowsing(undefined)} />}
-    {removing && model && <Modal title={{ sources: '删除数据源', nodes: '删除节点标签', edges: '删除边类型' }[removing.section]} close={() => setRemoving(undefined)}>
+    {removing && model && <Modal layout="center" title={{ sources: '删除数据源', nodes: '删除节点标签', edges: '删除边类型' }[removing.section]} close={() => setRemoving(undefined)}>
       <div className="dialog-form">
         <p>从草稿中删除 <code>{removing.name}</code>？生效版本会在发布后更新。</p>
         {!!dependencies.length && <div>以下边类型也会从草稿中删除：
@@ -424,7 +433,7 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
       restore={allow.publish ? (revision, backup) => activate(revision, 'restore', backup) : undefined}
       offline={allow.publish && saved.active_revision ? () => setModal('unpublish') : undefined}
       rollback={allow.publish ? revision => void activate(revision, 'rollback') : undefined} />}
-    {modal === 'unpublish' && <Modal title="下线模型" close={() => setModal(undefined)}>
+    {modal === 'unpublish' && <Modal layout="center" title="下线模型" close={() => setModal(undefined)}>
       <div className="dialog-form">
         <p>下线后将拒绝新的查询、导出和邻居展开。草稿和历史版本会保留，可以重新发布。</p>
         <div className="dialog-actions">
@@ -434,12 +443,12 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
         </div>
       </div>
     </Modal>}
-    {modal === 'yaml'  && <Modal title="模型 YAML" close={() => setModal(undefined)}>
-      <div className="yaml-dialog">
+    {modal === 'yaml'  && <Modal title="模型 YAML" size="wide" description={allow.edit ? '编辑内容保留在当前草稿中，完成后可保存、校验并发布。' : '查看当前模型配置。'} close={() => setModal(undefined)}>
+      <div className="panel-layout yaml-editor"><div className="panel-body">
         <label><span className="sr-only">YAML 配置</span><textarea value={yaml} readOnly={!allow.edit} onChange={event => changeYaml(event.target.value)}
           spellCheck={false} className="mono" rows={22} data-initial-focus /></label>
         {draft.error && <p className="inline-error" role="alert">{draft.error}</p>}
-        <div className="dialog-actions">
+        </div><footer className="panel-footer">
           {allow.edit && <label className="button">导入 YAML 到草稿<input className="sr-only" type="file" accept=".yaml,.yml" disabled={busy} onChange={async event => {
             const file = event.target.files?.[0]; event.target.value = '';
             if (!file) return;
@@ -452,7 +461,7 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
           }} /></label>}
           <button className="button" onClick={() => downloadText(yaml, id + '.yaml')}>下载草稿 YAML</button>
           <button className="button primary" onClick={() => setModal(undefined)}>完成</button>
-        </div>
+        </footer>
       </div>
     </Modal>}
     {modal === 'title' && <NameDialog title="编辑模型名称" initial={text(model?.graph)} close={() => setModal(undefined)}
@@ -462,111 +471,4 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
       choices={addSection.key === 'sources' ? connectorChoices : undefined}
       submit={(name, type) => add(addSection.key, name, type)} />}</>}
   </main>;
-}
-
-
-function Versions({ id, yaml, busy, close, rollback, offline, archiveError, restore }: {
-  id: string; yaml: string; busy: boolean; close: () => void; rollback?: (revision: string) => void; offline?: () => void;
-  archiveError?: string; restore?: (revision: string, yaml: string) => Promise<void>;
-}) {
-  const [history, setHistory] = useState<VersionHistory>();
-  const [error, setError] = useState('');
-  const [comparison, setComparison] = useState<{ revision: string; yaml: string }>();
-  const [reading, setReading] = useState(false);
-  const [repair, setRepair] = useState<string>();
-  const uploadId = useId();
-  const [probing, setProbing] = useState(false);
-  const [readiness, setReadiness] = useState<ModelReadiness>();
-  async function probe() {
-    setProbing(true);
-    setError('');
-    setReadiness(undefined);
-    try {
-      setReadiness(await api<ModelReadiness>('/models/' + id + '/readiness'));
-    } catch (cause) {
-      if (cause instanceof ApiError && cause.readiness) setReadiness(cause.readiness);
-      else setError(errorText(cause));
-    } finally { setProbing(false); }
-  }
-  async function compare(revision: string) {
-    setReading(true); setError('');
-    try {
-      const archived = await api<{ yaml: string }>('/models/' + id + '/history/' + encodeURIComponent(revision));
-      setComparison({ revision, yaml: archived.yaml });
-    } catch (cause) {
-      if (cause instanceof ApiError && cause.code === 'model_archive_unavailable') setRepair(revision);
-      setError(errorText(cause));
-    }
-    finally { setReading(false); }
-  }
-  useEffect(() => {
-    const controller = new AbortController();
-    api<VersionHistory>('/models/' + id + '/history', { signal: controller.signal }).then(setHistory, cause => {
-      if (!controller.signal.aborted) setError(errorText(cause));
-    });
-    return () => controller.abort();
-  }, [id]);
-  async function upload(event: FormEvent<HTMLFormElement>, revision: string) {
-    event.preventDefault();
-    const file = new FormData(event.currentTarget).get('backup');
-    if (!(file instanceof File)) return;
-    setReading(true);
-    setError('');
-    try {
-      if (file.size > 1024 * 1024) throw new Error('YAML 文件超过 1 MiB');
-      const backup = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await file.arrayBuffer());
-      await restore?.(revision, backup);
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally { setReading(false); }
-  }
-  const repairRevision = repair ?? (archiveError ? history?.active_revision ?? undefined : undefined);
-  return <Modal title="模型版本历史" close={close}>
-    <div className={comparison ? 'yaml-dialog' : 'dialog-form'}>
-      {comparison && <div className="yaml-comparison">
-        <label>历史 YAML · {comparison.revision.slice(0, 14)}<textarea readOnly value={comparison.yaml} rows={12} className="mono" /></label>
-        <label>当前草稿 YAML<textarea readOnly value={yaml} rows={12} className="mono" /></label>
-        <button className="button compact" onClick={() => downloadText(comparison.yaml, id + '-' + comparison.revision.slice(0, 14) + '.yaml')}>下载历史 YAML</button>
-        <button className="button compact" onClick={() => setComparison(undefined)}>关闭对照</button>
-      </div>}
-      {rollback && <p className="muted small">回退前会校验该版本与当前数据源，草稿会保留。</p>}
-      {archiveError && <p className="inline-error">{archiveError}</p>}
-      {restore && repairRevision && <form className="dialog-form" onSubmit={event => void upload(event, repairRevision)}>
-        <label htmlFor={uploadId}>选择版本 {repairRevision.slice(0, 14)} 的原始备份 YAML</label>
-        <input id={uploadId} type="file" name="backup" accept=".yaml,.yml" required onChange={() => setError('')} />
-        <button type="submit" className="button compact" disabled={reading || busy}>恢复归档</button>
-      </form>}
-      {!!history?.offline_at_ms && <p className="muted small">已下线 · {new Date(history.offline_at_ms).toLocaleString()}</p>}
-      {offline && <div className="dialog-actions">
-        <button className="button compact" disabled={probing || busy} onClick={() => void probe()}>检查生效版本数据源</button>
-        <button className="button compact" disabled={busy} onClick={offline}>下线模型</button>
-      </div>}
-      {probing && <p role="status">正在检查数据源…</p>}
-      {readiness && <div role="status">
-        {readiness.status === 'mapping_invalid' && <p>映射结构不兼容{readiness.location?.kind === 'field' ? ' · ' + readiness.location.label + '.' + readiness.location.field : ''}</p>}
-        {readiness.status === 'worker_unavailable' && <p>部分或全部 Worker 无法执行此模型</p>}
-        <ul aria-label="数据源检查结果">
-          {Object.entries(readiness.sources).map(([name, available]) => <li key={name}><code>{name}</code> · {available ? '可用' : '不可用'}</li>)}
-          {readiness.workers?.map(({ worker, probe }) => <li key={worker}>Worker {worker} · {
-            !probe ? '无法完成检查' : probe.status === 'ready' ? '可用' : probe.status === 'mapping_invalid'
-              ? '映射结构不兼容' : Object.entries(probe.sources).filter(([, ok]) => !ok).map(([name]) => name).join('、') + ' 不可用'
-          }</li>)}
-        </ul>
-      </div>}
-      {error && <p className="inline-error" role="alert">{error}</p>}
-      {!history ? !error && <p role="status">正在加载版本…</p>
-        : !history.versions.length ? <p>尚未发布任何版本。</p> : <ol className="version-list">
-        {history.versions.map((entry, i) => <li key={i}>
-            <div><code title={entry.revision}>{entry.revision.slice(0, 14)}</code><small>
-              {{ adopt: '既有配置', publish: '发布', rollback: '回退' }[entry.action]}
-              {entry.at_ms > 0 && ' · ' + new Date(entry.at_ms).toLocaleString()}</small></div>
-            <button className="button compact" disabled={reading} onClick={() => void compare(entry.revision)}>查看并对照</button>
-            {history.active_revision === entry.revision
-              ? history.versions.findIndex(version => version.revision === entry.revision) === i && <span className="tag">生效中</span>
-              : rollback && <button className="button" aria-label={'回退至 ' + entry.revision.slice(0, 14)} disabled={busy}
-                onClick={() => rollback(entry.revision)}>回退</button>}
-          </li>)}
-        </ol>}
-    </div>
-  </Modal>;
 }

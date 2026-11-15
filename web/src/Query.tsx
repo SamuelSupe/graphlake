@@ -4,6 +4,7 @@ import { GraphCanvas, type GraphSelection } from './GraphCanvas';
 import { GraphExplorer, type GraphExplorerHandle } from './GraphExplorer';
 import { api, ApiError, downloadFile, errorText, request, type GraphSchema, type QueryResult } from './api';
 
+const QueryEditor = lazy(() => import('./QueryEditor'));
 const QueryScope = lazy(() => import('./QueryScope'));
 
 type Dialect = 'cypher' | 'sql' | 'gremlin';
@@ -103,6 +104,9 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const [running, setRunning] = useState<'query' | 'export'>();
   const [stopping, setStopping] = useState(false);
   const active = useRef<{ id: string; controller: AbortController } | null>(null);
+  const composer = useRef<HTMLDivElement>(null);
+  const optionsPanel = useRef<HTMLDetailsElement>(null);
+  const parameterInput = useRef<HTMLTextAreaElement>(null);
   const timeoutValid = !timeout || /^\d+$/.test(timeout) && Number(timeout) >= 1 && Number(timeout) <= 60_000;
   const canRun = !!query.trim() && timeoutValid && (!parameterRequired || language !== 'cypher' || !!parameters.trim());
   const statementFromEditor = (): Statement => ({
@@ -173,6 +177,14 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
     setParameterRequired(!!needsParameters && !statement.parameters_json);
     setError(undefined);
     setLoadNotice(statement.model_revision !== revision ? '已载入历史语句。再次运行将使用当前生效版本。' : '');
+    requestAnimationFrame(() => {
+      const missingParameters = statement.language === 'cypher' && needsParameters && !statement.parameters_json;
+      if (missingParameters && optionsPanel.current) optionsPanel.current.open = true;
+      const input = missingParameters ? parameterInput.current
+        : composer.current?.querySelector<HTMLElement>('[contenteditable="true"], textarea');
+      input?.focus({ preventScroll: true });
+      input?.scrollIntoView({ block: 'center' });
+    });
   }
 
   function remember(value?: Recoverable) {
@@ -350,7 +362,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const selectedType = schemaSelection && shownSchema?.data?.[schemaSelection.section][schemaSelection.name];
 
   return <section className="query-workspace" aria-label="只读查询">
-    <div className="query-composer">
+    <div className="query-composer" ref={composer}>
     <div className="query-toolbar">
       {running ? <button className="button" disabled={stopping} onClick={() => void stop()}><Square size={16} />{stopping ? '正在取消…' : '取消查询'}</button>
         : <button className="button primary" disabled={!canRun || !!pending} onClick={() => void run()}><Play size={16} />运行查询</button>}
@@ -362,25 +374,21 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
       {draftPending && <span className="query-revision muted">草稿待发布 · 查询使用生效版本</span>}
     </div>
     {!timeoutValid && <p className="inline-error query-notice" id={id + '-query-timeout-error'} role="alert">请输入 1 至 60000 毫秒的整数。</p>}
-    <label className="query-input"><span className="sr-only">查询语句</span>
-      <textarea value={query} onChange={event => {
-        setQueries(old => ({ ...old, [language]: event.target.value }));
-        setParameterRequired(false);
-      }}
-        onKeyDown={event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); void run(); } }}
-        spellCheck={false} rows={4} className="mono" />
-    </label>
+    <Suspense fallback={<label className="query-input">查询语句<textarea value={query} onChange={event => setQueries(old => ({ ...old, [language]: event.target.value }))} className="mono" rows={4} /></label>}>
+      <QueryEditor key={language} value={query} language={language} schema={schema?.revision === revision ? schema.data : undefined}
+        change={value => { setQueries(old => ({ ...old, [language]: value })); setParameterRequired(false); }} run={() => void run()} />
+    </Suspense>
     <div className="query-settings">
       <div className="query-disclosures">
-        {language === 'cypher' && <details className="query-details query-parameters" open={parameterRequired || undefined}><summary>Cypher 参数</summary>
-          <label>JSON 对象<textarea value={parameters} onChange={event => setParameters(event.target.value)} placeholder="{}" spellCheck={false} rows={3} className="mono" /></label>
-        </details>}
         <button className="button compact scope-button" disabled={!!generation || !!running} onClick={() => setEditingScope(true)}>
           查询范围{graphOptions.trim() && !generation ? ' · 已设置' : ''}
         </button>
-        <details className="query-details query-parameters" open={!timeoutValid || undefined}>
-          <summary>执行选项{(timeout || captureResult || generation) && ' · 已设置'}</summary>
-          <div className="form-fields execution-options">
+        <details ref={optionsPanel} className="query-details query-parameters" open={parameterRequired && language === 'cypher' || !timeoutValid || undefined}>
+          <summary>查询选项{(timeout || captureResult || generation || language === 'cypher' && parameters.trim()) ? ' · 已设置' : ''}</summary>
+          <div className="query-options-grid">
+            {language === 'cypher' && <label>Cypher 参数（JSON）<textarea ref={parameterInput} value={parameters} onChange={event => setParameters(event.target.value)} placeholder="{}" spellCheck={false} rows={3} className="mono"
+              aria-describedby={parameterRequired && !parameters.trim() ? id + '-query-parameters-hint' : undefined} /></label>}
+            <div className="form-fields execution-options">
             <label className="query-timeout">超时（毫秒）<input type="number" min={1} max={60_000} step={1} value={timeout}
               disabled={!!running} aria-invalid={!timeoutValid} aria-describedby={timeoutValid ? undefined : id + '-query-timeout-error'} placeholder={defaultTimeout ? String(defaultTimeout) : '服务器默认'}
               onChange={event => setTimeoutText(event.target.value)} /></label>
@@ -389,12 +397,12 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
             {recoverable && language === 'cypher' && (generation
               ? <button className="button compact" disabled={!!running} onClick={() => setSnapshot(undefined)}>切换至实时来源</button>
               : <button className="button compact" disabled={!!running} onClick={() => void selectSnapshot()}>使用已发布 CSR</button>)}
+            </div>
           </div>
         </details>
       </div>
-      <span className="query-shortcut"><kbd>⌘ / Ctrl</kbd> + <kbd>Enter</kbd> 运行查询</span>
     </div>
-    {parameterRequired && language === 'cypher' && !parameters.trim() && <p className="notice query-notice" role="status">此查询需要参数。填写 Cypher 参数后即可运行。</p>}
+    {parameterRequired && language === 'cypher' && !parameters.trim() && <p className="notice query-notice" id={id + '-query-parameters-hint'} role="status">此查询需要参数。填写 Cypher 参数后即可运行。</p>}
     {loadNotice && <p className="notice query-notice" role="status">{loadNotice}</p>}
     </div>
     {visible && editingScope && <Suspense><QueryScope value={graphOptions} save={setGraphOptions} close={() => setEditingScope(false)} /></Suspense>}
@@ -489,7 +497,8 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
         {!!page.sources.length && <dl>{page.sources.map((source, index) => <div key={index}><dt>{source.source}</dt><dd><code>{source.version}</code><small>{source.consistency}</small></dd></div>)}</dl>}
       </details>}
     </section>
-    <details className="query-details query-history-section"><summary>查询模板（{templates.length}）</summary>
+    <div className="query-library">
+    <details className="query-details query-history-section"><summary>查询模板 <span className="tool-count">{templates.length}</span></summary>
       <form className="query-toolbar template-form" onSubmit={event => {
         event.preventDefault();
         if (!templateName.trim() || !query.trim() || !timeoutValid) return;
@@ -503,6 +512,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
         {language === 'cypher' && <label><input type="checkbox" checked={keepParameters} onChange={event => setKeepParameters(event.target.checked)} />在此浏览器保存参数值</label>}
         <button className="button compact" disabled={!templateName.trim() || !query.trim() || !timeoutValid}>保存查询模板</button>
       </form>
+      {!templates.length && <p className="query-library-hint">把常用语句存为模板，下次直接载入。</p>}
       <ul className="version-list query-history">{templates.map(item => <li key={item.id}>
         <div><strong>{item.name}</strong><small>{item.statement.language} · {item.statement.query}</small></div>
         <button className="button compact" disabled={!!running} onClick={() => load(item.statement, item.needsParameters)}>载入模板</button>
@@ -510,12 +520,13 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
       </li>)}</ul>
     </details>
     <details className="query-details query-history-section">
-      <summary>查询历史（{history.length}）</summary>
-      {!history.length ? <p className="empty">暂无历史查询。</p> : <ol className="version-list query-history">
+      <summary>查询历史 <span className="tool-count">{history.length}</span></summary>
+      {!history.length ? <p className="empty">运行过的查询会显示在这里。</p> : <ol className="version-list query-history">
         {history.map((item, i) => <li key={i}><div><code title={item.query}>{item.query}</code>
           <small>{item.language} · {item.status} · 版本 {item.model_revision.slice(0, 10)} · {new Date(item.at).toLocaleString()}</small></div>
           <button className="button compact" disabled={!!running} onClick={() => load(item, item.needsParameters)}>载入语句</button></li>)}
       </ol>}
     </details>
+    </div>
   </section>;
 }

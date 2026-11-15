@@ -15,20 +15,24 @@ export function StatusLabel({ status, text }: { status: Status; text?: string })
   return <span className={'status ' + status}><Icon size={16} aria-hidden="true" />{text ?? label}</span>;
 }
 
-export function Modal({ title, close, children }: { title: string; close: () => void; children: ReactNode }) {
+export function Modal({ title, description, close, children, layout = 'drawer', size = 'standard' }: {
+  title: string; description?: string; close: () => void; children: ReactNode;
+  layout?: 'drawer' | 'center'; size?: 'standard' | 'medium' | 'wide';
+}) {
   const dialog = useRef<HTMLDialogElement>(null);
   const heading = useId();
   const locked = useContext(WorkspaceLocked);
   useLayoutEffect(() => {
     if (locked) return;
     const element = dialog.current;
-    element?.querySelector('[data-initial-focus]')?.setAttribute('autofocus', '');
+    (element?.querySelector('[data-initial-focus]') ?? element?.querySelector('h2'))?.setAttribute('autofocus', '');
     element?.showModal();
     return () => element?.close();
   }, [locked]);
-  return <dialog ref={dialog} aria-labelledby={heading} onClose={event => { if (!event.currentTarget.open && !locked) close(); }}>
-    <div className="dialog-heading"><h2 id={heading}>{title}</h2><form method="dialog"><button className="icon-button" aria-label="关闭"><X size={18} /></button></form></div>
-    {children}
+  return <dialog ref={dialog} className={'dialog-' + layout + ' dialog-' + size} aria-labelledby={heading} onClose={event => { if (!event.currentTarget.open && !locked) close(); }}>
+    <header className="dialog-heading"><div><h2 id={heading} tabIndex={-1}>{title}</h2>{description && <p>{description}</p>}</div>
+      <form method="dialog"><button className="icon-button" aria-label="关闭"><X size={18} /></button></form></header>
+    <div className="dialog-content">{children}</div>
   </dialog>;
 }
 
@@ -46,6 +50,7 @@ export function NameDialog({ title, close, submit, initial = '', withId = false,
   const [name, setName] = useState(initial);
   const [extra, setExtra] = useState(choices?.[0]?.[0] ?? '');
   const [error, setError] = useState('');
+  const idHint = useId();
   function send(event: FormEvent) {
     event.preventDefault();
     try {
@@ -56,16 +61,19 @@ export function NameDialog({ title, close, submit, initial = '', withId = false,
       setError(cause instanceof Error ? cause.message : '无法保存');
     }
   }
-  return <Modal title={title} close={close}>
-    <form onSubmit={send} className="dialog-form">
+  return <Modal title={title} description={withId ? '先填写基本信息，随后配置数据来源与图映射。' : choices ? '选择连接器，下一步填写连接和表映射。' : undefined} close={close}>
+    <form onSubmit={send} className="panel-layout">
+      <div className="panel-body form-fields">
       <label>{label}<input data-initial-focus required maxLength={128} placeholder={placeholder} value={name} onChange={event => { setName(event.target.value); setError(''); }} /></label>
-      {withId && <label>模型标识<input className="mono" required pattern={modelIdPattern} maxLength={64}
-        placeholder="payments" value={extra} onChange={event => setExtra(event.target.value)} /></label>}
+      {withId && <div className="form-fields"><label>模型标识<input className="mono" required pattern={modelIdPattern} maxLength={64} aria-describedby={idHint}
+        placeholder="payments" value={extra} onChange={event => setExtra(event.target.value)} /></label>
+        <p id={idHint} className="field-help">用于访问模型，可包含英文字母、数字、下划线和连字符。</p></div>}
       {choices && <label>连接器<select value={extra} onChange={event => setExtra(event.target.value)}>
         {choices.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
       </select></label>}
       {error && <p role="alert" className="inline-error">{error}</p>}
-      <div className="dialog-actions"><button type="button" className="button" onClick={close}>取消</button><button className="button primary" type="submit">{action}</button></div>
+      </div>
+      <footer className="panel-footer"><button type="button" className="button" onClick={close}>取消</button><button className="button primary" type="submit">{action}</button></footer>
     </form>
   </Modal>;
 }

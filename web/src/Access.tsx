@@ -135,8 +135,9 @@ function Member({ item, close, removed, saved }: {
     finally { setBusy(false); }
   }
 
-  return <Modal title={item ? '编辑成员 · ' + item.username : '新建成员'} close={() => { if (!busy) close(); }}>
-    <form className="dialog-form access-form" method="post" onSubmit={submit} aria-busy={busy}>
+  return <Modal title={item ? '编辑成员 · ' + item.username : '新建成员'} size="medium" close={() => { if (!busy) close(); }}>
+    <form className="panel-layout access-form" method="post" onSubmit={submit} aria-busy={busy}>
+      <div className="panel-body dialog-form">
       {!item && <fieldset className="access-members">
         <legend>账号类型</legend>
         <div className="access-role-grid">
@@ -161,8 +162,8 @@ function Member({ item, close, removed, saved }: {
       <p className="muted">将账号加入角色后才可访问对应的模型。</p>
       {item && <p className="muted">{service ? '保存后会关闭此账号的现有连接。' : '保存后该成员需要重新登录。'}</p>}
       {error && <p className="notice error" role="alert">{error}</p>}
-      <div className="dialog-actions">{item && <button type="button" className="button danger" disabled={busy} onClick={() => void remove()}>删除成员</button>}<button type="button" className="button" onClick={close} disabled={busy}>取消</button>
-        <button type="submit" className="button primary" disabled={busy}>{busy ? '保存中…' : '保存成员'}</button></div>
+      </div><footer className="panel-footer">{item && <button type="button" className="button danger" disabled={busy} onClick={() => void remove()}>删除成员</button>}<button type="button" className="button" onClick={close} disabled={busy}>取消</button>
+        <button type="submit" className="button primary" disabled={busy}>{busy ? '保存中…' : '保存成员'}</button></footer>
     </form>
   </Modal>;
 }
@@ -218,12 +219,12 @@ function RoleEditor({ name, item, models, users, close, saved }: {
     finally { setBusy(false); }
   }
 
-  return <Modal title={item ? '编辑角色 · ' + name : '新建角色'} close={() => { if (!busy) close(); }}>
-    <form className="dialog-form access-form" aria-busy={busy} onSubmit={event => {
+  return <Modal title={item ? '编辑角色 · ' + name : '新建角色'} size="medium" description="先选择成员，再分配模型权限与可查询的租户范围。" close={() => { if (!busy) close(); }}>
+    <form className="panel-layout access-form" aria-busy={busy} onSubmit={event => {
       event.preventDefault();
       void persist(name || String(new FormData(event.currentTarget).get('role')), false);
     }}>
-      <label>角色名称<input name="role" defaultValue={name} readOnly={!!item}
+      <div className="panel-body dialog-form"><label>角色名称<input name="role" defaultValue={name} readOnly={!!item}
         pattern={modelIdPattern} maxLength={64} required data-initial-focus={!item || undefined} /></label>
       <fieldset className="access-members">
         <legend>加入角色的成员</legend>
@@ -269,13 +270,13 @@ function RoleEditor({ name, item, models, users, close, saved }: {
       {item && <p className="muted">角色变更后，受影响的成员需重新登录。</p>}
       {error && <p className="notice error" role="alert">{error}</p>}
       {confirmDelete && <p role="status">删除角色后会撤销该角色授予的全部权限。</p>}
-      <div className="dialog-actions">
+      </div><footer className="panel-footer">
         {item && <button type="button" className="button danger" disabled={busy} onClick={() => {
           if (confirmDelete) void persist(name, true); else setConfirmDelete(true);
         }}>{confirmDelete ? '确认删除' : '删除角色'}</button>}
         <button type="button" className="button" onClick={confirmDelete ? () => setConfirmDelete(false) : close} disabled={busy}>取消</button>
         {!confirmDelete && <button type="submit" className="button primary" disabled={busy}>{busy ? '保存中…' : '保存角色'}</button>}
-      </div>
+      </footer>
     </form>
   </Modal>;
 }

@@ -81,7 +81,7 @@ export default function RecoveryImport({ token, job, start }: {
       </ol>
       {job.failure && <p className="notice error" role="alert">{job.failure}</p>}
     </section>}
-    {confirm && <Modal title="开始灾备恢复" close={() => setConfirm(false)}><div className="dialog-form">
+    {confirm && <Modal layout="center" title="开始灾备恢复" close={() => setConfirm(false)}><div className="dialog-form">
       <p>将从 <b>{bundle}</b> 恢复数据和控制状态。请确认目标集群和 PostgreSQL 数据库专用于本次恢复。</p>
       <div className="dialog-actions">
         <button type="button" className="button" data-initial-focus onClick={() => setConfirm(false)}>取消</button>

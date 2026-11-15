@@ -174,7 +174,7 @@ export default function RecoveryConsole() {
       </section>
       {error && <p className="notice error" role="alert">{error}</p>}
     </>}
-    {confirm && <Modal title="执行恢复验收" close={() => setConfirm(false)}><div className="dialog-form">
+    {confirm && <Modal layout="center" title="执行恢复验收" close={() => setConfirm(false)}><div className="dialog-form">
       <p>验收通过后，目标站将允许业务流量。请确认来源数据已冻结，且当前站点是计划切换的目标。</p>
       <div className="dialog-actions">
         <button type="button" className="button" data-initial-focus onClick={() => setConfirm(false)}>取消</button>

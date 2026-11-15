@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import { Activity, Download, Plus, RefreshCw, X } from 'lucide-react';
-import { api, ApiError, downloadText, errorText, type ModelReadiness, type ModelSummary } from './api';
+import { Download, Plus, RefreshCw, X } from 'lucide-react';
+import { api, ApiError, downloadText, errorText, type ModelSummary } from './api';
+import { ModelHealth } from './ModelHealth';
 import BackupStatus from './BackupStatus';
 
 const tabs = [
@@ -44,9 +45,6 @@ const alertNames: Record<string, string> = {
   GraphLakeBackupFailed: '备份或离线校验失败',
   GraphLakeBackupStale: '备份恢复点过期',
 };
-const probeLabels = {
-  ready: '可用', source_unavailable: '数据源不可用', mapping_invalid: '映射校验失败', worker_unavailable: 'Worker 不可用',
-};
 
 function Toggle({ name, label, checked, change }: { name: string; label: string; checked: boolean; change: (value: boolean) => void }) {
   const id = useId();
@@ -56,45 +54,8 @@ function Toggle({ name, label, checked, change }: { name: string; label: string;
   </div>;
 }
 
-function Probe({ models }: { models: ModelSummary[] }) {
-  const [selected, select] = useState('');
-  const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<ModelReadiness>();
-  const [error, setError] = useState('');
-  const candidates = models.filter(model => model.active_revision);
-  const id = candidates.some(model => model.id === selected) ? selected : candidates[0]?.id ?? '';
-  async function check(event: FormEvent) {
-    event.preventDefault();
-    setRunning(true); setResult(undefined); setError('');
-    try { setResult(await api<ModelReadiness>('/models/' + id + '/readiness')); }
-    catch (cause) {
-      if (cause instanceof ApiError && cause.readiness) setResult(cause.readiness);
-      else setError(errorText(cause));
-    } finally { setRunning(false); }
-  }
-  return <section className="settings-card">
-    <h2>模型探针</h2>
-    <p className="settings-hint">检查生效版本的来源、端点映射及 Worker。</p>
-    {candidates.length ? <form aria-label="模型探针" method="get" onSubmit={check} className="settings-stack">
-      <label>已发布模型<select name="model" value={id} disabled={running} onChange={event => {
-        select(event.target.value); setResult(undefined); setError('');
-      }}>{candidates.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label>
-      <button className="button" type="submit" disabled={running}><Activity size={16} aria-hidden="true" />{running ? '正在检查…' : '检查模型'}</button>
-    </form> : <p className="settings-hint">暂无已发布模型。</p>}
-    {error && <p role="alert" className="notice error">{error}</p>}
-    {result && <div className={result.status === 'ready' ? 'notice' : 'notice error'} role="status">
-      <strong>{probeLabels[result.status]}</strong>
-      <ul className="settings-probes">
-        {Object.entries(result.sources).map(([name, ok]) => <li key={name}><code>{name}</code> · {ok ? '可用' : '不可用'}</li>)}
-        {result.workers?.map(({ worker, probe }) => <li key={worker}>Worker {worker} · {probe ? probeLabels[probe.status] : '不可达'}
-          {probe && Object.entries(probe.sources).filter(([, available]) => !available).map(([name]) => <span key={name}> · <code>{name}</code></span>)}</li>)}
-      </ul>
-    </div>}
-  </section>;
-}
-
-export default function Settings({ models, locked, onDirty }: { models: ModelSummary[]; locked: boolean; onDirty: (key: string, value: boolean) => void }) {
-  const [tab, setTab] = useState<Tab>('telemetry');
+export default function Settings({ models, locked, onDirty, openModel, initialTab }: { initialTab?: Tab; openModel: (id: string, workspace: 'graph' | 'catalogs') => void; models: ModelSummary[]; locked: boolean; onDirty: (key: string, value: boolean) => void }) {
+  const [tab, setTab] = useState<Tab>(initialTab ?? 'telemetry');
   const tabId = useId();
   const tabButton = (value: Tab) => tabId + '-' + value;
   const tabPanel = (value: Tab) => tabButton(value) + '-panel';
@@ -314,6 +275,7 @@ export default function Settings({ models, locked, onDirty }: { models: ModelSum
     </form>}
     <section {...panel('health')}>
       <div className="settings-workspace settings-health">
+        <ModelHealth models={models} openModel={openModel} />
         <section className="settings-card">
           <div className="settings-section-title"><h2>上报状态</h2><button className="button compact" type="button" disabled={!snapshot || refreshing}
             onClick={() => void refreshStatus()}><RefreshCw size={14} aria-hidden="true" />刷新状态</button></div>
@@ -332,7 +294,6 @@ export default function Settings({ models, locked, onDirty }: { models: ModelSum
             <a href="/readyz" target="_blank" rel="noreferrer">服务就绪探针</a>
           </div>
         </section>
-        <Probe models={models} />
       </div>
     </section>
     <section {...panel('backup')}><BackupStatus visible={tab === 'backup' && !locked} /></section>

@@ -87,10 +87,13 @@ export function SourceBrowser({ id, yaml, model, current, fixedSource, close, ch
     if (reread) setTableAttempt(attempt => attempt + 1);
   }
 
-  return <Modal title="浏览来源表与字段" close={close}>
-    <div className="dialog-form source-browser">
+  const selectedTable = table ? [source, ...(namespaced ? [schema] : []), table].join('.') : '';
+  return <Modal title="浏览来源表与字段" size="wide" description={choose ? '选择来源表，核对字段和类型后带入当前映射。' : '选择来源表，查看字段名称、类型和是否允许空值。'} close={close}>
+    <div className="panel-layout source-browser">
+      <div className="panel-body source-browser-grid"><section className="source-picker" aria-label="选择来源">
+      <h3>选择来源</h3>
       {fixedSource ? <p className="source-browser-context"><strong>{fixedSource}</strong><span>{sourceLabel(kind)}</span></p>
-        : <label>数据源<select value={source} onChange={event => {
+        : <label>数据源<select data-initial-focus value={source} onChange={event => {
         setSource(event.target.value); setCatalog(''); setSchema(''); changeTable(''); setTypedTable(''); setTypedSchema(''); setSchemas([]); setTables([]); setErrors({}); setLimits({}); setLoadingSchemas(false); setLoadingTables(false);
       }}><option value="">选择数据源</option>
         {names.map(name => <option key={name} value={name}>{name} · {sourceLabel(model.sources[name].type)}</option>)}
@@ -128,14 +131,22 @@ export function SourceBrowser({ id, yaml, model, current, fixedSource, close, ch
       {!names.length && <p className="muted small">添加数据源后即可浏览。</p>}
       {(limits.schemas || limits.tables) && <p className="muted small">此列表最多显示 2000 项；其他表可手动输入。</p>}
       {Object.entries(errors).filter(([, error]) => error).map(([key, error]) => <p key={key} className="inline-error" role="alert">{error}</p>)}
+      </section><section className="source-preview" aria-label="字段预览">
+      <div className="panel-section-heading"><h3>来源字段 {columns && <span className="muted small">{columns.length} 个</span>}</h3>
+        {selectedTable && <code>{selectedTable}</code>}</div>
       {pending && <p className="muted small" role="status">正在读取字段…</p>}
-      {columns && <><h3>来源字段 <span className="muted small">（{columns.length}）</span></h3><dl className="browse-columns" aria-label="来源字段">
-        {columns.map(column => <div key={column.name}><dt><code>{column.name}</code></dt><dd>{column.data_type}</dd></div>)}
-      </dl></>}
-      {choose && <div className="dialog-actions"><button className="button primary" disabled={!columns || pending} onClick={() => {
-        if (columns) choose({ table: [source, ...(namespaced ? [schema] : []), table].join('.'), columns });
+      {columns ? <div className="source-column-table"><table aria-label="来源字段">
+        <thead><tr><th scope="col">字段</th><th scope="col">类型</th><th scope="col">可为空</th></tr></thead>
+        <tbody>{columns.map(column => <tr key={column.name}><th scope="row"><code>{column.name}</code></th><td><code>{column.data_type}</code></td><td>{column.nullable ? '是' : '否'}</td></tr>)}</tbody>
+      </table>{!columns.length && <p className="empty">此表未返回字段。</p>}</div>
+        : !pending && <p className="panel-placeholder">{errors.columns ? '字段读取失败，请检查来源或重新选择表。' : '选择来源表，在这里预览字段。'}</p>}
+      </section></div>
+      <footer className="panel-footer"><span className="panel-footer-context">{selectedTable || '尚未选择来源表'}</span>
+        <button className="button" onClick={close}>{choose ? '取消' : '完成'}</button>
+        {choose && <button className="button primary" disabled={!columns || pending} onClick={() => {
+        if (columns) choose({ table: selectedTable, columns });
         close();
-      }}>使用此表</button></div>}
+      }}>使用此表</button>}</footer>
     </div>
   </Modal>;
 }

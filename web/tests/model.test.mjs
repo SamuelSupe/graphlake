@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { setupIssue } from '../src/modelWorkflow.ts';
+import { modelChanges } from '../src/modelChanges.ts';
 import { appendMappingInput, documentOf, modelIdPattern, modelOf, removeGraphType, rename, validationTargets } from '../src/model.ts';
 
 test('model ID pattern works with the HTML pattern Unicode sets flag', () => {
@@ -144,4 +146,42 @@ test('a missing temporal column locates the model field or the mapped physical c
   const found = validationTargets(model, { kind: 'table', table: 'lake.finance.accounts', column: 'status' });
   assert.deepEqual(found.map(target => [target.selection.name, JSON.parse(target.control)]),
     [['Current', ['scd2', 'current_flag']], ['Combined', ['column', 0, 'active']]]);
+});
+
+
+test('setup blocks unfinished mappings but allows node-only and keyless multi-table graphs', () => {
+  const model = modelOf(`graph: demo
+sources: {lake: {type: parquet, tables: {accounts: [a.parquet], transfers: [t.parquet]}}}
+nodes: {Account: {source: lake.accounts, key: [id]}}
+edges: {}`);
+  assert.equal(setupIssue(model), undefined);
+  model.nodes.Account.inputs = [];
+  assert.equal(setupIssue(model), undefined);
+  model.edges.Transfer = { inputs: [{ table: 'lake.transfers' }], from: { node: 'Account', columns: ['src'] }, to: { node: 'Account', columns: ['dst'] } };
+  assert.equal(setupIssue(model), undefined);
+  model.edges.Transfer.to.columns = [''];
+  assert.deepEqual(setupIssue(model)?.selection, { section: 'edges', name: 'Transfer' });
+  delete model.edges.Transfer;
+  model.nodes.Account.key = [''];
+  assert.deepEqual(setupIssue(model)?.selection, { section: 'nodes', name: 'Account' });
+  model.nodes = {};
+  assert.equal(setupIssue(model)?.add, 'nodes');
+});
+
+test('version summary ignores formatting and reports source, endpoint and field changes without losing integer precision', () => {
+  const before = `graph: demo
+sources: {lake: {type: parquet, version: 9007199254740992}}
+nodes: {Account: {key: [id], source: lake.a, properties: [name]}}
+edges: {Transfer: {from: {node: Account}, to: {node: Account}}}`;
+  const reformatted = documentOf(before).toString();
+  assert.deepEqual(modelChanges(before, reformatted), []);
+  const doc = documentOf(before);
+  doc.setIn(['sources', 'lake', 'version'], 9007199254740993n);
+  doc.setIn(['nodes', 'Account', 'properties'], ['name', 'status']);
+  doc.deleteIn(['edges', 'Transfer']);
+  const changes = modelChanges(before, doc.toString());
+  assert.deepEqual(changes.map(({ kind, section, name }) => [kind, section, name]), [
+    ['changed', '数据源', 'lake'], ['changed', '节点', 'Account'], ['removed', '边', 'Transfer'],
+  ]);
+  assert.deepEqual(changes[1].fields, ['属性']);
 });

@@ -113,7 +113,11 @@ impl Trino {
                 token_env,
                 password_env,
             } => (uri, user, token_env, password_env, None),
-            Source::Mongodb(config) | Source::Elasticsearch(config) | Source::Redshift(config) => (
+            Source::Mongodb(config)
+            | Source::Elasticsearch(config)
+            | Source::Redshift(config)
+            | Source::Sqlserver(config)
+            | Source::Oracle(config) => (
                 &config.uri,
                 &config.user,
                 &config.token_env,
@@ -147,7 +151,7 @@ impl Trino {
             .collect::<Vec<_>>()
             .join(", ");
         let mut sql = format!("SELECT {selected} FROM {relation}");
-        let expected = if filters.is_empty() && !explain_only {
+        let expected = if !crate::engine::read_filters::needs_sql_types(filters) && !explain_only {
             None
         } else {
             let mut metadata_id = None;

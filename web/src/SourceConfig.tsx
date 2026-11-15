@@ -1,18 +1,43 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { Braces, Plus, X } from 'lucide-react';
 import { configText, connectorFields, integerInput, setOptional, type ConnectorField } from './connectors';
-import type { Edit } from './Inspector';
-import { record, text } from './model';
+import { ListField, type Edit } from './Inspector';
+import { record, strings, text } from './model';
 import { NameDialog } from './ui';
+import { TextTables } from './TextTables';
+import { StorageConfig } from './StorageConfig';
 
-export function SourceConfig({ type, item, path, edit, openYaml }: {
+export function SourceConfig({ type, item, path, edit, openYaml, form, modelId }: {
   type: string;
   item: Record<string, unknown>;
   path: string[];
   edit: Edit;
-  openYaml: () => void;
+  openYaml?: () => void;
+  form?: string;
+  modelId?: string;
 }) {
   const [adding, setAdding] = useState(false);
+  const [invalid, setInvalid] = useState<Record<string, boolean>>({});
+  const fieldId = useId();
+  if (type === 'object_storage') return <StorageConfig item={item} path={path} edit={edit} form={form} modelId={modelId} />;
+  if (type === 'csv' || type === 'jsonl') {
+    return <TextTables type={type} item={item} path={path} edit={edit} form={form} />;
+  }
+  if (type === 'parquet') {
+    const tables = record(item.tables);
+    return <>
+      <div className="field-title">表映射<button type="button" className="icon-button" aria-label="添加 Parquet 表" onClick={() => setAdding(true)}><Plus size={17} /></button></div>
+      {Object.entries(tables).map(([table, paths]) => <div className="parquet-table" key={table}>
+        <div className="field-title"><code>{table}</code><button type="button" className="icon-button" aria-label={'移除表 ' + table}
+          onClick={() => edit(doc => doc.deleteIn([...path, 'tables', table]))}><X size={16} /></button></div>
+        <ListField label="文件路径" form={form} placeholder="文件路径或 URL" items={strings(paths)} change={next => edit(doc => doc.setIn([...path, 'tables', table], next))} />
+      </div>)}
+      {adding && <NameDialog title="添加 Parquet 表" label="表名" placeholder="schema.table" action="添加" close={() => setAdding(false)} submit={name => {
+        if (Object.hasOwn(tables, name)) throw new Error('表映射已存在');
+        edit(doc => doc.setIn([...path, 'tables', name], ['']));
+      }} />}
+    </>;
+  }
   if (!Object.hasOwn(connectorFields, type)) {
     return <button type="button" className="button" onClick={openYaml}><Braces size={16} />查看 YAML</button>;
   }
@@ -22,18 +47,30 @@ export function SourceConfig({ type, item, path, edit, openYaml }: {
       return <label className="check-label" key={field.key}><input type="checkbox" checked={item[field.key] !== false}
         onChange={event => edit(doc => doc.setIn([...path, field.key], event.target.checked))} />{field.label}</label>;
     }
-    return <label key={field.key}>{field.label}<input className="mono" value={configText(item[field.key])}
-      spellCheck={false} autoCapitalize="none" autoComplete="off"
+    const id = fieldId + '-' + field.key;
+    const message = field.kind === 'integer' ? '请输入大于 0 的整数。' : field.key === 'uri' ? '请输入完整的服务地址，例如 https://example.com。' : '请填写' + field.label + '。';
+    return <div className="source-field" key={field.key}>
+      <label htmlFor={id}>{field.label}<span className="field-requirement">{field.optional ? '选填' : '必填'}</span></label>
+      {field.hint && <p id={id + '-hint'} className="muted small">{field.hint}</p>}
+      <input id={id} name={field.key} form={form} required={!!form && !field.optional} className="mono" value={configText(item[field.key])}
+      type={field.key === 'uri' ? 'url' : 'text'}
+      pattern={field.kind === 'integer' ? '0*[1-9][0-9]*' : !field.optional ? '.*\\S.*' : undefined}
+      aria-invalid={!!invalid[field.key]} aria-describedby={[field.hint ? id + '-hint' : '', invalid[field.key] ? id + '-error' : ''].filter(Boolean).join(' ') || undefined}
+      onInvalid={() => setInvalid(current => ({ ...current, [field.key]: true }))}
+      spellCheck={false} autoCapitalize="none" autoCorrect="off" autoComplete="off"
       inputMode={field.kind === 'integer' ? 'numeric' : undefined}
-      placeholder={field.key.endsWith('_env') ? '环境变量名' : field.key === 'database' ? 'projects/…/instances/…/databases/…' : undefined}
+      placeholder={field.placeholder ?? (field.key.endsWith('_env') ? '环境变量名' : field.key === 'database' ? 'projects/…/instances/…/databases/…' : undefined)}
       onChange={event => {
         const value = event.target.value;
+        if (invalid[field.key]) setInvalid(current => ({ ...current, [field.key]: false }));
         edit(doc => {
           const next = field.kind === 'integer' ? integerInput(value) : value;
           if (field.optional) setOptional(doc, [...path, field.key], next);
           else doc.setIn([...path, field.key], next);
         });
-      }} /></label>;
+      }} />
+      {invalid[field.key] && <p id={id + '-error'} className="inline-error">{message}</p>}
+    </div>;
   }
 
   const delta = type === 'delta';
@@ -53,7 +90,7 @@ export function SourceConfig({ type, item, path, edit, openYaml }: {
               <div className="field-title"><code>{table}</code><button className="icon-button" type="button"
                 aria-label={'移除 ' + table} onClick={() => edit(doc => doc.deleteIn(entry))}><X size={16} /></button></div>
               {delta ? <>
-                <label>表路径<input className="mono" value={text(record(value).path)}
+                <label>表路径<input form={form} required={!!form} className="mono" value={text(record(value).path)}
                   onChange={event => edit(doc => doc.setIn([...entry, 'path'], event.target.value))} /></label>
                 <label>表版本<input className="mono" inputMode="numeric" placeholder="最新版本" value={configText(record(value).version)}
                   onChange={event => edit(doc => setOptional(doc, [...entry, 'version'], integerInput(event.target.value)))} /></label>

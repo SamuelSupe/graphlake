@@ -175,6 +175,7 @@ pub(in crate::admin::cluster::csr) async fn register_tables(
         )?;
     }
     Ok(Prepared {
+        aggregate: None,
         versions: generation.source_versions(),
         reservations: Vec::new(),
         postgres: BTreeMap::new(),

@@ -1,3 +1,6 @@
+#[path = "engine/direct_sources.rs"]
+mod direct_sources;
+
 #[path = "engine/query_model.rs"]
 mod query_model;
 

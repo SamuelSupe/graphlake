@@ -29,6 +29,7 @@ use super::ReadStats;
 pub(crate) struct Buffer {
     pool: Arc<dyn MemoryPool>,
     budget: MemoryReservation,
+    source_reservation: usize,
     disk: Option<Arc<DiskManager>>,
     memory: Vec<RecordBatch>,
     file: Option<DiskBuffer>,
@@ -45,6 +46,7 @@ impl Buffer {
         Self {
             pool: Arc::clone(pool),
             budget: MemoryConsumer::new("GraphLake source snapshot").register(pool),
+            source_reservation: 0,
             disk: disk
                 .filter(|disk| disk.max_temp_directory_size() > 0)
                 .cloned(),
@@ -52,6 +54,11 @@ impl Buffer {
             file: None,
             compression: None,
         }
+    }
+
+    pub(crate) fn with_source_reservation(mut self, bytes: usize) -> Self {
+        self.source_reservation = bytes;
+        self
     }
 
     #[cfg(feature = "admin")]
@@ -72,10 +79,16 @@ impl Buffer {
     pub(crate) fn push_chunks(&mut self, batch: RecordBatch, batch_size: usize) -> Result<()> {
         let bytes = batch.get_array_memory_size();
         // Leave room for the next connector page and downstream operators.
+        // A source engine reservation already has its own share of the pool.
         if self.file.is_none()
             && let Some(disk) = &self.disk
             && let MemoryLimit::Finite(limit) = self.pool.memory_limit()
-            && self.pool.reserved().saturating_add(bytes) > limit / 4
+            && self
+                .pool
+                .reserved()
+                .saturating_sub(self.source_reservation)
+                .saturating_add(bytes)
+                > limit.saturating_sub(self.source_reservation) / 4
         {
             let file = disk.create_tmp_file("materializing a GraphLake source snapshot")?;
             let mut writer = StreamWriter::try_new_with_options(

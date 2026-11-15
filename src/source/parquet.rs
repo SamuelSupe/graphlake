@@ -50,7 +50,7 @@ pub(crate) async fn object_version(
 }
 
 #[derive(Clone, Debug)]
-struct PinnedFile {
+pub(super) struct PinnedFile {
     store: Arc<dyn ObjectStore>,
     meta: ObjectMeta,
     local: bool,
@@ -60,7 +60,7 @@ struct PinnedFile {
 }
 
 impl PinnedFile {
-    fn version(&self, location: &str) -> SourceVersion {
+    pub(super) fn version(&self, location: &str) -> SourceVersion {
         SourceVersion {
             source: location.to_owned(),
             version: self
@@ -73,7 +73,28 @@ impl PinnedFile {
         }
     }
 
-    async fn open(file: &str, pool: Arc<dyn MemoryPool>, stats: Arc<ReadStats>) -> Result<Self> {
+    pub(super) fn len(&self) -> u64 {
+        self.meta.size
+    }
+
+    pub(super) async fn open(
+        file: &str,
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+    ) -> Result<Self> {
+        Self::open_storage(file, None, pool, stats).await
+    }
+
+    pub(super) async fn open_storage(
+        file: &str,
+        store: Option<&Arc<dyn ObjectStore>>,
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+    ) -> Result<Self> {
+        if let Some(store) = store {
+            let path = super::storage::object_path(file)?;
+            return Self::pin(Arc::clone(store), path, false, pool, stats).await;
+        }
         let url = if file.contains("://") {
             Url::parse(file).context("invalid Parquet object URL")?
         } else {
@@ -107,23 +128,33 @@ impl PinnedFile {
             let (store, path) = object_store::parse_url(&url)?;
             (Arc::from(store), path)
         };
+        Self::pin(store, path, url.scheme() == "file", pool, stats).await
+    }
+
+    async fn pin(
+        store: Arc<dyn ObjectStore>,
+        path: ObjectPath,
+        local: bool,
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+    ) -> Result<Self> {
         stats.request();
         let meta = store
             .head(&path)
             .await
-            .with_context(|| format!("pinning Parquet object {url}"))?;
+            .with_context(|| format!("pinning object {path}"))?;
         ensure!(
             meta.version.is_some()
                 || meta
                     .e_tag
                     .as_ref()
                     .is_some_and(|tag| !tag.starts_with("W/")),
-            "Parquet object {url} must provide an object version or strong ETag"
+            "object {path} must provide a version or strong ETag"
         );
         Ok(Self {
             store,
             meta,
-            local: url.scheme() == "file",
+            local,
             parallel_ranges: false,
             pool,
             stats,
@@ -427,6 +458,17 @@ impl ParquetTable {
         pool: Arc<dyn MemoryPool>,
         stats: Arc<ReadStats>,
     ) -> Result<(Self, Vec<SourceVersion>)> {
+        Self::open_storage(locations, columns, None, pool, stats).await
+    }
+
+    pub(crate) async fn open_storage(
+        locations: &[String],
+        columns: &[String],
+        storage: Option<&crate::StorageConfig>,
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+    ) -> Result<(Self, Vec<SourceVersion>)> {
+        let store = storage.map(super::storage::open).transpose()?;
         let mut versions = Vec::new();
         let mut schema = None;
         let mut readers = BTreeMap::new();
@@ -435,7 +477,13 @@ impl ParquetTable {
         #[cfg(feature = "admin")]
         let mut scan_objects = Vec::new();
         for (index, location) in locations.iter().enumerate() {
-            let file = PinnedFile::open(location, Arc::clone(&pool), Arc::clone(&stats)).await?;
+            let file = PinnedFile::open_storage(
+                location,
+                store.as_ref(),
+                Arc::clone(&pool),
+                Arc::clone(&stats),
+            )
+            .await?;
             let builder = ParquetRecordBatchStreamBuilder::new(file.clone())
                 .await
                 .with_context(|| format!("reading Parquet schema for {location}"))?;

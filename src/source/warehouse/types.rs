@@ -13,7 +13,7 @@ use datafusion::arrow::{
     datatypes::{DataType, SchemaRef, TimeUnit},
 };
 
-pub(super) fn numeric(precision: u8, scale: i8) -> Result<DataType> {
+pub(crate) fn numeric(precision: u8, scale: i8) -> Result<DataType> {
     ensure!(
         (1..=38).contains(&precision) && scale >= 0 && scale as u8 <= precision,
         "warehouse fixed-point value exceeds Decimal128 precision or scale"
@@ -22,14 +22,14 @@ pub(super) fn numeric(precision: u8, scale: i8) -> Result<DataType> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Encoding {
+pub(crate) enum Encoding {
     Snowflake,
     BigQuery,
     Trino,
     Rfc3339,
 }
 
-pub(super) fn batch(
+pub(crate) fn batch(
     schema: SchemaRef,
     rows: &[Vec<Option<String>>],
     encoding: Encoding,

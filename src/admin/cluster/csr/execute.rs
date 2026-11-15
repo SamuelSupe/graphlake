@@ -928,6 +928,7 @@ pub(in crate::admin::cluster) async fn query_csr(
             );
             let versions = execution.graph.manifest.source_versions();
             let prepared = Prepared {
+                aggregate: None,
                 versions,
                 reservations: Vec::new(),
                 postgres: BTreeMap::new(),

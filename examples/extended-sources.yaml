@@ -1,0 +1,78 @@
+# Connection templates. Replace endpoints/environment references and map the tables
+# needed by your model. No credentials are stored in this file.
+graph: extended-sources
+sources:
+  analytics:
+    type: doris # also: starrocks, tidb, oceanbase (MySQL mode), mariadb
+    dsn_env: GRAPHLAKE_ANALYTICS_DSN
+    tls: true
+  sqlserver:
+    type: sqlserver_native
+    host: sqlserver.example.com
+    port: 1433
+    database: finance
+    user: graph_reader
+    password_env: GRAPHLAKE_SQLSERVER_PASSWORD
+    tls: true
+  oracle:
+    type: oracle_native
+    connect_string: db.example.com:1521/FREEPDB1
+    user: GRAPH_READER
+    password_env: GRAPHLAKE_ORACLE_PASSWORD
+  documents:
+    type: mongodb_native
+    dsn_env: GRAPHLAKE_MONGODB_DSN
+    schema_sample_size: 1000
+  local:
+    type: duckdb
+    path: data/analytics.duckdb
+  lakehouse:
+    type: databricks
+    uri: https://workspace.example.databricks.com
+    token_env: GRAPHLAKE_DATABRICKS_TOKEN
+    warehouse: replace-with-warehouse-id
+    catalog: main
+  objects:
+    type: object_storage
+    storage:
+      provider: s3 # minio, oss, tos, cos, azure, gcs are also supported
+      bucket: graphlake-example
+      region: us-east-1
+      access_key_env: GRAPHLAKE_STORAGE_KEY
+      secret_key_env: GRAPHLAKE_STORAGE_SECRET
+    format: parquet
+    tables:
+      accounts:
+        files: [exports/accounts.parquet]
+  azure_files:
+    type: object_storage
+    storage:
+      provider: azure
+      account: graphlakeexample
+      bucket: exports
+      account_key_env: GRAPHLAKE_AZURE_KEY
+    format: csv
+    tables:
+      accounts:
+        files: [accounts.csv]
+        columns:
+          - {name: id, data_type: Int64, nullable: false}
+          - {name: name, data_type: Utf8}
+  gcs_files:
+    type: object_storage
+    storage:
+      provider: gcs
+      bucket: graphlake-example
+      service_account_env: GRAPHLAKE_GCS_CREDENTIALS
+    format: jsonl
+    tables:
+      accounts:
+        files: [exports/accounts.jsonl]
+        columns:
+          - {name: id, data_type: Int64, nullable: false}
+          - {name: name, data_type: Utf8}
+nodes:
+  Account:
+    source: objects.accounts
+    key: [id]
+    properties: [name]

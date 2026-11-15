@@ -57,9 +57,12 @@ export function addEdgeType(doc: YamlDocument, model: Model, name: string, from:
 export function sourceLabel(value: unknown) {
   const source = text(value);
   return ({
-    postgres: 'PostgreSQL', parquet: 'Parquet', mysql: 'MySQL', iceberg: 'Iceberg',
+    postgres: 'PostgreSQL', parquet: 'Parquet', csv: 'CSV', jsonl: 'JSON Lines', mysql: 'MySQL', iceberg: 'Iceberg',
     delta: 'Delta Lake', bigquery: 'BigQuery', snowflake: 'Snowflake',
-    clickhouse: 'ClickHouse', trino: 'Trino', mongodb: 'MongoDB',
+    clickhouse: 'ClickHouse', trino: 'Trino', mongodb: 'MongoDB (Trino)', sqlite: 'SQLite',
+    sqlserver: 'SQL Server (Trino)', oracle: 'Oracle (Trino)',
+    duckdb: 'DuckDB', doris: 'Apache Doris', starrocks: 'StarRocks', tidb: 'TiDB', oceanbase: 'OceanBase', mariadb: 'MariaDB',
+    sqlserver_native: 'SQL Server（直连）', oracle_native: 'Oracle（直连）', mongodb_native: 'MongoDB（直连）', databricks: 'Databricks SQL', object_storage: '对象存储',
     elasticsearch: 'Elasticsearch', redshift: 'Redshift', spanner: 'Spanner', sap_hana: 'SAP HANA',
   } as Record<string, string>)[source] ?? source;
 }

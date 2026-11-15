@@ -7,6 +7,24 @@
 - Add an administrator Overview with service readiness, query and HTTP trends, model checks, telemetry and backup status.
 - Let modelers reposition nodes and connect endpoints on the canvas. The edge drawer carries the selected endpoints into the draft.
 - Remove the alert-rule editor from Runtime Settings. Prometheus rules are managed in the deployment configuration.
+- Use a single DuckDB scan for narrow integer Top-N projections where a second row-ID lookup adds scan work.
+
+- Reduce DuckDB LIMIT and aggregate latency with table-local primary-key checks, and keep small snapshots in memory within the query budget.
+
+- Read only referenced columns for eligible SQL queries and push ordered LIMIT and scalar COUNT/MIN/MAX into DuckDB and PostgreSQL when the source proves business-key uniqueness.
+
+- Push safe integer and null predicates into direct SQL and warehouse reads, prune Iceberg scans, project MongoDB schema samples, and reduce range requests for remote CSV and JSON Lines.
+
+- Add direct SQL Server, Oracle, MongoDB, DuckDB and Databricks SQL sources, plus Doris, StarRocks, TiDB, OceanBase MySQL mode and MariaDB adapters. Existing named Trino configurations remain compatible.
+- Add per-source object-storage configuration and object listing for S3-compatible services, Azure Blob and GCS, with Parquet/CSV/JSON Lines table mappings.
+
+- Datasource usability: category filters, source search, required connection fields with inline feedback, and configuration dialogs with local save/conflict feedback and a persistent action area.
+
+- Card-based datasource workspace with searchable connectors, direct connection and table configuration before adding to a draft, and per-source configuration and schema browsing.
+
+- Native CSV and JSON Lines sources with explicit schemas, local/HTTP/S3 file lists, pinned object versions, bounded materialization, and workbench table/column editing.
+- Native read-only SQLite sources with a shared read transaction per query, typed rows, predicate pushdown, cancellation, and workbench browsing.
+- Named SQL Server and Oracle source configurations through existing Trino catalogs.
 
 ## v1.0.0
 

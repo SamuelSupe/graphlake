@@ -3401,3 +3401,147 @@ edges:
     assert_eq!(conflict.status(), StatusCode::UNPROCESSABLE_ENTITY);
     Ok(())
 }
+
+#[tokio::test]
+async fn text_sqlite_and_duckdb_sources_browse_publish_query_and_restart() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    fs::write(root.path().join("accounts.csv"), "id,name\n1,Alice\n")?;
+    fs::write(
+        root.path().join("notes.jsonl"),
+        "{\"id\":1,\"note\":\"imported\"}\n",
+    )?;
+    rusqlite::Connection::open(root.path().join("local.db"))?.execute_batch(
+        "CREATE TABLE flags (id INTEGER, enabled BOOLEAN); INSERT INTO flags VALUES (1,1);",
+    )?;
+    duckdb::Connection::open(root.path().join("analytics.duckdb"))?.execute_batch("CREATE TABLE amounts (id BIGINT, amount DECIMAL(12,2)); INSERT INTO amounts VALUES (1,12.25)")?;
+    let yaml = r#"graph: integration
+sources:
+  csv:
+    type: csv
+    tables:
+      accounts:
+        files: [accounts.csv]
+        columns: [{name: id, data_type: Int64}, {name: name, data_type: Utf8}]
+  json:
+    type: jsonl
+    tables:
+      notes:
+        files: [notes.jsonl]
+        columns: [{name: id, data_type: Int64}, {name: note, data_type: Utf8}]
+  db: {type: sqlite, path: local.db}
+  analytics: {type: duckdb, path: analytics.duckdb}
+nodes:
+  Account: {source: csv.accounts, key: [id], properties: [name]}
+  Note: {source: json.notes, key: [id], properties: [note]}
+  Flag: {source: db.flags, key: [id], properties: [enabled]}
+  Amount: {source: analytics.main.amounts, key: [id], properties: [amount]}
+"#;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let created: Value = server
+        .request(Method::POST, "models")
+        .json(&json!({"id":"payments","yaml":yaml}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let no_bucket = server
+        .request(Method::POST, "models/payments/browse")
+        .json(&json!({
+            "yaml": "graph: object-browser\nsources:\n  files:\n    type: object_storage\n    storage: {provider: s3, bucket: ''}\n    format: parquet\n    tables: {}\nnodes: {}\n",
+            "source": "files",
+            "object_prefix": "exports/"
+        }))
+        .send()
+        .await?;
+    assert_eq!(no_bucket.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        no_bucket.json::<Value>().await?["code"],
+        "object_list_failed"
+    );
+    for (source, table, column, kind, schema) in [
+        ("csv", "accounts", "name", "Utf8", None),
+        ("json", "notes", "note", "Utf8", None),
+        ("db", "flags", "enabled", "Boolean", None),
+        (
+            "analytics",
+            "amounts",
+            "amount",
+            "Decimal128(12, 2)",
+            Some("main"),
+        ),
+    ] {
+        let listing: Value = server
+            .request(Method::POST, "models/payments/browse")
+            .json(&json!({"yaml":yaml,"source":source,"schema":schema}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(listing["tables"], json!([table]));
+        let fields: Value = server
+            .request(Method::POST, "models/payments/browse")
+            .json(&json!({"yaml":yaml,"source":source,"table":table,"schema":schema}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(
+            fields["columns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field["name"] == column && field["data_type"] == kind),
+            "{fields}"
+        );
+    }
+    let validation = server.validate("payments", yaml).await?;
+    assert_eq!(validation["status"], "passed", "{validation}");
+    server
+        .request(Method::POST, "models/payments/publish")
+        .json(&json!({"revision":created["revision"],"active_revision":null}))
+        .send()
+        .await?
+        .error_for_status()?;
+    for restart in [false, true] {
+        if restart {
+            drop(server);
+            server = Server::start(root.path(), "", 0)?;
+            server.login().await?;
+        }
+        let result: Value = server.query(Uuid::new_v4(), "sql",
+            "SELECT a.name, n.note, f.enabled, d.amount FROM \"Account\" a JOIN \"Note\" n ON a.id=n.id JOIN \"Flag\" f ON f.id=a.id JOIN \"Amount\" d ON d.id=a.id"
+        ).await?.error_for_status()?.json().await?;
+        assert_eq!(
+            result["rows"],
+            json!([["Alice", "imported", "true", "12.25"]]),
+            "{result}"
+        );
+        let readiness: Value = server
+            .request(Method::GET, "models/payments/readiness")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(
+            readiness["sources"],
+            json!({"csv":true,"json":true,"db":true,"analytics":true})
+        );
+    }
+    fs::write(root.path().join("accounts.csv"), "name,id\nAlice,1\n")?;
+    assert_eq!(
+        server
+            .request(Method::GET, "models/payments/readiness")
+            .send()
+            .await?
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    Ok(())
+}

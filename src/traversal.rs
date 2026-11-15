@@ -159,6 +159,7 @@ impl Engine {
             *scope.csr_generation.lock().expect("CSR metrics") =
                 Some(generation.generation.clone());
             let prepared = Prepared {
+                aggregate: None,
                 versions: generation.versions.clone(),
                 reservations: Vec::new(),
                 postgres: Default::default(),

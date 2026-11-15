@@ -1,6 +1,8 @@
 use super::*;
 use futures::TryStreamExt;
 use graphlake::{Catalog, Engine, Language, QueryOptions};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 const BASE: &str = "models/payments/local-tables";
 
@@ -212,6 +214,8 @@ async fn local_tables_atomic_incremental_restart_and_failure() -> Result<()> {
     assert_eq!(failed["status"], "failed");
     assert!(failed["error"].as_str().unwrap().contains("重复主键"));
     assert_eq!(fs::read(path)?, committed);
+    assert_eq!(load(&server, "people", "full").await?["status"], "failed");
+    assert_eq!(fs::read(path)?, committed);
     drop(server);
     let mut server = Server::start(root.path(), "", 0)?;
     server.login().await?;
@@ -224,15 +228,33 @@ async fn local_tables_atomic_incremental_restart_and_failure() -> Result<()> {
     assert_eq!(retry["status"], "succeeded", "{retry}");
     assert_eq!(retry["loaded_rows"], 2);
     assert_eq!(retry["total_rows"], 4);
+    #[cfg(unix)]
+    let snapshot = fs::File::open(path)?;
     let repeated = load(&server, "people", "incremental").await?;
+    assert_eq!(repeated["status"], "succeeded", "{repeated}");
     assert_eq!(repeated["total_rows"], 4);
     assert_eq!(repeated["loaded_rows"], 1);
+    parquet_rows(&source, &[])?;
+    let no_rows = load(&server, "people", "incremental").await?;
+    assert_eq!(no_rows["status"], "succeeded", "{no_rows}");
+    assert_eq!(no_rows["total_rows"], 4);
+    assert_eq!(no_rows["loaded_rows"], 0);
+    #[cfg(unix)]
+    assert_eq!(fs::metadata(path)?.ino(), snapshot.metadata()?.ino());
+    // The same primary key and watermark do not make a changed payload a no-op.
+    parquet_rows(&source, &[(1, "same watermark", 40), (4, "new", 35)])?;
+    let boundary_update = load(&server, "people", "incremental").await?;
+    assert_eq!(boundary_update["status"], "succeeded", "{boundary_update}");
+    assert_eq!(
+        rows(root.path(), path).await?[0],
+        (1, "same watermark".into(), 40)
+    );
     let full = load(&server, "people", "full").await?;
     assert_eq!(full["total_rows"], 2);
     fs::remove_file(source)?;
     assert_eq!(
         rows(root.path(), path).await?,
-        vec![(1, "after restart".into(), 40), (4, "new".into(), 35)]
+        vec![(1, "same watermark".into(), 40), (4, "new".into(), 35)]
     );
     assert_eq!(load(&server, "people", "full").await?["status"], "failed");
     assert_eq!(rows(root.path(), path).await?.len(), 2);
@@ -423,19 +445,33 @@ async fn local_tables_postgres_upsert_and_cancel() -> Result<()> {
     assert_eq!(recovered["history"][0]["id"], interrupted["id"]);
     assert_eq!(recovered["history"][0]["status"], "interrupted");
     assert_eq!(load(&server, "pg", "incremental").await?["total_rows"], 3);
-    pg.batch_execute(&format!("CREATE TABLE {schema}.moments(id bigint PRIMARY KEY, name text NOT NULL, version timestamptz NOT NULL); INSERT INTO {schema}.moments VALUES (1,'first','2026-11-15 00:00:00+00')")).await?;
+    pg.batch_execute(&format!("CREATE TABLE {schema}.moments(id bigint PRIMARY KEY, name text, version timestamptz NOT NULL); INSERT INTO {schema}.moments VALUES (1,'first','2026-11-15 00:00:00+00')")).await?;
     create(&server, "moments", &format!("input.{schema}.moments")).await?;
     assert_eq!(
         load(&server, "moments", "incremental").await?["total_rows"],
         1
     );
-    pg.batch_execute(&format!("UPDATE {schema}.moments SET name='changed', version='2026-11-15 00:00:01+00'; INSERT INTO {schema}.moments VALUES (2,'boundary','2026-11-15 08:00:00+08')")).await?;
+    pg.batch_execute(&format!("UPDATE {schema}.moments SET name=NULL, version='2026-11-15 00:00:01+00'; INSERT INTO {schema}.moments VALUES (2,'boundary','2026-11-15 08:00:00+08')")).await?;
     let timestamps = load(&server, "moments", "incremental").await?;
     assert_eq!(timestamps["status"], "succeeded", "{timestamps}");
     assert_eq!(timestamps["total_rows"], 2);
     assert_eq!(timestamps["loaded_rows"], 2);
     let current = table(&server, "moments").await?;
     let timestamp_path = current["path"].as_str().unwrap();
+    #[cfg(unix)]
+    let original = fs::File::open(timestamp_path)?;
+    let timestamp_replay = load(&server, "moments", "incremental").await?;
+    assert_eq!(
+        timestamp_replay["status"], "succeeded",
+        "{timestamp_replay}"
+    );
+    assert_eq!(timestamp_replay["loaded_rows"], 1);
+    assert_eq!(timestamp_replay["total_rows"], 2);
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(timestamp_path)?.ino(),
+        original.metadata()?.ino()
+    );
     let before = fs::read(timestamp_path)?;
     pg.batch_execute(&format!(
         "ALTER TABLE {schema}.moments ALTER COLUMN name TYPE bigint USING id"

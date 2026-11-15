@@ -46,12 +46,13 @@ export default function AI({ locked, authEnabled, openServiceSettings }: {
     </header>
     <div className="mcp-guide">
       <section className="mcp-intro" aria-labelledby="ai-guide-title"><h2 id="ai-guide-title">把 GraphLake 连接到 Agent</h2><p>通过 MCP 查询数据、构建模型。AI 的权限与你的账号保持一致。</p></section>
-      {serviceOff && <div className="notice mcp-service-notice">
+      {serviceOff && access.account_allowed && <div className="notice mcp-service-notice">
         <p>{openServiceSettings ? '请在运行配置中启用 MCP 服务。' : 'MCP 服务尚未启用，请联系管理员开启。'}</p>
         {openServiceSettings && <button type="button" className="button compact" disabled={locked} onClick={openServiceSettings}>前往 MCP 配置</button>}
       </div>}
       {error && <p className="notice error" role="alert">{error} <button type="button" className="text-button" onClick={changed}>重试</button></p>}
-      {!access ? !error && <p role="status">正在读取当前用户的 AI 权限…</p> : <>
+      {!access ? !error && <p role="status">正在读取当前用户的 AI 权限…</p> : !access.account_allowed
+        ? <p className="notice">当前账号未获准接入 MCP，请联系管理员。</p> : <>
         <div className="mcp-setup">
           <AiToken locked={locked} authEnabled={authEnabled} canIssue={access.can_issue} token={tokenUpdate?.value ?? ''}
             issued={value => setTokenUpdate({ value })} />

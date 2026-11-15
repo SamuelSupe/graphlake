@@ -51,6 +51,10 @@ struct Account {
     token_sha256: Option<[u8; 32]>,
     disabled: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    console_disabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    mcp_disabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     reset_required: bool,
 }
 
@@ -170,11 +174,9 @@ impl Users {
 
     pub(super) fn verifier(&self, name: &str) -> Option<(String, Principal)> {
         let live = self.live.lock().unwrap();
-        let account = live
-            .directory
-            .accounts
-            .get(name)
-            .filter(|entry| !entry.disabled && entry.token_sha256.is_none())?;
+        let account = live.directory.accounts.get(name).filter(|entry| {
+            !entry.disabled && !entry.console_disabled && entry.token_sha256.is_none()
+        })?;
         Some((
             account.password_hash.clone(),
             Principal::User {
@@ -264,10 +266,19 @@ impl Users {
 
     pub(super) fn watch(&self, principal: &Principal) -> Option<watch::Receiver<()>> {
         let live = self.live.lock().unwrap();
-        account(&live, principal)?;
+        if account(&live, principal)?.console_disabled {
+            return None;
+        }
         live.watches
             .get(principal.audit_name())
             .map(watch::Sender::subscribe)
+    }
+
+    pub(super) fn mcp_allowed(&self, principal: &Principal) -> bool {
+        match principal {
+            Principal::Admin | Principal::Service(_) => true,
+            _ => account(&self.live.lock().unwrap(), principal).is_some_and(|a| !a.mcp_disabled),
+        }
     }
 }
 
@@ -337,7 +348,8 @@ fn check_directory(directory: &Directory) -> ApiResult<()> {
             || if user.token_sha256.is_some() {
                 !user.password_hash.is_empty()
             } else {
-                !auth::supported_hash(&user.password_hash)
+                !(user.console_disabled && user.password_hash.is_empty()
+                    || auth::supported_hash(&user.password_hash))
             }
         {
             return Err(Error::invalid(
@@ -391,6 +403,10 @@ pub(super) struct User {
     version: Uuid,
     disabled: bool,
     service: bool,
+    console_access: bool,
+    mcp_access: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_token: Option<String>,
     roles: Vec<String>,
 }
 
@@ -411,6 +427,9 @@ fn user_view(directory: &Directory, name: &str, entry: &Account) -> User {
         version: entry.version,
         disabled: entry.disabled,
         service: entry.token_sha256.is_some(),
+        console_access: entry.token_sha256.is_none() && !entry.console_disabled,
+        mcp_access: !entry.mcp_disabled,
+        mcp_token: None,
         roles: directory
             .groups
             .iter()
@@ -429,6 +448,10 @@ pub(super) struct Edit {
     service: bool,
     token: Option<String>,
     disabled: bool,
+    console_access: Option<bool>,
+    mcp_access: Option<bool>,
+    #[serde(default)]
+    issue_mcp_token: bool,
 }
 
 pub(super) async fn update(
@@ -474,6 +497,25 @@ pub(super) async fn update(
         if existing.is_some_and(|account| account.token_sha256.is_some() != edit.service) {
             return Err(Error::invalid("account_type", "已有成员的账号类型不可更改"));
         }
+        let console_access = edit.console_access.unwrap_or_else(|| {
+            !edit.service && existing.is_none_or(|account| !account.console_disabled)
+        });
+        let mcp_access = edit
+            .mcp_access
+            .unwrap_or_else(|| existing.is_none_or(|account| !account.mcp_disabled));
+        if edit.service && console_access {
+            return Err(Error::invalid(
+                "invalid_console_access",
+                "服务账号不能登录控制台",
+            ));
+        }
+        if edit.issue_mcp_token && (edit.service || console_access || !mcp_access || edit.disabled)
+        {
+            return Err(Error::invalid(
+                "invalid_mcp_token_issue",
+                "只能为启用的仅 MCP 账号签发令牌",
+            ));
+        }
         if let Some(account) = existing
             && account.reset_required
             && token_sha256.is_some()
@@ -484,7 +526,7 @@ pub(super) async fn update(
                 "恢复后的服务账号须使用新令牌",
             ));
         }
-        let has_new_credential = token_sha256.is_some() || hash.is_some();
+        let has_new_credential = token_sha256.is_some() || hash.is_some() || edit.issue_mcp_token;
         if !edit.disabled
             && !has_new_credential
             && existing.is_some_and(|account| account.reset_required)
@@ -504,7 +546,13 @@ pub(super) async fn update(
         } else {
             let password = hash
                 .or_else(|| existing.map(|entry| entry.password_hash.clone()))
-                .ok_or_else(|| Error::invalid("password_required", "新账号需要初始密码"))?;
+                .unwrap_or_default();
+            if console_access && password.is_empty() {
+                return Err(Error::invalid(
+                    "password_required",
+                    "允许登录控制台时需要设置密码",
+                ));
+            }
             (password, None)
         };
         let entry = Account {
@@ -513,11 +561,18 @@ pub(super) async fn update(
             password_hash,
             token_sha256,
             disabled: edit.disabled,
+            console_disabled: !edit.service && !console_access,
+            mcp_disabled: !mcp_access,
             reset_required,
         };
-        let response = user_view(&next, &name, &entry);
-        if has_new_credential || edit.disabled {
+        let mut response = user_view(&next, &name, &entry);
+        if has_new_credential || edit.disabled || !mcp_access {
             next.ai_tokens.remove(&name);
+        }
+        if edit.issue_mcp_token {
+            let (token, value) = delegation::generate(entry.id.to_string())?;
+            next.ai_tokens.insert(name.clone(), token);
+            response.mcp_token = Some(value);
         }
         next.accounts.insert(name.clone(), entry);
         commit(&app, next, revision, BTreeSet::from([name])).await?;

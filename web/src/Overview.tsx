@@ -234,6 +234,7 @@ export default function Overview({ active, openModel, openSettings }: Props) {
             </div>
             {backups ? <dl className="overview-rows">
               {backupJobs.map(([key, name]) => <BackupJob key={key} name={name} job={backups[key]} />)}
+              {backups.manual?.state === 'enabled' && <BackupJob name="手动控制状态备份" job={backups.manual.job} />}
             </dl> : snapshot?.backups.error ? <Unavailable error={snapshot.backups.error} /> : <p className="muted">正在读取备份…</p>}
           </section>
         </div>

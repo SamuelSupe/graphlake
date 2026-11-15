@@ -1,10 +1,14 @@
 pub(crate) mod delta;
+pub(crate) mod direct;
 pub(crate) mod iceberg;
 pub(crate) mod mysql;
 pub(crate) mod parquet;
 pub(crate) mod parquet_snapshot;
 pub(crate) mod postgres;
 pub(crate) mod snapshot;
+pub(crate) mod sqlite;
+pub(crate) mod storage;
+pub(crate) mod text;
 pub(crate) mod warehouse;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +35,8 @@ pub(crate) struct ReadStats {
     snapshot_spilled_bytes: AtomicU64,
     mysql_rows: AtomicU64,
     mysql_arrow_bytes: AtomicU64,
+    sqlite_rows: AtomicU64,
+    sqlite_arrow_bytes: AtomicU64,
     iceberg_rows: AtomicU64,
     iceberg_arrow_bytes: AtomicU64,
     frontier_requests: AtomicU64,
@@ -48,6 +54,8 @@ pub struct ReadMetrics {
     pub snapshot_spilled_bytes: u64,
     pub mysql_rows: u64,
     pub mysql_arrow_bytes: u64,
+    pub sqlite_rows: u64,
+    pub sqlite_arrow_bytes: u64,
     pub iceberg_rows: u64,
     pub iceberg_arrow_bytes: u64,
     pub frontier_requests: u64,
@@ -95,6 +103,13 @@ impl ReadStats {
             .fetch_add(batch.get_array_memory_size() as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn sqlite_batch(&self, batch: &RecordBatch) {
+        self.sqlite_rows
+            .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+        self.sqlite_arrow_bytes
+            .fetch_add(batch.get_array_memory_size() as u64, Ordering::Relaxed);
+    }
+
     pub(crate) fn frontier_request(&self) {
         self.frontier_requests.fetch_add(1, Ordering::Relaxed);
         self.request();
@@ -115,6 +130,8 @@ impl ReadStats {
             snapshot_spilled_bytes: self.snapshot_spilled_bytes.load(Ordering::Relaxed),
             mysql_rows: self.mysql_rows.load(Ordering::Relaxed),
             mysql_arrow_bytes: self.mysql_arrow_bytes.load(Ordering::Relaxed),
+            sqlite_rows: self.sqlite_rows.load(Ordering::Relaxed),
+            sqlite_arrow_bytes: self.sqlite_arrow_bytes.load(Ordering::Relaxed),
             iceberg_rows: self.iceberg_rows.load(Ordering::Relaxed),
             iceberg_arrow_bytes: self.iceberg_arrow_bytes.load(Ordering::Relaxed),
             frontier_requests: self.frontier_requests.load(Ordering::Relaxed),

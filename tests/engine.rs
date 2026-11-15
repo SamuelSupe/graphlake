@@ -1,3 +1,6 @@
+#[path = "engine/direct_sources.rs"]
+mod direct_sources;
+
 #[path = "engine/query_model.rs"]
 mod query_model;
 
@@ -272,6 +275,36 @@ async fn query_streams_hold_shared_capacity_until_completion_or_drop() -> Result
     };
     let mut second = engine.query(Language::Sql, sql, options).await?;
     assert_eq!(rows(&mut second).await?.len(), 4);
+    let mut abandoned = engine
+        .query(
+            Language::Sql,
+            sql,
+            QueryOptions {
+                timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut admitted = engine
+        .query(
+            Language::Sql,
+            sql,
+            QueryOptions {
+                timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(rows(&mut admitted).await?.len(), 4);
+    assert!(
+        abandoned
+            .batches
+            .try_next()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("deadline")
+    );
     Ok(())
 }
 
@@ -680,6 +713,34 @@ fn traversal_request(direction: Direction, kind: TraversalKind) -> Traversal {
 }
 
 #[tokio::test]
+async fn parquet_key_validation_reuses_only_the_pinned_file_set() -> Result<()> {
+    let (directory, engine) = local_fixture("key: [tenant, id]")?;
+    let query = r#"SELECT id FROM "Account" ORDER BY id LIMIT 1"#;
+    let mut cold = engine
+        .query(Language::Sql, query, Default::default())
+        .await?;
+    let expected = rows(&mut cold).await?;
+    let cold_bytes = cold.metrics().reads.object_bytes;
+    let mut warm = engine
+        .query(Language::Sql, query, Default::default())
+        .await?;
+    assert_eq!(rows(&mut warm).await?, expected);
+    assert!(warm.metrics().reads.object_bytes < cold_bytes);
+    let one = accounts()?.slice(0, 1);
+    let duplicated = graphlake::arrow::compute::concat_batches(&one.schema(), [&one, &one])?;
+    let replacement = directory.path().join("replacement.parquet");
+    std::fs::write(&replacement, parquet(&duplicated)?)?;
+    std::fs::rename(replacement, directory.path().join("accounts.parquet"))?;
+    let error = engine
+        .query(Language::Sql, query, Default::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("duplicate business key in Account"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn persisted_csr_keeps_old_readers_and_recovers_from_failed_refresh() -> Result<()> {
     let (dir, engine) = local_fixture("key: [tenant, id]")?;
     let cache = dir.path().join("csr");
@@ -768,12 +829,15 @@ async fn persisted_csr_keeps_old_readers_and_recovers_from_failed_refresh() -> R
     *damaged.last_mut().unwrap() ^= 1;
     std::fs::write(data, damaged)?;
     let error = restarted
-        .traverse(request.clone(), opts.clone())
+        .traverse_with_strategy(request.clone(), opts.clone(), TraversalStrategy::Cached)
         .await
         .err()
         .unwrap();
     assert!(format!("{error:#}").contains("checksum mismatch"));
     std::fs::rename(&updated, &source)?;
+    let mut fallback = restarted.traverse(request.clone(), opts.clone()).await?;
+    assert_eq!(rows(&mut fallback).await?.len(), 2);
+    assert!(fallback.metrics().csr_generation.is_none());
     restarted.refresh("Transfer", opts.clone()).await?;
     let mut recovered = restarted.traverse(request, opts).await?;
     assert_eq!(rows(&mut recovered).await?.len(), 2);

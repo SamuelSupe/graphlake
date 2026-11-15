@@ -23,6 +23,7 @@ pub(super) struct Request {
     source: String,
     schema: Option<String>,
     table: Option<String>,
+    object_prefix: Option<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -31,6 +32,7 @@ pub(super) struct Listing {
     tables: Vec<String>,
     columns: Vec<Column>,
     truncated: bool,
+    objects: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -56,20 +58,33 @@ pub(super) async fn browse(
         .sources
         .get(&request.source)
         .ok_or_else(Error::not_found)?;
+    let listing_objects =
+        request.object_prefix.is_some() && matches!(source, Source::ObjectStorage { .. });
     let result = tokio::time::timeout(app.options.timeout, read(&catalog, source, &request, &app))
         .await
         .map_err(|_| {
             Error::new(
                 axum::http::StatusCode::GATEWAY_TIMEOUT,
                 "timeout",
-                "读取表结构超时",
+                if listing_objects {
+                    "读取对象列表超时"
+                } else {
+                    "读取表结构超时"
+                },
             )
         })?
         .map_err(|_| {
-            Error::invalid(
-                "browse_failed",
-                "无法读取表结构，请检查数据源配置、权限和表名",
-            )
+            if listing_objects {
+                Error::invalid(
+                    "object_list_failed",
+                    "无法读取对象列表，请检查存储端点、桶或容器名称，以及列出对象的权限",
+                )
+            } else {
+                Error::invalid(
+                    "browse_failed",
+                    "无法读取表结构，请检查数据源配置、权限和表名",
+                )
+            }
         })?;
     Ok(Json(result))
 }
@@ -101,6 +116,119 @@ async fn read(
     let relation = relation.as_deref();
     let mut provider: Option<Arc<dyn TableProvider>> = None;
     match source {
+        Source::Duckdb { .. }
+        | Source::SqlserverNative { .. }
+        | Source::OracleNative { .. }
+        | Source::MongodbNative { .. } => {
+            let mut driver = Box::pin(crate::source::direct::Driver::open(
+                source,
+                timeout,
+                Arc::new(runtime),
+                stats,
+                1,
+            ))
+            .await?;
+            if let Some(name) = relation {
+                provider = Some(driver.table(name, &[], &[], size, true).await?.0);
+            } else if request.schema.is_some() {
+                listing.tables = driver.browse(request.schema.as_deref()).await?;
+            } else {
+                listing.schemas = driver.browse(None).await?;
+            }
+        }
+        Source::Databricks { .. } => {
+            let driver = crate::source::warehouse::databricks::Databricks::new(
+                source,
+                timeout,
+                Arc::clone(pool),
+                stats,
+            )?;
+            if let Some(name) = relation {
+                provider = Some(driver.table(name, &[], &[], size, disk, true).await?.0);
+            } else if request.schema.is_some() {
+                listing.tables = driver.browse(request.schema.as_deref()).await?;
+            } else {
+                listing.schemas = driver.browse(None).await?;
+            }
+        }
+        Source::ObjectStorage {
+            storage,
+            format,
+            tables,
+        } => {
+            if let Some(prefix) = &request.object_prefix {
+                use futures::TryStreamExt;
+                let store = crate::source::storage::open(storage)?;
+                let prefix = if prefix.is_empty() {
+                    None
+                } else {
+                    Some(crate::source::storage::object_path(prefix)?)
+                };
+                let mut stream = store.list(prefix.as_ref());
+                let budget = datafusion::execution::memory_pool::MemoryConsumer::new(
+                    "GraphLake object listing",
+                )
+                .register(pool);
+                while let Some(object) = stream.try_next().await? {
+                    let path = object.location.to_string();
+                    budget.try_grow(path.len() + 64)?;
+                    listing.objects.push(path);
+                    if listing.objects.len() > 2000 {
+                        listing.truncated = true;
+                        break;
+                    }
+                }
+                listing.objects.sort();
+                listing.objects.truncate(2000);
+                return Ok(listing);
+            }
+            if let Some(name) = relation {
+                let mapping = &tables[name];
+                provider = Some(if matches!(format, crate::ObjectFormat::Parquet) {
+                    Arc::new(
+                        ParquetTable::open_storage(
+                            &mapping.files,
+                            &[],
+                            Some(storage),
+                            Arc::clone(pool),
+                            stats,
+                            false,
+                        )
+                        .await?
+                        .0,
+                    )
+                } else {
+                    crate::source::text::open(
+                        mapping,
+                        matches!(format, crate::ObjectFormat::Csv),
+                        &[],
+                        size,
+                        Arc::clone(pool),
+                        disk,
+                        stats,
+                        true,
+                        Some(storage),
+                    )
+                    .await?
+                    .0
+                });
+            } else {
+                listing.tables = tables.keys().cloned().collect();
+            }
+        }
+        Source::Sqlite { path } => {
+            let snapshot = crate::source::sqlite::Snapshot::open(path, timeout, stats).await?;
+            if let Some(name) = relation {
+                provider = Some(
+                    snapshot
+                        .table(name, &[], &[], &Arc::new(runtime), size, true)
+                        .await?
+                        .0,
+                );
+            } else {
+                listing.tables = snapshot.browse().await?;
+            }
+        }
         Source::Postgres { dsn_env } => {
             let snapshot = Snapshot::open(dsn_env, app.options.timeout, stats).await?;
             if let Some(schema) = &request.schema {
@@ -130,6 +258,27 @@ async fn read(
                 let (table, _) =
                     ParquetTable::open(files, &[], Arc::clone(pool), stats, false).await?;
                 provider = Some(Arc::new(table));
+            } else {
+                listing.tables = tables.keys().take(2001).cloned().collect();
+            }
+        }
+        Source::Csv { tables } | Source::Jsonl { tables } => {
+            if let Some(name) = relation {
+                provider = Some(
+                    crate::source::text::open(
+                        &tables[name],
+                        matches!(source, Source::Csv { .. }),
+                        &[],
+                        size,
+                        Arc::clone(pool),
+                        disk,
+                        stats,
+                        true,
+                        None,
+                    )
+                    .await?
+                    .0,
+                );
             } else {
                 listing.tables = tables.keys().take(2001).cloned().collect();
             }
@@ -166,6 +315,7 @@ async fn read(
                     name,
                     name,
                     &[],
+                    &[],
                     snapshots.get(name).copied(),
                     stats,
                 )
@@ -192,19 +342,14 @@ async fn read(
                 );
             }
         }
-        Source::Mysql {
-            dsn_env,
-            tls,
-            ca_file,
-        } => {
-            let mut session = crate::source::mysql::Snapshot::open(
-                dsn_env,
-                *tls,
-                ca_file.as_deref(),
-                timeout,
-                stats,
-            )
-            .await?;
+        Source::Mysql { .. }
+        | Source::Doris(_)
+        | Source::Starrocks(_)
+        | Source::Tidb(_)
+        | Source::Oceanbase(_)
+        | Source::Mariadb(_) => {
+            let mut session =
+                crate::source::mysql::Snapshot::open_source(source, timeout, stats).await?;
             if let Some(name) = relation {
                 listing
                     .columns
@@ -225,7 +370,9 @@ async fn read(
         Source::Trino { .. }
         | Source::Mongodb(_)
         | Source::Elasticsearch(_)
-        | Source::Redshift(_) => {
+        | Source::Redshift(_)
+        | Source::Sqlserver(_)
+        | Source::Oracle(_) => {
             let session = crate::source::warehouse::trino::Trino::new(
                 source,
                 timeout,
@@ -313,7 +460,7 @@ async fn read(
                 )
                 .await?;
                 if let Some(name) = relation {
-                    provider = Some(session.table(name, &[], size, disk, true).await?.0);
+                    provider = Some(session.table(name, &[], &[], size, disk, true).await?.0);
                 } else {
                     listing.tables = session.browse(namespace).await?;
                 }

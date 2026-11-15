@@ -599,6 +599,210 @@ async fn login_member(server: &Server, name: &str) -> Result<String> {
 }
 
 #[tokio::test]
+async fn account_access_separates_console_sessions_and_mcp_credentials() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    payments_file(&root.path().join("payments.parquet"), false, &[8, 9, 10])?;
+    fs::write(
+        root.path().join("payments.yaml"),
+        "graph: Payments\nsources:\n  src:\n    type: parquet\n    tables: { rows: [./payments.parquet] }\nnodes:\n  Payment: { source: src.rows, key: [tenant_id, payment_id], properties: [channel] }\n",
+    )?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    configure(
+        &server,
+        json!({"enabled":true,"query":true,"modeling":true}),
+    )
+    .await?;
+    let update = |name: &str, changes: Value| {
+        server
+            .request(Method::PUT, &format!("users/{name}"))
+            .json(&changes)
+    };
+    let member_login = |name: &str| {
+        server
+            .guest(Method::POST, "auth/login")
+            .json(&json!({"username":name,"password":PASSWORD}))
+    };
+
+    let legacy: Value = update("alice", json!({"password":PASSWORD,"disabled":false}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(legacy["console_access"], true);
+    assert_eq!(legacy["mcp_access"], true);
+    let headless: Value = update(
+        "automation",
+        json!({"disabled":false,"console_access":false,"issue_mcp_token":true}),
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    let automation_token = headless["mcp_token"]
+        .as_str()
+        .context("missing one-time MCP token")?;
+    update(
+        "pipeline",
+        json!({"service":true,"token":TOKEN,"disabled":false,"mcp_access":false}),
+    )
+    .send()
+    .await?
+    .error_for_status()?;
+    server
+        .request(Method::PUT, "roles/readers")
+        .json(&json!({"members":["alice","automation","pipeline"],"grants":{"payments":["query"]}}))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let alice_cookie = login_member(&server, "alice").await?;
+    let issue = |cookie: &str| {
+        server
+            .guest(Method::POST, "mcp/token")
+            .header("Cookie", cookie)
+            .json(&json!({"revision":null}))
+    };
+    let issued: Value = issue(&alice_cookie)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let alice_token = issued["token"].as_str().context("missing personal token")?;
+    rpc_at(&server, "/mcp/query", alice_token, "ping", json!({}))
+        .send()
+        .await?
+        .error_for_status()?;
+    rpc_at(&server, "/mcp/query", automation_token, "ping", json!({}))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        member_login("automation").send().await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        server
+            .guest(Method::GET, "models")
+            .bearer_auth(automation_token)
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        rpc(&server, TOKEN, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let basic = server
+        .http
+        .post(format!("{}/mcp", server.base))
+        .basic_auth("svc/pipeline", Some(TOKEN))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"ping"}));
+    assert_eq!(basic.send().await?.status(), StatusCode::UNAUTHORIZED);
+    server
+        .guest(Method::GET, "models")
+        .basic_auth("svc/pipeline", Some(TOKEN))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let users: Vec<Value> = server
+        .request(Method::GET, "users")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(users.iter().all(|user| user.get("mcp_token").is_none()));
+    let alice = users
+        .iter()
+        .find(|user| user["username"] == "alice")
+        .unwrap();
+    let console_only: Value = update(
+        "alice",
+        json!({"version":alice["version"],"disabled":false,"mcp_access":false}),
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    for path in ["/mcp", "/mcp/query", "/mcp/modeling"] {
+        assert_eq!(
+            rpc_at(&server, path, alice_token, "ping", json!({}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let cookie = login_member(&server, "alice").await?;
+    assert_eq!(issue(&cookie).send().await?.status(), StatusCode::FORBIDDEN);
+    let scope: Value = server
+        .guest(Method::GET, "mcp/access")
+        .header("Cookie", &cookie)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(scope["account_allowed"], false);
+    assert_eq!(scope["scope"]["models"], json!([]));
+
+    let mcp_only: Value = update("alice", json!({"version":console_only["version"],"disabled":false,"console_access":false,"mcp_access":true,"issue_mcp_token":true}))
+        .send().await?.error_for_status()?.json().await?;
+    assert_eq!(
+        member_login("alice").send().await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        server
+            .guest(Method::GET, "models")
+            .header("Cookie", cookie)
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let new_token = mcp_only["mcp_token"]
+        .as_str()
+        .context("missing replacement MCP token")?;
+    drop(server);
+    let server = Server::start(root.path(), "", 0)?;
+    assert_eq!(
+        rpc(&server, alice_token, "ping", json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    rpc_at(&server, "/mcp/query", new_token, "ping", json!({}))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        server
+            .guest(Method::POST, "auth/login")
+            .json(&json!({"username":"alice","password":PASSWORD}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn personal_ai_tokens_inherit_live_user_permissions_and_are_mcp_only() -> Result<()> {
     let root = tempfile::tempdir()?;
     setup_assets(root.path())?;

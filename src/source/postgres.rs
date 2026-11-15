@@ -32,7 +32,11 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 use tokio::{runtime::Handle, task::JoinHandle};
-use tokio_postgres::{Client, Column, Config, Row, config::SslMode, types::Type};
+use tokio_postgres::{
+    Client, Column, Config, Row,
+    config::SslMode,
+    types::{FromSql, Type},
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use super::{ReadStats, decimal128};
@@ -445,6 +449,7 @@ impl Snapshot {
                 .map(|col| col.type_().clone())
                 .collect(),
             scan_filter: None,
+            top: None,
         })
     }
 }
@@ -478,6 +483,7 @@ pub(crate) struct PgTable {
     schema: SchemaRef,
     types: Vec<Type>,
     scan_filter: Option<String>,
+    top: Option<(String, usize)>,
 }
 
 impl std::fmt::Debug for PgTable {
@@ -489,6 +495,79 @@ impl std::fmt::Debug for PgTable {
 }
 
 impl PgTable {
+    pub(crate) async fn pushdown(
+        &mut self,
+        keys: &[String],
+        operation: &crate::engine::sql_read::Pushdown,
+    ) -> Result<Option<RecordBatch>> {
+        use crate::engine::sql_read::{Aggregate, Native};
+        let integer = |name: &str| {
+            self.schema
+                .field_with_name(name)
+                .is_ok_and(|field| field.data_type().is_integer())
+        };
+        if !keys.iter().all(|key| integer(key)) || !self.guarantees_unique_key(keys).await? {
+            return Ok(None);
+        }
+        let Some(mut terms) =
+            crate::engine::read_filters::exact_terms(&operation.filters, &self.schema, ident)
+        else {
+            return Ok(None);
+        };
+        terms.extend(keys.iter().map(|key| format!("{} IS NOT NULL", ident(key))));
+        let condition = terms.join(" AND ");
+        match &operation.operation {
+            Native::Top { order, limit } => {
+                let Ok(limit) = usize::try_from(*limit) else {
+                    return Ok(None);
+                };
+                let order = order
+                    .iter()
+                    .map(|(key, asc)| {
+                        format!("{} {}", ident(key), if *asc { "ASC" } else { "DESC" })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                *self = self.restricted(condition);
+                self.top = Some((order, limit));
+                Ok(None)
+            }
+            Native::Aggregate { function, column } => {
+                let (function, data_type) = match function {
+                    Aggregate::Count => ("COUNT", DataType::Int64),
+                    Aggregate::Min | Aggregate::Max if column.as_deref().is_some_and(integer) => (
+                        if matches!(function, Aggregate::Min) {
+                            "MIN"
+                        } else {
+                            "MAX"
+                        },
+                        self.schema
+                            .field_with_name(column.as_deref().unwrap())?
+                            .data_type()
+                            .clone(),
+                    ),
+                    _ => return Ok(None),
+                };
+                let input = column.as_deref().map(ident).unwrap_or_else(|| "*".into());
+                self.snapshot.stats.request();
+                let row = self
+                    .snapshot
+                    .client
+                    .query_one(
+                        &format!(
+                            "SELECT {function}({input}) FROM {} WHERE {condition}",
+                            self.relation
+                        ),
+                        &[],
+                    )
+                    .await?;
+                let schema = Arc::new(Schema::new(vec![Field::new("aggregate", data_type, true)]));
+                let batch = to_batch(schema, &[row])?;
+                self.snapshot.stats.batch(&batch);
+                Ok(Some(batch))
+            }
+        }
+    }
     #[cfg(feature = "admin")]
     pub(crate) async fn probe(&self) -> Result<()> {
         let columns = self
@@ -619,11 +698,16 @@ impl TableProvider for PgTable {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => Arc::clone(&self.schema),
         };
+        let limit = match (&self.top, limit) {
+            (Some((_, top)), limit) => Some(limit.map_or(*top, |limit| limit.min(*top))),
+            (None, limit) => limit,
+        };
         let partition = Arc::new(PgPartition {
             snapshot: Arc::clone(&self.snapshot),
             relation: self.relation.clone(),
             schema: Arc::clone(&schema),
             limit,
+            order: self.top.as_ref().map(|(order, _)| order.clone()),
             filter: filters
                 .iter()
                 .map(|expr| {
@@ -652,6 +736,7 @@ struct PgPartition {
     relation: String,
     schema: SchemaRef,
     limit: Option<usize>,
+    order: Option<String>,
     filter: String,
 }
 
@@ -665,6 +750,11 @@ impl PartitionStream for PgPartition {
         let schema = Arc::clone(&self.schema);
         let relation = self.relation.clone();
         let limit = self.limit;
+        let order = self
+            .order
+            .as_ref()
+            .map(|order| format!(" ORDER BY {order}"))
+            .unwrap_or_default();
         let filter = if self.filter.is_empty() {
             String::new()
         } else {
@@ -686,7 +776,7 @@ impl PartitionStream for PgPartition {
             let limit_sql = limit.map(|value| format!(" LIMIT {value}")).unwrap_or_default();
             snapshot.stats.request();
             snapshot.client.batch_execute(&format!(
-                "DECLARE {cursor} NO SCROLL CURSOR FOR SELECT {columns} FROM {relation}{filter}{limit_sql}"
+                "DECLARE {cursor} NO SCROLL CURSOR FOR SELECT {columns} FROM {relation}{filter}{order}{limit_sql}"
             )).await.map_err(external)?;
             // A Bolt transaction can keep the PostgreSQL snapshot alive after
             // DISCARD, LIMIT or a dropped result stream.
@@ -858,7 +948,7 @@ fn field(col: &Column) -> Result<Field> {
             let typmod = col.type_modifier();
             ensure!(
                 typmod >= 4,
-                "PostgreSQL NUMERIC column {} requires declared precision and scale",
+                "PostgreSQL NUMERIC column {} requires declared precision and scale; for unrestricted values expose the column as text in a PostgreSQL view",
                 col.name()
             );
             let precision = (typmod - 4) >> 16;
@@ -873,6 +963,42 @@ fn field(col: &Column) -> Result<Field> {
         ref ty => bail!("unsupported PostgreSQL type {ty} for column {}", col.name()),
     };
     Ok(Field::new(col.name(), ty, true))
+}
+
+struct Temporal<T>(T);
+
+impl<'a, T: FromSql<'a>> FromSql<'a> for Temporal<T> {
+    fn accepts(ty: &Type) -> bool {
+        T::accepts(ty)
+    }
+
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // PostgreSQL uses reserved signed integer bounds for temporal infinities.
+        let special = if *ty == Type::DATE {
+            raw.try_into()
+                .ok()
+                .and_then(|bytes| match i32::from_be_bytes(bytes) {
+                    i32::MAX => Some("infinity"),
+                    i32::MIN => Some("-infinity"),
+                    _ => None,
+                })
+        } else {
+            raw.try_into()
+                .ok()
+                .and_then(|bytes| match i64::from_be_bytes(bytes) {
+                    i64::MAX => Some("infinity"),
+                    i64::MIN => Some("-infinity"),
+                    _ => None,
+                })
+        };
+        if let Some(value) = special {
+            return Err(anyhow!("PostgreSQL {ty} {value} has no Arrow temporal representation; expose the column as text in a PostgreSQL view").into());
+        }
+        T::from_sql(ty, raw).map(Self)
+    }
 }
 
 fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
@@ -914,8 +1040,9 @@ fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
                     Arc::new(Date32Array::from(
                         rows.iter()
                             .map(|row| {
-                                row.try_get::<_, Option<NaiveDate>>(i)
-                                    .map(|v| v.map(|v| (v - epoch).num_days() as i32))
+                                row.try_get::<_, Option<Temporal<NaiveDate>>>(i)
+                                    .map(|v| v.map(|v| (v.0 - epoch).num_days() as i32))
+                                    .with_context(|| format!("decoding PostgreSQL column {}", f.name()))
                             })
                             .collect::<Result<Vec<_>, _>>()?,
                     ))
@@ -925,12 +1052,12 @@ fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
                         .iter()
                         .map(|row| match timezone {
                             Some(_) => row
-                                .try_get::<_, Option<DateTime<Utc>>>(i)
-                                .map(|v| v.map(|v| v.timestamp_micros())),
+                                .try_get::<_, Option<Temporal<DateTime<Utc>>>>(i)
+                                .map(|v| v.map(|v| v.0.timestamp_micros())),
                             None => row
-                                .try_get::<_, Option<NaiveDateTime>>(i)
-                                .map(|v| v.map(|v| v.and_utc().timestamp_micros())),
-                        })
+                                .try_get::<_, Option<Temporal<NaiveDateTime>>>(i)
+                                .map(|v| v.map(|v| v.0.and_utc().timestamp_micros())),
+                        }.with_context(|| format!("decoding PostgreSQL column {}", f.name())))
                         .collect::<Result<Vec<_>, _>>()?;
                     Arc::new(
                         TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone()),
@@ -941,7 +1068,13 @@ fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
                         .iter()
                         .map(|row| {
                             row.try_get::<_, Option<&str>>(i)?
-                                .map(|v| decimal128(v, *scale))
+                                .map(|v| {
+                                    ensure!(v != "NaN",
+                                        "PostgreSQL NUMERIC column {} contains NaN, which Decimal128 cannot represent; expose the column as text in a PostgreSQL view",
+                                        f.name()
+                                    );
+                                    decimal128(v, *scale)
+                                })
                                 .transpose()
                         })
                         .collect::<Result<Vec<_>>>()?;

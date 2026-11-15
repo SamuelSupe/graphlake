@@ -7,11 +7,12 @@ export function mappingControl(active: ReadonlySet<string>, model: string, ...pa
   return { 'data-mapping-control': key, 'aria-invalid': invalid || undefined, 'aria-describedby': invalid ? model + '-model-validation-error' : undefined };
 }
 
-export function MappingColumn({ label, value, columns, change, placeholder = '选择来源列', location }: {
+export function MappingColumn({ label, value, columns, change, placeholder = '选择来源列', location, form }: {
   label: string; value: string; columns?: Column[]; change: (value: string) => void; placeholder?: string;
   location?: ReturnType<typeof mappingControl>;
+  form?: string;
 }) {
-  if (!columns) return <input className="mono" aria-label={label} value={value} placeholder={placeholder} {...location}
+  if (!columns) return <input form={form} required={!!form} className="mono" aria-label={label} value={value} placeholder={placeholder} {...location}
     onChange={event => change(event.target.value)} />;
   return <select className="mono" aria-label={label} value={value} {...location} onChange={event => change(event.target.value)}>
     <option value="">{placeholder}</option>

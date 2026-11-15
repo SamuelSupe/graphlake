@@ -34,19 +34,16 @@ pub(in crate::admin) async fn upgrade(
     if headers.contains_key(header::ORIGIN) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if access.sockets.available_permits() == 0 {
+    let Ok(pending) = Arc::clone(&access.pending_sockets).try_acquire_owned() else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
+    };
     socket
         .max_message_size(256 * 1024)
         .max_frame_size(256 * 1024)
         .on_upgrade(move |socket| async move {
-            let access = app.wire.as_ref().expect("Gremlin configured");
-            if let Ok(_slot) = access.sockets.try_acquire() {
-                tokio::select! {
-                    _ = app.shutdown.cancelled() => {},
-                    _ = serve(&app, socket) => {},
-                }
+            tokio::select! {
+                _ = app.shutdown.cancelled() => {},
+                _ = serve(&app, socket, pending) => {},
             }
         })
 }
@@ -99,11 +96,14 @@ async fn receive(socket: &mut Input, wait: Duration) -> Option<Request> {
     .flatten()
 }
 
-async fn serve(app: &Arc<App>, socket: WebSocket) {
+async fn serve(app: &Arc<App>, socket: WebSocket, pending: tokio::sync::OwnedSemaphorePermit) {
     use futures::StreamExt;
     let (mut output, mut input) = socket.split();
     let mut credential: Option<super::super::access::Credential> = None;
     let mut queued = std::collections::VecDeque::new();
+    let mut pending = Some(pending);
+    let mut _authenticated_slot = None;
+    let auth_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let request = if let Some(request) = queued.pop_front() {
             request
@@ -134,25 +134,28 @@ async fn serve(app: &Arc<App>, socket: WebSocket) {
             {
                 return;
             }
-            credential = receive(&mut input, Duration::from_secs(5))
-                .await
-                .and_then(|auth| {
-                    if auth.op != "authentication" || auth.binary != request.binary {
-                        return None;
+            credential = receive(
+                &mut input,
+                auth_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .and_then(|auth| {
+                if auth.op != "authentication" || auth.binary != request.binary {
+                    return None;
+                }
+                let sasl = auth.args.get("sasl")?.as_str()?;
+                if sasl.len() > 512 {
+                    return None;
+                }
+                let plain = String::from_utf8(STANDARD.decode(sasl).ok()?).ok()?;
+                let mut parts = plain.split('\0');
+                match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                    (Some(""), Some(user), Some(token), None) => {
+                        super::super::access::authenticate(&app, user, token, false)
                     }
-                    let sasl = auth.args.get("sasl")?.as_str()?;
-                    if sasl.len() > 512 {
-                        return None;
-                    }
-                    let plain = String::from_utf8(STANDARD.decode(sasl).ok()?).ok()?;
-                    let mut parts = plain.split('\0');
-                    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                        (Some(""), Some(user), Some(token), None) => {
-                            super::super::access::authenticate(&app, user, token, false)
-                        }
-                        _ => None,
-                    }
-                });
+                    _ => None,
+                }
+            });
             app.access.record(
                 credential.as_ref().map(|credential| &credential.principal),
                 "gremlin",
@@ -174,6 +177,14 @@ async fn serve(app: &Arc<App>, socket: WebSocket) {
                 .await;
                 return;
             }
+        }
+        if pending.take().is_some() {
+            let access = app.wire.as_ref().expect("Gremlin configured");
+            let Ok(slot) = access.sockets.try_acquire() else {
+                send_error(&mut output, &request, Error::busy()).await;
+                return;
+            };
+            _authenticated_slot = Some(slot);
         }
         if let Some(ha) = &app.ha
             && ha.leader.confirm().await.is_err()

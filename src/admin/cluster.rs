@@ -259,11 +259,9 @@ impl Coordinator {
         };
         options.timeout = query::remaining(options.timeout, started)?;
         let active = query::admit(app, id, &model, &owner, &mut options).await?;
-        let yaml = {
-            let mut models = app.models.lock().unwrap();
-            models.query_engine(&model, &request.model_revision, &owner)?;
-            models.archived(&model, &request.model_revision)?
-        };
+        let (_, yaml, _) = app
+            .query_model(&model, &request.model_revision, &owner)
+            .await?;
         let deadline = started
             + request
                 .timeout_ms
@@ -389,14 +387,18 @@ impl Coordinator {
         let Some(worker) = saved.job.worker else {
             return Ok(false);
         };
+        let heartbeat_age = now_ms().saturating_sub(saved.job.worker_seen_ms);
         if !matches!(saved.job.state, JobState::Running)
-            || now_ms().saturating_sub(saved.job.worker_seen_ms) <= WORKER_HEARTBEAT_TIMEOUT_MS
+            || heartbeat_age <= WORKER_HEARTBEAT_TIMEOUT_MS
         {
             return Ok(false);
         }
         // A long query can delay lease writes while the worker process still owns
-        // the attempt. Check the same process identity before declaring it lost.
-        if self.worker_identity_is_live(worker).await {
+        // the attempt. A live process gets one grace window, but it cannot
+        // extend the lifetime of a query indefinitely without heartbeats.
+        if heartbeat_age <= 2 * WORKER_HEARTBEAT_TIMEOUT_MS
+            && self.worker_identity_is_live(worker).await
+        {
             return Ok(false);
         }
         let mut job = saved.job.clone();

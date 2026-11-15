@@ -1,10 +1,11 @@
 mod bigquery;
 pub(crate) mod clickhouse;
+pub(crate) mod databricks;
 pub(crate) mod hana;
 mod snowflake;
 pub(crate) mod spanner;
 pub(crate) mod trino;
-mod types;
+pub(crate) mod types;
 
 use std::{sync::Arc, time::Duration};
 
@@ -30,7 +31,11 @@ use serde::de::DeserializeOwned;
 use url::Url;
 
 use super::{ReadStats, snapshot::Buffer};
-use crate::{Source, catalog::warehouse_endpoint};
+use crate::{
+    Predicate, Source,
+    catalog::warehouse_endpoint,
+    engine::read_filters::{needs_sql_types, where_clause},
+};
 
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -187,6 +192,7 @@ impl Snapshot {
         &self,
         relation: &str,
         columns: &[String],
+        filters: &[Predicate],
         batch_size: usize,
         disk: &Arc<DiskManager>,
         explain_only: bool,
@@ -195,21 +201,40 @@ impl Snapshot {
             Driver::Snowflake(_) => snowflake::select(relation, columns, &self.version),
             Driver::BigQuery(_) => bigquery::select(relation, columns, &self.version)?,
         };
-        if explain_only {
-            sql.push_str(" WHERE FALSE");
+        let mut expected = None;
+        if explain_only || needs_sql_types(filters) {
+            let (schema, buffer) = self
+                .read(
+                    &format!("{sql} WHERE FALSE"),
+                    columns,
+                    batch_size,
+                    false,
+                    None,
+                )
+                .await?;
+            ensure!(
+                buffer.memory().is_empty(),
+                "warehouse schema query returned rows"
+            );
+            if explain_only {
+                return buffer.finish_schema(schema);
+            }
+            let clause = match &self.driver {
+                Driver::Snowflake(_) => where_clause(filters, &schema, crate::catalog::ident),
+                Driver::BigQuery(_) => {
+                    where_clause(filters, &schema, |column| format!("`{column}`"))
+                }
+            };
+            sql.push_str(&clause);
+            expected = Some(schema);
         }
         let (schema, buffer) = self
-            .read(
-                &sql,
-                columns,
-                batch_size,
-                true,
-                (!explain_only).then_some(disk),
-            )
+            .read(&sql, columns, batch_size, true, Some(disk))
             .await?;
-        if explain_only {
-            return buffer.finish_schema(schema);
-        }
+        ensure!(
+            expected.is_none_or(|expected| expected.fields() == schema.fields()),
+            "warehouse result schema changed after describing the table"
+        );
         let stats = match &self.driver {
             Driver::Snowflake(source) => &source.http.stats,
             Driver::BigQuery(source) => &source.http.stats,

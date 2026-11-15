@@ -260,7 +260,7 @@ pub(in crate::admin) async fn current(
 ) -> ApiResult<Json<serde_json::Value>> {
     let cluster = app.cluster.as_ref().ok_or_else(Error::not_found)?;
     crate::admin::access::check_query(&app, &principal, &model)?;
-    let revision = app.models.lock().unwrap().require_published(&model)?;
+    let revision = app.published_model_revision(&model).await?;
     let (generation, _) = cluster
         .shared
         .metadata
@@ -286,11 +286,9 @@ pub(in crate::admin) async fn refresh(
         .filter(|c| c.graph_partitions > 0)
         .ok_or_else(Error::not_found)?;
     let _slot = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let engine =
-        app.models
-            .lock()
-            .unwrap()
-            .query_engine(&model, &request.model_revision, &principal)?;
+    let (_, _, engine) = app
+        .query_model(&model, &request.model_revision, &principal)
+        .await?;
     let (_, prior) = cluster
         .shared
         .metadata
@@ -392,6 +390,13 @@ impl Manifest {
                     "pinned object" => "pinned object",
                     "PostgreSQL repeatable read" => "PostgreSQL repeatable read",
                     "MySQL InnoDB repeatable read" => "MySQL InnoDB repeatable read",
+                    "SQLite read transaction" => "SQLite read transaction",
+                    "DuckDB read transaction" => "DuckDB read transaction",
+                    "Oracle read-only transaction" => "Oracle read-only transaction",
+                    "SQL Server statement" => "SQL Server statement",
+                    "MongoDB cursor" => "MongoDB cursor",
+                    "Databricks statement" => "Databricks statement",
+                    "MySQL-compatible statement" => "MySQL-compatible statement",
                     "Iceberg snapshot" => "Iceberg snapshot",
                     "Delta version" => "Delta version",
                     "Spanner read-only transaction" => "Spanner read-only transaction",
@@ -542,4 +547,4 @@ fn compact_view(array: datafusion::arrow::array::ArrayRef) -> datafusion::arrow:
 
 pub(crate) use execute::CypherCsr;
 pub(in crate::admin) use execute::Stats;
-pub(super) use execute::{query_csr, run_task};
+pub(super) use execute::{ArcBlocks, query_csr, run_task};

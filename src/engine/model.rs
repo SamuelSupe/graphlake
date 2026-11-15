@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -39,9 +39,13 @@ struct Label<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct TopologyFields<'a>(pub Option<&'a str>);
 
+pub(super) type KeyChecks = Mutex<BTreeMap<String, Vec<(String, String)>>>;
+
 pub(super) struct Tables<'a> {
     pub raw: &'a BTreeMap<&'a str, Raw>,
     pub postgres: &'a BTreeMap<String, Arc<PgTable>>,
+    pub proven_key_label: Option<&'a str>,
+    pub parquet_keys: &'a KeyChecks,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -51,6 +55,7 @@ pub(super) struct ReadKind<'a> {
     pub explain_only: bool,
     pub lazy_validation: bool,
     pub check_data: bool,
+    pub sql: Option<&'a super::sql_read::Read>,
     #[cfg(feature = "admin")]
     pub probe_source: Option<&'a str>,
     #[cfg(feature = "admin")]
@@ -77,6 +82,7 @@ fn label<'a>(
     name: &str,
     options: &GraphOptions,
     topology: Option<TopologyFields<'_>>,
+    sql: Option<&super::sql_read::Read>,
 ) -> Label<'a> {
     let mapping = catalog.mapping(name);
     let (mut fields, keys) = if let Some(node) = catalog.nodes.get(name) {
@@ -98,6 +104,21 @@ fn label<'a>(
                     edge.from.columns.contains(field)
                         || edge.to.columns.contains(field)
                         || weight == Some(field.as_str())
+                })
+        });
+    }
+    if let Some(used) = sql.and_then(|sql| sql.columns.as_ref())
+        && !keys.is_empty()
+        && mapping.inputs.is_empty()
+        && mapping.scd2.is_none()
+    {
+        fields.retain(|field| {
+            used.contains(field)
+                || keys.contains(field)
+                || (!mapping.unpartitioned
+                    && options.logical_partition.iter().any(|p| p.column == *field))
+                || catalog.edges.get(name).is_some_and(|edge| {
+                    edge.from.columns.contains(field) || edge.to.columns.contains(field)
                 })
         });
     }
@@ -125,6 +146,7 @@ pub(super) fn required<'a>(
     labels: &mut BTreeSet<String>,
     options: &GraphOptions,
     topology: Option<TopologyFields<'_>>,
+    sql: Option<&super::sql_read::Read>,
 ) -> Result<BTreeMap<&'a str, BTreeSet<String>>> {
     for name in labels.clone() {
         if let Some(edge) = catalog.edges.get(&name) {
@@ -139,7 +161,7 @@ pub(super) fn required<'a>(
     }
     let mut required = BTreeMap::<&str, BTreeSet<String>>::new();
     for name in labels.iter() {
-        let label = label(catalog, name, options, topology);
+        let label = label(catalog, name, options, topology, sql);
         let fields = label.read_fields();
         if !label.mapping.unpartitioned {
             for predicate in &options.logical_partition {
@@ -186,7 +208,7 @@ pub(super) async fn register(
     let mut reservations = Vec::new();
     let mut modeled = BTreeMap::<&str, Raw>::new();
     for (index, name) in labels.iter().enumerate() {
-        let label = label(catalog, name, &scope.options.graph, read.topology);
+        let label = label(catalog, name, &scope.options.graph, read.topology, read.sql);
         let alias = format!("model_{index}");
         let (frame, budget) = bind_label(private, &tables, scope, name, &label, read)
             .await
@@ -197,6 +219,7 @@ pub(super) async fn register(
         let mut table = Raw {
             schema: Arc::clone(frame.schema().inner()),
             alias,
+            parquet_versions: None,
         };
         #[cfg(feature = "admin")]
         let neighbor_read = read.exploration.is_some();
@@ -270,7 +293,8 @@ pub(super) async fn register(
                 }
             }
             if read.validate_endpoints {
-                let fields = columns([&edge.identity(), &edge.source_columns()]);
+                let mut fields = columns([&edge.identity(), &edge.source_columns()]);
+                fields.retain(|field| table.schema.field_with_name(field).is_ok());
                 frame = private
                     .sql(&format!(
                         "SELECT {} FROM {} AS src{joins}",
@@ -466,9 +490,23 @@ async fn bind_label(
         && mapping.inputs.is_empty()
         && mapping.scd2.is_none()
     {
-        let unique = match tables.postgres.get(mapping.source) {
-            Some(table) => table.guarantees_unique_key(label.keys).await?,
-            None => false,
+        // Only complete scans may establish a proof for the pinned file set.
+        let full_scan = scope.options.graph.logical_partition.is_empty();
+        #[cfg(feature = "admin")]
+        let full_scan = full_scan && read.exploration.is_none() && read.distributed.is_none();
+        let parquet = tables.raw[mapping.source]
+            .parquet_versions
+            .as_ref()
+            .filter(|_| full_scan);
+        let cached = parquet
+            .is_some_and(|objects| tables.parquet_keys.lock().unwrap().get(name) == Some(objects));
+        let unique = if cached || tables.proven_key_label == Some(name) {
+            true
+        } else {
+            match tables.postgres.get(mapping.source) {
+                Some(table) => table.guarantees_unique_key(label.keys).await?,
+                None => false,
+            }
         };
         if !unique {
             if read.lazy_validation {
@@ -505,6 +543,13 @@ async fn bind_label(
                     )
                     .context(ValidationSite::field(name, "key", None)));
                 }
+            }
+            if let Some(objects) = parquet {
+                tables
+                    .parquet_keys
+                    .lock()
+                    .unwrap()
+                    .insert(name.into(), objects.clone());
             }
         }
     }

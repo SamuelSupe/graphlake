@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
+};
+
+use futures::TryStreamExt;
 
 use boltr::types::{
     BoltDict, BoltNode, BoltPath, BoltRelationship, BoltUnboundRelationship, BoltValue,
@@ -14,7 +20,7 @@ use super::super::query::{
 use super::{ApiResult, Error, result_limit, value_at};
 use crate::{
     Catalog, QueryResult, ScalarValue,
-    arrow::array::{Array, ArrayRef, RecordBatch, StructArray},
+    arrow::array::{Array, ArrayRef, StructArray},
     catalog::ident,
     engine::query_graph::GraphColumn,
 };
@@ -322,42 +328,76 @@ async fn hydrate(
     id: &Identity,
     budget: &mut usize,
 ) -> ApiResult<BoltValue> {
-    let node_type = id.kind == Kind::Node;
-    let keys = key_names(catalog, node_type, &id.label);
+    hydrate_many(catalog, result, BTreeSet::from([id.clone()]), budget)
+        .await?
+        .remove(id)
+        .ok_or_else(invalid)
+}
+
+async fn hydrate_many(
+    catalog: &Catalog,
+    result: &mut QueryResult,
+    identities: BTreeSet<Identity>,
+    budget: &mut usize,
+) -> ApiResult<BTreeMap<Identity, BoltValue>> {
     let context = result.graph_context.clone().ok_or_else(invalid)?;
-    let batches: Vec<RecordBatch> = result
-        .graph_read(async {
-            let schema = context
-                .table_provider(datafusion::common::TableReference::bare(id.label.as_str()))
-                .await?
-                .schema();
-            let mut values = Vec::with_capacity(keys.len());
-            let conditions = exploration_key_match("e", &keys, &id.key, &schema, &mut values)?;
-            let sql = format!(
-                "SELECT e.* FROM {} e WHERE {conditions} LIMIT 1",
-                ident(&id.label)
-            );
-            Ok(context
-                .sql(&sql)
-                .await?
-                .with_param_values(values)?
-                .collect()
-                .await?)
-        })
-        .await
-        .map_err(query_error)?;
-    let batch = batches
-        .iter()
-        .find(|batch| batch.num_rows() != 0)
-        .ok_or_else(invalid)?;
-    let values = property_values(catalog, id, 0, |name| batch.column_by_name(name), budget)?;
-    Ok(if node_type {
-        BoltValue::Node(node(id, values, budget)?)
-    } else {
-        let ends = endpoints(catalog, &id.label, 0, |name| batch.column_by_name(name))
-            .ok_or_else(invalid)?;
-        BoltValue::Relationship(edge(id, values, ends, budget)?)
-    })
+    let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for id in identities {
+        groups
+            .entry((id.kind, id.label.clone()))
+            .or_default()
+            .push(id);
+    }
+    let mut hydrated = BTreeMap::new();
+    for ((kind, label), ids) in groups {
+        let node_type = kind == Kind::Node;
+        let keys = key_names(catalog, node_type, &label);
+        let provider = context
+            .table_provider(datafusion::common::TableReference::bare(label.as_str()))
+            .await
+            .map_err(|error| query_error(error.into()))?;
+        let schema = provider.schema();
+        for group in ids.chunks((128 / keys.len()).max(1)) {
+            let mut batches = result
+                .graph_read(async {
+                    let mut values = Vec::with_capacity(group.len() * keys.len());
+                    let conditions = group
+                        .iter()
+                        .map(|id| exploration_key_match("e", &keys, &id.key, &schema, &mut values))
+                        .collect::<anyhow::Result<Vec<_>>>()?
+                        .join(" OR ");
+                    let sql = format!("SELECT e.* FROM {} AS e WHERE {conditions}", ident(&label));
+                    Ok(context
+                        .sql(&sql)
+                        .await?
+                        .with_param_values(values)?
+                        .execute_stream()
+                        .await?)
+                })
+                .await
+                .map_err(query_error)?;
+            while let Some(batch) = result
+                .graph_read(async { Ok(batches.try_next().await?) })
+                .await
+                .map_err(query_error)?
+            {
+                for row in 0..batch.num_rows() {
+                    let get = |name: &str| batch.column_by_name(name);
+                    let id = from_fields(catalog, &label, node_type, row, &keys, get)
+                        .ok_or_else(invalid)?;
+                    let properties = property_values(catalog, &id, row, get, budget)?;
+                    let value = if node_type {
+                        BoltValue::Node(node(&id, properties, budget)?)
+                    } else {
+                        let ends = endpoints(catalog, &label, row, get).ok_or_else(invalid)?;
+                        BoltValue::Relationship(edge(&id, properties, ends, budget)?)
+                    };
+                    hydrated.insert(id, value);
+                }
+            }
+        }
+    }
+    Ok(hydrated)
 }
 
 fn encode_id(id: &Identity, budget: &mut usize) -> ApiResult<(i64, String)> {
@@ -439,6 +479,22 @@ async fn path(
             None => tagged(catalog, node, record, row),
         }
     };
+    if nodes
+        .len()
+        .saturating_add(edges.len())
+        .saturating_mul(std::mem::size_of::<Identity>())
+        > *budget
+    {
+        return Err(result_limit());
+    }
+    let nodes = (0..nodes.len())
+        .map(|row| read(nodes, &labels.0, true, row))
+        .collect::<ApiResult<Vec<_>>>()?;
+    let edges = (0..edges.len())
+        .map(|row| read(edges, &labels.1, false, row))
+        .collect::<ApiResult<Vec<_>>>()?;
+    let unique = nodes.iter().chain(&edges).cloned().collect();
+    let mut hydrated = hydrate_many(catalog, result, unique, budget).await?;
     let mut path = BoltPath {
         nodes: Vec::new(),
         rels: Vec::new(),
@@ -447,12 +503,11 @@ async fn path(
     let mut node_indices = BTreeMap::new();
     let mut edge_indices = BTreeMap::new();
     let mut visits = Vec::new();
-    for row in 0..nodes.len() {
-        let id = read(nodes, &labels.0, true, row)?;
+    for id in nodes {
         let index = if let Some(&index) = node_indices.get(&id) {
             index
         } else {
-            let BoltValue::Node(node) = hydrate(catalog, result, &id, budget).await? else {
+            let Some(BoltValue::Node(node)) = hydrated.remove(&id) else {
                 return Err(invalid());
             };
             let index = path.nodes.len();
@@ -462,12 +517,11 @@ async fn path(
         };
         visits.push(index);
     }
-    for row in 0..edges.len() {
-        let id = read(edges, &labels.1, false, row)?;
+    for (row, id) in edges.into_iter().enumerate() {
         let (index, start) = if let Some(&entry) = edge_indices.get(&id) {
             entry
         } else {
-            let BoltValue::Relationship(edge) = hydrate(catalog, result, &id, budget).await? else {
+            let Some(BoltValue::Relationship(edge)) = hydrated.remove(&id) else {
                 return Err(invalid());
             };
             let entry = (path.rels.len(), edge.start_node_id);

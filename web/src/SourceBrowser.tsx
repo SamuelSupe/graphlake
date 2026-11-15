@@ -4,7 +4,7 @@ import { sourceLabel, type Model } from './model';
 import { Modal } from './ui';
 
 export type TableSelection = { table: string; columns: Column[] };
-const hasNamespace = (kind: unknown) => ['postgres', 'mysql', 'iceberg', 'trino', 'mongodb', 'elasticsearch', 'redshift', 'clickhouse', 'sap_hana', 'snowflake', 'bigquery'].includes(String(kind));
+const hasNamespace = (kind: unknown) => ['duckdb', 'doris', 'starrocks', 'tidb', 'oceanbase', 'mariadb', 'sqlserver_native', 'oracle_native', 'mongodb_native', 'databricks', 'postgres', 'mysql', 'iceberg', 'trino', 'mongodb', 'elasticsearch', 'redshift', 'sqlserver', 'oracle', 'clickhouse', 'sap_hana', 'snowflake', 'bigquery'].includes(String(kind));
 
 function splitTable(kind: unknown, table: string) {
   if (!hasNamespace(kind)) return ['', table];

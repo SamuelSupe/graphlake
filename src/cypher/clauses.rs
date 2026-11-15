@@ -913,11 +913,12 @@ fn single(
                     .filter(|(start, end)| *start < index && index <= *end)
                     .map(|(_, end)| {
                         let mut replay = with.clone();
-                        replay.where_clause = None;
                         if end == index {
                             replay.body.order_by.clear();
                             replay.body.skip = None;
                             replay.body.limit = None;
+                        } else {
+                            replay.where_clause = None;
                         }
                         replay
                     });
@@ -931,23 +932,29 @@ fn single(
                     with,
                     &body,
                     stage.as_ref().map_or_else(String::new, Stage::input),
-                    |sql, columns, _| match imported {
-                        Some(imports) => imports.restore(sql, columns),
-                        None => Ok(sql),
+                    |next| {
+                        if let Some(imports) = imported {
+                            next.sql =
+                                imports.restore(std::mem::take(&mut next.sql), &mut next.scope)?;
+                        }
+                        if !next.order.is_empty()
+                            && (with.where_clause.is_some() || skip.is_some() || limit.is_some())
+                        {
+                            next.sort();
+                        }
+                        for (clause, expression) in [("LIMIT", limit), ("OFFSET", skip)] {
+                            if let Some(expr) = expression {
+                                let value = batch_call::page(Some(&expr), 0, clause)?;
+                                next.sql.push_str(&format!(" {clause} {value}"));
+                            }
+                        }
+                        Ok(())
                     },
+                    imported
+                        .and_then(|imports| imports.explicit)
+                        .unwrap_or_default(),
                     plan,
                 )?;
-                if !next.order.is_empty()
-                    && (with.where_clause.is_some() || skip.is_some() || limit.is_some())
-                {
-                    next.sort();
-                }
-                for (clause, expression) in [("LIMIT", limit), ("OFFSET", skip)] {
-                    if let Some(expr) = expression {
-                        let value = batch_call::page(Some(&expr), 0, clause)?;
-                        next.sql.push_str(&format!(" {clause} {value}"));
-                    }
-                }
                 if let Some(grouped) = grouped.as_ref().filter(|grouped| grouped.page == index) {
                     path_page::restore(&mut next, catalog, &grouped.edges);
                 }
@@ -1157,7 +1164,8 @@ fn project_with(
     with: &opencypher::With,
     body: &opencypher::ReturnBody,
     from: String,
-    restore: impl FnOnce(String, &mut Scope, &[OrderKey]) -> Result<String>,
+    restore_and_page: impl FnOnce(&mut Stage) -> Result<()>,
+    imports: &[String],
     plan: &mut Plan,
 ) -> Result<Stage> {
     let grouped = with.distinct
@@ -1165,44 +1173,64 @@ fn project_with(
             .items
             .iter()
             .any(|item| batch_call::has_aggregate(&item.expr));
-    let mut predicates = Vec::new();
-    if !grouped && let Some(predicate) = &with.where_clause {
-        // A plain WITH sees its new aliases and the input bindings in WHERE.
-        let aliases = body
+    let mut body = body.clone();
+    let mut hidden = Vec::new();
+    if !grouped
+        && !body.star
+        && let Some(predicate) = &with.where_clause
+    {
+        let projected = body
             .items
             .iter()
-            .filter_map(|item| {
-                item.alias.as_ref().map(|alias| {
-                    Ok((
-                        alias.0.clone(),
-                        (input.expr(&item.expr)?, Value::projected(input, &item.expr)),
-                    ))
-                })
+            .map(|item| {
+                item.alias
+                    .as_ref()
+                    .map_or_else(|| super::expression_name(&item.expr), |v| v.0.clone())
             })
-            .collect::<Result<Aliases>>()?;
-        predicates.push(input.expr_with_aliases(predicate, &aliases)?);
+            .collect::<std::collections::BTreeSet<_>>();
+        // A plain WITH's WHERE can refer to input variables that were not projected.
+        let referenced = super::page::referenced_names(predicate);
+        for name in Scope::from_plan(input).columns.into_keys() {
+            if !projected.contains(&name) && referenced.contains(&name) {
+                let variable = opencypher::Variable(name.clone());
+                body.items.push(opencypher::ReturnItem {
+                    expr: Expr {
+                        kind: ExprKind::Variable(variable.clone()),
+                        span: with.span,
+                    },
+                    alias: Some(variable),
+                    span: with.span,
+                });
+                if !imports.contains(&name) {
+                    hidden.push(name);
+                }
+            }
+        }
     }
-    let (sql, mut scope, order) =
-        input.project(body, with.distinct, from, &predicates, true, false)?;
+    let (sql, scope, order) = input.project(&body, with.distinct, from, &[], true, false)?;
     input.collect_expressions(plan);
-    let mut sql = restore(sql, &mut scope, &order)?;
-    if grouped && let Some(predicate) = &with.where_clause {
-        let mut output = MatchPlan::new(catalog);
-        output.call_imports = input.call_imports.clone();
-        output.indexed_csr = plan.indexed_csr;
-        output.partitioned_csr = input.partitioned_csr;
-        scope.bind("projected", &mut output);
-        let predicate = output.expr(predicate)?;
-        let from = output.join_expressions(&format!(" FROM ({sql}) AS projected"));
-        sql = format!("SELECT projected.*{from} WHERE {predicate}");
-        output.collect_expressions(plan);
-    }
-    Ok(Stage {
+    let mut next = Stage {
         sql,
         scope,
         output: Vec::new(),
         order,
-    })
+    };
+    restore_and_page(&mut next)?;
+    if let Some(predicate) = &with.where_clause {
+        let mut output = MatchPlan::new(catalog);
+        output.call_imports = input.call_imports.clone();
+        output.indexed_csr = plan.indexed_csr;
+        output.partitioned_csr = input.partitioned_csr;
+        next.scope.bind("projected", &mut output);
+        let predicate = output.expr(predicate)?;
+        let from = output.join_expressions(&format!(" FROM ({}) AS projected", next.sql));
+        for name in hidden {
+            next.scope.columns.remove(&name);
+        }
+        next.sql = format!("SELECT projected.*{from} WHERE {predicate}");
+        output.collect_expressions(plan);
+    }
+    Ok(next)
 }
 
 fn unwind_stage(
@@ -1598,17 +1626,20 @@ fn join_match(
             row.push('_');
         }
         let row = ident(&row);
-        let left_fields = left
-            .scope
-            .columns
-            .keys()
-            .map(|name| qualified("l", name))
-            .collect::<Vec<_>>();
-        let order = if left_fields.is_empty() {
-            "1".into()
-        } else {
-            left_fields.join(", ")
-        };
+        let table = format!("__graphlake_optional_input_{}", pattern.span.start);
+        plan.calls.push(super::apply::Apply {
+            table: table.clone(),
+            seed: String::new(),
+            outer: format!("SELECT l.*, row_number() OVER () AS {row}{}", left.input()),
+            inner: String::new(),
+            nested: Vec::new(),
+            lookups: Vec::new(),
+            limit: None,
+            mode: super::apply::Mode::Materialize,
+        });
+        // Both branches must read the same numbered rows, even when the
+        // upstream partitions have no deterministic order.
+        let table = ident(&table);
         let right_fields = right_columns
             .columns
             .keys()
@@ -1619,18 +1650,13 @@ fn join_match(
             project.push("1 AS __graphlake_seed".into());
         }
         let from = predicate_scope.join_expressions(&format!(
-            " FROM (SELECT l.*, row_number() OVER (ORDER BY {order} ROWS UNBOUNDED PRECEDING) AS {row}{}) AS l JOIN ({right_sql}) AS r ON {join}",
-            left.input()
+            " FROM {table} AS l JOIN ({right_sql}) AS r ON {join}"
         ));
         format!(
-            "WITH __graphlake_optional_input AS (
-               SELECT l.*, row_number() OVER (ORDER BY {order} ROWS UNBOUNDED PRECEDING) AS {row}{input}
-             )
-             SELECT {projection} FROM __graphlake_optional_input AS l
+            "SELECT {projection} FROM {table} AS l
              LEFT JOIN (
                SELECT l.{row}{right_fields}{from} WHERE {filter}
              ) AS r ON l.{row} = r.{row}",
-            input = left.input(),
             projection = project.join(", "),
         )
     } else {

@@ -94,6 +94,7 @@ impl Engine {
                         name,
                         table,
                         &[],
+                        &[],
                         snapshots.get(table).copied(),
                         Arc::clone(&scope.reads),
                     )

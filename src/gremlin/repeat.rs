@@ -107,7 +107,13 @@ impl Repeat {
             context.deregister_table(seed.clone())?;
             drop(budget);
         }
+        let mut rounds = 0;
         while active {
+            anyhow::ensure!(
+                rounds < super::MAX_REPEAT_ROUNDS,
+                "repeat() is limited to 256 iterations"
+            );
+            rounds += 1;
             scope.check()?;
             let budget = install(context, scope, seed.clone(), &schema, frontier)?;
             let mut nested_budget = Vec::new();

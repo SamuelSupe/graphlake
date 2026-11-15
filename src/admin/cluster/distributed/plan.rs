@@ -20,7 +20,7 @@ use datafusion::{
         execution_plan::{
             Boundedness, ChildrenPropertiesMode, EmissionType, ReplaceChildrenOptions,
         },
-        joins::{HashJoinExec, SortMergeJoinExec},
+        joins::{HashJoinExec, PartitionMode, SortMergeJoinExec},
         repartition::RepartitionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec,
     },
@@ -374,6 +374,14 @@ pub(super) fn build(
     partitions: usize,
     has_staged_input: bool,
 ) -> Result<Option<(Arc<dyn ExecutionPlan>, Vec<Stage>)>> {
+    // Some operators (for example null-aware anti joins) require CollectLeft
+    // regardless of optimizer thresholds.
+    if contains(root.as_ref(), |plan| {
+        plan.downcast_ref::<HashJoinExec>()
+            .is_some_and(|join| join.partition_mode() == &PartitionMode::CollectLeft)
+    }) {
+        return Ok(None);
+    }
     let mut stages = Vec::new();
     let Ok(rewritten) = split(root, &mut stages, partitions) else {
         return Ok(None);

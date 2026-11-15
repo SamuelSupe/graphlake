@@ -1,9 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use axum::{
@@ -102,7 +102,7 @@ pub(super) struct Models {
     dir: PathBuf,
     sources: PathBuf,
     checks: BTreeMap<String, (String, Status)>,
-    engine: Option<(String, String, Engine)>,
+    engines: Arc<Mutex<VecDeque<(String, String, Engine)>>>,
 }
 
 pub(super) fn valid_id(id: &str) -> bool {
@@ -122,7 +122,7 @@ impl Models {
             dir,
             sources,
             checks: BTreeMap::new(),
-            engine: None,
+            engines: Default::default(),
         }
     }
 
@@ -462,50 +462,104 @@ impl Models {
         self.get(id)
     }
 
+    // Published files are atomically replaced. Readers can validate a pinned
+    // archive without holding the lock used for draft and manifest mutations.
+    pub(super) fn read_files(&self) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            sources: self.sources.clone(),
+            checks: BTreeMap::new(),
+            engines: Arc::clone(&self.engines),
+        }
+    }
+
     pub(super) fn query_engine(
-        &mut self,
+        &self,
+        app: &App,
         id: &str,
-        expected: &str,
+        expected: Option<&str>,
         principal: &Principal,
-    ) -> ApiResult<Engine> {
+    ) -> ApiResult<(String, String, Engine)> {
         let path = self.path(id)?;
-        let state = self.version_state(id)?;
-        let (active, legacy) = if let Some(state) = state {
-            // Check the visible entry's identity without reading the draft. A broken
-            // external edit must not prevent queries against the published archive.
-            metadata(&path)?.ok_or_else(Error::not_found)?;
-            let active = state.active.ok_or_else(unpublished)?;
-            (active, None)
-        } else if *principal == Principal::Admin && self.dir == self.sources {
-            let model = self.get(id)?;
-            if model.revision != expected {
-                return Err(versions::active_conflict());
+        let (active, yaml) = match self.version_state(id)? {
+            Some(state) => {
+                metadata(&path)?.ok_or_else(Error::not_found)?;
+                let active = state.active.ok_or_else(unpublished)?;
+                if expected.is_some_and(|expected| active != expected) {
+                    return Err(versions::active_conflict());
+                }
+                let yaml = self.archived(id, &active)?;
+                (active, yaml)
             }
-            parse(&model.yaml, &self.source_path(&id)?)?;
-            self.adopt(id, &model)?;
-            (model.revision, Some(model.yaml))
-        } else {
-            return Err(Error::not_found());
+            None if *principal == Principal::Admin
+                && self.dir == self.sources
+                && expected.is_some() =>
+            {
+                app.models
+                    .lock()
+                    .unwrap()
+                    .adopt_for_query(id, expected.unwrap())?
+            }
+            None if expected.is_none() => {
+                metadata(&path)?.ok_or_else(Error::not_found)?;
+                return Err(unpublished());
+            }
+            None => return Err(Error::not_found()),
         };
-        if active != expected {
+        let engine = self.cached_engine(id, &active, &yaml)?;
+        if self.active_revision(id)?.as_deref() != Some(&active) {
             return Err(versions::active_conflict());
         }
-        let yaml = match legacy {
-            Some(yaml) => yaml,
-            None => self.archived(id, &active)?,
-        };
-        if let Some((key, version, engine)) = &self.engine
-            && key == id
-            && version == &active
-        {
-            return Ok(engine.clone());
+        Ok((active, yaml, engine))
+    }
+
+    fn adopt_for_query(&mut self, id: &str, expected: &str) -> ApiResult<(String, String)> {
+        if self.version_state(id)?.is_some() {
+            let active = self.published_revision(id)?;
+            if active != expected {
+                return Err(versions::active_conflict());
+            }
+            return Ok((active, self.archived(id, expected)?));
         }
-        let mut catalog = parse(&yaml, &self.source_path(id)?)?;
+        let model = self.get(id)?;
+        if model.revision != expected {
+            return Err(versions::active_conflict());
+        }
+        parse(&model.yaml, &self.source_path(id)?)?;
+        self.adopt(id, &model)?;
+        Ok((model.revision, model.yaml))
+    }
+
+    fn cached_engine(&self, id: &str, active: &str, yaml: &str) -> ApiResult<Engine> {
+        {
+            let mut engines = self.engines.lock().unwrap();
+            if let Some(index) = engines
+                .iter()
+                .position(|(key, version, _)| key == id && version == active)
+            {
+                let entry = engines.remove(index).expect("cached engine");
+                let engine = entry.2.clone();
+                engines.push_back(entry);
+                return Ok(engine);
+            }
+        }
+        let mut catalog = parse(yaml, &self.source_path(id)?)?;
         // The engine refuses EXPORT to any unregistered destination.
         catalog.export_locations.clear();
         let engine =
             Engine::new(catalog).map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
-        self.engine = Some((id.into(), active, engine.clone()));
+        let mut engines = self.engines.lock().unwrap();
+        if let Some((_, _, already_cached)) = engines
+            .iter()
+            .find(|(key, revision, _)| key == id && revision == active)
+        {
+            return Ok(already_cached.clone());
+        }
+        engines.retain(|(key, _, _)| key != id);
+        if engines.len() == 4 {
+            engines.pop_front();
+        }
+        engines.push_back((id.into(), active.into(), engine.clone()));
         Ok(engine)
     }
 
@@ -515,6 +569,36 @@ impl Models {
         let mut catalog = parse(&yaml, &self.source_path(id)?)?;
         catalog.export_locations.clear();
         Engine::new(catalog).map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))
+    }
+}
+
+impl App {
+    pub(super) async fn published_model_revision(&self, id: &str) -> ApiResult<String> {
+        let files = self.models.lock().unwrap().read_files();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || files.require_published(&id))
+            .await
+            .map_err(|_| Error::storage())?
+    }
+
+    pub(super) async fn query_model(
+        self: &Arc<Self>,
+        id: &str,
+        expected: &str,
+        principal: &Principal,
+    ) -> ApiResult<(String, String, Engine)> {
+        let (app, id, expected, principal) = (
+            Arc::clone(self),
+            id.to_owned(),
+            expected.to_owned(),
+            principal.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let files = app.models.lock().unwrap().read_files();
+            files.query_engine(&app, &id, Some(&expected), &principal)
+        })
+        .await
+        .map_err(|_| Error::storage())?
     }
 }
 
@@ -717,11 +801,7 @@ pub(super) async fn schema(
     RoutePath((id, revision)): RoutePath<(String, String)>,
     axum::Extension(principal): axum::Extension<Principal>,
 ) -> ApiResult<Json<GraphSchema>> {
-    let engine = app
-        .models
-        .lock()
-        .unwrap()
-        .query_engine(&id, &revision, &principal)?;
+    let (_, _, engine) = app.query_model(&id, &revision, &principal).await?;
     let catalog = &engine.catalog;
     Ok(Json(GraphSchema {
         graph: catalog.graph.clone(),

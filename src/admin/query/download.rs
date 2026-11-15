@@ -8,6 +8,9 @@ use crate::arrow::ipc::writer::StreamWriter;
 
 use super::*;
 
+const SNAPSHOTS_PER_OWNER: usize = 4;
+const SNAPSHOTS_TOTAL: usize = 32;
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const SNAPSHOT_BUDGET: u64 = 1024 * 1024 * 1024;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30 * 60);
 const TICKET_TTL: Duration = Duration::from_secs(60);
@@ -92,10 +95,26 @@ pub(super) fn save_snapshot(
     };
     let mut results = app.results.lock().unwrap();
     results.retain(|saved| saved.created.elapsed() < SNAPSHOT_TTL);
-    while results.len() >= 4
+    let first_owned = |results: &std::collections::VecDeque<ResultSnapshot>| {
+        results
+            .iter()
+            .position(|saved| saved.owner == snapshot.owner)
+    };
+    if results
+        .iter()
+        .filter(|saved| saved.owner == snapshot.owner)
+        .count()
+        >= SNAPSHOTS_PER_OWNER
+    {
+        if let Some(index) = first_owned(&results) {
+            results.remove(index);
+        }
+    }
+    while results.len() >= SNAPSHOTS_TOTAL
         || snapshot.length + results.iter().map(|saved| saved.length).sum::<u64>() > SNAPSHOT_BUDGET
     {
-        results.pop_front();
+        let index = first_owned(&results).unwrap_or(0);
+        results.remove(index);
     }
     results.push_back(snapshot);
     let app = Arc::downgrade(app);
@@ -343,13 +362,7 @@ fn attachment(
     revision: String,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Response {
-    let stream = async_stream::stream! {
-        let _permit = permit;
-        let mut reader = ReaderStream::new(tokio::fs::File::from_std(file));
-        while let Some(chunk) = futures::StreamExt::next(&mut reader).await {
-            yield chunk;
-        }
-    };
+    let stream = ReaderStream::new(tokio::fs::File::from_std(file));
     (
         [
             (
@@ -366,9 +379,51 @@ fn attachment(
                 revision,
             ),
         ],
-        Body::from_stream(stream),
+        download_body(stream, permit),
     )
         .into_response()
+}
+
+pub(in crate::admin) fn download_body<E>(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Body
+where
+    E: Into<axum::BoxError> + Send + 'static,
+{
+    use futures::StreamExt;
+    let Some(permit) = permit else {
+        return Body::empty();
+    };
+    let expires = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
+    let permit = Arc::new(std::sync::Mutex::new(Some(permit)));
+    let watchdog = Arc::downgrade(&permit);
+    tokio::spawn(async move {
+        tokio::time::sleep_until(expires).await;
+        // Hyper may stop polling this body entirely under TCP backpressure.
+        if let Some(permit) = watchdog.upgrade() {
+            permit.lock().unwrap().take();
+        }
+    });
+    Body::from_stream(async_stream::stream! {
+        let _permit = permit;
+        let mut stream = Box::pin(stream);
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(expires) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Arrow download timed out")),
+                chunk = stream.next() => Ok(chunk),
+            };
+            match chunk {
+                Ok(Some(chunk)) => yield chunk.map_err(Into::<axum::BoxError>::into),
+                Ok(None) => break,
+                Err(error) => {
+                    yield Err(error.into());
+                    break;
+                }
+            }
+        }
+    })
 }
 
 fn write_error() -> Error {

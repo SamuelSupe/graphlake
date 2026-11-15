@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::{
         array::{RecordBatch, RecordBatchOptions},
-        datatypes::SchemaRef,
+        datatypes::{DataType, Schema, SchemaRef},
         ipc::reader::StreamReader,
     },
     catalog::{Session, TableProvider},
@@ -23,13 +23,17 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 use iceberg::{
-    Catalog, CatalogBuilder, TableIdent, arrow::schema_to_arrow_schema, spec::FormatVersion,
+    Catalog, CatalogBuilder, TableIdent,
+    arrow::schema_to_arrow_schema,
+    expr::{Predicate, Reference},
+    spec::{Datum, FormatVersion},
     table::Table,
 };
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 
 use super::{ReadStats, SourceVersion};
+use crate::{Comparison, Predicate as ReadPredicate};
 
 pub(crate) async fn catalog(
     name: &str,
@@ -72,6 +76,7 @@ pub(crate) struct IcebergTable {
     table: Table,
     snapshot: Option<i64>,
     schema: SchemaRef,
+    filter: Option<Predicate>,
     stats: Arc<ReadStats>,
 }
 
@@ -81,6 +86,7 @@ impl IcebergTable {
         reference: &str,
         relation: &str,
         columns: &[String],
+        filters: &[ReadPredicate],
         requested: Option<i64>,
         stats: Arc<ReadStats>,
     ) -> Result<(Self, SourceVersion)> {
@@ -115,7 +121,11 @@ impl IcebergTable {
                 .collect::<Result<Vec<_>, _>>()?;
             schema.project(&projection)?
         };
-        let bridge = bridge(&schema, None)?;
+        let schema = bridge(&schema, None)?.schema();
+        let filter = filters
+            .iter()
+            .filter_map(|filter| iceberg_predicate(&schema, filter))
+            .reduce(Predicate::and);
         let version = SourceVersion {
             source: reference.into(),
             version: snapshot
@@ -126,7 +136,8 @@ impl IcebergTable {
             Self {
                 table,
                 snapshot,
-                schema: bridge.schema(),
+                schema,
+                filter,
                 stats,
             },
             version,
@@ -186,16 +197,20 @@ impl PartitionStream for IcebergTable {
             table,
             snapshot,
             schema,
+            filter,
             stats,
         } = self.clone();
         let output = Arc::clone(&schema);
         let stream = async_stream::try_stream! {
             if let Some(snapshot) = snapshot {
                 let columns = schema.fields().iter().map(|field| field.name());
-                let scan = table.scan().snapshot_id(snapshot).select(columns)
+                let mut scan = table.scan().snapshot_id(snapshot).select(columns)
                     .with_batch_size(Some(context.session_config().batch_size()))
-                    .with_concurrency_limit(context.session_config().target_partitions())
-                    .build().map_err(external)?;
+                    .with_concurrency_limit(context.session_config().target_partitions());
+                if let Some(filter) = filter {
+                    scan = scan.with_filter(filter);
+                }
+                let scan = scan.build().map_err(external)?;
                 stats.request();
                 let mut batches = scan.to_arrow().await.map_err(external)?;
                 while let Some(batch) = batches.try_next().await.map_err(external)? {
@@ -218,6 +233,34 @@ impl PartitionStream for IcebergTable {
         };
         Box::pin(RecordBatchStreamAdapter::new(output, stream))
     }
+}
+
+fn iceberg_predicate(schema: &Schema, filter: &ReadPredicate) -> Option<Predicate> {
+    if filter.column.contains('.') {
+        return None;
+    }
+    let kind = schema.field_with_name(&filter.column).ok()?.data_type();
+    let reference = Reference::new(&filter.column);
+    let value = match (kind, filter.op) {
+        (DataType::Int32 | DataType::Int64, Comparison::IsNull) => {
+            return Some(reference.is_null());
+        }
+        (DataType::Int32 | DataType::Int64, Comparison::IsNotNull) => {
+            return Some(reference.is_not_null());
+        }
+        (DataType::Int32, _) => Datum::int(i32::try_from(filter.value.as_i64()?).ok()?),
+        (DataType::Int64, _) => Datum::long(filter.value.as_i64()?),
+        _ => return None,
+    };
+    Some(match filter.op {
+        Comparison::Eq => reference.equal_to(value),
+        Comparison::Ne => reference.not_equal_to(value),
+        Comparison::Lt => reference.less_than(value),
+        Comparison::Le => reference.less_than_or_equal_to(value),
+        Comparison::Gt => reference.greater_than(value),
+        Comparison::Ge => reference.greater_than_or_equal_to(value),
+        Comparison::IsNull | Comparison::IsNotNull => unreachable!(),
+    })
 }
 
 // Iceberg currently uses Arrow 58. IPC preserves field IDs, decimals and nested

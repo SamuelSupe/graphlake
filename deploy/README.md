@@ -33,13 +33,19 @@ curl -fsS http://127.0.0.1:7337/readyz
 
 将模型和相对路径引用的本地数据文件迁入 `catalog/`，以服务用户身份读取。迁移已有后台时先停旧服务，保留整个目录和隐藏文件。已有 `.graphlake-auth` 的目录沿用原管理员密码。将 YAML 中 `*_env` 字段引用的源凭据写入 `/etc/graphlake/graphlake.env`，该文件由 root 持有，权限 `0600`。修改后重启服务。使用 `journalctl -u graphlake` 查看启动和退出状态。服务单元配置 4 个共享查询槽，可根据主机内存和可用临时磁盘通过 systemd drop-in 调整。
 
+## 扩展数据源运行依赖
+
+SQL Server 使用内置 TDS 驱动，MongoDB 使用内置 MongoDB 驱动，DuckDB 随程序构建；这些连接器无需额外网关。Oracle 直连使用 ODPI-C，在运行时加载 Oracle Instant Client。请按目标操作系统和架构安装官方客户端及其系统依赖，为 `graphlake` 服务配置可访问的客户端库搜索路径；Oracle 客户端不随发行包分发。旧的 SQL Server、Oracle、MongoDB Trino 入口仍然可用。
+
+每个数据源的 `*_env` 引用也适用于对象存储。显式配置的对象存储密钥不会与另一组默认环境凭据混用。云存储使用默认身份时，需在服务用户环境中提供相应凭据链；GCS 的 `service_account_env` 引用 JSON 内容，Azure 的 `account_key_env` 引用账号密钥。配置与边界见[连接器参考](../docs/reference.zh-CN.md#扩展数据库与对象存储)。
+
 ## HTTPS 入口
 
 使用 `--public-url https://graphlake.example` 配置浏览器实际访问的 HTTPS 来源，有自定义端口时将端口写入该 URL。反代负责 TLS，保留原始 `Host`、`Origin` 和 WebSocket 升级请求，后端监听本机回环地址。管理会话 Cookie 带 `Secure`、`HttpOnly` 和 `SameSite=Strict`。转发头不会改变允许的主机名或来源。入口可使用安装包附带的 [HAProxy 配置](haproxy.cfg)，单机时将主后端改为 `127.0.0.1:7337` 并移除备用后端。多 Coordinator 模式见 [故障接管](cluster.md#coordinator-故障接管)。
 
 ## 客户端接入
 
-先发布需要开放的模型，例如 `payments`。在「权限管理 → 新建成员」选择「服务账号」，使用 `openssl rand -hex 32` 为每个应用生成独立令牌，再将账号加入角色。客户端使用 `svc/账号名称` 及该令牌。HTTP、Bolt 和 Gremlin 使用同一角色和租户范围。查询及导出分别授权。停用账号、移除角色或轮换令牌会关闭该账号现有连接，旧结果和下载票据随授权版本失效。人工密码登录和企业登录仍使用人工账号。
+先发布需要开放的模型，例如 `payments`。在「权限管理 → 成员 → 新建成员」选择「服务账号」，使用 `openssl rand -hex 32` 为每个应用生成独立令牌，再将账号加入角色。客户端使用 `svc/账号名称` 及该令牌。HTTP、Bolt 和 Gremlin 使用同一角色和租户范围。查询及导出分别授权。停用账号、移除角色或轮换令牌会关闭该账号现有连接，旧结果和下载票据随授权版本失效。人工密码登录和企业登录仍使用人工账号。
 
 原有 `service-accounts.json` 继续接受原用户名及令牌。升级后旧配置默认提供查询权限。需要保留旧账号对特定模型的完整下载时，显式配置 `export_models`。要启用租户范围，用新令牌创建角色中的服务账号，更新客户端，然后撤销原账号。单机用同目录文件原子替换管理原有配置，权限为 `0600`。Coordinator HA 使用[集群账号接口](cluster.md#coordinator-故障接管)。
 
@@ -96,7 +102,7 @@ finally:
     conn.close()
 ```
 
-Bolt 5.1–5.4 支持直连、自动提交、显式只读事务和托管只读事务。事务固定开始时的发布版本。首次读取时为每个 PostgreSQL 来源建立可重复读快照，并记录使用的 Parquet 对象版本。事务内重新读取已替换的 Parquet 会失败。显式事务支持 PostgreSQL 和 Parquet，其他连接器继续使用自动提交。事务超时和连接空闲超时限制快照保留时间。Gremlin 支持 WebSocket、SASL PLAIN、GraphSON 3、GraphBinary 1.0，以及两种编码下受支持的只读脚本和字节码。使用 `gremlinpython` 时可选 `GraphBinarySerializersV1()`。
+Bolt 5.1–5.4 支持直连、自动提交、显式只读事务和托管只读事务。事务固定开始时的发布版本。首次读取时为每个 PostgreSQL 来源建立可重复读快照，并记录使用的 Parquet 对象版本。事务内重新读取已替换的 Parquet 会失败。显式事务支持 PostgreSQL 和 Parquet，其他连接器继续使用自动提交。事务超时和连接空闲超时限制快照保留时间。Bolt 的 NOOP 不延长等待 PULL 的时限。启用溢写时，显式事务允许在读取前提交多条 RUN，单个未消费结果最多暂存 64 MiB，同时受服务配置的查询溢写预算限制。Gremlin 支持 WebSocket、SASL PLAIN、GraphSON 3、GraphBinary 1.0，以及两种编码下受支持的只读脚本和字节码。使用 `gremlinpython` 时可选 `GraphBinarySerializersV1()`。
 
 Bolt 按 `PULL` 传输结果，Gremlin 以状态 206 传输中间批次，每批最多 128 条、约 2 MiB。单条记录保留编码预算。两种驱动返回原生节点、边和路径，定点小数及超出有符号 64 位的整数使用字符串。Gremlin 路径的步骤标签和标量保真以当前遍历引擎的路径表示为限。任意 Groovy、字节码策略、动态脚本绑定和 Bolt 集群路由仍超出当前范围。Bolt 和 Gremlin 在完成时返回 `model_revision`。
 
@@ -152,7 +158,11 @@ curl -fsS http://127.0.0.1:7337/readyz
 
 ## 用户与角色
 
-通过 HTTPS 登录内置 `admin`，打开「权限管理」。先创建成员，再创建角色。为角色选择模型、勾选所需操作，并将用户加入角色。用户可以加入多个角色，有效权限取并集。新成员未加入角色时可以登录，模型列表为空。
+登录后，主导航的退出入口旁显示当前用户名及管理员或普通用户身份。关闭认证的开发模式显示「未启用认证」。
+
+通过 HTTPS 登录内置 `admin`，打开「权限管理」。在「成员」标签页创建成员，再到「角色」标签页创建角色。为角色选择模型、勾选所需操作，并将用户加入角色。用户可以加入多个角色，有效权限取并集。允许登录控制台的成员在分配角色前也可以登录，模型列表为空。
+
+在「成员 → 编辑 → 接入权限」可分别设置「允许登录控制台」和「允许接入 MCP」。仅接入 MCP 的人工账号不需要控制台密码。管理员可勾选「签发 MCP 令牌」，保存后复制一次性显示的 Bearer 令牌并通过安全渠道交付。该令牌受该账号的模型角色和租户范围限制。关闭控制台登录会拒绝本地密码及企业登录，并使旧会话失效。关闭 MCP 会撤销个人令牌，重新启用时需签发新令牌。服务账号可关闭 MCP 接入，现有 HTTP API、Bolt 和 Gremlin 授权仍由其模型角色控制。升级保留已有账号的接入方式。
 
 | 模型权限 | 可执行操作 |
 | --- | --- |
@@ -166,9 +176,11 @@ curl -fsS http://127.0.0.1:7337/readyz
 
 角色可给一个模型配置 `partitions` 等值谓词，例如 `{"direct":{"column":"tenant_id","op":"eq","value":1}}`。配置字段须出现在所有节点、边及边端点业务键中。HTTP、Bolt、Gremlin、图探索和授权后的导出均由服务端附加范围。CSR 的共享快照目前只供未限定租户的查询使用。不同角色对同一模型授予互相冲突的租户值时拒绝查询。同一成员拥有其他未设范围的查询角色时，已配置的租户限制仍然有效。敏感属性列用数据库视图或独立模型投影隔离。
 
-普通用户每账号最多四个活动会话。登录失败按账号和来源分别计数。HTTPS 反代部署可将 `GRAPHLAKE_TRUST_PROXY_CLIENT_IP=1` 加入环境文件，前端反代须覆盖 `X-GraphLake-Client-IP`，并禁止外部直连。安装包的 HAProxy 样例已设置覆盖。直连模式使用回环来源，管理员使用独立的验证容量及来源计数。超过上限的登录返回 `429` 和 `Retry-After`。
+普通用户每账号最多四个活动会话。登录失败按账号和来源分别计数。HTTPS 反代部署可将 `GRAPHLAKE_TRUST_PROXY_CLIENT_IP=1` 加入环境文件，前端反代须覆盖 `X-GraphLake-Client-IP`，并禁止外部直连。安装包的 HAProxy 样例已设置覆盖。缺少可信客户端 IP 时，普通有效账号按自身计数，未知账号共享来源限额。管理员使用独立的验证容量，达到共享失败限额后每 12 秒允许一次密码校验。限流响应带 `429` 和 `Retry-After`。
 
 单机账号与角色保存在 `catalog/.graphlake-auth/users.json`，权限为 `0600`。停机备份包含该文件。HA 模式把账号和角色提交到 etcd，接管后自动加载。管理 API 使用 `GET /api/v1/users`、`GET /api/v1/roles`、`PUT /api/v1/users/{username}` 与 `PUT /api/v1/roles/{role}`。更新请求传入当前 `version`。删除请求的 JSON 正文为当前版本 UUID。用户可用 `GET /api/v1/my-roles` 查看对各模型的有效权限。
+
+账号接口用 `console_access` 和 `mcp_access` 布尔字段设置接入权限。编辑时省略字段将保留现有设置。管理员用 `issue_mcp_token: true` 为已启用的仅 MCP 人工账号签发或轮换令牌，只有此次保存响应包含 `mcp_token` 明文。恢复后的仅 MCP 账号可以在重新启用时签发新令牌。
 
 
 ## 告警与审计收集
@@ -189,7 +201,9 @@ curl -fsS http://127.0.0.1:7337/readyz
 
 「健康检查」可单次检查已发布模型的来源、端点及 Worker，并显示遥测上报状态。切换页签会保留未保存的遥测配置。生产告警在部署侧维护 [prometheus-rules.yaml](prometheus-rules.yaml)，由 Prometheus 加载，通知渠道由 Alertmanager 管理。
 
-「备份与恢复」读取备份任务的状态文件，显示最近尝试、最近成功和数据检查点。定时备份默认写入 `/var/lib/graphlake-backups/export-status.json`。异地校验可指定 `--status-file /var/lib/graphlake-backups/verify-status.json`。如使用独立目录，在后台进程设置 `GRAPHLAKE_BACKUP_STATUS_DIR` 指向状态文件所在目录，并为服务用户授权读取。目标站的 [HTTPS 恢复页](cluster.md#绑定恢复点并开放入口) 可选择已同步的异地副本、恢复控制状态和数据、查看每个阶段的结果并验收切流。
+「备份与恢复」可发起[手动控制状态备份](cluster.md#在线控制状态备份与恢复)，也显示定时任务和异地校验的最近尝试、最近成功和数据检查点。定时备份默认写入 `/var/lib/graphlake-backups/export-status.json`。异地校验可指定 `--status-file /var/lib/graphlake-backups/verify-status.json`。如使用独立目录，在后台进程设置 `GRAPHLAKE_BACKUP_STATUS_DIR` 指向状态文件所在目录，并为服务用户授权读取。选择「恢复备份」可打开[目标站 HTTPS 恢复页](cluster.md#绑定恢复点并开放入口)，检查已同步的恢复点、确认恢复、查看各阶段结果并执行验收。
+
+单机部署可停止服务后以私有权限复制模型目录，包括隐藏的版本和认证文件。还原时同样先停止服务，并保留文件权限。PostgreSQL、Parquet 及配置引用的其他源数据需要另行备份。
 
 默认关闭 OTLP。复制随包提供的 [telemetry.yaml](telemetry.yaml)，在文件中设置 `enabled: true` 和接收端基址。设置 `GRAPHLAKE_TELEMETRY_CONFIG=/etc/graphlake/telemetry.yaml` 后重启服务，或传入 `--telemetry-config /etc/graphlake/telemetry.yaml`。命令行参数优先。单机、Coordinator、Worker 及备份导出和恢复命令都可加载配置。systemd 服务和备份单元从现有环境文件读取变量，保持原环境文件权限。
 

@@ -117,10 +117,11 @@ impl Distributed {
         config.optimizer.enable_aggregate_dynamic_filter_pushdown = false;
         config.optimizer.repartition_file_scans = false;
         config.execution.enable_file_stream_work_stealing = false;
+        // Separate stage tasks cannot share a CollectLeft build-side bitmap.
+        config.optimizer.hash_join_single_partition_threshold = 0;
+        config.optimizer.hash_join_single_partition_threshold_rows = 0;
         if memory_bytes <= 64 * 1024 * 1024 {
             config.optimizer.prefer_hash_join = false;
-            config.optimizer.hash_join_single_partition_threshold = 0;
-            config.optimizer.hash_join_single_partition_threshold_rows = 0;
             config.execution.sort_spill_reservation_bytes = 256 * 1024;
         }
     }

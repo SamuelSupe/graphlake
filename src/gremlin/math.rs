@@ -1,7 +1,7 @@
 use anyhow::{Result, bail, ensure};
-use opencypher::{BinaryOp, Expr, ExprKind, UnaryOp, Visitor, parse_expr, walk_expr};
+use opencypher::{BinaryOp, Expr, ExprKind, UnaryOp, Visitor, walk_expr};
 
-use super::{Traversers, string, text, values::by_traversal, variants::Kind};
+use super::{Traversers, parse::parse_expr, string, text, values::by_traversal, variants::Kind};
 
 impl Traversers<'_> {
     pub(super) fn math(

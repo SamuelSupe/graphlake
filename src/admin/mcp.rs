@@ -48,6 +48,9 @@ impl Service {
 
     fn allows(self, app: &App, principal: &Principal) -> bool {
         use super::users::Role;
+        if !app.users.mcp_allowed(principal) {
+            return false;
+        }
         if matches!(principal, Principal::Admin) {
             return true;
         }
@@ -94,11 +97,14 @@ pub(super) fn authenticate(app: &App, headers: &HeaderMap) -> Option<Credential>
         return None;
     }
     let (scheme, token) = value.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("bearer") {
+    let credential = if scheme.eq_ignore_ascii_case("bearer") {
         super::users::delegation::authenticate(app, token).or_else(|| app.users.bearer(token))
     } else {
         access::http(app, headers)
-    }
+    }?;
+    app.users
+        .mcp_allowed(&credential.principal)
+        .then_some(credential)
 }
 
 pub(super) async fn no_stream() -> Response {

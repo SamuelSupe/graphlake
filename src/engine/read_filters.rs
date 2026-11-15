@@ -100,6 +100,23 @@ impl Visitor for CountQueries {
     }
 }
 
+pub(super) fn exact(expr: &Expr, qualifier: &str, filters: &mut Vec<Predicate>) -> bool {
+    match expr {
+        Expr::Nested(inner) => exact(inner, qualifier, filters),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => exact(left, qualifier, filters) && exact(right, qualifier, filters),
+        Expr::BinaryOp { .. } | Expr::IsNull(_) | Expr::IsNotNull(_) => {
+            let before = filters.len();
+            extract(expr, qualifier, filters);
+            filters.len() == before + 1 && needs_sql_types(&filters[before..])
+        }
+        _ => false,
+    }
+}
+
 fn extract(expr: &Expr, qualifier: &str, filters: &mut Vec<Predicate>) {
     let (column, op, value) = match expr {
         Expr::Nested(inner) => return extract(inner, qualifier, filters),
@@ -278,30 +295,56 @@ pub(crate) fn where_clause(
 ) -> String {
     let terms = filters
         .iter()
-        .filter_map(|predicate| {
-            let kind = schema.field_with_name(&predicate.column).ok()?.data_type();
-            let column = ident(&predicate.column);
-            let operator = match predicate.op {
-                Comparison::IsNull => return Some(format!("{column} IS NULL")),
-                Comparison::IsNotNull => return Some(format!("{column} IS NOT NULL")),
-                Comparison::Eq => "=",
-                Comparison::Ne => "<>",
-                Comparison::Lt => "<",
-                Comparison::Le => "<=",
-                Comparison::Gt => ">",
-                Comparison::Ge => ">=",
-            };
-            if !kind.is_integer() {
-                return None;
-            }
-            let value = predicate.value.as_i64()?.to_string();
-            ScalarValue::try_from_string(value.clone(), kind).ok()?;
-            Some(format!("{column} {operator} {value}"))
-        })
+        .filter_map(|p| sql_term(p, schema, &ident))
         .collect::<Vec<_>>();
     if terms.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", terms.join(" AND "))
     }
+}
+
+// LIMIT and aggregates may only move past a WHERE when every term is exact.
+pub(crate) fn exact_terms(
+    filters: &[Predicate],
+    schema: &Schema,
+    ident: impl Fn(&str) -> String,
+) -> Option<Vec<String>> {
+    filters
+        .iter()
+        .map(|p| sql_term(p, schema, &ident))
+        .collect()
+}
+
+pub(crate) fn sql_term(
+    predicate: &Predicate,
+    schema: &Schema,
+    ident: impl Fn(&str) -> String,
+) -> Option<String> {
+    let kind = schema.field_with_name(&predicate.column).ok()?.data_type();
+    let column = ident(&predicate.column);
+    let operator = match predicate.op {
+        Comparison::IsNull => return Some(format!("{column} IS NULL")),
+        Comparison::IsNotNull => return Some(format!("{column} IS NOT NULL")),
+        Comparison::Eq => "=",
+        Comparison::Ne => "<>",
+        Comparison::Lt => "<",
+        Comparison::Le => "<=",
+        Comparison::Gt => ">",
+        Comparison::Ge => ">=",
+    };
+    if !kind.is_integer() {
+        return None;
+    }
+    let value = predicate.value.as_i64()?.to_string();
+    ScalarValue::try_from_string(value.clone(), kind).ok()?;
+    Some(format!("{column} {operator} {value}"))
+}
+
+// Warehouse schema probes are themselves remote statements. Skip the probe
+// when no predicate could use the type-checked SQL translation.
+pub(crate) fn needs_sql_types(filters: &[Predicate]) -> bool {
+    filters
+        .iter()
+        .any(|p| matches!(p.op, Comparison::IsNull | Comparison::IsNotNull) || p.value.is_i64())
 }

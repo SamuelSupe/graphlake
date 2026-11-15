@@ -47,7 +47,7 @@ async fn cypher_correlated_call_paginates_in_input_order_across_partitions() -> 
 }
 
 #[tokio::test]
-async fn cypher_with_filters_before_per_key_pagination() -> Result<()> {
+async fn cypher_with_filters_after_per_key_pagination() -> Result<()> {
     let (_dir, engine) = local_fixture("key: [tenant, id]")?;
     let mut result = engine
         .query(
@@ -56,7 +56,18 @@ async fn cypher_with_filters_before_per_key_pagination() -> Result<()> {
             Default::default(),
         )
         .await?;
-    assert_eq!(rows(&mut result).await?, [json!({"y":3})]);
+    assert_eq!(rows(&mut result).await?, [json!({"y":2})]);
+
+    let mut scoped = engine
+        .query(
+            Language::Cypher,
+            "MATCH (a:Account {tenant:1}) WITH a.id AS id ORDER BY id LIMIT 1
+         WHERE EXISTS { MATCH (a)-[:Transfer]->(:Account) }
+         RETURN id",
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(rows(&mut scoped).await?, [json!({"id":1})]);
 
     for (projection, items, predicate) in [
         ("x AS y", "[1,2,3]", "x > k AND y > k"),
@@ -81,15 +92,7 @@ async fn cypher_with_filters_before_per_key_pagination() -> Result<()> {
             )
             .await
             .with_context(|| query.clone())?;
-        assert_eq!(
-            rows(&mut result).await?,
-            [
-                json!({"k":1,"y":2}),
-                json!({"k":2,"y":3}),
-                json!({"k":2,"y":3}),
-            ],
-            "{query}"
-        );
+        assert!(rows(&mut result).await?.is_empty(), "{query}");
     }
 
     let mut result = engine
@@ -637,6 +640,73 @@ async fn gremlin_branches_and_until_operate_on_each_traverser() -> Result<()> {
             "{query}"
         );
     }
+    let cyclic = async {
+        let mut result = engine.query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').has('id',1).limit(1).repeat(__.has('id',1)).until(__.has('id',99)).count()",
+            Default::default(),
+        ).await?;
+        rows(&mut result).await
+    }.await;
+    assert!(format!("{:#}", cyclic.expect_err("unbounded repeat")).contains("256 iterations"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_queries_bound_expanded_expressions_before_sql_planning() -> Result<()> {
+    let (_files, engine) = local_fixture("key: [tenant, id]")?;
+    let slices = format!("RETURN [1,2,3]{} AS value", "[1..]".repeat(16));
+    let math = format!(
+        "g.V().limit(1).math('{}_{}')",
+        "(".repeat(2000),
+        ")".repeat(2000)
+    );
+    let filters = format!("g.V(){}.count()", ".filter(__.has('id'))".repeat(25));
+    for (language, query, expected) in [
+        (Language::Cypher, slices, "generated SQL size limit"),
+        (Language::Gremlin, math, "expression complexity"),
+        (Language::Gremlin, filters, "correlated plan size limit"),
+    ] {
+        let error = engine
+            .query(language, &query, Default::default())
+            .await
+            .err()
+            .context("oversized query reached execution")?;
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cypher_reports_arithmetic_and_sum_overflow() -> Result<()> {
+    let (_files, engine) = local_fixture("key: [tenant, id]")?;
+    for query in [
+        "RETURN 9223372036854775807 + 1 AS value",
+        "MATCH (a:Account) RETURN a.tenant * 9223372036854775807 AS value",
+        "UNWIND [9223372036854775807, 1] AS n RETURN sum(n) AS value",
+        "UNWIND [9223372036854775807, 1, 1] AS n RETURN sum(DISTINCT n) AS value",
+    ] {
+        let result = async {
+            let mut result = engine
+                .query(
+                    Language::Cypher,
+                    query,
+                    QueryOptions {
+                        batch_size: 1,
+                        partitions: 2,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            rows(&mut result).await
+        }
+        .await;
+        let error = result.expect_err(query);
+        assert!(
+            format!("{error:#}").to_lowercase().contains("overflow"),
+            "{query}: {error:#}"
+        );
+    }
     Ok(())
 }
 
@@ -658,6 +728,38 @@ async fn composed_cypher_preserves_optional_rows_and_scope() -> Result<()> {
             json!({"id":3,"transfers":0,"rows":1}),
         ]
     );
+
+    for predicate in [
+        "EXISTS { MATCH (b)-[:Transfer]->(c:Account) WHERE c.id = x }",
+        "COUNT { MATCH (b)-[:Transfer]->(c:Account) WHERE c.id = x } > 0",
+    ] {
+        let query = format!(
+            "UNWIND [3, 2, 3, 7] AS x
+             OPTIONAL MATCH (a:Account {{tenant:1,id:1}})-[t:Transfer]->(b:Account)
+             WHERE {predicate}
+             RETURN x, count(t) AS hits, count(*) AS rows ORDER BY x"
+        );
+        let mut answer = engine
+            .query(
+                Language::Cypher,
+                &query,
+                QueryOptions {
+                    batch_size: 1,
+                    partitions: 4,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            rows(&mut answer).await?,
+            [
+                json!({"x":2,"hits":1,"rows":1}),
+                json!({"x":3,"hits":4,"rows":4}),
+                json!({"x":7,"hits":0,"rows":1})
+            ],
+            "{query}"
+        );
+    }
 
     let mut answer = engine
         .query(
@@ -825,6 +927,25 @@ async fn cypher_collect_distinct_merges_ordered_spills_within_memory_budget() ->
 #[tokio::test]
 async fn cypher_undirected_and_shortest_paths_keep_parallel_edge_identity() -> Result<()> {
     let (_files, engine) = local_fixture("key: [tenant, id]")?;
+    for statement in [
+        "MATCH (a:Account)-[:Transfer]-(b:Account) RETURN a.id, b.id",
+        "MATCH (a:Account), (b:Account) WHERE a.id = b.tenant RETURN a.id, b.id",
+    ] {
+        let mut result = engine
+            .query(Language::Cypher, statement, Default::default())
+            .await?;
+        assert!(
+            result.physical_plan.contains("HashJoinExec"),
+            "{}",
+            result.physical_plan
+        );
+        assert!(
+            !result.physical_plan.contains("NestedLoopJoinExec"),
+            "{}",
+            result.physical_plan
+        );
+        assert!(!rows(&mut result).await?.is_empty());
+    }
     let mut answer = engine
         .query(
             Language::Cypher,
@@ -859,6 +980,10 @@ async fn cypher_undirected_and_shortest_paths_keep_parallel_edge_identity() -> R
         "MATCH p=allShortestPaths((a:Account {tenant:1,id:1})-[:Transfer*1..2]->(b:Account {tenant:1,id:2}))
          WHERE length(p)=2 RETURN count(p) AS paths", Default::default()).await?;
     assert_eq!(rows(&mut answer).await?, [json!({"paths":2})]);
+    let mut answer = engine.query(Language::Cypher,
+        "MATCH p=allShortestPaths((a:Account {tenant:1,id:1})-[:Transfer*2..3]->(b:Account {tenant:1,id:2}))
+         RETURN length(p) AS hops, count(*) AS paths", Default::default()).await?;
+    assert_eq!(rows(&mut answer).await?, [json!({"hops":2,"paths":2})]);
     Ok(())
 }
 

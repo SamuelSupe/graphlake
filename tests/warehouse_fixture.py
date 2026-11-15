@@ -1,7 +1,8 @@
-"""Loopback fixture for Snowflake, BigQuery and Trino query protocols."""
+"""Loopback fixture for Snowflake, BigQuery, Trino and Databricks query protocols."""
 import argparse
 import gzip
 import json
+import operator
 import re
 import uuid
 from collections import Counter
@@ -14,6 +15,7 @@ SNAPSHOT = "2026-11-10T09:00:00.123456Z"
 BILLING = "/bigquery/v2/projects/billing-test"
 STATEMENTS = "/api/v2/statements"
 TRINO = "/v1/statement"
+DATABRICKS = "/api/2.0/sql/statements"
 ACCOUNTS = [
     (1, 1, "active", "15.25", "1794301200123456"),
     (1, 2, "active", None, "1794301200123456"),
@@ -33,6 +35,27 @@ def projection(sql, quote, names, rows):
         [None if row[index] is None else str(row[index]) for index in map(names.index, fields)]
         for row in rows
     ]
+
+
+def warehouse_projection(sql, quote, names, rows):
+    if sql.endswith((" WHERE FALSE", " LIMIT 0")):
+        rows = []
+    elif " WHERE " in sql:
+        operators = {"=": operator.eq, "<>": operator.ne, "<": operator.lt,
+                     "<=": operator.le, ">": operator.gt, ">=": operator.ge}
+        for term in sql.rsplit(" WHERE ", 1)[1].split(" AND "):
+            null_check = re.fullmatch(rf'{quote}([a-z_]+){quote} IS (NOT )?NULL', term)
+            if null_check:
+                name, negate = null_check.groups()
+                index = names.index(name)
+                rows = [row for row in rows if (row[index] is not None) == bool(negate)]
+                continue
+            match = re.fullmatch(rf'{quote}([a-z_]+){quote} (<=|>=|<>|=|<|>) (-?\d+)', term)
+            assert match, f"unexpected warehouse predicate: {term}"
+            name, op, value = match.groups()
+            index = names.index(name)
+            rows = [row for row in rows if row[index] is not None and operators[op](row[index], int(value))]
+    return projection(sql, quote, names, rows)
 
 
 class WarehouseHandler(BaseHTTPRequestHandler):
@@ -63,8 +86,9 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         path, params = self.request_parts()
         if path.endswith("/cancel"):
             job = path.split("/")[-2]
-            assert "stalled" in self.jobs[job]
-            self.cancelled["snowflake" if path.startswith(STATEMENTS) else "bigquery"] += 1
+            if not path.startswith(DATABRICKS):
+                assert "stalled" in self.jobs[job]
+            self.cancelled["databricks" if path.startswith(DATABRICKS) else "snowflake" if path.startswith(STATEMENTS) else "bigquery"] += 1
             self.send_json({})
             return
 
@@ -82,6 +106,13 @@ class WarehouseHandler(BaseHTTPRequestHandler):
                             "nextUri": f"http://{origin}{TRINO}/executing/{job}/1"})
             return
         body = json.loads(raw)
+        if path == DATABRICKS:
+            assert body["warehouse_id"] == "WH_TEST" and body["catalog"] == "main"
+            assert body["format"] == "JSON_ARRAY" and body["disposition"] == "INLINE"
+            job = str(uuid.uuid4())
+            self.jobs[job] = body["statement"]
+            self.send_json({"statement_id": job, "status": {"state": "PENDING"}})
+            return
         if path == STATEMENTS:
             assert params["async"] == ["true"] and params["nullable"] == ["true"]
             uuid.UUID(params["requestId"][0])
@@ -107,6 +138,11 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             self.send_json(self.cancelled)
             return
         path, params = self.request_parts()
+        if path.startswith(DATABRICKS + "/"):
+            parts = path[len(DATABRICKS) + 1:].split("/")
+            job = parts[0]
+            self.databricks_result(self.jobs[job], job, int(parts[-1]) if len(parts) > 1 else None)
+            return
         if path.startswith(TRINO + "/"):
             _, job, page = path.rsplit("/", 2)
             self.trino_result(self.jobs[job], job, page)
@@ -125,6 +161,41 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         assert "stalled" in self.jobs[path.split("/")[-2]]
         self.cancelled["trino"] += 1
         self.send_json({})
+
+    def databricks_result(self, sql, job, page):
+        if "stalled" in sql:
+            self.send_json({"statement_id": job, "status": {"state": "RUNNING"}})
+            return
+        types = {"tenant": "LONG", "id": "LONG", "status": "STRING", "balance": "DECIMAL", "created": "TIMESTAMP"}
+        if sql.startswith("SELECT schema_name AS name FROM `main`.information_schema.schemata"):
+            fields, rows = ["name"], [["sales"]]
+        elif sql.startswith("SELECT table_name AS name FROM `main`.information_schema.tables"):
+            assert "table_schema='sales'" in sql
+            fields, rows = ["name"], [["accounts"]]
+        else:
+            assert "FROM `main`.`sales`." in sql
+            names = ["tenant", "id", "status", "balance", "created"]
+            if sql.startswith("SELECT * FROM "):
+                sql = sql.replace("*", ", ".join(f"`{name}`" for name in names), 1)
+            fields, rows = warehouse_projection(sql, "`", names, ACCOUNTS)
+        types["name"] = "STRING"
+        columns = [{"name": field, "type_name": types[field], "type_precision": 18, "type_scale": 2} for field in fields]
+        if "created" in fields:
+            for row in rows:
+                row[fields.index("created")] = SNAPSHOT
+        index = page or 0
+        selected = rows[index * 2:(index + 1) * 2]
+        chunk = {"chunk_index": index, "row_offset": index * 2, "row_count": len(selected), "data_array": selected}
+        if (index + 1) * 2 < len(rows):
+            link = f"{DATABRICKS}/{job}/result/chunks/{index + 1}?row_offset={(index + 1) * 2}"
+            if "foreign" in sql:
+                link = "http://localhost:1" + link
+            chunk["next_chunk_internal_link"] = link
+        if page is not None:
+            self.send_json(chunk)
+            return
+        self.send_json({"statement_id": job, "status": {"state": "SUCCEEDED"},
+                        "manifest": {"schema": {"columns": columns}, "total_row_count": len(rows) + (1 if "incomplete" in sql else 0), "truncated": "truncated" in sql}, "result": chunk})
 
     def trino_result(self, sql, job, page):
         if "stalled" in sql:
@@ -189,13 +260,11 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             cut = 1
         else:
             assert f"""FROM "db"."sales"."transfers" AT (TIMESTAMP => '{SNAPSHOT}'::TIMESTAMP_TZ)""" in sql
-            names, rows = projection(sql, '"', ("tenant", "id", "src", "dst", "amount"), TRANSFERS)
+            names, rows = warehouse_projection(sql, '"', ("tenant", "id", "src", "dst", "amount"), TRANSFERS)
             columns = [
                 {"name": name, "type": "fixed", "precision": 18, "scale": 0, "nullable": False}
                 for name in names
             ]
-            if sql.endswith(" WHERE FALSE"):
-                rows = []
             cut = min(2, len(rows))
         if params.get("partition") == ["1"]:
             self.send_json({"data": rows[cut:]}, compressed=True)
@@ -221,14 +290,12 @@ class WarehouseHandler(BaseHTTPRequestHandler):
             rows = [[SNAPSHOT]]
         else:
             assert f"FROM `data-test.sales.accounts` FOR SYSTEM_TIME AS OF TIMESTAMP '{SNAPSHOT}'" in sql
-            names, rows = projection(sql, "`", ("tenant", "id", "status", "balance", "created"), ACCOUNTS)
+            names, rows = warehouse_projection(sql, "`", ("tenant", "id", "status", "balance", "created"), ACCOUNTS)
             types = {"status": "STRING", "balance": "NUMERIC", "created": "TIMESTAMP"}
             columns = [{"name": name, "type": types.get(name, "INT64")} for name in names]
             for column in columns:
                 if column["name"] == "balance":
                     column.update(precision="38", scale="2")
-            if sql.endswith(" WHERE FALSE"):
-                rows = []
 
         token = params.get("pageToken")
         assert token in (None, ["page-2"])

@@ -79,6 +79,21 @@ edges:
             .iter()
             .all(|version| version.version == VERSION)
     );
+    let baseline = result.metrics().reads.warehouse_rows;
+    let mut partitioned = options.clone();
+    partitioned
+        .graph
+        .logical_partition
+        .push(graphlake::Predicate {
+            column: "tenant".into(),
+            op: graphlake::Comparison::Eq,
+            value: 1.into(),
+        });
+    let mut filtered = engine
+        .query(Language::Cypher, TWO_HOPS, partitioned)
+        .await?;
+    assert_eq!(rows(&mut filtered).await?, expected_two_hops());
+    assert_eq!(filtered.metrics().reads.warehouse_rows, baseline - 2);
 
     let mut result = engine
         .query(
@@ -105,6 +120,7 @@ edges:
         count += batch.column(0).null_count();
     }
     assert_eq!(count, 1);
+    assert_eq!(result.metrics().reads.warehouse_rows, 3);
     Ok(())
 }
 
@@ -218,7 +234,13 @@ nodes:
 #[ignore = "requires the loopback warehouse API fixture"]
 async fn named_trino_connectors_qualify_the_catalog_and_preserve_results() -> Result<()> {
     let uri = std::env::var("GRAPHLAKE_TEST_WAREHOUSE_URI")?;
-    for kind in ["mongodb", "elasticsearch", "redshift"] {
+    for kind in [
+        "mongodb",
+        "elasticsearch",
+        "redshift",
+        "sqlserver",
+        "oracle",
+    ] {
         let table = if kind == "elasticsearch" {
             "accounts.2026.11"
         } else {
@@ -411,12 +433,9 @@ nodes:
         [serde_json::json!({"id":42,"n":8192})]
     );
     assert_eq!(nested.metrics().reads.warehouse_rows, 8192);
+    let wide_sql = r#"SELECT count(*) AS n, sum(length(name)) AS bytes FROM "Account""#;
     let mut result = engine
-        .query(
-            Language::Sql,
-            r#"SELECT count(*) AS n, sum(length(name)) AS bytes FROM "Account""#,
-            options.clone(),
-        )
+        .query(Language::Sql, wide_sql, options.clone())
         .await?;
     assert_eq!(
         rows(&mut result).await?,
@@ -427,14 +446,7 @@ nodes:
         spill_bytes: 1024,
         ..options
     };
-    let Err(error) = engine
-        .query(
-            Language::Sql,
-            r#"SELECT count(*) FROM "Account""#,
-            constrained,
-        )
-        .await
-    else {
+    let Err(error) = engine.query(Language::Sql, wide_sql, constrained).await else {
         panic!("source spill exceeded its disk quota");
     };
     assert!(format!("{error:#}").contains("allowable limit"));
@@ -457,7 +469,11 @@ nodes:
   Account:
     source: remote.graphlake.nodes
     key: [id]
-    properties: [amount, name]"
+    properties: [amount, name, posted]
+  StringKey:
+    source: remote.graphlake.nodes
+    key: [name]
+    properties: [amount]"
     ))?;
     let mut result = engine
         .query(
@@ -476,5 +492,171 @@ nodes:
             "n": 3000, "amount": 4499250.0, "name": "node-1"
         })]
     );
+    let mut dates = engine
+        .query(
+            Language::Sql,
+            r#"SELECT posted FROM "Account" WHERE id <= 2 ORDER BY id"#,
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(
+        dates.batches.schema().field(0).data_type(),
+        &graphlake::arrow::datatypes::DataType::Date32
+    );
+    assert_eq!(
+        rows(&mut dates).await?,
+        [
+            serde_json::json!({"posted": "2026-01-02"}),
+            serde_json::json!({}),
+        ]
+    );
+    for (value, count) in [("node-1", 1), (r#"测试''节点\path"#, 0)] {
+        let mut filtered = engine
+            .query(
+                Language::Sql,
+                &format!(r#"SELECT amount FROM "StringKey" WHERE name = '{value}'"#),
+                Default::default(),
+            )
+            .await?;
+        let mut control = engine.query(
+            Language::Sql,
+            &format!(r#"WITH full_scan AS (SELECT * FROM "StringKey") SELECT amount FROM full_scan WHERE name = '{value}'"#),
+            Default::default(),
+        ).await?;
+        let expected = rows(&mut control).await?;
+        assert_eq!(expected.len(), count);
+        assert_eq!(rows(&mut filtered).await?, expected);
+        assert_eq!(filtered.metrics().reads.warehouse_rows, count as u64);
+        assert_eq!(control.metrics().reads.warehouse_rows, 3000);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the loopback warehouse API fixture"]
+async fn databricks_preserves_pages_types_and_rejects_incomplete_results() -> Result<()> {
+    let uri = std::env::var("GRAPHLAKE_TEST_WAREHOUSE_URI")?;
+    for table in ["accounts", "foreign", "truncated", "incomplete"] {
+        let engine = engine(&format!(
+            "graph: databricks\nsources:\n  db: {{type: databricks, uri: '{uri}', token_env: GRAPHLAKE_TEST_WAREHOUSE_TOKEN, warehouse: WH_TEST, catalog: main}}\nnodes:\n  Account: {{source: db.sales.{table}, key: [tenant, id], properties: [balance, created]}}"
+        ))?;
+        let query = "SELECT balance, created FROM \"Account\" ORDER BY tenant, id";
+        let result = engine
+            .query(
+                Language::Sql,
+                query,
+                QueryOptions {
+                    batch_size: 2,
+                    ..Default::default()
+                },
+            )
+            .await;
+        if table != "accounts" {
+            assert!(result.is_err(), "{table} must not return partial results");
+            continue;
+        }
+        let mut result = result?;
+        let batch = result.batches.try_next().await?.unwrap();
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            1525
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            1794301200123456
+        );
+        let mut count = batch.num_rows();
+        while let Some(batch) = result.batches.try_next().await? {
+            count += batch.num_rows();
+        }
+        assert_eq!(count, 4);
+        let mut point = engine
+            .query(
+                Language::Sql,
+                "SELECT id FROM \"Account\" WHERE tenant = 1 AND id = 2",
+                Default::default(),
+            )
+            .await?;
+        assert_eq!(rows(&mut point).await?, vec![serde_json::json!({"id": 2})]);
+        assert_eq!(point.metrics().reads.warehouse_rows, 1);
+        let mut options = QueryOptions::default();
+        options.graph.logical_partition.push(graphlake::Predicate {
+            column: "balance".into(),
+            op: graphlake::Comparison::IsNull,
+            value: serde_json::Value::Null,
+        });
+        let mut null_balance = engine
+            .query(Language::Sql, "SELECT id FROM \"Account\"", options)
+            .await?;
+        assert_eq!(
+            rows(&mut null_balance).await?,
+            vec![serde_json::json!({"id": 2})]
+        );
+        assert_eq!(null_balance.metrics().reads.warehouse_rows, 1);
+        let mut explain = engine
+            .query(
+                Language::Sql,
+                "EXPLAIN SELECT * FROM \"Account\"",
+                Default::default(),
+            )
+            .await?;
+        assert!(!rows(&mut explain).await?.is_empty());
+        assert_eq!(explain.metrics().reads.warehouse_rows, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the loopback warehouse API fixture"]
+async fn databricks_cancels_on_query_timeout() -> Result<()> {
+    let uri = std::env::var("GRAPHLAKE_TEST_WAREHOUSE_URI")?;
+    let client = reqwest::Client::new();
+    let before: BTreeMap<String, u64> = client
+        .get(format!("{uri}/fixture/cancelled"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let engine = engine(&format!(
+        "graph: cancelled\nsources:\n  db: {{type: databricks, uri: '{uri}', token_env: GRAPHLAKE_TEST_WAREHOUSE_TOKEN, warehouse: WH_TEST, catalog: main}}\nnodes:\n  Account: {{source: db.sales.stalled, key: [id]}}"
+    ))?;
+    assert!(
+        engine
+            .query(
+                Language::Sql,
+                "SELECT * FROM \"Account\"",
+                QueryOptions {
+                    timeout: Duration::from_secs(1),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let after: BTreeMap<String, u64> = client
+                .get(format!("{uri}/fixture/cancelled"))
+                .send()
+                .await?
+                .json()
+                .await?;
+            if after.get("databricks").unwrap_or(&0) > before.get("databricks").unwrap_or(&0) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await??;
     Ok(())
 }

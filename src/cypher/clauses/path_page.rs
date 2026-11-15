@@ -234,7 +234,16 @@ impl<'a> Page<'a> {
         for (body, predicate) in self
             .with
             .iter()
-            .map(|with| (&with.body, with.where_clause.as_ref()))
+            .enumerate()
+            .map(|(index, with)| {
+                // The predicate attached to the paged WITH runs after the page.
+                let predicate = if self.output.is_none() && index + 1 == self.with.len() {
+                    None
+                } else {
+                    with.where_clause.as_ref()
+                };
+                (&with.body, predicate)
+            })
             .chain(self.output.map(|body| (body, None)))
         {
             let input = MatchPlan::new(catalog);

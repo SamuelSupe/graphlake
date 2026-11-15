@@ -84,9 +84,52 @@ pub struct Catalog {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Source {
+    Sqlite {
+        path: String,
+    },
     Postgres {
         dsn_env: String,
     },
+    Duckdb {
+        path: String,
+    },
+    Doris(MysqlConnection),
+    Starrocks(MysqlConnection),
+    Tidb(MysqlConnection),
+    Oceanbase(MysqlConnection),
+    Mariadb(MysqlConnection),
+    SqlserverNative {
+        host: String,
+        port: u16,
+        database: String,
+        user: String,
+        password_env: String,
+        #[serde(default = "default_tls")]
+        tls: bool,
+        ca_file: Option<String>,
+    },
+    OracleNative {
+        connect_string: String,
+        user: String,
+        password_env: String,
+    },
+    MongodbNative {
+        dsn_env: String,
+        #[serde(default = "default_schema_sample_size")]
+        schema_sample_size: u32,
+    },
+    Databricks {
+        uri: String,
+        token_env: String,
+        warehouse: String,
+        catalog: String,
+    },
+    ObjectStorage {
+        storage: StorageConfig,
+        format: ObjectFormat,
+        tables: BTreeMap<String, TextTable>,
+    },
+
     Mysql {
         dsn_env: String,
         #[serde(default = "default_tls")]
@@ -123,6 +166,8 @@ pub enum Source {
     Mongodb(TrinoCatalog),
     Elasticsearch(TrinoCatalog),
     Redshift(TrinoCatalog),
+    Sqlserver(TrinoCatalog),
+    Oracle(TrinoCatalog),
     Spanner {
         database: String,
         uri: Option<String>,
@@ -140,6 +185,12 @@ pub enum Source {
     Parquet {
         tables: BTreeMap<String, Vec<String>>,
     },
+    Csv {
+        tables: BTreeMap<String, TextTable>,
+    },
+    Jsonl {
+        tables: BTreeMap<String, TextTable>,
+    },
     Delta {
         tables: BTreeMap<String, DeltaTable>,
     },
@@ -150,6 +201,42 @@ pub enum Source {
         #[serde(default)]
         snapshots: BTreeMap<String, i64>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MysqlConnection {
+    pub dsn_env: String,
+    #[serde(default = "default_tls")]
+    pub tls: bool,
+    pub ca_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectFormat {
+    Parquet,
+    Csv,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    pub provider: String,
+    pub bucket: String,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub access_key_env: Option<String>,
+    pub secret_key_env: Option<String>,
+    pub session_token_env: Option<String>,
+    pub account: Option<String>,
+    pub account_key_env: Option<String>,
+    pub service_account_env: Option<String>,
+}
+
+fn default_schema_sample_size() -> u32 {
+    1000
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -167,6 +254,90 @@ pub struct TrinoCatalog {
 pub struct DeltaTable {
     pub path: String,
     pub version: Option<u64>,
+}
+
+/// An explicit file list with an ordered schema; CSV headers must match this order.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextTable {
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub columns: Vec<TextColumn>,
+}
+
+/// A text-file column using Arrow type notation, for example `Int64` or `Utf8`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextColumn {
+    pub name: String,
+    pub data_type: String,
+    #[serde(default = "default_nullable")]
+    pub nullable: bool,
+}
+
+fn default_nullable() -> bool {
+    true
+}
+
+impl TextTable {
+    pub(crate) fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        ensure!(
+            !self.files.is_empty() && self.files.iter().all(|file| !file.trim().is_empty()),
+            "text table needs an explicit file list"
+        );
+        ensure!(
+            !self.columns.is_empty(),
+            "text table needs an explicit column schema"
+        );
+        let mut names = BTreeSet::new();
+        let fields = self
+            .columns
+            .iter()
+            .map(|column| {
+                validate_name(&column.name)?;
+                ensure!(
+                    names.insert(&column.name),
+                    "duplicate text column {}",
+                    column.name
+                );
+                let kind: DataType = column
+                    .data_type
+                    .parse()
+                    .context("invalid text column Arrow type")?;
+                ensure!(
+                    matches!(
+                        kind,
+                        DataType::Boolean
+                            | DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::UInt8
+                            | DataType::UInt16
+                            | DataType::UInt32
+                            | DataType::UInt64
+                            | DataType::Float32
+                            | DataType::Float64
+                            | DataType::Utf8
+                            | DataType::Date32
+                            | DataType::Timestamp(_, _)
+                            | DataType::Decimal128(_, _)
+                    ),
+                    "unsupported text column type {}",
+                    column.data_type
+                );
+                if let DataType::Decimal128(precision, scale) = kind {
+                    ensure!(
+                        precision > 0 && precision <= 38 && scale >= 0 && scale as u8 <= precision,
+                        "text decimal requires 0 <= scale <= precision <= 38"
+                    );
+                }
+                Ok(Field::new(&column.name, kind, column.nullable))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(std::sync::Arc::new(Schema::new(fields)))
+    }
 }
 
 fn default_tls() -> bool {
@@ -318,6 +489,7 @@ impl Catalog {
             .unwrap_or_default();
         for source in catalog.sources.values_mut() {
             match source {
+                Source::Sqlite { path } | Source::Duckdb { path } => resolve_path(path, &base)?,
                 Source::Parquet { tables } => {
                     for file in tables.values_mut().flatten() {
                         resolve_path(file, &base)?;
@@ -328,7 +500,18 @@ impl Catalog {
                         resolve_path(&mut table.path, &base)?;
                     }
                 }
+                Source::Csv { tables } | Source::Jsonl { tables } => {
+                    for table in tables.values_mut() {
+                        for file in &mut table.files {
+                            resolve_path(file, &base)?;
+                        }
+                    }
+                }
                 Source::Mysql {
+                    ca_file: Some(path),
+                    ..
+                }
+                | Source::SqlserverNative {
                     ca_file: Some(path),
                     ..
                 }
@@ -336,6 +519,15 @@ impl Catalog {
                     ca_file: Some(path),
                     ..
                 } => resolve_path(path, &base)?,
+                Source::Doris(config)
+                | Source::Starrocks(config)
+                | Source::Tidb(config)
+                | Source::Oceanbase(config)
+                | Source::Mariadb(config) => {
+                    if let Some(path) = &mut config.ca_file {
+                        resolve_path(path, &base)?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -523,6 +715,115 @@ impl Catalog {
             .get(name)
             .with_context(|| format!("unknown source {name}"))?;
         match source {
+            Source::Sqlite { path } => {
+                ensure!(
+                    !path.trim().is_empty() && !path.contains("://") && path != ":memory:",
+                    "SQLite requires a local database file path"
+                );
+                validate_name(table)?;
+            }
+            Source::Duckdb { path } => {
+                ensure!(
+                    !path.trim().is_empty() && !path.contains("://") && path != ":memory:",
+                    "DuckDB requires a local database file path"
+                );
+                qualified_table(table, 2)?;
+            }
+            Source::Doris(config)
+            | Source::Starrocks(config)
+            | Source::Tidb(config)
+            | Source::Oceanbase(config)
+            | Source::Mariadb(config) => {
+                ensure!(
+                    !config.dsn_env.trim().is_empty(),
+                    "database source requires dsn_env"
+                );
+                ensure!(
+                    config.tls || config.ca_file.is_none(),
+                    "ca_file requires TLS"
+                );
+                qualified_table(table, 2)?;
+            }
+            Source::SqlserverNative {
+                host,
+                port,
+                database,
+                user,
+                password_env,
+                tls,
+                ca_file,
+            } => {
+                url::Host::parse(host).context("invalid SQL Server host")?;
+                ensure!(
+                    *port > 0
+                        && !database.trim().is_empty()
+                        && !user.trim().is_empty()
+                        && !password_env.trim().is_empty(),
+                    "SQL Server requires database, user, port and password_env"
+                );
+                ensure!(*tls || ca_file.is_none(), "ca_file requires TLS");
+                qualified_table(table, 2)?;
+            }
+            Source::OracleNative {
+                connect_string,
+                user,
+                password_env,
+            } => {
+                ensure!(
+                    !connect_string.trim().is_empty()
+                        && !user.trim().is_empty()
+                        && !password_env.trim().is_empty(),
+                    "Oracle requires connect_string, user and password_env"
+                );
+                qualified_table(table, 2)?;
+            }
+            Source::MongodbNative {
+                dsn_env,
+                schema_sample_size,
+            } => {
+                ensure!(
+                    !dsn_env.trim().is_empty() && (1..=10000).contains(schema_sample_size),
+                    "MongoDB requires dsn_env and schema_sample_size between 1 and 10000"
+                );
+                let (database, collection) = table
+                    .split_once('.')
+                    .context("expected MongoDB database.collection")?;
+                validate_name(database)?;
+                validate_name(collection)?;
+            }
+            Source::Databricks {
+                uri,
+                token_env,
+                warehouse,
+                catalog,
+            } => {
+                warehouse_endpoint(uri)?;
+                ensure!(
+                    !token_env.trim().is_empty()
+                        && !warehouse.trim().is_empty()
+                        && !catalog.trim().is_empty(),
+                    "Databricks requires token_env, warehouse and catalog"
+                );
+                qualified_table(table, 2)?;
+            }
+            Source::ObjectStorage {
+                storage,
+                format,
+                tables,
+            } => {
+                crate::source::storage::validate(storage)?;
+                let mapping = tables.get(table).context("unknown object-storage table")?;
+                ensure!(
+                    !mapping.files.is_empty(),
+                    "object-storage table requires files"
+                );
+                for path in &mapping.files {
+                    crate::source::storage::object_path(path)?;
+                }
+                if !matches!(format, ObjectFormat::Parquet) {
+                    mapping.schema()?;
+                }
+            }
             Source::Postgres { dsn_env } | Source::Mysql { dsn_env, .. } => {
                 ensure!(!dsn_env.is_empty(), "database source {name} needs dsn_env");
                 let (schema, relation) = table
@@ -593,7 +894,11 @@ impl Catalog {
                 warehouse_endpoint(uri)?;
                 validate_http_auth(user, token_env.as_deref(), password_env.as_deref())?;
             }
-            Source::Mongodb(config) | Source::Elasticsearch(config) | Source::Redshift(config) => {
+            Source::Mongodb(config)
+            | Source::Elasticsearch(config)
+            | Source::Redshift(config)
+            | Source::Sqlserver(config)
+            | Source::Oracle(config) => {
                 let (schema, table) = table
                     .split_once('.')
                     .with_context(|| format!("expected source.schema.table, got {reference}"))?;
@@ -676,6 +981,12 @@ impl Catalog {
                     ),
                     "Parquet table {reference} needs an explicit file list"
                 );
+            }
+            Source::Csv { tables } | Source::Jsonl { tables } => {
+                tables
+                    .get(table)
+                    .with_context(|| format!("unknown text table {reference}"))?
+                    .schema()?;
             }
         }
         Ok((name, table, source))

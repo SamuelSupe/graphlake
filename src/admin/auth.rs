@@ -221,6 +221,7 @@ struct Sessions {
     tokens: HashMap<Token, Session>,
     failures: HashMap<FailureKey, VecDeque<Instant>>,
     last_failure_prune: Option<Instant>,
+    admin_retry_at: Option<Instant>,
 }
 
 impl Sessions {
@@ -284,15 +285,18 @@ enum FailureKey {
     Administrator(Option<IpAddr>),
 }
 
-fn login_keys(name: &str, source: Option<IpAddr>) -> Vec<(FailureKey, usize)> {
+fn login_keys(name: &str, source: Option<IpAddr>, known_account: bool) -> Vec<(FailureKey, usize)> {
     if name == USERNAME {
         vec![(FailureKey::Administrator(source), MAX_FAILURES)]
     } else {
-        let name = if models::valid_id(name) { name } else { "" };
-        vec![
-            (FailureKey::Account(name.into()), MAX_FAILURES),
-            (FailureKey::Source(source), SOURCE_FAILURES),
-        ]
+        let mut keys = Vec::new();
+        if known_account {
+            keys.push((FailureKey::Account(name.into()), MAX_FAILURES));
+        }
+        if source.is_some() || !known_account {
+            keys.push((FailureKey::Source(source), SOURCE_FAILURES));
+        }
+        keys
     }
 }
 
@@ -312,10 +316,25 @@ struct SharedSessions {
     user_tokens: Vec<(Token, Session)>,
 }
 
+impl SharedSessions {
+    fn active_tokens(self, now: SystemTime) -> HashMap<Token, Session> {
+        self.tokens
+            .into_iter()
+            .filter(|(_, session)| session.principal == Principal::Admin)
+            .chain(
+                self.user_tokens
+                    .into_iter()
+                    .filter(|(_, session)| matches!(session.principal, Principal::User { .. })),
+            )
+            .filter(|(_, session)| session.active(now))
+            .collect()
+    }
+}
+
 struct SharedAuth {
     leader: Arc<super::cluster::control::Leadership>,
     password_version: Token,
-    revision: tokio::sync::Mutex<i64>,
+    revision: tokio::sync::Mutex<Option<i64>>,
 }
 
 pub(super) struct Auth {
@@ -381,22 +400,13 @@ impl Auth {
             {
                 revision = version;
                 if saved.password_version == password_version {
-                    let now = SystemTime::now();
-                    sessions.tokens = saved
-                        .tokens
-                        .into_iter()
-                        .filter(|(_, session)| session.principal == Principal::Admin)
-                        .chain(saved.user_tokens.into_iter().filter(|(_, session)| {
-                            matches!(session.principal, Principal::User { .. })
-                        }))
-                        .filter(|(_, session)| session.active(now))
-                        .collect();
+                    sessions.tokens = saved.active_tokens(SystemTime::now());
                 }
             }
             Some(SharedAuth {
                 leader,
                 password_version,
-                revision: tokio::sync::Mutex::new(revision),
+                revision: tokio::sync::Mutex::new(Some(revision)),
             })
         } else {
             None
@@ -516,10 +526,15 @@ impl Auth {
         }
         if update {
             let auth = self.clone();
-            tokio::spawn(async move { auth.apply(SessionChange::Touch(token, now)).await })
+            match tokio::spawn(async move { auth.apply(SessionChange::Touch(token, now)).await })
                 .await
-                .ok()?
-                .ok()?;
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error))
+                    if error.status.is_server_error()
+                        && self.sessions.lock().unwrap().check(token, now, false) => {}
+                _ => return None,
+            }
         }
         Some(principal)
     }
@@ -560,7 +575,27 @@ impl Auth {
 
     async fn apply(&self, change: SessionChange) -> super::ApiResult<()> {
         if let Some(shared) = &self.shared {
+            let touch = matches!(change, SessionChange::Touch(..));
             let mut revision = shared.revision.lock().await;
+            let previous = if let Some(previous) = *revision {
+                previous
+            } else {
+                // A failed touch may already have committed. Reconcile against
+                // the fenced, linearizable checkpoint before any further writes.
+                let saved = shared.leader.get::<SharedSessions>("sessions").await?;
+                let (tokens, current) = match saved {
+                    Some((saved, current)) if saved.password_version == shared.password_version => {
+                        (saved.active_tokens(SystemTime::now()), current)
+                    }
+                    _ => {
+                        shared.leader.retire();
+                        return Err(super::cluster::control::lost());
+                    }
+                };
+                self.sessions.lock().unwrap().tokens = tokens;
+                *revision = Some(current);
+                current
+            };
             let mut snapshot = Sessions {
                 tokens: self.sessions.lock().unwrap().tokens.clone(),
                 ..Default::default()
@@ -578,16 +613,26 @@ impl Auth {
                 tokens,
                 user_tokens,
             };
-            // The transaction may have committed even if the client disconnects.
-            // Persist independently of the HTTP handler and retire the process on an ambiguous response.
+            // A login or logout changes authorization. An ambiguous idle-time
+            // refresh can be reconciled without retiring this Coordinator.
             let result = shared
                 .leader
-                .commit("sessions", *revision, &data, None::<(uuid::Uuid, &())>)
+                .commit("sessions", previous, &data, None::<(uuid::Uuid, &())>)
                 .await;
             match result {
                 Ok(Some(next)) => {
                     self.sessions.lock().unwrap().tokens = snapshot.tokens;
-                    *revision = next;
+                    *revision = Some(next);
+                }
+                Err(error) if touch => {
+                    if error.code != super::cluster::control::UNCERTAIN {
+                        *revision = None;
+                    }
+                    return Err(error);
+                }
+                Ok(None) if touch => {
+                    *revision = None;
+                    return Err(super::cluster::control::unavailable());
                 }
                 Err(error) => {
                     if error.code != super::cluster::control::UNCERTAIN {
@@ -625,13 +670,20 @@ impl SessionChange {
     fn apply(self, sessions: &mut Sessions) -> super::ApiResult<bool> {
         match self {
             Self::Touch(token, now) => {
-                if !sessions.check(token, now, true) {
+                if !sessions.check(token, now, false) {
                     return Err(Error::new(
                         StatusCode::UNAUTHORIZED,
                         "auth_required",
                         "请重新登录",
                     ));
                 }
+                let session = sessions.tokens.get_mut(&token).expect("checked session");
+                if now.duration_since(session.last_used).unwrap_or_default()
+                    < Duration::from_secs(5)
+                {
+                    return Ok(false);
+                }
+                session.last_used = now;
                 Ok(true)
             }
             Self::Replace(old, new) => {
@@ -731,7 +783,6 @@ pub(super) async fn login(
         })
         .flatten()
         .map(|ip| ip.to_canonical());
-    let keys = login_keys(&input.username, source);
     let semaphore = if input.username == USERNAME {
         &auth.admin_password_slot
     } else {
@@ -744,7 +795,10 @@ pub(super) async fn login(
     let worker = tokio::task::spawn_blocking(move || {
         let _slot = slot;
         let auth = &verifier.auth;
-        {
+        let named = verifier.users.verifier(&input.username);
+        let keys = login_keys(&input.username, source, named.is_some());
+        let shared_admin = input.username == USERNAME && source.is_none();
+        let retry = {
             let now = Instant::now();
             let mut sessions = auth.sessions.lock().unwrap();
             if sessions
@@ -754,19 +808,27 @@ pub(super) async fn login(
                 prune_failures(&mut sessions.failures, now);
                 sessions.last_failure_prune = Some(now);
             }
-            if let Some(seconds) = keys
+            let wait = keys
                 .iter()
                 .filter_map(|(key, limit)| {
                     let times = sessions.failures.get(key)?;
                     let age = now.duration_since(*times.iter().rev().nth(*limit - 1)?);
                     (age < FAILURE_WINDOW).then(|| (FAILURE_WINDOW - age).as_secs() + 1)
                 })
-                .max()
-            {
-                return Err(throttled(seconds));
+                .max();
+            if let Some(seconds) = wait {
+                if !shared_admin {
+                    return Err(throttled(seconds));
+                }
+                if let Some(at) = sessions.admin_retry_at.filter(|at| *at > now) {
+                    return Err(throttled(at.duration_since(now).as_secs() + 1));
+                }
+                // With no client identity, pace password verification after a
+                // burst so a shared failure bucket cannot reject every login.
+                sessions.admin_retry_at = Some(now + FAILURE_WINDOW / MAX_FAILURES as u32);
             }
-        }
-        let named = verifier.users.verifier(&input.username);
+            wait.is_some()
+        };
         let encoded = named
             .as_ref()
             .map(|(hash, _)| hash.as_str())
@@ -805,6 +867,9 @@ pub(super) async fn login(
                     times.pop_front();
                 }
                 times.push_back(now);
+            }
+            if retry {
+                return Err(throttled((FAILURE_WINDOW / MAX_FAILURES as u32).as_secs()));
             }
             return Err(Error::new(
                 StatusCode::UNAUTHORIZED,

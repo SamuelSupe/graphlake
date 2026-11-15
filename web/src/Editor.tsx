@@ -2,8 +2,9 @@ import type { useMutations } from './Mutations';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, Waypoints, X } from 'lucide-react';
 import { api, ApiError, downloadText, errorText, type Column, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
-import { connectorChoices, newConnector } from './connectors';
-import { Catalogs } from './Catalogs';
+import { newConnector } from './connectors';
+import { AddSource } from './AddSource';
+import { Catalogs, ConnectorGallery } from './Catalogs';
 import type { LocalTable } from './LocalTables';
 import { SourceBrowser, type TableSelection } from './SourceBrowser';
 import type { CanvasConnection } from './GraphCanvas';
@@ -51,6 +52,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const [catalogSelection, setCatalogSelection] = useState<string>();
   const [browsing, setBrowsing] = useState<string>();
   const [localTables, setLocalTables] = useState(false);
+  const [newSourceType, setNewSourceType] = useState<string>();
   const [modal, setModal] = useState<Section | 'yaml' | 'title' | 'versions' | 'unpublish' | 'nodes-list' | 'edges-list'>();
   const [loading, setLoading] = useState(!initial);
   const [saving, setSaving] = useState(false);
@@ -235,7 +237,12 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     } finally { setActivating(false); }
   }
 
-  function add(section: 'sources' | 'nodes', name: string, type: string) {
+  function openSource(type?: string) {
+    setNewSourceType(type);
+    setModal('sources');
+  }
+
+  function add(section: 'sources' | 'nodes', name: string, type: string, config?: Record<string, unknown>) {
     if (!model) return;
     if (section === 'sources' && (!allow.configure || name.includes('.') || name.includes('\0'))) throw new Error('请输入不含点的数据源名称');
     const exists = (key: Section) => Object.hasOwn(model[key], name);
@@ -243,7 +250,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       throw new Error('名称已存在');
     }
     edit(doc => {
-      if (section === 'sources') doc.setIn([section, name], newConnector(type));
+      if (section === 'sources') doc.setIn([section, name], config ?? newConnector(type));
       else doc.setIn([section, name], { source: '', key: [''], properties: [] });
     });
     if (section === 'sources' && workspace === 'catalogs') setCatalogSelection(name);
@@ -359,11 +366,10 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     </div>}
   </>;
   const inspector = model && inspectorSelection && <aside className="inspector" ref={inspectorPanel} aria-label="配置详情">
-    <button className="icon-button inspector-close" aria-label="关闭配置详情" onClick={() => {
-      if (workspace === 'catalogs') setCatalogSelection(undefined);
-      else setSelection(undefined);
+    {workspace !== 'catalogs' && <button className="icon-button inspector-close" aria-label="关闭配置详情" onClick={() => {
+      setSelection(undefined);
       inspectorInvoker.current?.focus();
-    }}><X size={18} /></button>
+    }}><X size={18} /></button>}
     <fieldset className="inspector-fields" disabled={!allow.edit || inspectorSelection.section === 'sources' && !allow.configure || saving || activating || checking}>
       <Inspector key={inspectorKey} model={model} selected={inspectorSelection}
         edit={edit} select={next => {
@@ -385,7 +391,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         {workspace === 'graph' && <button className="icon-button" aria-label="返回图模型列表" title="返回图模型列表" onClick={close}><ArrowLeft size={17} /></button>}
         <h1>{title}</h1>
         {workspace === 'catalogs' && model && <>
-          <button className="button primary compact" disabled={busy || !allow.configure} onClick={() => setModal('sources')}><Plus size={16} />添加数据源</button>
+          <button className="button primary compact" disabled={busy || !allow.configure || !allow.edit} onClick={() => openSource()}><Plus size={16} />添加数据源</button>
         </>}
       </div>
       <div className="workspace-context">
@@ -405,7 +411,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     {saved?.archive_error && <p className="notice error" role="alert">{saved.archive_error}{' '}
       <button className="button compact" onClick={() => setModal('versions')}>查看版本历史</button>
     </p>}
-    {workspace !== 'graph' && notices}
+    {workspace !== 'graph' && !(workspace === 'catalogs' && inspectorSelection) && notices}
     {workspace === 'catalogs' && model && saved && <div className="catalog-workspace">
       <div className="catalog-controls">
         {allow.configure && <button className="button compact" disabled={!saved.revision} onClick={() => setLocalTables(true)}>本地表与同步</button>}
@@ -424,8 +430,11 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
           inspectorInvoker.current = document.activeElement as HTMLElement;
           setCatalogSelection(name);
         }} browse={setBrowsing} />
-        {inspector}
       </div>
+      <section className="listing connector-section" aria-label="添加数据源">
+        <div className="catalog-section-heading"><h2>添加数据源</h2><p className="muted small">选择连接器卡片，直接配置连接参数或文件表映射。</p></div>
+        <ConnectorGallery add={openSource} disabled={busy || !allow.configure || !allow.edit} />
+      </section>
     </div>}
     {allow.query && saved?.active_revision && !saved.archive_error && <div className="query-shell" hidden={workspace !== 'query'}>
       <Query canExport={allow.export} id={id} actor={actor} revision={saved.active_revision} draftPending={dirty || saved.revision !== saved.active_revision}
@@ -437,7 +446,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     {loading ? <p className="empty" role="status">正在读取配置…</p>
       : model && saved && workspace === 'graph' ? <div className="graph-workspace">
         {!saved.active_revision && allow.edit && <ModelSetup configure={allow.configure} publishAllowed={allow.publish} model={model} issue={incomplete} dirty={dirty} busy={!!busy} canPublish={canPublish}
-          add={section => setModal(section)} select={setSelection} save={() => void save()} publish={() => void activate(saved.revision, 'publish')} />}
+          add={section => section === 'sources' ? openSource() : setModal(section)} select={setSelection} save={() => void save()} publish={() => void activate(saved.revision, 'publish')} />}
         {saved.active_revision && incomplete && <p className="notice">{incomplete.message}</p>}
         <div className="graph-command-bar">
           <div className="graph-toolbar" role="group" aria-label="建模工具栏">
@@ -458,7 +467,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
               <button className="tool-button" onClick={() => setModal('edges-list')}><List size={20} />边 <span className="tool-count">{Object.keys(model.edges).length}</span></button>
             </div>
             <details className="workspace-tools"><summary>更多工具</summary><div>
-              {allow.configure && <button className="button compact" onClick={() => initial ? setModal('sources') : goTo('catalogs')}>
+              {allow.configure && <button className="button compact" onClick={() => initial ? openSource() : goTo('catalogs')}>
                 <Database size={16} />{initial ? '添加数据源' : '数据源'}
               </button>}
               {allow.edit && <button className="button compact" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} />{checking ? '正在校验…' : '校验结构'}</button>}
@@ -490,7 +499,18 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         </div>
       </div> : !saved ? <div className="empty" role="alert">{workspace === 'graph' && notice?.text}<button className="button" onClick={refresh}>重试读取配置</button></div>
       : !model && workspace !== 'query' && <div className="empty" role="alert">{draft.error}<button className="button" onClick={() => setModal('yaml')}>编辑 YAML</button></div>}
-    {active && <>{listSection && model && <Modal title={listSection === 'nodes' ? '节点标签' : '边类型'} description="选择标签，返回画布继续配置映射。" close={() => setModal(undefined)}>
+    {active && <>{workspace === 'catalogs' && inspectorSelection && <Modal title="配置数据源" size="medium" close={() => setCatalogSelection(undefined)}>
+      <div className="panel-layout source-settings">
+        <div className="panel-body form-fields">{inspector}{notices}</div>
+        <footer className="panel-footer">
+          <p className="panel-footer-context" role="status">{dirty ? '当前模型有未保存的修改。关闭后仍保留在草稿中。'
+            : saved?.revision !== saved?.active_revision ? '草稿已保存，发布后生效。' : '当前配置已保存并发布。'}</p>
+          <button className="button" onClick={() => setCatalogSelection(undefined)}>关闭配置</button>
+          <button className="button primary" disabled={!dirty || busy || !allow.edit || !allow.configure} onClick={() => void save()}>{saving ? '保存中…' : '保存草稿'}</button>
+        </footer>
+      </div>
+    </Modal>}
+    {listSection && model && <Modal title={listSection === 'nodes' ? '节点标签' : '边类型'} description="选择标签，返回画布继续配置映射。" close={() => setModal(undefined)}>
       <div className="panel-layout"><div className="panel-body form-fields">
         {!Object.keys(model[listSection]).length && <p className="muted">暂无{listSection === 'nodes' ? '节点标签' : '边类型'}</p>}
         {Object.keys(model[listSection]).map(name => <button className="sidebar-item" key={name} onClick={() => {
@@ -570,9 +590,9 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       submit={name => edit(doc => doc.set('graph', name))} />}
     {modal === 'edges' && model && <EdgeDraftDialog model={model} ends={edgeEnds} create={createEdge}
       close={() => { setEdgeEnds(undefined); setModal(undefined); }} />}
-    {(modal === 'sources' || modal === 'nodes') && <NameDialog title={modal === 'sources' ? '添加数据源' : '添加节点'} close={() => setModal(undefined)}
-      action={modal === 'sources' ? '添加并配置' : '添加'}
-      choices={modal === 'sources' ? connectorChoices : undefined}
-      submit={(name, type) => add(modal, name, type)} />}</>}
+    {modal === 'sources' && <AddSource modelId={id} initialType={newSourceType} close={() => setModal(undefined)}
+      submit={(name, source) => add('sources', name, text(source.type), source)} />}
+    {modal === 'nodes' && <NameDialog title="添加节点" close={() => setModal(undefined)}
+      action="添加" submit={(name, type) => add('nodes', name, type)} />}</>}
   </main>;
 }

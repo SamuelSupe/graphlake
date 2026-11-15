@@ -14,6 +14,7 @@ pub(crate) use query_functions::register as register_graph_functions;
 #[cfg(feature = "admin")]
 pub(crate) mod query_graph;
 pub(crate) mod read_filters;
+pub(crate) mod sql_read;
 
 #[cfg(feature = "admin")]
 pub(crate) use query::spilled_bytes as execution_spill;
@@ -27,7 +28,7 @@ pub(crate) fn variant_fields(fields: &crate::arrow::datatypes::Fields) -> bool {
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -72,6 +73,7 @@ pub struct Engine {
     pub(crate) catalog: Arc<Catalog>,
     pub(crate) cache: Option<crate::traversal::Cache>,
     admission: Arc<query::Admission>,
+    parquet_keys: Arc<model::KeyChecks>,
     spanner: Arc<BTreeMap<String, source::warehouse::spanner::Client>>,
 }
 
@@ -101,6 +103,7 @@ impl Engine {
             catalog: Arc::new(catalog),
             cache: None,
             admission,
+            parquet_keys: Arc::new(Mutex::new(BTreeMap::new())),
             spanner: Arc::new(spanner),
         })
     }
@@ -391,6 +394,19 @@ impl Engine {
                     Statement::Statement(stmt) => read_filters::query_filter(stmt, &self.catalog),
                     _ => None,
                 };
+                let mut sql = match &statement {
+                    Statement::Statement(stmt)
+                        if matches!(language, Language::Sql) && !exporting && !schema_only =>
+                    {
+                        sql_read::hint(stmt, &self.catalog)
+                    }
+                    _ => None,
+                };
+                if !scope.options.graph.logical_partition.is_empty()
+                    && let Some(sql) = sql.as_mut()
+                {
+                    sql.native = None;
+                }
                 #[cfg(feature = "admin")]
                 let distributed = distributed.filter(|_| {
                     csr.is_none()
@@ -402,6 +418,12 @@ impl Engine {
                         && procedures.is_empty()
                         && schema_procedures.is_empty()
                 });
+                #[cfg(feature = "admin")]
+                if (distributed.is_some() || transaction.is_some())
+                    && let Some(sql) = sql.as_mut()
+                {
+                    sql.native = None;
+                }
                 #[cfg(feature = "admin")]
                 let snapshot = if let Some(csr) = csr {
                     Some(
@@ -427,6 +449,7 @@ impl Engine {
                             #[cfg(feature = "admin")]
                             distributed,
                             explain_only: schema_only,
+                            sql: sql.as_ref(),
                             #[cfg(feature = "admin")]
                             graph_versions: _preview
                                 && !schema_only
@@ -545,7 +568,15 @@ impl Engine {
                 let distributed_planning = distributed.is_some();
                 #[cfg(not(feature = "admin"))]
                 let distributed_planning = false;
-                let frame = if ordered_call_output || distributed_planning {
+                let frame = if let Some(batch) = prepared.aggregate.take() {
+                    let schema = Arc::clone(plan.schema().inner());
+                    ensure!(
+                        schema.fields().len() == 1
+                            && schema.field(0).data_type() == batch.column(0).data_type(),
+                        "source aggregate did not match the SQL result type"
+                    );
+                    context.read_batch(RecordBatch::try_new(schema, batch.columns().to_vec())?)?
+                } else if ordered_call_output || distributed_planning {
                     DataFrame::new(state, plan)
                 } else {
                     context.execute_logical_plan(plan).await?
@@ -652,7 +683,8 @@ impl Engine {
             .chain(self.catalog.edges.keys())
             .cloned()
             .collect();
-        let references = model::required(&self.catalog, &mut labels, &scope.options.graph, None)?;
+        let references =
+            model::required(&self.catalog, &mut labels, &scope.options.graph, None, None)?;
         let sources = references
             .keys()
             .map(|reference| {
@@ -790,12 +822,18 @@ impl Engine {
         filter: Option<&(String, Vec<crate::Predicate>)>,
     ) -> Result<Prepared> {
         let catalog = &self.catalog;
-        let required = model::required(catalog, &mut labels, &scope.options.graph, read.topology)?;
+        let required = model::required(
+            catalog,
+            &mut labels,
+            &scope.options.graph,
+            read.topology,
+            read.sql,
+        )?;
         if scope.options.graph.require_consistent_snapshot {
             verify_consistent_snapshot(catalog, required.keys().copied())?;
         }
         let filters = read_filters::for_labels(catalog, &labels, &scope.options.graph, filter);
-        let (private, tables, mut prepared) =
+        let (private, tables, mut prepared, proven_key_label) =
             sources::prepare(catalog, &self.spanner, scope, required, &filters, read).await?;
         #[cfg(feature = "admin")]
         if read.probe_source.is_some() {
@@ -810,6 +848,8 @@ impl Engine {
                 model::Tables {
                     raw: &tables,
                     postgres: &prepared.postgres,
+                    proven_key_label,
+                    parquet_keys: &self.parquet_keys,
                 },
                 scope,
                 read,
@@ -873,11 +913,20 @@ fn verify_consistent_snapshot<'a>(
         let first = *first_source.get_or_insert(name);
         let supported = match source {
             Source::Postgres { .. }
+            | Source::Sqlite { .. }
+            | Source::Duckdb { .. }
+            | Source::OracleNative { .. }
+            | Source::Mariadb(_)
             | Source::Mysql { .. }
             | Source::Snowflake { .. }
             | Source::Bigquery { .. }
             | Source::Spanner { .. } => name == first,
+            Source::MongodbNative { .. } => false,
+            Source::ObjectStorage { tables, .. } => count == 1 && tables[relation].files.len() == 1,
             Source::Parquet { tables } => count == 1 && tables[relation].len() == 1,
+            Source::Csv { tables } | Source::Jsonl { tables } => {
+                count == 1 && tables[relation].files.len() == 1
+            }
             _ => count == 1,
         };
         ensure!(
@@ -889,6 +938,7 @@ fn verify_consistent_snapshot<'a>(
 }
 
 pub(crate) struct Prepared {
+    pub(crate) aggregate: Option<RecordBatch>,
     pub(crate) versions: Vec<SourceVersion>,
     pub(crate) reservations: Vec<MemoryReservation>,
     pub(crate) postgres: BTreeMap<String, Arc<PgTable>>,
@@ -897,6 +947,7 @@ pub(crate) struct Prepared {
 struct Raw {
     alias: String,
     schema: SchemaRef,
+    parquet_versions: Option<Vec<(String, String)>>,
 }
 
 async fn materialize_edges(

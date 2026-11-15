@@ -419,12 +419,22 @@ where
                 } else {
                     10
                 };
-                match tokio::time::timeout(Duration::from_secs(idle), self.reader.read_message())
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => return None,
-                }
+                let read = async {
+                    loop {
+                        let message = self.reader.read_message().await?;
+                        if !message.is_empty() {
+                            return Ok(message);
+                        }
+                    }
+                };
+                let idle_at = Instant::now() + Duration::from_secs(idle);
+                let deadline = self
+                    .results
+                    .results
+                    .values()
+                    .filter_map(|pending| pending.records.deadline())
+                    .fold(idle_at, Instant::min);
+                tokio::time::timeout_at(deadline, read).await.ok()?
             }
         };
 

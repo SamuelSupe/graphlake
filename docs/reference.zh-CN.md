@@ -1,6 +1,6 @@
 # GraphLake 技术参考
 
-GraphLake 是单进程、只读的 Rust 图分析引擎。Rust API、CLI、Python 绑定和 C ABI 共享同一套引擎。引擎直接读取 PostgreSQL、MySQL、Parquet、Iceberg、Delta Lake、Snowflake、BigQuery、ClickHouse、Trino、Spanner 和 SAP HANA，也可以通过 Trino Catalog 读取 SQL Server、Oracle、Hive、Hudi、MongoDB、Elasticsearch 和 Redshift。Cypher 和只读 Gremlin 通过 DataFusion 执行关联、过滤和聚合。有界遍历可以从索引批量查边、扫描构建 CSR，或读取已发布的 CSR 代次。图投影支持多种节点与边标签，可运行 PageRank、弱连通分量、加权路径、Louvain、Leiden 和 Node2Vec。
+GraphLake 是单进程、只读的 Rust 图分析引擎。Rust API、CLI、Python 绑定和 C ABI 共享同一套引擎。引擎支持关系库、文档库、文件、数据湖与数仓的直接读取，包括 SQL Server、Oracle、MongoDB、DuckDB、Doris、StarRocks 和 Databricks 等扩展来源；也可通过 Trino Catalog 读取 SQL Server、Oracle、Hive、Hudi、MongoDB、Elasticsearch 和 Redshift。各连接器的配置、运行依赖和读取边界见下文。Cypher 和只读 Gremlin 通过 DataFusion 执行关联、过滤和聚合。有界遍历可以从索引批量查边、扫描构建 CSR，或读取已发布的 CSR 代次。图投影支持多种节点与边标签，可运行 PageRank、弱连通分量、加权路径、Louvain、Leiden 和 Node2Vec。
 
 ## 本地运行
 
@@ -21,7 +21,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml traverse \
   --edge Transfer --start 1 --start 10 --max-hops 3 shortest --target 1 --target 30
 ```
 
-两跳查询返回 `{"account":30,"paths":2,"amount":600}`。最短路径返回终点、跳数和有序的边业务键。默认输出 JSON Lines，`--format arrow` 输出 Arrow IPC 流。`--diagnostics` 将物理计划、各来源版本和运行统计写入 stderr。
+两跳查询返回 `{"account":30,"paths":2,"amount":600}`。最短路径返回终点、跳数和有序的边业务键。默认输出 JSON Lines，`--format arrow` 输出 Arrow IPC 流。浮点 `Infinity`、`-Infinity` 和 `NaN` 在 JSON Lines 中以字符串输出，在 CSV 中以对应文本输出。Arrow 保留原浮点值和空值。`--diagnostics` 将物理计划、各来源版本和运行统计写入 stderr。
 
 ## 本机管理后台
 
@@ -59,7 +59,9 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 侧边栏独立的「AI」页面默认展示 Agent 接入指南，用户可生成、轮换或撤销个人 AI 令牌，查看自身可用模型并测试连接。AI 继承令牌所属用户当前的查询、建模、发布权限及租户范围，审计记录归属实际用户。查询与建模各有一个 MCP 地址（`/mcp/query` 和 `/mcp/modeling`），管理员在「运行配置 → MCP 服务」中独立启停。详见 [MCP 接入与能力边界](mcp.md)。
 
-后台和 Worker 提供 Prometheus 指标。「运行配置」包括日志与遥测、健康检查、备份与恢复及 MCP 服务。管理员可编辑日志和 OpenTelemetry 配置、检查发布模型的数据源、查看最近备份状态和配置 MCP 服务。目标站可在 HTTPS 恢复页选择已同步的异地备份，恢复控制状态、PostgreSQL 和 Parquet 数据，随后执行验收并核对切流状态。[恢复操作](../deploy/cluster.md#绑定恢复点并开放入口) · [OpenTelemetry 配置](../deploy/README.md#opentelemetry-上报)
+后台和 Worker 提供 Prometheus 指标。「运行配置」包括日志与遥测、健康检查、备份与恢复及 MCP 服务。管理员可编辑日志和 OpenTelemetry 配置、检查发布模型的数据源、查看最近备份状态和配置 MCP 服务。从「备份与恢复 → 恢复备份」进入目标站 HTTPS 恢复页，可选择并检查已同步的恢复点，确认恢复后查看各阶段进度、执行验收并核对切流状态。[恢复操作](../deploy/cluster.md#绑定恢复点并开放入口) · [OpenTelemetry 配置](../deploy/README.md#opentelemetry-上报)
+
+启用 Coordinator 故障接管并配置私有目录后，管理员可在「备份与恢复」选择「立即备份」，在服务器生成已校验的控制状态文件。PostgreSQL 与 Parquet 源数据另行备份。[配置手动备份](../deploy/cluster.md#在线控制状态备份与恢复)
 
 在浏览器打开 [本机管理后台](http://127.0.0.1:7337/)。使用 `--port` 可指定端口，`--timeout-ms` 可将默认 60 秒的执行期限调短。服务绑定 IPv4 回环地址，页面和 API 共用同一个来源。模型文件命名为 `<标识>.yaml`，标识以 ASCII 字母或数字开头，可包含下划线和连字符，长度最多 64。模型目录中的文件继续使用原有 YAML 格式和相对路径规则。启动服务前，在同一进程环境中设置 Catalog 引用的凭据变量。
 
@@ -67,9 +69,11 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 后台用于受信任主机上的回环 HTTP。后台和凭据命令应在同一操作系统环境运行。使用 OrbStack 共享目录时，请在同一个 Linux 实例里启动和管理凭据，macOS 和虚拟机的文件锁各自生效。会话 Cookie 使用 `HttpOnly`、`SameSite=Strict`，名称包含监听端口。会话闲置 30 分钟、建立满 8 小时、退出或服务重启后失效。会话过期会锁定当前页面，重新登录后可继续编辑留在页面中的草稿，并手动重试失败的操作。退出登录时会提示确认放弃未保存的草稿，并清除页面中的模型和结果。构建产物放在独立的 `--assets-dir` 中，服务只读取入口页和 `assets/` 下的构建资源。
 
-服务提供 `/healthz`、`/readyz` 和 Prometheus `/metrics`。用 `--driver-model <已发布模型>` 可为现有 TinkerPop 客户端开启只读 Gremlin WebSocket；另加 `--bolt-port 7687` 可为 Neo4j 驱动开启只读 Bolt。HTTP、Bolt 和 Gremlin 共用模型授权，独立服务账号通过 `.graphlake-auth/service-accounts.json` 配置，操作审计写入同目录。驱动与 HTTP 查询共享 `--query-slots`（默认 1），过载时进入有界队列。Bolt 支持托管只读事务，两种驱动均提供原生图对象和分批结果。连接示例、协议范围、Linux 打包、systemd 单元和升级恢复步骤见 [单机部署手册](../deploy/README.md)。
+服务提供 `/healthz`、`/readyz` 和 Prometheus `/metrics`。用 `--driver-model <已发布模型>` 可为现有 TinkerPop 客户端开启只读 Gremlin WebSocket；另加 `--bolt-port 7687` 可为 Neo4j 驱动开启只读 Bolt。HTTP、Bolt 和 Gremlin 共用模型授权，独立服务账号通过 `.graphlake-auth/service-accounts.json` 配置，操作审计写入同目录。驱动与 HTTP 查询共享 `--query-slots`（默认 1），过载时进入有界队列。Bolt 支持托管只读事务，两种驱动均提供原生图对象和分批结果。单机结果快照每个身份最多保留 4 个，服务合计最多 32 个、1 GiB。Arrow 下载从开始发送起最多占用传输槽 60 秒。连接示例、协议范围、Linux 打包、systemd 单元和升级恢复步骤见 [单机部署手册](../deploy/README.md)。
 
-桌面从左侧、窄屏从顶部导航切换图模型、数据源和查询。当前模型可在工作区标题栏切换。模型和数据源列表在较窄容器中按条目排布。图模型列表支持搜索、新建和从 YAML 文件导入草稿。可在编辑器下载当前草稿，也可打开版本历史比较归档 YAML 与草稿、下载归档 YAML。导入文件里的相对路径以后台的模型目录解析。打开模型后可在画布选择节点或边。配置面板在桌面位于画布右侧，在窄屏位于画布下方。画布上方保留添加、保存、发布及带数量的节点/边入口；手动校验、版本历史和 YAML 位于「更多工具」。数据源工作区以表格列出当前模型的数据源，可浏览来源表和列，选表后可将来源带入映射。PostgreSQL、MySQL、ClickHouse、Trino 及其连接器和 Iceberg 支持逐级浏览，Parquet、Delta 浏览已配置的表，Spanner 可列出数据库内的表。Snowflake、BigQuery 和 SAP HANA 可按已映射或手工输入的限定模式列出表。也可输入完整表名直接读取字段。节点和边可配置多个来源表、逻辑字段到物理列的映射、类型转换、行过滤、优先顺序与重复键策略。当前连接器均可从数据源页配置，凭据填写服务进程的环境变量名。可配置 Delta 表版本、Iceberg 表快照及连接器的高级字段。重命名数据源会更新单表和多表引用，删除前需解除引用。节点和边可在「时态与分区」设置 SCD2 和局部跳过逻辑分区。模型 YAML 仍可查看、导入和导出。
+桌面从左侧、窄屏从顶部导航切换图模型、数据源和查询。当前模型可在工作区标题栏切换。模型列表在较窄容器中按条目排布，数据源卡片随可用宽度自动换列。图模型列表支持搜索、新建和从 YAML 文件导入草稿。可在编辑器下载当前草稿，也可打开版本历史并排查看归档 YAML 和草稿、下载归档 YAML。导入文件里的相对路径以后台的模型目录解析。打开模型后可在画布选择节点或边。配置面板在桌面位于画布右侧，在窄屏位于画布下方。画布上方保留添加、保存、发布及带数量的节点和边入口。可直接从画布连接端点建边，手动校验、版本历史和 YAML 位于「更多工具」。数据源工作区以卡片展示当前模型已配置的数据源；点击卡片的「配置」打开独立弹窗，可就地保存草稿并查看保存结果；关闭弹窗会保留未保存的编辑，点击「浏览表与字段」读取来源结构，选表后可将来源带入映射。已配置的数据源支持按名称或连接器类型搜索。下方的连接器卡片支持按数据库、文件与数据湖、数仓与分析、通过 Trino 分类筛选，并可组合关键词搜索，显示匹配数量；无匹配时可清除筛选。点击「配置」即可在弹窗填写数据源名称和连接参数，或添加文件表映射与列类型，完成后「添加到草稿」。新建连接的必填项会在提交时校验并聚焦缺失字段；文件路径和列名等已有输入也参与必填校验。取消新建不会修改模型。随后保存草稿、校验并发布，配置才会进入生效版本。PostgreSQL、MySQL、ClickHouse、Trino 及其连接器和 Iceberg 支持逐级浏览，Parquet、CSV、JSON Lines 和 Delta 浏览已配置的表，SQLite、Spanner 可列出数据库内的表。Snowflake、BigQuery 和 SAP HANA 可按已映射或手工输入的限定模式列出表。也可输入完整表名直接读取字段。节点和边可配置多个来源表、逻辑字段到物理列的映射、类型转换、行过滤、优先顺序与重复键策略。当前连接器均可从数据源页配置，凭据填写服务进程的环境变量名。可配置 Delta 表版本、Iceberg 表快照及连接器的高级字段。重命名数据源会更新单表和多表引用，删除前需解除引用。节点和边可在「时态与分区」设置 SCD2 和局部跳过逻辑分区。模型 YAML 仍可查看、导入和导出。
+
+数据源卡片显示连接器的 SVG 标识。已配置的对象存储卡片与存储服务选择器会显示当前供应商的标识。
 
 选择来源表后，单表映射的业务键、属性和边端点可从带类型的来源列中选择。多表映射保留公共逻辑字段，每个来源可独立选择物理列和过滤列。模型工作区在切换标签或页签时保留最近读取的来源列，修改来源配置后不使用旧列提示。重新选表时保留已有字段，未在新表中找到的列会标明。可在配置面板删除边类型；删除节点标签时，确认框列出将同时移除的关联边。图模型须保留至少一个节点标签，删除先更新草稿，发布后才影响查询。
 
@@ -99,9 +103,97 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 ## 图映射与连接器
 
+### 扩展数据库与对象存储
+
+数据源卡片包含直连与 Trino 两种入口。旧的 `sqlserver`、`oracle`、`mongodb` 配置仍通过 Trino；新增直连类型分别为 `sqlserver_native`、`oracle_native`、`mongodb_native`，不会自动改变已有连接方式。完整配置示例见 [extended-sources.yaml](../examples/extended-sources.yaml)。
+
+| 类型 | 配置与读取边界 |
+| --- | --- |
+| `doris` / `starrocks` | MySQL 协议；配置 `dsn_env`、`tls`、可选 `ca_file`。按语句读取，不执行 InnoDB 快照初始化。支持普通标量类型和不超过 38 位的 Decimal；复杂类型需要远端视图转换。 |
+| `tidb` / `oceanbase` | 同样使用 MySQL 连接字段；OceanBase 仅支持 MySQL 模式租户。按语句读取，不声明跨表一致快照。 |
+| `mariadb` | 使用 MySQL 连接字段；InnoDB 只读重复读事务，使用 MariaDB 的 `max_statement_time`。 |
+| `sqlserver_native` | `host`、`port`、`database`、`user`、`password_env`，TLS 默认开启，可配置 `ca_file`。通过 TDS 直接执行生成的 SELECT；按语句读取，不声明跨表同一快照。读取账号应只授予 SELECT 和所需元数据权限。 |
+| `oracle_native` | `connect_string`、`user`、`password_env`。使用 Easy Connect 或 TNS 名称；GraphLake 进程所在机器需安装 Oracle Instant Client，库搜索路径需能找到客户端库。使用只读事务，`NUMBER(p,s)` 在可表达时映射 Decimal128，无固定精度或负标度的 NUMBER 保留为文本以避免精度丢失。Oracle DATE 保留时分秒。 |
+| `mongodb_native` | `dsn_env` 保存 `mongodb://` 或 `mongodb+srv://` 连接串。引用使用 `source.database.collection`。默认采样 1000 条推断结构，`schema_sample_size` 可设为 1–10000；空集合或采样内全为空的字段无法推断。嵌套对象展开为点分字段，数组保留为 Extended JSON 文本，ObjectId 为十六进制文本，Decimal128 保留为十进制文本。采样和后续读取发现类型不一致时失败，不做静默转换。普通游标不保证一致快照，`require_consistent_snapshot` 拒绝此来源。 |
+| `duckdb` | `path` 指向服务端数据库文件，引用使用 `source.schema.table`（常见模式为 `main`）。只读打开并使用事务；禁止外部访问与自动扩展访问，关闭 DuckDB 临时落盘，查询结果通过 GraphLake 的磁盘配额溢写。DuckDB 执行引擎预留查询内存预算的一半；读取期间文件不能由其他进程写入。 |
+| `databricks` | 工作区 `uri`、`token_env`、SQL Warehouse ID `warehouse`、`catalog`；引用使用 `source.schema.table`。通过 Statement Execution API 读取 JSON_ARRAY 分页，校验行数、游标和截断标记，超时取消语句。使用 INLINE 结果，受 Databricks 的 INLINE 大小限制；超过限制需缩小远端视图，不会返回部分结果。复杂类型应在远端视图转为标量。 |
+
+Oracle 客户端是运行时依赖，不随 GraphLake 分发。CLI 会保留 Oracle 驱动的错误原因。遇到 `DPI-1047` 时检查客户端库搜索路径及其系统依赖，例如 Linux 的 `libaio`；遇到 `ORA-12541` 时检查连接地址和数据库监听器。SQL Server、Oracle 等服务端行为必须在目标数据库版本上进行实连验收；协议夹具不能替代这一验收。所有连接器的外部读取都只生成查询和会话设置，不提供写入 SQL。
+
+`object_storage` 为每个数据源分别保存存储配置，不修改进程环境变量。配置 `storage.provider`、`storage.bucket`、`format`（`parquet`、`csv`、`jsonl`）和表映射 `tables`；每张表的 `files` 是桶内相对对象键，不是 URL。CSV/JSON Lines 同时声明 `columns`，格式与独立文件连接器一致。界面按完整路径段递归列出对象，例如 `exports/2026/`，并可将对象加入表映射。列表最多展示 2000 项，需要列出对象的权限。列出对象与按已知对象键读取文件分别授权。
+
+| 存储服务 | 配置 |
+| --- | --- |
+| `s3` / `minio` | 可选 `region`、`endpoint`；MinIO 必须指定 endpoint。`access_key_env` 与 `secret_key_env` 成对配置，可另配 `session_token_env`。S3 可使用服务端默认身份。 |
+| `oss` | 指定区域及 OSS endpoint，账号须启用 S3 兼容 V4 认证；使用相同的密钥环境变量字段。 |
+| `tos` | 指定区域以及 `https://tos-s3-区域.volces.com` 兼容端点，使用相同的密钥环境变量字段。 |
+| `cos` | 指定区域以及 COS endpoint，桶名包含 APPID，使用相同的密钥环境变量字段。 |
+| `azure` | `bucket` 为容器名，`account` 为存储账号；`account_key_env` 可引用账号密钥。未指定时使用 Azure 默认凭据链，可指定自定义 endpoint。 |
+| `gcs` | `bucket` 为桶名；`service_account_env` 引用包含服务账号 JSON 的环境变量，或使用默认身份。不接受自定义 endpoint。 |
+
+OSS/TOS/COS 自动使用带桶名的虚拟主机访问；S3/MinIO 自定义 endpoint 使用 path-style。HTTP endpoint 仅允许回环测试地址，其余连接使用 HTTPS。对象读取固定版本或强 ETag，后续范围读取保持相同版本；多对象不声明为同一快照。凭据只在服务端读取，配置中填写环境变量名。云端权限、端点和凭据链仍需在实际账户环境验证。
+
+数据源按映射列读取。DuckDB、SQL Server、Oracle、Databricks、Snowflake 和 BigQuery 会下推类型匹配的整数比较与空值判断；Iceberg 使用顶层 32/64 位整数条件在固定快照内裁剪。可下推条件来自物理映射过滤、逻辑分区，以及能证明只读取同一节点表的查询中的业务键。共享物理表只下推各用法共有的条件，列转换后的逻辑过滤仍在本地执行。GraphLake 保留查询过滤与业务键校验，字符串排序规则、隐式类型转换、复杂表达式和跨源关联由本地引擎处理。
+
+通过 SQL API 读取数仓时，存在可下推条件才发出额外的零行查询确认列类型，数据语句仍使用原有的快照设置。MongoDB 在采样和读取时都投影映射字段，采样不受查询过滤影响。对象存储的同表文件共享客户端，CSV 和 JSON Lines 按内存预算合并范围读取，单次最多 1 MiB；对象版本固定和逐条解码校验保持有效。
+
+普通 SQL 的单层 `SELECT` 及显式 `ON` 连接从源读取查询引用的列，同时保留业务键、关系端点和分区条件使用的列。通配符、CTE、子查询和隐式连接列仍使用完整投影。多输入和 SCD2 继续读取用于去重及冲突判断的完整映射。CSV 和 JSON Lines 仍扫描并校验完整文件。
+
+DuckDB 和 PostgreSQL 可下推单节点表的有序 `LIMIT`（无 `OFFSET`）、标量 `COUNT(*)`、`COUNT(列)` 和整型 `MIN/MAX`。源端须有能够证明整数业务键唯一的约束，有序 LIMIT 须按完整业务键排序。所有 WHERE 条件都须能精确下推，目前覆盖以 AND 连接的整数比较和空值判断。下推仍在原读快照内执行。DuckDB 直接查验映射表的完整主键。多个 DuckDB 来源共享查询内存的一半，剩余预算用于缓冲、溢写和本地运算。PostgreSQL 聚合和有序 LIMIT 都排除空业务键。业务键无约束、排序存在并列、聚合带分组或 DISTINCT，以及无法证明条件等价的查询使用本地计划。
+
+用 CLI 的 `--diagnostics` 对照 `metrics.reads` 和 `metrics.elapsed_ms`。其中 `warehouse_rows`、`postgres_rows` 与对应的 Arrow 字节数统计进入 GraphLake 的数据，源数据库内部扫描量需用其执行诊断另行测量。
+
+DuckDB 可利用行组的列最小值和最大值裁剪有序 `LIMIT` 的扫描范围，裁剪效果取决于键在行组间的分布和查询过滤条件。无 `WHERE`、至多 50 行、按单列整数主键排序且只读主键和一个整数属性时，连接器使用单趟扫描，避免按行 ID 再读取同一批行组。带过滤条件或涉及宽列的查询沿用 DuckDB 的优化器策略。
+
+
 [跨源示例](../examples/finance.yaml) 将 PostgreSQL 账户与 S3 转账表关联。PostgreSQL 连接串从 `dsn_env` 指定的环境变量读取，TLS 使用系统证书验证。测试实例可在连接串中显式设置 `sslmode=disable`。连接器支持布尔、整数、浮点、文本、UUID、二进制、日期、时间戳和声明了精度与小数位的 `NUMERIC(p,s)`。Decimal 转为 Arrow Decimal128，要求 `0 <= s <= p <= 38`。UUID 转为文本，带时区时间戳按 UTC 输出。
 
 Parquet 表显式列出文件，YAML 中的相对路径以配置文件目录为准。同一表各文件的映射列须具有相同的 Arrow 类型。HTTP 服务须支持 HEAD、Range 和强 ETag。S3 使用 `AWS_REGION` 等标准 AWS 配置，也可通过 `AWS_ENDPOINT` 指定兼容服务。
+
+
+通过 Snowflake、Spanner、Trino、SAP HANA 和 SQL Server／Oracle 直连读取的时间戳统一映射为 Arrow 微秒时间戳，可保留 9999-12-31 等源端长时间范围的日期。超出微秒的尾数被截去。TIME 列仍按连接器映射保留其时间精度。
+
+PostgreSQL 无穷日期、无穷时间戳和定点 `NaN` 在读取时报告具体值和类型。需要这些值或无精度约束的 `NUMERIC` 时，可在源端创建只读视图，将相应列转成 `text`，例如 `valid_until::text AS valid_until`。有限日期与定点数继续使用 Arrow 类型。
+
+**CSV / JSON Lines**
+
+`type: csv` 和 `type: jsonl` 原生读取 UTF-8 文本文件，支持本地路径、HTTP(S) 和 S3。每张表的 `files` 必须显式列出文件；相对路径以 YAML 所在目录为准。HTTP 服务需要 HEAD、Range 和强 ETag，S3 使用与 Parquet 相同的 AWS 环境配置。读取按对象版本或 ETag 固定，检测到读取期间的对象变化则失败。查询内的重复扫描读取同一份受内存、磁盘预算约束的物化结果；不同文件之间没有共同提交点。
+
+文本解码复用 [Apache Arrow CSV Reader](https://arrow.apache.org/rust/arrow_csv/reader/index.html) 与 JSON Reader。列采用显式 `columns` 列表，避免自动推断破坏前导零业务键、大整数或金额精度。`nullable` 默认 `true`。支持 Boolean、Int8/16/32/64、UInt8/16/32/64、Float32/64、Utf8、Date32、Timestamp 和 Decimal128；Decimal 要求 `0 <= scale <= precision <= 38`。CSV 必须为逗号分隔、带表头格式，所有列的名字与顺序必须匹配声明，支持引号和引号内换行，空字段读为 NULL。JSON Lines 每条记录为对象，按顶层字段名读取，未声明的字段忽略，缺失字段视为 NULL；声明列的类型不匹配会失败。Decimal 推荐在 JSON 中写为字符串。
+
+```yaml
+sources:
+  files:
+    type: csv
+    tables:
+      accounts:
+        files: [accounts.csv]
+        columns:
+          - {name: id, data_type: Int64, nullable: false}
+          - {name: name, data_type: Utf8}
+```
+
+节点引用写作 `files.accounts`。[完整可运行示例](../examples/text/graph.yaml) 将 CSV 节点与 JSON Lines 边关联。浏览器可添加表映射、文件路径、列名、类型及空值约束；「浏览表与字段」检查文件可读取并解码首条记录后返回声明的列结构。完整数据验证仍需执行模型验证或查询。
+
+**SQLite**
+
+```yaml
+sources:
+  local:
+    type: sqlite
+    path: ./business.db
+nodes:
+  Account:
+    source: local.accounts
+    key: [id]
+    properties: [name]
+```
+
+SQLite 使用本地数据库文件（事务语义见 [SQLite 官方隔离说明](https://sqlite.org/isolation.html)），表引用为 `source.table`。相对路径以 YAML 所在目录为准；数据库必须已经存在。连接以只读标志打开并启用 `query_only`，不会创建数据库、写入业务表或执行用户 SQL。一次查询中同一来源的所有表共用一个读取事务；会话标识记录在 `sources` 中。WAL 模式下并发提交不会改变该事务已固定的视图。SQL 扫描在阻塞线程执行，取消会通过 SQLite progress handler 中断工作；锁等待最多 100 ms。
+
+按列声明类型映射 INTEGER affinity → Int64、TEXT affinity → Utf8、REAL affinity → Float64、BLOB → Binary；BOOL/BOOLEAN 仅接受 0、1 或 NULL。NUMERIC/DECIMAL、无声明类型和其他无法稳定映射的类型返回错误，不自动猜测或转换。SQLite 的动态类型允许一列混入其他存储类型，GraphLake 会拒绝与声明不符的值。空值仍按源列约束及图键规则处理。映射列投影和安全的整数、布尔、NULL 过滤可下推，结果按查询预算物化，支持溢写。浏览器可发现数据库中的表、视图及支持类型的列。
+
+SQLite、CSV 和 JSON Lines 当前不支持显式 Bolt 读取事务；SQLite 也不作为恢复向导的 PostgreSQL 恢复目标。多文件来源要求一致快照时会被拒绝；同一 SQLite 来源的多表可共享一致快照。
 
 - 节点和有键的边要求来源提供唯一的业务键。复合键按 Catalog 中的列顺序和 Arrow 类型匹配。图查询过滤空键和找不到端点的边。
 - 边可以省略 `key`。引擎在查询内物化一次并分配 `__graphlake_edge_id`，同一查询中的各次扫描共享这些 ID。
@@ -166,7 +258,7 @@ sources:
 
 Snowflake 表引用形如 `snow.FINANCE.PUBLIC.TRANSFERS`，按映射中的精确大小写读取数据库、schema、表和列。`role` 可省略。Snowflake 将 `NUMBER(p,0)` 按精度映射为 Int16、Int32、Int64 或 Decimal128。BigQuery 表引用形如 `bq.data-project.finance.accounts`，`maximum_bytes_billed` 限制每个查询作业的计费字节。BigQuery `INT64` 映射为 Int64，`NUMERIC` 保留精度和小数位，嵌套或重复字段、`BIGNUMERIC` 会返回类型错误。单个 API 响应解码上限为 32 MiB，Arrow 批次占用查询内存预算。
 
-ClickHouse 通过 HTTP 读取 ArrowStream，表引用使用 `source.database.table`。配置 `user` 和可选的 `password_env`。投影下推到 ClickHouse，默认以 Arrow Utf8 读取字符串并展开 LowCardinality 字符串。若只读账号禁止更改查询设置，引擎沿用服务器配置的 Arrow 格式和远端执行限制。查询结果按语句记录 ClickHouse 查询 ID。
+ClickHouse 通过 HTTP 读取 ArrowStream，将 Date 和 Nullable(Date) 映射为 Arrow Date32，表引用使用 `source.database.table`。配置 `user` 和可选的 `password_env`。投影下推到 ClickHouse，默认以 Arrow Utf8 读取字符串并展开 LowCardinality 字符串。若只读账号禁止更改查询设置，引擎沿用服务器配置的 Arrow 格式和远端执行限制。查询结果按语句记录 ClickHouse 查询 ID。锁定只读配置需在服务端设置远端执行时限和断连取消，GraphLake 仍按请求超时停止等待。
 
 Trino 通过协调器的 HTTP 查询协议读取 `source.catalog.schema.table`。配置 `user`，并按协调器认证方式配置 `token_env` 或 `password_env`。引擎读取分页结果，保留十进制精度，并启用 Trino 参数化时间类型以保留不超过纳秒的时间精度。带时区时间戳归一为 UTC。数组、Map、Row 等结构化 Trino 列需要先在远端视图中展开或转换。结果按表记录 Trino 查询 ID。
 
@@ -183,6 +275,8 @@ sources:
     user: graph_reader
     token_env: GRAPHLAKE_TRINO_TOKEN
 ```
+
+SQL Server 和 Oracle 可使用 `type: sqlserver`、`type: oracle`，配置结构与 MongoDB 等命名 Trino 连接器相同（`uri`、`catalog`、`user` 及可选认证变量），节点引用为 `source.schema.table`。它们依赖已经部署的 Trino Catalog，不是原生数据库驱动。通用 Trino 入口仍然可用。
 
 在 Trino 部署中配置 [SQL Server](https://trino.io/docs/current/connector/sqlserver.html)、[Oracle](https://trino.io/docs/current/connector/oracle.html)、[Hive](https://trino.io/docs/current/connector/hive.html) 和 [Hudi](https://trino.io/docs/current/connector/hudi.html) Catalog 后，可将节点或边的来源分别映射到 `federated.sqlserver.dbo.accounts`、`federated.oracle.finance.transfers`、`federated.hive.finance.accounts` 或 `federated.hudi.finance.transfers`。JDBC 凭据、Metastore 和文件存储由 Trino 管理。ClickHouse 和 Trino 都校验 TLS，明文 HTTP 限回环地址。两个连接器均按远端语句读取，查询跨表组合时各表可见版本由远端系统分别决定。
 
@@ -229,7 +323,7 @@ nodes:
         columns: {tenant: tenant_id, id: account_id, name: account_name}
 ```
 
-分区和 SCD2 条件在去重及端点校验前应用。普通单表节点和有键边会拒绝参与查询的重复业务键。整图分析和 CSR 刷新在构建拓扑时校验业务键，包含端点缺失的边。普通查询可复用满足键约束的 PostgreSQL 有效唯一索引。多表映射和 SCD2 折叠完整相同的记录，同键冲突默认报错。键点查和相关子查询可先筛选候选键，再校验各候选键的完整输入记录。候选键之外的冲突由扫描对应键的查询或拓扑构建发现。多表有键标签可配置 `on_conflict: prefer_first`，按输入顺序选择完整记录，优先输入内部仍须满足键唯一性。无键边保留独立的查询内身份。
+分区和 SCD2 条件在去重及端点校验前应用。普通单表节点和有键边会拒绝参与查询的重复业务键。整图分析和 CSR 刷新在构建拓扑时校验业务键，包含端点缺失的边。普通查询可复用满足键约束的 PostgreSQL 有效唯一索引。同一引擎会复用已通过完整校验的 Parquet 业务键证明，文件版本变化时重新校验。多表映射和 SCD2 折叠完整相同的记录，同键冲突默认报错。键点查和相关子查询可先筛选候选键，再校验各候选键的完整输入记录。候选键之外的冲突由扫描对应键的查询或拓扑构建发现。多表有键标签可配置 `on_conflict: prefer_first`，按输入顺序选择完整记录，优先输入内部仍须满足键唯一性。无键边保留独立的查询内身份。
 
 `snapshot_time` 可指定与 SCD2 列同类型的日期、时间戳或整数，历史区间采用 `[valid_from, valid_to)`。空起点表示无下界，空结束值默认表示无上界，可用 `open_end` 配置结束值哨兵。默认读取当前记录，可用 `current_flag` 和 `current_value` 定义当前标记。业务时间和数据源快照版本分别指定。
 
@@ -297,6 +391,8 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml query \
 
 `CALL db.schema.nodeTypeProperties()` 和 `CALL db.schema.relTypeProperties()` 从映射后的表结构返回属性名称、类型和空值约束。它们读取来源表结构或所选 CSR 的结构。`CALL dbms.components()` 返回引擎名称、版本和版本类别，`CALL dbms.info()` 返回图名称。`date()` 和 `datetime()` 支持当前时间及单个字符串或可转换标量参数，如 `date('2025-01-01')`。
 
+Cypher 的 `WITH ... SKIP ... LIMIT ... WHERE ...` 先分页再应用同一子句的过滤条件。整数和定点算术、`sum()` 及 `sum(DISTINCT ...)` 超出结果类型范围时返回错误。Cypher 和 Gremlin 都限制生成的计划大小，Gremlin 也检查 `math()` 公式的解析复杂度。
+
 普通 `EXPLAIN` 只加载规划所需的列类型、文件或快照元数据。需要查询结果来描述列类型的连接器提交零行语句，执行计划中的这些表使用仅包含 schema 的输入。`EXPLAIN ANALYZE` 会执行查询，业务键冲突和数据读取错误在执行时报告。
 
 变长关系用 `*N` 或 `*MIN..MAX`，上界最大为 256。零跳要求同一个节点满足两端的节点条件，关系的类型和方向约束正跳。异构关系的精确零跳模式可从一端显式或已绑定的标签推断另一端。有向和无向模式都保留平行边，每个 `MATCH` 子句内同一条边只能使用一次。`length(p)`、`nodes(p)` 和 `relationships(p)` 读取路径长度及有序身份，变长关系变量可投影为有序边键列表。跨标签或边类型的路径身份包含标签和按列顺序排列的文本键。
@@ -338,7 +434,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml query --language 
 
 `group().by(label()).by(count())` 和 `groupCount().by(label())` 按节点标签计数。Arrow Map 使用文本键保存类型信息，数值 `1` 的键可为 `@Int64:1`，字符串 `"1"` 的键为 `1`，以 `@` 开头的字符串再加一个 `@` 转义。省略 `group()` 的第二个 `by()` 时，每个分组收集原始遍历值。第二个 `by()` 可以收集属性或执行分组内的聚合。空输入产生空映射。`mean()` 返回数值的 Float64 平均值，空输入不产生结果。`sum()` 汇总数值，空输入返回零。整数和十进制数使用相应的精确数值类型，包含浮点数时使用 Float64。`min()` 和 `max()` 返回排序后的极值并保留原值类型，空输入无结果。`fold()` 把结果收成列表，保留已经指定的顺序，空输入产生空列表。`unfold()` 展开列表，也可将分组映射、投影和属性映射展开成 `key`、`value` 条目。
 
-`valueMap('property', ...)` 返回属性映射，省略属性名时返回该类型的所有映射属性。顶点属性是列表，边属性是标量。`repeat(...).until(__.has(...))` 每轮之后检查终止条件，`until(...).repeat(...)` 在进入下一轮之前检查。循环可跨标签，并可在顶点、边与标量之间切换。混合类型循环按轮求值，当前轮与终止结果可按查询预算溢写。条件支持属性、标签、标量和 `simplePath()` 筛选。
+`valueMap('property', ...)` 返回属性映射，省略属性名时返回该类型的所有映射属性。顶点属性是列表，边属性是标量。`repeat(...).until(__.has(...))` 每轮之后检查终止条件，`until(...).repeat(...)` 在进入下一轮之前检查。循环可跨标签，并可在顶点、边与标量之间切换。每个循环最多执行 256 轮，仍需继续时返回查询错误。混合类型循环按轮求值，当前轮与终止结果可按查询预算溢写。条件支持属性、标签、标量和 `simplePath()` 筛选。
 
 `where(out('Transfer').count().is(gt(1)))` 保留子遍历有结果的原始记录。`where('a',neq('b'))` 比较两个步骤标签的元素身份。`repeat(...).times(3).emit()` 输出每轮结果，前置 `emit().repeat(...)` 也可输出起点。`emit(__.has(...))` 筛选中间结果，终止记录仍按循环终止条件返回。
 
@@ -377,11 +473,11 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml --diagnostics \
 
 刷新从新快照构建正反向 CSR，连同 Arrow 业务键、边身份和来源版本写入同一校验文件。同步文件后原子替换当前代次，随后同步目录。同一映射与权限范围内的刷新串行执行，已启动的查询保留原代次。读取时校验文件完整性，刷新会回收该映射的中断暂存文件。调用方按来源权限隔离缓存目录和 `cache-scope`，授权或来源身份变化时使用新的权限范围。已发布的代次由显式刷新推进，可离线遍历。Cypher 属性查询从来源快照读取。
 
-可通过 `--timeout-ms`、`--memory-mib`、`--spill-mib`、`--partitions` 和 `--batch-size` 控制每次查询。内存上限用于 DataFusion 追踪的算子、PostgreSQL 读取批次、Parquet 范围缓冲、查询内物化和图遍历状态。进程 RSS 还包含运行时开销、解码中的临时缓冲和调用方持有的批次。图状态达到预算时返回资源错误。关闭结果流会释放本地状态和来源连接，CLI 支持 Ctrl-C。诊断记录前沿请求、扫描回退、CSR 代次和各深度访问数。PostgreSQL、MySQL、Iceberg 和数仓字节数为已解码的 Arrow 批次大小，Parquet 字节数为读取的对象范围大小。Iceberg 请求数按 Catalog 加载和扫描调用统计，Delta 请求数按快照加载统计。Delta 扫描的文件和行级执行统计可通过 `EXPLAIN ANALYZE` 查看。
+可通过 `--timeout-ms`、`--memory-mib`、`--spill-mib`、`--partitions` 和 `--batch-size` 控制每次查询。内存上限用于 DataFusion 追踪的算子、PostgreSQL 读取批次、Parquet 范围缓冲、查询内物化和图遍历状态。进程 RSS 还包含运行时开销、解码中的临时缓冲和调用方持有的批次。图状态达到预算时返回资源错误。关闭结果流会释放本地状态和来源连接，CLI 支持 Ctrl-C。诊断记录前沿请求、扫描回退、CSR 代次和各深度访问数。PostgreSQL、MySQL、SQLite、Iceberg 和数仓字节数为已解码的 Arrow 批次大小，Parquet、CSV、JSON Lines 的 `object_bytes` 为读取的对象范围大小。Iceberg 请求数按 Catalog 加载和扫描调用统计，Delta 请求数按快照加载统计。Delta 扫描的文件和行级执行统计可通过 `EXPLAIN ANALYZE` 查看。
 
 同一进程通过 `Engine::new` 创建的实例共享 8 个活动查询、2 GiB 内存预算和 8 GiB 临时磁盘预算。查询进入时预留声明的额度，读取完成或关闭结果流后释放。等待资源计入查询超时，也可以取消。Rust 可通过 `Engine::new_with_limits` 为一个实例及其克隆配置独立预算。CLI 单次执行按命令行参数分配预算。
 
-MySQL、Trino、ClickHouse、Snowflake、BigQuery、Spanner 和 SAP HANA 的查询结果可以物化到受磁盘配额约束的 Arrow IPC 临时文件。多表映射去重、无键边身份、相关 `CALL` 的分批或逐行求值结果也可溢写。Cypher 诊断的 `spilled_bytes` 包含已完成的批量子查询执行阶段和 `collect()` 的算子溢写。低内存下引擎可降低内部并行度，保留排序归并的工作内存。诊断中的 `reads.snapshot_spilled_bytes` 记录这些物化操作产生的磁盘字节。MySQL、Trino、ClickHouse、Spanner 和 SAP HANA 可把单节点标签查询的整数业务键条件及可安全转换的映射或分区条件下推到源端。引擎仍在本地应用条件，复杂查询仍可能扫描整个源表。
+CSV、JSON Lines、SQLite、MySQL、Trino、ClickHouse、Snowflake、BigQuery、Spanner 和 SAP HANA 的查询结果可以物化到受磁盘配额约束的 Arrow IPC 临时文件。多表映射去重、无键边身份、相关 `CALL` 的分批或逐行求值结果也可溢写。Cypher 诊断的 `spilled_bytes` 包含已完成的批量子查询执行阶段和 `collect()` 的算子溢写。低内存下引擎可降低内部并行度，保留排序归并的工作内存。诊断中的 `reads.snapshot_spilled_bytes` 记录这些物化操作产生的磁盘字节。MySQL、Trino、ClickHouse、Spanner 和 SAP HANA 可把单节点标签查询的整数业务键条件及可安全转换的映射或分区条件下推到源端。引擎仍在本地应用条件，ClickHouse 也支持对原生 String 列下推文本等值条件。复杂查询仍可能扫描整个源表。
 
 ## 整图算法
 
@@ -556,7 +652,7 @@ GRAPHLAKE_TEST_DELTA_FIXTURE=/tmp/graphlake-delta-test/fixture.json \
   cargo test --locked --test engine mysql_snapshot_joins_delta -- --ignored
 ```
 
-数仓协议测试使用本地 HTTP fixture 验证 Snowflake、BigQuery 和 Trino，覆盖跨源关联、Time Travel、分页、游标来源校验、类型转换、超时取消、键条件下推和磁盘预算。两个命令分别在终端运行。
+数仓协议测试使用本地 HTTP fixture 验证 Snowflake、BigQuery、Databricks 和 Trino，覆盖跨源关联、Time Travel、分页、游标来源校验、类型转换、超时取消、键条件下推和磁盘预算。用 `reads.warehouse_rows` 比较下推前后进入 GraphLake 的行数；这一指标不代表数仓内部扫描量或账单。两个命令分别在终端运行。
 
 ```sh
 python3 tests/warehouse_fixture.py /tmp/graphlake-warehouse-uri
@@ -590,10 +686,11 @@ ClickHouse 只读账号回归使用独立的 ClickHouse 25.8 测试实例。以�
 
 ```sql
 CREATE DATABASE graphlake;
-CREATE TABLE graphlake.nodes (id Int64, name LowCardinality(String), amount Decimal(12, 2))
+CREATE TABLE graphlake.nodes (id Int64, name LowCardinality(String), amount Decimal(12, 2), posted Nullable(Date))
 ENGINE = MergeTree ORDER BY id;
 INSERT INTO graphlake.nodes
-SELECT toInt64(number + 1), concat('node-', toString(number + 1)), toDecimal64(number, 2) + 0.25
+SELECT toInt64(number + 1), concat('node-', toString(number + 1)), toDecimal64(number, 2) + 0.25,
+       if(number % 2 = 0, toDate('2026-01-02'), NULL)
 FROM numbers(3000);
 CREATE USER readonly_reader IDENTIFIED BY 'graphlake-test-password' SETTINGS readonly = 1;
 GRANT SELECT ON graphlake.nodes TO readonly_reader;
@@ -613,3 +710,48 @@ GRAPHLAKE_TEST_CLICKHOUSE_PASSWORD=graphlake-test-password \
 cargo build --locked --bin graphlake
 python tests/large_graph_smoke.py target/debug/graphlake "$(mktemp -d)/graph"
 ```
+
+
+### 新增文件和数据库来源的集成验证
+
+```sh
+cargo test --locked --features admin --test engine sources::
+cargo test --locked --features admin --lib source::sqlite::tests
+cargo test --locked --features admin --test admin text_sqlite_and_duckdb_sources_browse_publish_query_and_restart
+# 需要可写的测试 S3 bucket 及 AWS_REGION/AWS_ENDPOINT/AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY（HTTP 测试服务另设 AWS_ALLOW_HTTP=true）：
+cargo test --locked --features admin --test engine text_sources_s3_keep_versions -- --ignored
+```
+
+上述无外部服务用例覆盖跨文件图查询、整数/Decimal/NULL、CSV 表头漂移、无效 JSON 行、低内存溢写、超大记录预算、SQLite 快照与只读/取消，以及管理 API 的浏览、验证、发布、查询和重启。命名 SQL Server / Oracle 的协议回归复用 `tests/warehouse_fixture.py` 和 `named_trino_connectors_qualify_the_catalog_and_preserve_results`；协议夹具通过不代表真实 SQL Server / Oracle 的服务端类型映射已验证，后者需要部署对应数据库和 Trino Catalog。
+
+### 扩展连接器回归命令
+
+```sh
+cargo test --locked --features admin --test engine direct_sources::duckdb_
+cargo test --locked --features admin --test admin text_sqlite_and_duckdb_sources
+# MongoDB 测试会创建并删除带随机后缀的 graphlake_* 测试数据库：
+GRAPHLAKE_TEST_MONGODB_DSN='mongodb://127.0.0.1:27017' \
+  cargo test --locked --features admin --test engine mongodb_native_ -- --ignored
+# KIND 可为 doris、starrocks、tidb、oceanbase、mariadb；使用独立测试实例：
+GRAPHLAKE_TEST_MYSQL_COMPAT_KIND=mariadb \
+GRAPHLAKE_TEST_MYSQL_COMPAT_DSN='mysql://test:test@127.0.0.1:3306/' \
+  cargo test --locked --features admin --test engine mysql_compatible_sources_ -- --ignored
+# 复用上面的 warehouse_fixture.py，设置其返回的 URI 和测试令牌：
+GRAPHLAKE_TEST_WAREHOUSE_URI=http://127.0.0.1:PORT \
+GRAPHLAKE_TEST_WAREHOUSE_TOKEN=graphlake-fixture \
+  cargo test --locked --features admin --test engine databricks_ -- --ignored
+# 已存在且可写的专用 S3 兼容测试桶；KEY / SECRET 为测试凭据：
+GRAPHLAKE_TEST_STORAGE_ENDPOINT=http://127.0.0.1:9000 \
+GRAPHLAKE_TEST_STORAGE_BUCKET=graphlake-test \
+GRAPHLAKE_TEST_STORAGE_KEY=test-key GRAPHLAKE_TEST_STORAGE_SECRET=test-secret \
+  cargo test --locked --features admin --test engine object_storage_sources_ -- --ignored
+```
+
+`native_sql_sources_preserve_integer_decimal_timestamp_and_null_values` 需要真实 SQL Server 或 Oracle。用 `GRAPHLAKE_TEST_DIRECT_SQL_CATALOG` 指定模型 YAML：包含名为 `Record` 的节点，键为 `ID`，属性包含 `AMOUNT`、`CREATED`，来源指向测试表。SQL Server 使用 `ID BIGINT`、`AMOUNT DECIMAL(18,2)`、`CREATED DATETIME2(6)`；Oracle 使用 `ID NUMBER(18,0)`、`AMOUNT NUMBER(18,2)`、`CREATED TIMESTAMP(6)`。两行 ID 为 `9007199254740993` 和 `9007199254740994`，AMOUNT 分别为 `15.25`、NULL，CREATED 为 `2026-11-10 09:00:00.123456`。执行：
+
+```sh
+GRAPHLAKE_TEST_DIRECT_SQL_CATALOG=/path/to/sql-fixture.yaml \
+  cargo test --locked --features admin --test engine native_sql_sources_ -- --ignored
+```
+
+ARM64 调试链接如果因可执行文件体积遇到 GNU ld 的 `R_AARCH64_CALL26` 重定位溢出，可以使用 LLD 链接器；这属于构建工具链要求，不应跳过运行验证。

@@ -1,13 +1,13 @@
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
-use axum::{Extension, Json, extract::State as AppState};
+use axum::{Extension, Json, extract::State as AppState, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -18,7 +18,9 @@ use super::{
 };
 use crate::CancellationToken;
 
-const LIMIT: usize = 132 * 1024 * 1024;
+// The backup still uses the portable v1 JSON format, including the files
+// rather than references into the HA object store.
+const LIMIT: u64 = 2 * super::cluster::control::CATALOG_BYTES_LIMIT + 4 * 1024 * 1024;
 const FORMAT: u32 = 1;
 
 #[derive(Deserialize, Serialize)]
@@ -46,6 +48,8 @@ struct BackupStatus {
     attempted_ms: u64,
     last_success_ms: Option<u64>,
     checkpoint_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -61,7 +65,25 @@ pub(super) struct BackupOverview {
     export: JobStatus,
     offline: JobStatus,
     recovery_configured: bool,
+    manual: ManualStatus,
 }
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum ManualStatus {
+    Unsupported,
+    NotConfigured,
+    Enabled { running: bool, job: JobStatus },
+}
+
+#[derive(Serialize)]
+pub(super) struct Exported {
+    file: String,
+    checkpoint_ms: u64,
+    status_recorded: bool,
+}
+
+const MANUAL_STATUS: &str = "manual-export-status.json";
 
 fn job_status(dir: &Path, name: &str) -> JobStatus {
     match models::read_file(&dir.join(name), 4096) {
@@ -85,24 +107,150 @@ pub(super) async fn overview(
         || PathBuf::from("/var/lib/graphlake-backups"),
         PathBuf::from,
     );
-    let (export, offline) = tokio::time::timeout(
+    let manual_dir = app.manual_backup_dir.clone();
+    let (export, offline, manual_job) = tokio::time::timeout(
         Duration::from_secs(2),
         tokio::task::spawn_blocking(move || {
             (
                 job_status(&dir, "export-status.json"),
                 job_status(&dir, "verify-status.json"),
+                manual_dir.map_or(JobStatus::NotRecorded, |dir| {
+                    job_status(&dir, MANUAL_STATUS)
+                }),
             )
         }),
     )
     .await
     .ok()
     .and_then(Result::ok)
-    .unwrap_or((JobStatus::Unavailable, JobStatus::Unavailable));
+    .unwrap_or((
+        JobStatus::Unavailable,
+        JobStatus::Unavailable,
+        JobStatus::Unavailable,
+    ));
+    let manual = if app.ha.is_none() {
+        ManualStatus::Unsupported
+    } else if app.manual_backup_dir.is_none() {
+        ManualStatus::NotConfigured
+    } else {
+        ManualStatus::Enabled {
+            running: app.backup_work.available_permits() == 0,
+            job: manual_job,
+        }
+    };
     Ok(Json(BackupOverview {
         export,
         offline,
         recovery_configured,
+        manual,
     }))
+}
+
+pub(super) async fn export(
+    AppState(app): AppState<Arc<App>>,
+    Extension(principal): Extension<access::Principal>,
+) -> ApiResult<Json<Exported>> {
+    if principal != access::Principal::Admin {
+        return Err(access::forbidden());
+    }
+    let dir = app.manual_backup_dir.clone().ok_or_else(|| {
+        if app.ha.is_some() {
+            Error::invalid("backup_not_configured", "请在服务主机配置手动备份目录")
+        } else {
+            Error::invalid(
+                "backup_not_supported",
+                "手动控制状态备份需要启用 Coordinator 故障接管",
+            )
+        }
+    })?;
+    let slot = app
+        .backup_work
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::busy())?;
+    let control = app
+        .cluster
+        .as_ref()
+        .expect("HA requires a cluster")
+        .control()
+        .map_err(|_| Error::storage())?;
+    // Once accepted, keep the slot until the file and status have been written even if the client leaves.
+    tokio::spawn(async move {
+        let state = match tokio::time::timeout(Duration::from_secs(30), control.checkpoint()).await
+        {
+            Ok(Ok((catalog, policy, users))) => Ok(State {
+                catalog,
+                policy,
+                users,
+            }),
+            Ok(Err(_)) => Err(Error::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "backup_checkpoint_unavailable",
+                "无法读取集群控制状态，请检查 etcd 和对象存储",
+            )),
+            Err(_) => Err(Error::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "backup_checkpoint_timeout",
+                "读取集群控制状态超时",
+            )),
+        };
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            persist_export(dir, state)
+        })
+        .await
+        .map_err(|_| Error::storage())?
+    })
+    .await
+    .map_err(|_| Error::storage())?
+    .map(Json)
+}
+
+fn persist_export(dir: PathBuf, state: ApiResult<State>) -> ApiResult<Exported> {
+    let meta = fs::symlink_metadata(&dir).ok();
+    if !dir.is_absolute()
+        || !meta.as_ref().is_some_and(|meta| {
+            meta.is_dir() && super::auth::private_permissions(meta, false).is_ok()
+        })
+    {
+        return Err(Error::invalid(
+            "backup_directory",
+            "手动备份目录必须是权限为 0700 的现有绝对路径",
+        ));
+    }
+    let file = format!(
+        "control-manual-{}-{}.json",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        uuid::Uuid::new_v4().simple()
+    );
+    let result = state.and_then(|state| {
+        write(&dir.join(&file), state).map_err(|_| {
+            Error::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backup_write_failed",
+                "校验或写入备份失败，请检查模型归档和目录权限",
+            )
+        })
+    });
+    let status = record_export_status(
+        &dir.join(MANUAL_STATUS),
+        result
+            .as_ref()
+            .map(|timestamp| Some(*timestamp))
+            .map_err(|error| format_error(error.clone())),
+        Some(&file),
+    );
+    let checkpoint_ms = result?;
+    super::telemetry::event(
+        opentelemetry::logs::Severity::Info,
+        "backup_exported",
+        serde_json::json!({}),
+    );
+    Ok(Exported {
+        file,
+        checkpoint_ms,
+        status_recorded: status.is_ok(),
+    })
 }
 
 fn now_ms() -> u64 {
@@ -118,7 +266,22 @@ fn format_error(error: Error) -> anyhow::Error {
 }
 
 fn checksum(state: &State) -> Result<String> {
-    Ok(Sha256::digest(serde_json::to_vec(state)?)
+    struct HashWriter(Sha256);
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, state)?;
+    Ok(writer
+        .0
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
@@ -149,14 +312,13 @@ pub(super) fn read(file: &Path) -> Result<Backup> {
     let file = options.open(file)?;
     let metadata = file.metadata()?;
     ensure!(
-        metadata.is_file() && metadata.len() <= LIMIT as u64,
+        metadata.is_file() && metadata.len() <= LIMIT,
         "invalid backup file"
     );
     super::auth::private_permissions(&metadata, true)?;
-    let mut bytes = Vec::new();
-    file.take(LIMIT as u64 + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= LIMIT, "backup exceeds size limit");
-    let backup: Backup = serde_json::from_slice(&bytes).context("invalid HA backup")?;
+    let mut reader = BufReader::new(file.take(LIMIT + 1));
+    let backup: Backup = serde_json::from_reader(&mut reader).context("invalid HA backup")?;
+    ensure!(reader.into_inner().limit() > 0, "backup exceeds size limit");
     ensure!(backup.format == FORMAT, "unsupported HA backup format");
     ensure!(
         checksum(&backup.state)? == backup.sha256,
@@ -173,7 +335,7 @@ pub(super) fn read(file: &Path) -> Result<Backup> {
     Ok(backup)
 }
 
-fn write(path: &Path, state: State) -> Result<()> {
+fn write(path: &Path, state: State) -> Result<u64> {
     verify(&state)?;
     let timestamp = now_ms();
     let sha256 = checksum(&state)?;
@@ -192,7 +354,7 @@ fn write(path: &Path, state: State) -> Result<()> {
     serde_json::to_writer(&mut temp, &backup)?;
     temp.flush()?;
     ensure!(
-        temp.as_file().metadata()?.len() <= LIMIT as u64,
+        temp.as_file().metadata()?.len() <= LIMIT,
         "backup exceeds size limit"
     );
     temp.as_file().sync_all()?;
@@ -200,7 +362,7 @@ fn write(path: &Path, state: State) -> Result<()> {
         .context("publishing private backup file")?;
     #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    Ok(timestamp)
 }
 
 /// Export a consistent control-plane checkpoint or restore into a fresh namespace.
@@ -289,6 +451,14 @@ pub fn check_checkpoint(file: &Path) -> Result<Option<u64>> {
 
 /// Publish the outcome separately from the private backup artifact.
 pub fn record_status(path: &Path, result: Result<Option<u64>>) -> Result<()> {
+    record_export_status(path, result, None)
+}
+
+fn record_export_status(
+    path: &Path,
+    result: Result<Option<u64>>,
+    artifact: Option<&str>,
+) -> Result<()> {
     let mut lock = fs::OpenOptions::new();
     lock.write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -315,6 +485,7 @@ pub fn record_status(path: &Path, result: Result<Option<u64>>) -> Result<()> {
     if let Ok(checkpoint_ms) = &result {
         status.last_success_ms = Some(now);
         status.checkpoint_ms = *checkpoint_ms;
+        status.artifact = artifact.map(str::to_owned);
     }
     models::atomic_write(path, &serde_json::to_vec(&status)?, previous.is_none())
         .map_err(format_error)?;
@@ -367,6 +538,45 @@ mod tests {
             job_status(dir.path(), "export-status.json"),
             JobStatus::Unavailable
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn manual_export_keeps_the_verified_file_and_checkpoint_after_a_failed_attempt() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        }
+        let scheduled = dir.path().join("export-status.json");
+        record_status(&scheduled, Ok(Some(123)))?;
+        let result = persist_export(
+            dir.path().to_owned(),
+            Ok(State {
+                catalog: CatalogState::default(),
+                policy: "{}".to_owned(),
+                users: serde_json::json!({"accounts": {}, "groups": {}}),
+            }),
+        )
+        .map_err(format_error)?;
+        assert!(result.status_recorded);
+        let archive = read(&dir.path().join(&result.file))?;
+        assert_eq!(archive.created_at_ms, Some(result.checkpoint_ms));
+
+        let failed = persist_export(dir.path().to_owned(), Err(Error::busy()));
+        assert!(matches!(failed, Err(error) if error.code == "busy"));
+        let JobStatus::Recorded(manual) = job_status(dir.path(), MANUAL_STATUS) else {
+            panic!("manual export result must survive a failed subsequent attempt");
+        };
+        assert!(!manual.ok);
+        assert_eq!(manual.artifact.as_deref(), Some(result.file.as_str()));
+        assert_eq!(manual.checkpoint_ms, Some(result.checkpoint_ms));
+        let JobStatus::Recorded(timer) = job_status(dir.path(), "export-status.json") else {
+            panic!("the scheduled result must remain readable");
+        };
+        assert!(timer.ok);
+        assert_eq!(timer.checkpoint_ms, Some(123));
         Ok(())
     }
 }

@@ -10,7 +10,7 @@ use datafusion::{
     arrow::{
         array::{RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Field, Schema, SchemaRef},
-        json::LineDelimitedWriter,
+        json::writer::LineDelimited,
     },
     common::DataFusionError,
     execution::{SendableRecordBatchStream, memory_pool::MemoryConsumer},
@@ -176,11 +176,20 @@ impl Destination {
             let mut writer = ArrowWriter::try_new(writer, batches.schema(), None)?;
             while let Some(batch) = batches.try_next().await? {
                 scope.check()?;
-                budget.try_grow(batch.get_array_memory_size().saturating_mul(2))?;
+                let batch_memory = batch.get_array_memory_size().saturating_mul(2);
+                if budget.try_grow(batch_memory).is_err() {
+                    writer.flush()?;
+                    budget.free();
+                    budget.try_grow(batch_memory)?;
+                }
                 writer.write(&batch)?;
-                writer.flush()?;
+                if writer.memory_size() >= (scope.options.memory_bytes / 8).min(8 * 1024 * 1024)
+                    || budget.try_resize(writer.memory_size()).is_err()
+                {
+                    writer.flush()?;
+                    budget.free();
+                }
                 count += batch.num_rows() as u64;
-                budget.free();
             }
             writer.into_inner()?.flush()?;
         } else {
@@ -199,7 +208,7 @@ impl Destination {
             while let Some(batch) = batches.try_next().await? {
                 scope.check()?;
                 budget.try_grow(batch.get_array_memory_size().saturating_mul(4))?;
-                let mut json = LineDelimitedWriter::new(Vec::new());
+                let mut json = crate::json_writer().build::<_, LineDelimited>(Vec::new());
                 json.write(&batch)?;
                 json.finish()?;
                 let bytes = json.into_inner();

@@ -79,6 +79,8 @@ struct App {
     shutdown: CancellationToken,
     metrics: ops::Metrics,
     readiness: Arc<Semaphore>,
+    manual_backup_dir: Option<PathBuf>,
+    backup_work: Arc<Semaphore>,
     wire: Option<wire::Access>,
     cluster: Option<cluster::Coordinator>,
     ha: Option<ha::Ha>,
@@ -391,6 +393,10 @@ pub async fn serve_clustered_with_status(
         shutdown: shutdown.clone(),
         metrics: ops::Metrics::new(query_slots),
         readiness: Arc::new(Semaphore::new(1)),
+        manual_backup_dir: ha
+            .as_ref()
+            .and_then(|_| std::env::var_os("GRAPHLAKE_MANUAL_BACKUP_DIR").map(PathBuf::from)),
+        backup_work: Arc::new(Semaphore::new(1)),
         wire,
         cluster,
         ha,
@@ -442,6 +448,7 @@ pub async fn serve_clustered_with_status(
         .route("/v1/models/{id}/readiness", get(ops::model_ready))
         .route("/v1/models/{id}/browse", post(browse::browse))
         .route("/v1/backups/status", get(backup::overview))
+        .route("/v1/backups/export", post(backup::export))
         .route("/v1/mcp/access", get(mcp::settings::access))
         .route("/v1/mcp/token", get(users::delegation::status).post(users::delegation::issue).delete(users::delegation::revoke)
             .layer(DefaultBodyLimit::max(4096)))
@@ -640,23 +647,6 @@ async fn guard_request(
     });
     let public = auth::Auth::public(&request);
     let basic = !public && headers.contains_key(header::AUTHORIZATION);
-    let leadership = if valid_host
-        && !is_probe
-        && let Some(ha) = &app.ha
-    {
-        match ha.leader.confirm().await {
-            Ok(leadership) => Some(leadership),
-            Err(error) => {
-                let mut response = error.into_response();
-                response
-                    .headers_mut()
-                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                return response;
-            }
-        }
-    } else {
-        None
-    };
     if valid_host
         && !is_probe
         && !recovery_rpc
@@ -683,15 +673,17 @@ async fn guard_request(
         .map(|credential| credential.live.clone());
     let same_origin = exact_header(headers, header::ORIGIN, &app.origin);
     let read = matches!(*request.method(), Method::GET | Method::HEAD);
-    let principal = if let Some(credential) = credential {
-        Some(credential.principal)
-    } else if valid_host
+    let cookie_auth = valid_host
         && is_api
         && (read || same_origin)
         && !headers.contains_key(header::AUTHORIZATION)
-        && (!public || path == "/api/v1/auth/logout")
-    {
-        app.auth.principal(&app.users, headers, !public).await
+        && (!public || path == "/api/v1/auth/logout");
+    let principal = if let Some(credential) = credential {
+        Some(credential.principal)
+    } else if cookie_auth {
+        app.auth
+            .principal(&app.users, headers, !public && app.ha.is_none())
+            .await
     } else {
         None
     };
@@ -734,6 +726,36 @@ async fn guard_request(
     {
         access::forbidden().into_response()
     } else {
+        let leadership = if !is_probe && let Some(ha) = &app.ha {
+            match ha.leader.confirm().await {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    let mut response = error.into_response();
+                    response
+                        .headers_mut()
+                        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                    return response;
+                }
+            }
+        } else {
+            None
+        };
+        if leadership.is_some()
+            && cookie_auth
+            && !public
+            && app
+                .auth
+                .principal(&app.users, request.headers(), true)
+                .await
+                != principal
+        {
+            return Error::new(
+                StatusCode::UNAUTHORIZED,
+                "auth_required",
+                "请登录 GraphLake 管理后台",
+            )
+            .into_response();
+        }
         if let Some(principal) = &principal {
             request.extensions_mut().insert(principal.clone());
         }

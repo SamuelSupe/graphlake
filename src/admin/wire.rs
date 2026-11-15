@@ -36,6 +36,7 @@ const ROW_BYTES: usize = 1024 * 1024;
 pub(super) struct Access {
     pub(super) model: String,
     sockets: tokio::sync::Semaphore,
+    pending_sockets: Arc<tokio::sync::Semaphore>,
 }
 
 impl Access {
@@ -47,6 +48,7 @@ impl Access {
         Ok(Self {
             model,
             sockets: tokio::sync::Semaphore::new(16),
+            pending_sockets: Arc::new(tokio::sync::Semaphore::new(16)),
         })
     }
 }
@@ -61,9 +63,8 @@ struct Target {
 impl Target {
     fn engine(&self, app: &App) -> ApiResult<(String, Engine)> {
         super::access::check_query(app, &self.principal, &self.model)?;
-        let mut models = app.models.lock().unwrap();
-        let revision = models.require_published(&self.model)?;
-        let engine = models.query_engine(&self.model, &revision, &self.principal)?;
+        let files = app.models.lock().unwrap().read_files();
+        let (revision, _, engine) = files.query_engine(app, &self.model, None, &self.principal)?;
         Ok((revision, engine))
     }
 
@@ -92,6 +93,7 @@ struct Rows {
     columns: Vec<String>,
     revision: String,
     started: Instant,
+    deadline: Instant,
     span: Option<Context>,
     leadership: Option<crate::CancellationToken>,
 }
@@ -235,6 +237,7 @@ async fn execute_inner(
         }
         options.timeout = options.timeout.min(timeout);
     }
+    let deadline = started + options.timeout;
     options.parameters = parameters;
     let active = query::admit(
         app,
@@ -245,10 +248,7 @@ async fn execute_inner(
     )
     .await?;
     let (revision, engine, pinned) = if let Some((revision, engine, pinned)) = transaction {
-        app.models
-            .lock()
-            .unwrap()
-            .require_published(&target.model)?;
+        app.published_model_revision(&target.model).await?;
         (revision.to_owned(), engine.clone(), Some(pinned))
     } else {
         let (revision, engine) = target.engine(app)?;
@@ -280,6 +280,7 @@ async fn execute_inner(
         columns,
         revision,
         started,
+        deadline,
         span: None,
         leadership: None,
     })
@@ -321,6 +322,13 @@ impl Rows {
     async fn next_inner(&mut self) -> ApiResult<Option<Vec<BoltValue>>> {
         if self.finished {
             return Ok(None);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(Error::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                "Query deadline exceeded",
+            ));
         }
         if self.active.token.is_cancelled() {
             return Err(Error::new(

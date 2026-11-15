@@ -39,9 +39,13 @@ The example returns account `30`, two paths, and a total amount of `600`.
 
 ## Data sources and interfaces
 
-- **Direct connectors** — PostgreSQL, MySQL, Parquet, Iceberg, Delta Lake, Snowflake, BigQuery, ClickHouse, Trino, Spanner, and SAP HANA.
-- **Through Trino** — SQL Server, Oracle, Hive, Hudi, MongoDB, Elasticsearch, and Redshift. The corresponding Trino catalog supplies access to the source.
+- **Direct connectors** — PostgreSQL, MySQL, SQLite, CSV, JSON Lines, Parquet, Iceberg, Delta Lake, Snowflake, BigQuery, ClickHouse, Trino, Spanner, and SAP HANA.
+- **Additional direct connectors** — SQL Server (TDS), Oracle (Oracle Instant Client required), MongoDB, DuckDB, Databricks SQL, Apache Doris, StarRocks, TiDB, OceanBase MySQL mode, and MariaDB.
+- **Per-connection object storage** — S3, MinIO, OSS (S3-compatible authentication), TOS (S3 endpoint), COS, Azure Blob Storage, and GCS. Browse object keys and map Parquet, CSV, or JSON Lines files; credentials remain server-side environment references.
+- **Through Trino** — SQL Server, Oracle, Hive, Hudi, MongoDB, Elasticsearch, and Redshift. The corresponding Trino catalog supplies access to the source. SQL Server and Oracle have dedicated `sqlserver` and `oracle` configuration choices.
 - **Clients** — Browser, HTTP API and MCP, Bolt and Gremlin WebSocket, command line, embedded Rust, and source-built Python and C bindings. Explicit Bolt transactions are available for PostgreSQL and Parquet.
+
+Configure sources directly from connector cards in the **Data Sources** workspace, then save and publish the model draft.
 
 See the [technical reference](docs/reference.zh-CN.md#图映射与连接器) for source configuration, query semantics, the API, and the bindings.
 

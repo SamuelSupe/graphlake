@@ -692,6 +692,12 @@ fn references(expr: &Expr, name: &str) -> bool {
     visitor.full || !visitor.fields.is_empty()
 }
 
+pub(super) fn referenced_names(expr: &Expr) -> BTreeSet<String> {
+    let mut visitor = Variables(BTreeSet::new());
+    visitor.visit_expr(expr);
+    visitor.0
+}
+
 struct Variables(BTreeSet<String>);
 
 impl Visitor for Variables {

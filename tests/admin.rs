@@ -3,6 +3,9 @@
 #[path = "admin/mcp.rs"]
 mod mcp;
 
+#[path = "admin/local_tables.rs"]
+mod local_tables;
+
 use std::{
     fs,
     io::{BufRead, BufReader},

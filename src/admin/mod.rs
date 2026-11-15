@@ -6,6 +6,7 @@ mod backup;
 mod browse;
 pub(crate) mod cluster;
 mod ha;
+mod local_tables;
 mod mcp;
 mod models;
 mod ops;
@@ -56,6 +57,7 @@ struct App {
     access: access::Policy,
     assets: Arc<assets::Assets>,
     models: Mutex<models::Models>,
+    local_tables: local_tables::LocalTables,
     work: Arc<Semaphore>,
     query_waiters: Semaphore,
     export_waiters: Semaphore,
@@ -356,12 +358,14 @@ pub async fn serve_clustered_with_status(
         .map_or_else(query::Sessions::default, |cluster| {
             query::Sessions::with_cursor_key(cluster.cursor_key())
         });
+    let local_tables = local_tables::LocalTables::open(models.source_directory().to_owned())?;
     let app = Arc::new(App {
         auth,
         users,
         access,
         assets,
         models: Mutex::new(models),
+        local_tables,
         work: Arc::new(Semaphore::new(query_slots)),
         query_waiters: Semaphore::new(16),
         export_waiters: Semaphore::new(4),
@@ -401,7 +405,12 @@ pub async fn serve_clustered_with_status(
         tokio::spawn(ha::watch_backend(Arc::downgrade(&app)));
     }
     tokio::spawn(access::Policy::watch(Arc::downgrade(&app)));
+    tokio::spawn(local_tables::watch(Arc::downgrade(&app)));
     let api = Router::new()
+        .route("/v1/models/{id}/local-tables", get(local_tables::list).post(local_tables::create))
+        .route("/v1/models/{id}/local-tables/{name}", axum::routing::put(local_tables::schedule))
+        .route("/v1/models/{id}/local-tables/{name}/load", post(local_tables::load))
+        .route("/v1/models/{id}/local-tables/{name}/cancel", post(local_tables::cancel))
         .route("/v1/models", get(models::list).post(models::create))
         .route("/v1/models/validate", post(models::validate))
         .route("/v1/models/{id}", get(models::read).put(models::update))

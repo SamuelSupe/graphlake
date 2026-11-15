@@ -12,12 +12,18 @@ const advice: Record<ModelReadiness['status'], string> = {
   worker_unavailable: '检查列出的 Worker 进程、网络和来源访问权限，然后重新检查。',
 };
 
-export function ModelHealth({ models, openModel }: { models: ModelSummary[]; openModel?: (id: string, workspace: 'graph' | 'catalogs') => void }) {
+export function ModelHealth({ models, openModel, visible = true }: { models: ModelSummary[]; openModel?: (id: string, workspace: 'graph' | 'catalogs') => void; visible?: boolean }) {
   const [checks, setChecks] = useState<Record<string, Check>>({});
   const [checking, setChecking] = useState<string>();
   const [onlyProblems, setOnlyProblems] = useState(false);
   const active = useRef<AbortController | null>(null);
-  useEffect(() => () => active.current?.abort(), []);
+  useEffect(() => {
+    if (!visible) setChecking(undefined);
+    return () => {
+      active.current?.abort();
+      active.current = null;
+    };
+  }, [visible]);
   async function inspect(candidates: ModelSummary[]) {
     if (active.current) return;
     const controller = new AbortController();

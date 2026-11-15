@@ -1,0 +1,55 @@
+.canvas-panel:has(> .canvas-frame) { display: flex; flex-direction: column; }
+.canvas-frame { position: relative; flex: 1; min-block-size: 0; }
+.canvas-instructions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2px 12px;
+  min-block-size: 40px;
+  padding: 5px 12px;
+  border-block-end: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: .8125rem;
+}
+.canvas-instructions > p { display: flex; align-items: center; gap: 6px; min-inline-size: 0; overflow-wrap: anywhere; }
+.canvas-instructions svg { flex: none; }
+.canvas-instructions[data-active] { background: #edf2ff; color: #254895; }
+.canvas-instructions .text-button { min-block-size: 26px; font-size: .8125rem; }
+.graph-vertex { position: absolute; z-index: 1; }
+.graph-vertex:focus-within, .graph-vertex:hover, .graph-vertex[data-moving] { z-index: 2; }
+.graph-vertex > .graph-node { inset: 0 auto auto 0; }
+.graph-vertex .node-dot { display: grid; place-items: center; color: #fff; }
+.graph-node[data-movable] {
+  cursor: grab;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.graph-node[data-movable]:active, .graph-vertex[data-moving] .graph-node { cursor: grabbing; }
+.graph-stage .graph-edge[data-label-below] { transform: translateX(-50%); }
+.graph-port {
+  position: absolute;
+  inset: 0 auto auto 20px;
+  display: grid;
+  place-items: center;
+  inline-size: 26px;
+  block-size: 26px;
+  padding: 0;
+  transform: translateY(-50%);
+  border: 1px solid #c5d3eb;
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--blue-dark);
+}
+.graph-port:hover, .graph-port:focus-visible { border-color: var(--blue); background: #e9f0ff; }
+.graph-vertex[data-link-source] .node-dot { box-shadow: 0 0 0 2px var(--blue), 0 0 0 5px #bed2ff; }
+.graph-vertex[data-link-target] .node-dot { box-shadow: 0 0 0 2px var(--blue), 0 0 0 5px #d5e1ff; }
+.graph-stage[data-placing] { cursor: crosshair; }
+.graph-stage[data-linking] .graph-node { cursor: crosshair; }
+.graph-toolbar .tool-button[aria-pressed="true"] { color: var(--blue-dark); background: var(--tint); border-color: #c9d7ff; }
+@media (pointer: coarse) {
+  .graph-port { inset-inline-start: 24px; inline-size: 44px; block-size: 44px; }
+}

@@ -1,11 +1,12 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2, Download, GitFork, Network, Play, Square, Table2 } from 'lucide-react';
-import { GraphCanvas, type GraphSelection } from './GraphCanvas';
+import type { GraphSelection } from './GraphCanvas';
 import { GraphExplorer, type GraphExplorerHandle } from './GraphExplorer';
 import { api, ApiError, downloadFile, errorText, request, type GraphSchema, type QueryResult } from './api';
 
 const QueryEditor = lazy(() => import('./QueryEditor'));
 const QueryScope = lazy(() => import('./QueryScope'));
+const GraphCanvas = lazy(() => import('./GraphCanvas'));
 
 type Dialect = 'cypher' | 'sql' | 'gremlin';
 type Statement = { language: Dialect; query: string; parameters_json?: string; timeout_ms?: number; model_revision: string; graph_options?: string; capture_result?: boolean; csr_generation?: string };
@@ -449,7 +450,9 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
       <div className={'result-panel result-' + view} role="tabpanel" aria-labelledby={id + '-result-tab-' + view}
         tabIndex={view === 'raw' && !page || view === 'graph' && !canvas || view === 'table' && !page ? 0 : undefined}>
         {view === 'schema' && (shownSchema?.data ? <div className="schema-canvas">
-          <GraphCanvas model={shownSchema.data} selected={schemaSelection} select={setSchemaSelection} />
+          <Suspense fallback={<p className="empty" role="status">正在打开图结构…</p>}>
+            <GraphCanvas model={shownSchema.data} selected={schemaSelection} select={setSchemaSelection} />
+          </Suspense>
           {schemaSelection && selectedType && <aside className="schema-type" aria-label="生效类型详情">
             <strong>{schemaSelection.name}</strong>
             {'from' in selectedType && <p>{selectedType.from.node} → {selectedType.to.node}</p>}

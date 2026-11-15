@@ -6,7 +6,7 @@
 2. 把 `ingress` 设置为客户端实际使用的地址。HTTPS 检查服务身份，并通过同一个入口执行模型探针与业务查询。Bolt 进行 5.4 协商，Gremlin 执行 WebSocket 升级并验证服务端握手。启用 TLS 的目标校验系统 CA，可用 `ca_file` 指定部署使用的 CA 文件。回环测试可使用明文。仅配置部署已启用的协议。
 3. 创建专用的角色服务账号，授予待监控模型的查询权限。模型会随发布自动发现。为每个模型设置一条已知结果的只读查询，限制返回行数，并对多行结果显式排序。结果按 API 的字符串或 null 表达比较，同时检查查询版本和截断标记。模型恢复需要来源探针及业务查询都通过。发布新模型后要同步配置查询。模型下线后移除对应配置。定时状态最多发现 256 个模型。
 4. 将令牌写入 root 所有、权限 0600 的 `/etc/graphlake/monitor.env`。把实例配置放入 `/etc/graphlake/monitor.json`，允许服务账号读取。安装并启动 `graphlake-monitor.service`。备份状态文件由同一主机的 GraphLake 用户读取。异地运行独立的监控进程，并在 Prometheus 中加入对应目标。
-5. 在 Prometheus 中加载随包的 `prometheus-rules.yaml`，或从「运行配置」下载已保存版本。独立监控端的抓取任务名为 `graphlake-monitor`。如抓取实际生产入口的 `/metrics`，使用 `graphlake-active`。两台 Coordinator 的候选端口交给监控进程，避免把等待主权的候选误判为应用不可用。配置 Alertmanager 路由，并开启接收端的恢复通知。
+5. 在部署侧按需调整随包的 `prometheus-rules.yaml`，再由 Prometheus 加载。独立监控端的抓取任务名为 `graphlake-monitor`。如抓取实际生产入口的 `/metrics`，使用 `graphlake-active`。两台 Coordinator 的候选端口交给监控进程，避免把等待主权的候选误判为应用不可用。配置 Alertmanager 路由，并开启接收端的恢复通知。
 
 可用 `graphlake-monitor --config /etc/graphlake/monitor.json --once` 检查单轮结果。持续服务使用 `--state-file` 保存故障标签，重启后仍需成功执行已知结果查询才清除原来源故障。正常探针完成后如果来源仍可读但查询返回错误或错值，告警继续保留。HTTP 查询已知的来源连接失败使用 503 和 `source_unavailable`。配置或查询语义错误仍有独立计数 `graphlake_query_errors_total{category="configuration"}`。访问失败不输出令牌、查询文本或连接串。
 

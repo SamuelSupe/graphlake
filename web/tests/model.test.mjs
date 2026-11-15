@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setupIssue } from '../src/modelWorkflow.ts';
 import { modelChanges } from '../src/modelChanges.ts';
-import { appendMappingInput, documentOf, modelIdPattern, modelOf, removeGraphType, rename, validationTargets } from '../src/model.ts';
+import { addEdgeType, appendMappingInput, documentOf, modelIdPattern, modelOf, removeGraphType, rename, validationTargets } from '../src/model.ts';
 
 test('model ID pattern works with the HTML pattern Unicode sets flag', () => {
   const pattern = new RegExp('^(?:' + modelIdPattern + ')$', 'v');
@@ -45,6 +45,22 @@ test('visual edits preserve advanced YAML and update both edge endpoints', () =>
   assert.deepEqual(after.nodes.CustomerAccount.properties, ['name', 'status']);
   assert.deepEqual(after.edges.Transfer.from, { node: 'CustomerAccount', columns: ['tenant', 'src'] });
   assert.deepEqual(after.edges.Transfer.to, { node: 'CustomerAccount', columns: ['tenant', 'dst'] });
+});
+
+test('creating an edge from the canvas keeps its direction and leaves source fields for mapping', () => {
+  const yaml = `graph: finance
+nodes:
+  Account: {source: lake.accounts, key: [tenant, account_id]}
+  Customer: {source: lake.customers, key: [customer_id]}
+edges: {}
+`;
+  const doc = documentOf(yaml);
+  addEdgeType(doc, modelOf(yaml), 'Owns', 'Customer', 'Account');
+  const model = modelOf(doc.toString());
+  assert.deepEqual(model.edges.Owns.from, { node: 'Customer', columns: [''] });
+  assert.deepEqual(model.edges.Owns.to, { node: 'Account', columns: ['', ''] });
+  assert.equal(model.edges.Owns.source, '');
+  assert.throws(() => addEdgeType(doc, model, 'Owns', 'Account', 'Customer'), /名称已存在/);
 });
 
 

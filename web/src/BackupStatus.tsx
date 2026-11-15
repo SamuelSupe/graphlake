@@ -5,7 +5,7 @@ import { api, errorText } from './api';
 type Job = { state: 'not_recorded' | 'unavailable' } | { state: 'recorded'; result: {
   ok: boolean; attempted_ms: number; last_success_ms: number | null; checkpoint_ms: number | null;
 } };
-type Overview = { export: Job; offline: Job; recovery_configured: boolean };
+export type BackupSnapshot = { export: Job; offline: Job; recovery_configured: boolean };
 
 function JobSummary({ title, job }: { title: string; job: Job }) {
   return <section className="settings-card">
@@ -23,7 +23,7 @@ function JobSummary({ title, job }: { title: string; job: Job }) {
 const time = (ms: number | null) => ms === null ? '—' : new Date(ms).toLocaleString();
 
 export default function BackupStatus({ visible }: { visible: boolean }) {
-  const [data, setData] = useState<Overview>();
+  const [data, setData] = useState<BackupSnapshot>();
   const [error, setError] = useState('');
   const [revision, refresh] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -32,7 +32,7 @@ export default function BackupStatus({ visible }: { visible: boolean }) {
     const controller = new AbortController();
     setLoading(true);
     setError('');
-    api<Overview>('/backups/status', { signal: controller.signal }).then(setData, cause => {
+    api<BackupSnapshot>('/backups/status', { signal: controller.signal }).then(setData, cause => {
       if (!controller.signal.aborted) setError(errorText(cause));
     }).finally(() => {
       if (!controller.signal.aborted) setLoading(false);

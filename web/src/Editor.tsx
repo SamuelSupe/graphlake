@@ -1,13 +1,15 @@
 import type { useMutations } from './Mutations';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, X } from 'lucide-react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowLeft, Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, Waypoints, X } from 'lucide-react';
 import { api, ApiError, downloadText, errorText, type Column, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
 import { connectorChoices, newConnector } from './connectors';
 import { Catalogs } from './Catalogs';
 import { SourceBrowser, type TableSelection } from './SourceBrowser';
-import { GraphCanvas } from './GraphCanvas';
+import type { CanvasConnection } from './GraphCanvas';
+import { EdgeDraftDialog, type EdgeEnds } from './EdgeDraftDialog';
+import type { Point } from './modelCanvasGeometry';
 import { Inspector, type Edit } from './Inspector';
-import { documentOf, incidentEdgeTypes, modelOf, removeGraphType, sourceLabel, sourceSignature, text, validationTargets, type Section, type Selection, type ValidationTarget } from './model';
+import { addEdgeType, documentOf, incidentEdgeTypes, modelOf, removeGraphType, sourceLabel, sourceSignature, text, validationTargets, type Section, type Selection, type ValidationTarget } from './model';
 import { Query } from './Query';
 import { Versions } from './ModelVersions';
 import { ModelSetup } from './ModelSetup';
@@ -15,14 +17,9 @@ import { setupIssue } from './modelWorkflow';
 import { Modal, NameDialog, StatusLabel } from './ui';
 
 export type Workspace = 'graph' | 'catalogs' | 'query';
+const GraphCanvas = lazy(() => import('./GraphCanvas'));
 
-const sections = [
-  { key: 'sources', label: '数据源', Icon: Database },
-  { key: 'nodes', label: '节点标签', Icon: Box },
-  { key: 'edges', label: '边类型', Icon: GitCommitHorizontal },
-] as const;
-
-export function Editor({ id, initial, active, onDirty, close, created, changed, workspace, models, goTo, changeModel, allow, actor, mutations, recovered }: {
+export default function Editor({ id, initial, active, onDirty, close, created, changed, workspace, models, goTo, changeModel, allow, actor, mutations, recovered, canvasLayouts }: {
   id: string;
   actor: string;
   allow: { configure: boolean; edit: boolean; publish: boolean; query: boolean; export: boolean };
@@ -38,10 +35,14 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
   models: ModelSummary[];
   goTo: (workspace: Workspace) => void;
   changeModel: (id: string) => void;
+  canvasLayouts: Map<string, Map<string, Point>>;
 }) {
   const [saved, setSaved] = useState(initial);
   const [yaml, setYaml] = useState(initial?.yaml ?? '');
   const [selection, setSelection] = useState<Selection>();
+  const [positions, setPositions] = useState(() => canvasLayouts.get(id) ?? new Map<string, Point>());
+  const [connection, setConnection] = useState<CanvasConnection>();
+  const [edgeEnds, setEdgeEnds] = useState<EdgeEnds>();
   const [checked, setChecked] = useState<{ yaml: string; result: Validation }>();
   const [locating, setLocating] = useState<ValidationTarget>();
   const [removing, setRemoving] = useState<Selection>();
@@ -58,6 +59,11 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
   const inspectorPanel = useRef<HTMLElement>(null);
   const inspectorInvoker = useRef<HTMLElement | null>(null);
   const addNodeButton = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (positions.size) canvasLayouts.set(id, positions);
+    else canvasLayouts.delete(id);
+  }, [canvasLayouts, id, positions]);
 
   function refresh() {
     if (dirty && !window.confirm('重新加载会丢弃未保存的修改。继续？')) return;
@@ -206,7 +212,7 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
     } finally { setActivating(false); }
   }
 
-  function add(section: Section, name: string, type: string) {
+  function add(section: 'sources' | 'nodes', name: string, type: string) {
     if (!model) return;
     if (section === 'sources' && (!allow.configure || name.includes('.') || name.includes('\0'))) throw new Error('请输入不含点的数据源名称');
     const exists = (key: Section) => Object.hasOwn(model[key], name);
@@ -215,17 +221,68 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
     }
     edit(doc => {
       if (section === 'sources') doc.setIn([section, name], newConnector(type));
-      else if (section === 'nodes') doc.setIn([section, name], { source: '', key: [''], properties: [] });
-      else doc.setIn([section, name], { source: '', key: [], from: { node: '', columns: [] }, to: { node: '', columns: [] }, properties: [] });
+      else doc.setIn([section, name], { source: '', key: [''], properties: [] });
     });
     if (section === 'sources' && workspace === 'catalogs') setCatalogSelection(name);
     else setSelection({ section, name });
   }
 
-  const addSection = sections.find(section => section.key === modal);
   const listSection = modal === 'nodes-list' ? 'nodes' : modal === 'edges-list' ? 'edges' : undefined;
   const title = { graph: '图模型', catalogs: '数据源', query: '查询' }[workspace];
   const busy = mutations.pending || saving || checking || activating;
+  const nodeNames = Object.keys(model?.nodes ?? {});
+  const canConnect = active && allow.edit && !busy && workspace === 'graph' && !modal && !!nodeNames.length;
+  const connecting = canConnect ? connection : undefined;
+  useEffect(() => {
+    if (!canConnect || connection?.from !== undefined && !Object.hasOwn(model?.nodes ?? {}, connection.from)) {
+      setConnection(undefined);
+    }
+  }, [canConnect, connection, model]);
+  useEffect(() => {
+    if (!connecting) return;
+    function cancel(event: KeyboardEvent) {
+      if (event.key !== 'Escape' || document.querySelector('dialog[open]')) return;
+      event.preventDefault();
+      setConnection(undefined);
+    }
+    window.addEventListener('keydown', cancel);
+    return () => window.removeEventListener('keydown', cancel);
+  }, [connecting]);
+
+  function pickEndpoint(name: string) {
+    if (!connecting) return;
+    if (connecting.from === undefined) { setConnection({ from: name }); return; }
+    inspectorInvoker.current = document.activeElement as HTMLElement;
+    setEdgeEnds({ from: connecting.from, to: name });
+    setConnection(undefined);
+    setModal('edges');
+  }
+
+  function createEdge(name: string, { from, to }: EdgeEnds) {
+    if (!model || !allow.edit || busy) throw new Error('当前无法修改草稿');
+    const doc = documentOf(yaml);
+    addEdgeType(doc, model, name, from, to);
+    changeYaml(doc.toString());
+    const target = { section: 'edges', name } as const;
+    setSelection(target);
+    setLocating({ selection: target, control: 'mapping', caption: '数据映射' });
+    setNotice({ text: '已在草稿中创建 ' + name + '。请补齐来源表与端点字段。' });
+  }
+
+  function moveNode(name: string, point: Point) {
+    setPositions(previous => new Map(previous).set(name, point));
+  }
+
+  function removeNodePosition(name: string, renameTo?: string) {
+    setPositions(previous => {
+      const position = previous.get(name);
+      if (!position) return previous;
+      const next = new Map(previous);
+      next.delete(name);
+      if (renameTo !== undefined) next.set(renameTo, position);
+      return next;
+    });
+  }
   const canPublish = allow.publish && Boolean(saved?.revision && !dirty && !busy && saved.revision !== saved.active_revision);
   const inspectorSelection: Selection | undefined = workspace === 'catalogs'
     ? model && catalogSelection && Object.hasOwn(model.sources, catalogSelection) ? { section: 'sources', name: catalogSelection } : undefined
@@ -288,7 +345,10 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
       <Inspector key={inspectorKey} model={model} selected={inspectorSelection}
         edit={edit} select={next => {
           if (next.section === 'sources' && workspace === 'catalogs') setCatalogSelection(next.name);
-          else setSelection(next);
+          else {
+            if (next.section === 'nodes' && inspectorSelection.section === 'nodes') removeNodePosition(inspectorSelection.name, next.name);
+            setSelection(next);
+          }
         }} id={id} yaml={yaml} openYaml={() => setModal('yaml')}
         getColumns={getColumns} rememberColumns={rememberColumns}
         invalid={invalid} onRemove={() => setRemoving(inspectorSelection)}
@@ -365,7 +425,8 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
             </div>}
             {allow.edit && <div className="tool-group">
               <button ref={addNodeButton} className="tool-button" disabled={busy} onClick={() => setModal('nodes')}><Plus size={20} />添加节点</button>
-              <button className="tool-button" disabled={busy} onClick={() => setModal('edges')}><GitCommitHorizontal size={20} />添加边</button>
+              <button type="button" className="tool-button" disabled={!canConnect} aria-pressed={!!connecting}
+                onClick={() => setConnection(connecting ? undefined : {})}><Waypoints size={20} aria-hidden="true" />连线建边</button>
             </div>}
             <div className="tool-group">
               <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={20} />节点 <span className="tool-count">{Object.keys(model.nodes).length}</span></button>
@@ -385,10 +446,21 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
         </div>
         {notices}
         <div className="graph-body">
+          <Suspense fallback={<div className="canvas-panel"><p className="empty" role="status">正在打开画布…</p></div>}>
           <GraphCanvas model={model} selected={selected} select={next => {
             inspectorInvoker.current = document.activeElement as HTMLElement;
             setSelection(next);
-          }} />
+          }} editing={allow.edit ? {
+            enabled: canConnect,
+            positions,
+            move: moveNode,
+            arrange: () => setPositions(new Map()),
+            connection: connecting,
+            start: from => setConnection({ from }),
+            pick: pickEndpoint,
+            cancel: () => setConnection(undefined),
+          } : undefined} />
+          </Suspense>
           {inspector}
         </div>
       </div> : !saved ? <div className="empty" role="alert">{workspace === 'graph' && notice?.text}<button className="button" onClick={refresh}>重试读取配置</button></div>
@@ -400,7 +472,8 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
           setSelection({ section: listSection, name }); setModal(undefined);
         }}>{listSection === 'nodes' ? <Box size={17} /> : <GitCommitHorizontal size={17} />}<code>{name}</code></button>)}
         </div>
-        {allow.edit && <footer className="panel-footer"><button className="button primary" onClick={() => setModal(listSection)}><Plus size={16} />添加{listSection === 'nodes' ? '节点' : '边'}</button></footer>}
+        {allow.edit && <footer className="panel-footer"><button className="button primary" disabled={busy || listSection === 'edges' && !nodeNames.length}
+          onClick={() => { setEdgeEnds(undefined); setModal(listSection); }}><Plus size={16} />添加{listSection === 'nodes' ? '节点' : '边'}</button></footer>}
       </div>
     </Modal>}
     {browsing && model && <SourceBrowser id={id} yaml={yaml} model={model} fixedSource={browsing} close={() => setBrowsing(undefined)} />}
@@ -416,6 +489,7 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
             if (removing.section === 'sources' && !allow.configure) return;
             const { section, name } = removing;
             edit(doc => removeGraphType(doc, model, section, name));
+            if (section === 'nodes') removeNodePosition(name);
             setRemoving(undefined);
             if (section === 'sources' && workspace === 'catalogs') {
               setCatalogSelection(undefined);
@@ -466,9 +540,11 @@ export function Editor({ id, initial, active, onDirty, close, created, changed, 
     </Modal>}
     {modal === 'title' && <NameDialog title="编辑模型名称" initial={text(model?.graph)} close={() => setModal(undefined)}
       submit={name => edit(doc => doc.set('graph', name))} />}
-    {addSection && <NameDialog title={addSection.key === 'sources' ? '添加数据源' : addSection.key === 'nodes' ? '添加节点' : '添加边'} close={() => setModal(undefined)}
-      action={addSection.key === 'sources' ? '添加并配置' : '添加'}
-      choices={addSection.key === 'sources' ? connectorChoices : undefined}
-      submit={(name, type) => add(addSection.key, name, type)} />}</>}
+    {modal === 'edges' && model && <EdgeDraftDialog model={model} ends={edgeEnds} create={createEdge}
+      close={() => { setEdgeEnds(undefined); setModal(undefined); }} />}
+    {(modal === 'sources' || modal === 'nodes') && <NameDialog title={modal === 'sources' ? '添加数据源' : '添加节点'} close={() => setModal(undefined)}
+      action={modal === 'sources' ? '添加并配置' : '添加'}
+      choices={modal === 'sources' ? connectorChoices : undefined}
+      submit={(name, type) => add(modal, name, type)} />}</>}
   </main>;
 }

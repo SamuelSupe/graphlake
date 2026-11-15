@@ -67,6 +67,8 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .yaml-editor .panel-body > label { display: flex; flex: 1; min-block-size: 200px; }
 .yaml-editor textarea { flex: 1; inline-size: 100%; min-block-size: 200px; resize: none; font-size: .8125rem; padding: 14px; background: var(--panel); }
 .scope-section { display: grid; gap: 16px; }
+.edge-draft-name { display: grid; gap: 6px; }
+.edge-draft-name input[aria-invalid="true"] { border-color: #a1322c; }
 
 /* Entry is animated; dismissal stays immediate so navigation and focus return are not delayed. */
 .dialog-drawer { transition-property: opacity, transform, display, overlay; transition-duration: 180ms; transition-timing-function: ease-out; transition-behavior: allow-discrete; }

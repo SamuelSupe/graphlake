@@ -4,8 +4,8 @@ import { api, errorText } from './api';
 
 type TokenStatus = { owner: string; active: boolean; revision: string | null; created_at_ms: number | null };
 
-export default function AiToken({ locked, canIssue, token, issued }: {
-  locked: boolean; canIssue: boolean; token: string; issued: (token: string) => void;
+export default function AiToken({ locked, authEnabled, canIssue, token, issued }: {
+  locked: boolean; authEnabled: boolean; canIssue: boolean; token: string; issued: (token: string) => void;
 }) {
   const [status, setStatus] = useState<TokenStatus>();
   const [show, setShow] = useState(false);
@@ -22,12 +22,13 @@ export default function AiToken({ locked, canIssue, token, issued }: {
       setBusy(false); setShow(false); setConfirm(undefined); setNotice('');
       return;
     }
+    if (!authEnabled) return;
     const controller = new AbortController();
     api<TokenStatus>('/mcp/token', { signal: controller.signal }).then(value => { setStatus(value); setError(''); }, cause => {
       if (!controller.signal.aborted) setError(errorText(cause));
     });
     return () => controller.abort();
-  }, [locked, attempt]);
+  }, [authEnabled, locked, attempt]);
   useEffect(() => () => { mutation.current?.abort(); mutation.current = undefined; }, []);
   async function change(revoke: boolean) {
     if (!status || locked || busy) return;
@@ -57,9 +58,10 @@ export default function AiToken({ locked, canIssue, token, issued }: {
     <div className="mcp-step-title"><span className="mcp-step-number" aria-hidden="true">1</span><h3 id="ai-token-title">个人令牌</h3></div>
     <div className="mcp-step-body">
     <p className="settings-hint">让 Agent 以你的身份访问 GraphLake，无需重复授权。</p>
-    {!status && !error && <p className="settings-hint" role="status">正在读取令牌状态…</p>}
+    {authEnabled && !status && !error && <p className="settings-hint" role="status">正在读取令牌状态…</p>}
     {status?.active && !token && <p>已有个人令牌，可继续使用。遗失后可在「管理令牌」中重新生成。</p>}
-    {!canIssue && <p className="notice">暂不能生成令牌，请联系管理员检查登录认证及查询、建模或发布权限。已有令牌仍可撤销。</p>}
+    {!authEnabled ? <p className="notice">启用登录认证后可生成个人 AI 令牌。</p>
+      : !canIssue && <p className="notice">暂不能生成令牌，请联系管理员检查查询、建模或发布权限。已有令牌仍可撤销。</p>}
     {token && !locked && <><div className="mcp-token-value">
       <code>{show ? token : '••••••••••••••••••••••••'}</code>
       <div className="settings-actions"><button ref={primaryButton} type="button" className="button primary" disabled={locked} onClick={() => void copy()}><Copy size={15} aria-hidden="true" />复制令牌</button><button type="button" className="text-button" disabled={locked} aria-pressed={show} onClick={() => setShow(value => !value)}>{show ? '隐藏令牌' : '显示令牌'}</button></div>

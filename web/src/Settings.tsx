@@ -1,52 +1,32 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import { Download, Plus, RefreshCw, X } from 'lucide-react';
-import { api, ApiError, downloadText, errorText, type ModelSummary } from './api';
+import { Plus, RefreshCw, X } from 'lucide-react';
+import { api, errorText, type ModelSummary } from './api';
 import { ModelHealth } from './ModelHealth';
 import BackupStatus from './BackupStatus';
 import McpServiceSettings from './McpServiceSettings';
 
 const tabs = [
   ['telemetry', '日志与遥测'],
-  ['alerts', '告警规则'],
   ['health', '健康检查'],
   ['backup', '备份与恢复'],
   ['mcp', 'MCP 服务'],
 ] as const;
-type Tab = typeof tabs[number][0];
+export type SettingsTab = typeof tabs[number][0];
 
 type Signal = 'metrics' | 'logs' | 'traces';
-type AlertRule = { enabled: boolean; delay_seconds: number; window_seconds: number | null; threshold: number | null };
-type Alerts = Record<string, AlertRule>;
 type Config = {
   enabled: boolean; endpoint: string | null; service_name: string; instance_id: string | null;
   log_format: 'text' | 'json'; metrics: boolean; logs: boolean; traces: boolean;
   trace_sample_ratio: number; export_interval_ms: number; timeout_ms: number;
-  allow_insecure_http: boolean; include_audit_identity: boolean; headers_env: Record<string, string>; alerts: Alerts;
+  allow_insecure_http: boolean; include_audit_identity: boolean; headers_env: Record<string, string>;
 };
-type Snapshot = {
-  active: Config; config: Config; alerts: Alerts; rules_yaml: string; revision: string;
+export type SettingsSnapshot = {
+  active: Config; config: Config; revision: string;
   restart_required: boolean; role: 'coordinator' | 'standalone' | null; file: string | null;
   signals: { name: Signal; failures: number; rejected: number; last_success_ms: number | null }[];
 };
 type Header = { id: number; name: string; variable: string };
 const names: Record<Signal, string> = { metrics: '指标', logs: '日志', traces: '链路' };
-const alertNames: Record<string, string> = {
-  GraphLakeMetricsUnavailable: 'Coordinator 指标不可达',
-  GraphLakeRequestFailures: '持续 HTTP 5xx',
-  GraphLakeAuditWriteFailures: '审计写入失败',
-  GraphLakeCoordinatorNotReady: 'HA 主节点未就绪',
-  GraphLakeOtlpExportFailed: 'OTLP 上报失败',
-  GraphLakeOtlpPartialRejected: 'OTLP 部分拒收',
-  GraphLakeMonitorUnavailable: '监控探针不可用',
-  GraphLakeCandidateUnavailable: 'Coordinator 候选进程不可达',
-  GraphLakeLeaderUnavailable: '主权或主节点就绪异常',
-  GraphLakeWorkerUnavailable: 'Worker 不可达',
-  GraphLakeIngressUnavailable: '客户端入口不可达',
-  GraphLakeModelDiscoveryFailed: '已发布模型发现失败',
-  GraphLakeModelUnavailable: '模型或来源不可用',
-  GraphLakeBackupFailed: '备份或离线校验失败',
-  GraphLakeBackupStale: '备份恢复点过期',
-};
 
 function Toggle({ name, label, checked, change }: { name: string; label: string; checked: boolean; change: (value: boolean) => void }) {
   const id = useId();
@@ -56,17 +36,16 @@ function Toggle({ name, label, checked, change }: { name: string; label: string;
   </div>;
 }
 
-export default function Settings({ models, locked, onDirty, openModel, initialTab }: { initialTab?: Tab; openModel: (id: string, workspace: 'graph' | 'catalogs') => void; models: ModelSummary[]; locked: boolean; onDirty: (key: string, value: boolean) => void }) {
-  const [tab, setTab] = useState<Tab>(initialTab ?? 'telemetry');
+export default function Settings({ models, locked, onDirty, openModel, initialTab }: { initialTab?: SettingsTab; openModel: (id: string, workspace: 'graph' | 'catalogs') => void; models: ModelSummary[]; locked: boolean; onDirty: (key: string, value: boolean) => void }) {
+  const [tab, setTab] = useState<SettingsTab>(initialTab ?? 'telemetry');
   const tabId = useId();
-  const tabButton = (value: Tab) => tabId + '-' + value;
-  const tabPanel = (value: Tab) => tabButton(value) + '-panel';
-  const panel = (value: Tab) => ({
+  const tabButton = (value: SettingsTab) => tabId + '-' + value;
+  const tabPanel = (value: SettingsTab) => tabButton(value) + '-panel';
+  const panel = (value: SettingsTab) => ({
     id: tabPanel(value), role: 'tabpanel', 'aria-labelledby': tabButton(value), hidden: tab !== value, 'data-settings-panel': value,
   });
-  const [snapshot, setSnapshot] = useState<Snapshot>();
+  const [snapshot, setSnapshot] = useState<SettingsSnapshot>();
   const [config, setConfig] = useState<Config>();
-  const [alerts, setAlerts] = useState<Alerts>({});
   const [headers, setHeaders] = useState<Header[]>([]);
   const headerId = useRef(0);
   const errorRef = useRef<HTMLParagraphElement>(null);
@@ -82,8 +61,8 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     onDirty('/settings/mcp', value);
   }, [onDirty]);
 
-  function adopt(next: Snapshot) {
-    setSnapshot(next); setConfig(next.config); setAlerts(next.alerts);
+  function adopt(next: SettingsSnapshot) {
+    setSnapshot(next); setConfig(next.config);
     setHeaders(Object.entries(next.config.headers_env).map(([name, variable]) => ({ id: headerId.current++, name, variable })));
     dirty.current = false; onDirty('/settings', false);
   }
@@ -91,7 +70,7 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
   useEffect(() => {
     if (locked) return;
     const controller = new AbortController();
-    api<Snapshot>('/settings', { signal: controller.signal }).then(value => {
+    api<SettingsSnapshot>('/settings', { signal: controller.signal }).then(value => {
       if (!controller.signal.aborted) {
         setError('');
         if (dirty.current) setSnapshot(previous => previous && { ...previous, signals: value.signals });
@@ -111,14 +90,11 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
   function change<K extends keyof Config>(key: K, value: Config[K]) {
     setConfig(current => current && { ...current, [key]: value }); changed();
   }
-  function changeAlert(name: string, patch: Partial<AlertRule>) {
-    setAlerts(current => ({ ...current, [name]: { ...current[name], ...patch } })); changed();
-  }
 
   async function refreshStatus() {
     setRefreshing(true);
     try {
-      const next = await api<Snapshot>('/settings');
+      const next = await api<SettingsSnapshot>('/settings');
       if (dirty.current) setSnapshot(previous => previous && { ...previous, signals: next.signals });
       else adopt(next);
     } catch (cause) { setError(errorText(cause)); }
@@ -132,9 +108,10 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     try {
       const entries = headers.map(({ name, variable }) => [name.trim().toLowerCase(), variable.trim()]);
       if (new Set(entries.map(([name]) => name)).size !== entries.length) throw new Error('同一个 HTTP 请求头只能配置一次。');
-      const next = await api<Snapshot>('/settings', {
+      const next = await api<SettingsSnapshot>('/settings', {
         method: 'PUT', headers: { 'If-Match': '"' + snapshot.revision + '"' },
-        body: JSON.stringify({ ...config, headers_env: Object.fromEntries(entries), alerts }),
+        // PUT replaces the document, so preserve server fields this form does not edit.
+        body: JSON.stringify({ ...config, headers_env: Object.fromEntries(entries) }),
       });
       adopt(next);
       setMessage(next.restart_required ? '配置已保存。重启此进程后应用运行配置。' : '配置已保存。');
@@ -151,7 +128,7 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
   }
 
   const readOnly = !snapshot?.file || locked || busy;
-  const editableTab = tab === 'telemetry' || tab === 'alerts';
+  const editableTab = tab === 'telemetry';
   return <main className="workbench">
     <header className="workspace-header">
       <div className="workspace-title"><h1>运行配置</h1></div>
@@ -179,18 +156,17 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     </div>
     {(editableTab || tab === 'health') && error && <p ref={errorRef} tabIndex={-1} role="alert" className="notice error settings-feedback">{error}</p>}
     {editableTab && message && <p role="status" className="notice settings-feedback">{message}</p>}
-    {(!config || !snapshot) && (['telemetry', 'alerts'] as const).map(key => <section key={key} {...panel(key)} aria-busy={!error}>
+    {(!config || !snapshot) && <section {...panel('telemetry')} aria-busy={!error}>
       <div className="settings-workspace">
         {error ? <button className="button" type="button" onClick={reloadConfig}>重试读取配置</button> : <p role="status">正在读取配置…</p>}
       </div>
-    </section>)}
+    </section>}
     {config && snapshot && <form id="runtime-settings" method="post" action="/api/v1/settings" onSubmit={save} onInvalidCapture={event => {
       const field = event.target;
       if (!(field instanceof HTMLInputElement)) return;
       event.preventDefault();
       if (event.currentTarget.querySelector('input:invalid') !== field) return;
-      const invalidTab = field.closest<HTMLElement>('[data-settings-panel]')?.dataset.settingsPanel;
-      if (invalidTab === 'telemetry' || invalidTab === 'alerts') setTab(invalidTab);
+      setTab('telemetry');
       for (let parent = field.parentElement; parent && parent !== event.currentTarget; parent = parent.parentElement) {
         if (parent instanceof HTMLDetailsElement) parent.open = true;
       }
@@ -253,34 +229,6 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
             </button>
           </fieldset>
           </details>
-        </div>
-      </div></section>
-      <section {...panel('alerts')}><div className="settings-workspace">
-        <div className="settings-card">
-          <div className="settings-section-title">
-            <h2>Prometheus 告警规则</h2>
-            <button className="button compact" type="button" onClick={() => downloadText(snapshot.rules_yaml, 'prometheus-rules.yaml')}>
-              <Download size={15} aria-hidden="true" />下载规则
-            </button>
-          </div>
-          <p className="settings-hint">保存后下载规则文件，由监控服务器加载。通知渠道由 Alertmanager 管理。</p>
-          <div className="settings-rule-list">
-          {Object.entries(alerts).map(([name, rule]) => <details className="form-disclosure" key={name}>
-            <summary>{alertNames[name] ?? name}{!rule.enabled && <small>已暂停</small>}</summary>
-            <fieldset className="settings-fields alert-fields" disabled={readOnly}>
-            <legend className="sr-only">{alertNames[name] ?? name}</legend>
-            <Toggle name={name + '_enabled'} label="启用规则" checked={rule.enabled} change={value => changeAlert(name, { enabled: value })} />
-            <div className="settings-grid settings-rule-grid">
-              <label>触发等待（秒）<input name={name + '_delay'} type="number" min="0" max="86400" required value={Number.isNaN(rule.delay_seconds) ? '' : rule.delay_seconds}
-                onChange={event => changeAlert(name, { delay_seconds: event.target.valueAsNumber })} /></label>
-              {rule.window_seconds !== null && <label>统计窗口（秒）<input name={name + '_window'} type="number" min="15" max="86400" required value={Number.isNaN(rule.window_seconds) ? '' : rule.window_seconds}
-                onChange={event => changeAlert(name, { window_seconds: event.target.valueAsNumber })} /></label>}
-              {rule.threshold !== null && <label>{name === 'GraphLakeRequestFailures' ? '每秒错误阈值' : '窗口内错误增量阈值'}<input name={name + '_threshold'} type="number" min="0" max="1000000" step="any" required value={Number.isNaN(rule.threshold) ? '' : rule.threshold}
-                onChange={event => changeAlert(name, { threshold: event.target.valueAsNumber })} /></label>}
-            </div>
-            </fieldset>
-          </details>)}
-          </div>
         </div>
       </div></section>
     </form>}

@@ -187,7 +187,7 @@ curl -fsS http://127.0.0.1:7337/readyz
 
 请求头值从服务进程环境读取。通过页面新增凭据绑定或变更带凭据的 Collector 来源时，请使用 `GRAPHLAKE_OTLP_` 前缀的环境变量，并通过 `GRAPHLAKE_OTLP_ALLOWED_ORIGINS` 指定逗号分隔的允许来源（例如 `https://collector.example.net:4318`）。既有的同来源绑定可继续使用。Worker 和备份命令可按下方方法使用各自的配置文件。
 
-「健康检查」可单次检查已发布模型的来源、端点及 Worker，并显示遥测上报状态。「告警规则」可配置随包规则的启用状态、等待时间及适用的阈值。切换页签会保留未保存的配置。展开对应规则进行编辑，保存后使用「下载规则」导出 YAML，交由 Prometheus 加载。告警通知渠道由 Alertmanager 管理。
+「健康检查」可单次检查已发布模型的来源、端点及 Worker，并显示遥测上报状态。切换页签会保留未保存的遥测配置。生产告警在部署侧维护 [prometheus-rules.yaml](prometheus-rules.yaml)，由 Prometheus 加载，通知渠道由 Alertmanager 管理。
 
 「备份与恢复」读取备份任务的状态文件，显示最近尝试、最近成功和数据检查点。定时备份默认写入 `/var/lib/graphlake-backups/export-status.json`。异地校验可指定 `--status-file /var/lib/graphlake-backups/verify-status.json`。如使用独立目录，在后台进程设置 `GRAPHLAKE_BACKUP_STATUS_DIR` 指向状态文件所在目录，并为服务用户授权读取。目标站的 [HTTPS 恢复页](cluster.md#绑定恢复点并开放入口) 可选择已同步的异地副本、恢复控制状态和数据、查看每个阶段的结果并验收切流。
 

@@ -81,7 +81,8 @@ impl Assets {
             [""]
             | [
                 "",
-                "new" | "catalogs" | "query" | "ai" | "access" | "settings" | "recovery",
+                "new" | "overview" | "catalogs" | "query" | "ai" | "access" | "settings"
+                | "recovery",
             ] => true,
             ["", "models", id] | ["", "models", id, "catalogs" | "query"] => {
                 super::models::valid_id(id)

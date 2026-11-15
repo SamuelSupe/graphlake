@@ -41,6 +41,19 @@ export function endpoint(value: unknown): Endpoint {
   return { node: text(item.node), columns: strings(item.columns) };
 }
 
+export function edgeNameIssue(model: Pick<Model, 'nodes' | 'edges'>, name: string) {
+  if (!name.trim()) return '请输入边类型名称';
+  if (Object.hasOwn(model.nodes, name) || Object.hasOwn(model.edges, name)) return '名称已存在';
+}
+
+export function addEdgeType(doc: YamlDocument, model: Model, name: string, from: string, to: string) {
+  const issue = edgeNameIssue(model, name);
+  if (issue) throw new Error(issue);
+  if (!Object.hasOwn(model.nodes, from) || !Object.hasOwn(model.nodes, to)) throw new Error('请选择有效的起点和终点');
+  const end = (node: string) => ({ node, columns: strings(model.nodes[node].key).map(() => '') });
+  doc.setIn(['edges', name], { source: '', key: [], from: end(from), to: end(to), properties: [] });
+}
+
 export function sourceLabel(value: unknown) {
   const source = text(value);
   return ({

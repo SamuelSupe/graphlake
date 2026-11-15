@@ -11,8 +11,8 @@ const examples = [
   { title: '构建模型', capability: 'modeling' as const, prompt: '读取我有建模权限的模型，按我的需求修改并校验。先保存草稿，发布前让我确认。' },
 ];
 
-export default function AI({ locked, openServiceSettings }: {
-  locked: boolean; openServiceSettings?: () => void;
+export default function AI({ locked, authEnabled, openServiceSettings }: {
+  locked: boolean; authEnabled: boolean; openServiceSettings?: () => void;
 }) {
   const [access, setAccess] = useState<McpAccess>();
   const [error, setError] = useState('');
@@ -53,7 +53,7 @@ export default function AI({ locked, openServiceSettings }: {
       {error && <p className="notice error" role="alert">{error} <button type="button" className="text-button" onClick={changed}>重试</button></p>}
       {!access ? !error && <p role="status">正在读取当前用户的 AI 权限…</p> : <>
         <div className="mcp-setup">
-          <AiToken locked={locked} canIssue={access.can_issue} token={tokenUpdate?.value ?? ''}
+          <AiToken locked={locked} authEnabled={authEnabled} canIssue={access.can_issue} token={tokenUpdate?.value ?? ''}
             issued={value => setTokenUpdate({ value })} />
           <McpConnection snapshot={access} locked={locked} tokenUpdate={tokenUpdate} />
           <section className="mcp-step" aria-labelledby="ai-examples-title">

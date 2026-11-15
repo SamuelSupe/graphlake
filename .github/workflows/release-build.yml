@@ -58,6 +58,7 @@ jobs:
 
       - name: Build and check the deployment archive
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
           test "$RELEASE_TAG" = "v$version"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"

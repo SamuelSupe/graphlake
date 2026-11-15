@@ -254,8 +254,8 @@ thead th { font-weight: 700; white-space: nowrap; }
   position: sticky; top: 0; align-self: start; height: 100dvh; overflow-y: auto;
   display: flex; flex-direction: column; color: var(--muted); background: var(--surface); border-inline-end: 1px solid var(--line); z-index: 5;
 }
-.app-rail button { color: inherit; }
-.app-rail button:focus-visible { outline-offset: -3px; }
+.app-rail :is(button, a) { color: inherit; }
+.app-rail :is(button, a):focus-visible { outline-offset: -3px; }
 .rail-brand {
   display: flex; align-items: center; justify-content: center; gap: 10px; flex: none; width: 100%; height: var(--header-height);
   background: transparent; border: 0; border-bottom: 1px solid var(--line);
@@ -265,6 +265,7 @@ thead th { font-weight: 700; white-space: nowrap; }
 .rail-items { display: grid; gap: 6px; padding: 18px 10px; }
 .rail-account { margin-top: auto; }
 .rail-link {
+  text-decoration: none;
   position: relative; display: flex; align-items: center; gap: 12px;
   min-height: 44px; padding: 10px 14px; border: 0; border-radius: 7px; background: transparent;
   font-size: .875rem; font-weight: 550; white-space: nowrap;
@@ -776,3 +777,77 @@ button.graph-edge:hover, .graph-edge[aria-pressed="true"] { color: var(--blue); 
   .recovery-console { padding-block-start: 16px; }
   .recovery-heading > a { margin-inline-start: 0; }
 }
+
+.mcp-form { display: grid; gap: 18px; min-inline-size: 0; }
+.mcp-form h2 + p { margin-block-start: 6px; }
+.mcp-capabilities { display: grid; margin: 0; padding: 0; border: 0; min-inline-size: 0; }
+.mcp-capability { display: grid; grid-template-columns: 1.125rem minmax(0, 1fr); align-items: start; column-gap: 10px; padding-block: 10px 14px; border-block-end: 1px solid var(--line); }
+.mcp-capability:first-of-type { padding-block-start: 0; }
+.mcp-capability:last-child { border-block-end: 0; padding-block-end: 0; }
+.mcp-capability input { inline-size: 1.125rem; block-size: 1.125rem; margin: 15px 0 0; accent-color: var(--blue); }
+.mcp-capability label { display: flex; align-items: center; min-block-size: 48px; cursor: pointer; }
+.mcp-capability p { line-height: 1.65; }
+.mcp-field { display: grid; gap: 6px; min-inline-size: 0; }
+.mcp-input-action { display: flex; align-items: center; gap: 8px; min-inline-size: 0; }
+.mcp-input-action input { min-inline-size: 0; flex: 1; }
+.mcp-input-action button { flex: none; }
+.mcp-details { min-inline-size: 0; }
+.mcp-details > summary { cursor: pointer; font-weight: 550; color: var(--muted); padding-block: 10px; min-block-size: 44px; }
+.mcp-details > summary:hover { color: var(--blue-dark); }
+.mcp-details > summary > span { margin-inline-start: 8px; font-size: .8125rem; font-weight: 400; }
+.mcp-snippet { margin: 0; padding: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; max-inline-size: 100%; font-size: 0.8125rem; }
+.mcp-test { display: grid; gap: 14px; padding-block: 8px; }
+.mcp-test-feedback { display: grid; gap: 12px; }
+.mcp-success { display: flex; align-items: center; gap: 8px; color: #1c733e; font-weight: 650; }
+.mcp-success svg { flex: none; }
+.mcp-models, .mcp-tool-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+.mcp-models { max-block-size: 22rem; overflow-y: auto; }
+.mcp-models li { display: grid; gap: 8px; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.mcp-model-name, .mcp-model-access { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.mcp-model-name code { color: var(--muted); }
+.mcp-model-name, .mcp-tool-list, .mcp-model-access code { overflow-wrap: anywhere; }
+.mcp-model-access .tag { white-space: normal; }
+.mcp-tool-list { margin-block-start: 8px; }
+
+.mcp-guide { inline-size: 100%; max-inline-size: 68rem; margin-inline: auto; padding: 32px var(--gutter) 40px; display: grid; gap: 16px; }
+.mcp-intro { display: grid; gap: 8px; margin-block-end: 8px; }
+.mcp-intro h2 { font-size: 1.5rem; letter-spacing: -.02em; }
+.mcp-intro p { color: var(--muted); line-height: 1.7; }
+.mcp-setup { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding-inline: 26px; min-inline-size: 0; }
+.mcp-step { display: grid; grid-template-columns: 10rem minmax(0, 1fr); align-items: start; gap: 24px; padding-block: 24px; }
+.mcp-step + .mcp-step { border-block-start: 1px solid var(--line); }
+.mcp-step-title { display: flex; align-items: center; gap: 10px; padding-block-start: 1px; }
+.mcp-step-title h3 { font-size: .9375rem; font-weight: 650; }
+.mcp-step-number { display: grid; place-items: center; flex: none; inline-size: 26px; block-size: 26px; background: var(--tint); color: var(--blue-dark); border-radius: 50%; font-size: .8125rem; font-weight: 650; }
+.mcp-step-body { display: grid; gap: 12px; min-inline-size: 0; }
+.mcp-step-body > .button { justify-self: start; }
+.mcp-step-body > .settings-hint { line-height: 1.65; }
+.mcp-step-body > .mcp-details + .mcp-details { margin-block-start: -10px; }
+.mcp-token-value { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; }
+.mcp-token-value code { overflow-wrap: anywhere; padding-block: 10px; }
+.mcp-token-value .settings-actions { gap: 12px; }
+.mcp-guide :is(.button, .text-button) { min-block-size: 44px; }
+.mcp-guide .notice { overflow-wrap: anywhere; }
+.mcp-guide input:not([type=checkbox]) { inline-size: 100%; font-size: 1rem; min-block-size: 48px; }
+.mcp-guide input:user-invalid { border-color: #a1322c; }
+.mcp-examples { display: grid; gap: 8px; }
+.mcp-example { display: flex; align-items: center; gap: 16px; padding: 12px 14px; background: var(--panel); border-radius: 6px; }
+.mcp-example > div { flex: 1; min-inline-size: 0; }
+.mcp-example h4 { margin: 0 0 4px; font-size: .875rem; font-weight: 600; }
+.mcp-example p { color: var(--muted); line-height: 1.6; }
+.mcp-example .button { flex: none; }
+.mcp-disclosure { min-inline-size: 0; }
+.mcp-disclosure + .mcp-disclosure { margin-block-start: -16px; border-block-start: 1px solid var(--line); }
+.mcp-disclosure > summary { padding-block: 16px; cursor: pointer; font-weight: 550; }
+.mcp-disclosure > summary > span { margin-inline-start: 14px; color: var(--muted); font-size: .8125rem; font-weight: 400; }
+.mcp-disclosure-body { display: grid; gap: 14px; padding-block: 0 18px; min-inline-size: 0; }
+@media (max-width: 700px) {
+  .mcp-guide { padding-block-start: 22px; }
+  .mcp-intro h2 { font-size: 1.25rem; }
+  .mcp-setup { padding-inline: 18px; }
+  .mcp-step { grid-template-columns: minmax(0, 1fr); gap: 14px; padding-block: 20px; }
+  .mcp-example { align-items: start; gap: 8px; padding: 12px; }
+  .mcp-example .button { padding-inline: 8px; }
+  .mcp-disclosure > summary > span { margin-inline-start: 8px; }
+}
+@media (pointer: coarse) { .mcp-guide :is(.button, .text-button, summary) { min-block-size: 48px; } }

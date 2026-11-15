@@ -469,7 +469,7 @@ impl Models {
     ) -> ApiResult<(StatusCode, Model)> {
         use crate::admin::ha::Mutation;
         let model = match mutation {
-            Mutation::Create { yaml } => {
+            Mutation::Create { yaml, .. } => {
                 return self
                     .save(id, yaml, None)
                     .map(|model| (StatusCode::CREATED, model));

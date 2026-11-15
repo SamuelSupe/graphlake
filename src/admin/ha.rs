@@ -205,12 +205,22 @@ fn catalog_file(name: &str) -> bool {
 #[derive(Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(super) enum Mutation {
-    Create { yaml: String },
-    Save { yaml: String, expected: String },
+    Create {
+        yaml: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        template_model: Option<String>,
+    },
+    Save {
+        yaml: String,
+        expected: String,
+    },
     Publish(models::versions::Activation),
     Rollback(models::versions::Activation),
     Unpublish(models::versions::Deactivation),
-    Restore { revision: String, yaml: String },
+    Restore {
+        revision: String,
+        yaml: String,
+    },
 }
 
 pub(super) async fn mutate(
@@ -299,9 +309,6 @@ async fn mutate_inner(
         Mutation::Create { .. } | Mutation::Save { .. } => Role::Modeler,
         _ => Role::Publisher,
     };
-    if matches!(mutation, Mutation::Create { .. }) && principal != Principal::Admin {
-        return Err(access::forbidden());
-    }
     users::check(app, &principal, id, role)?;
     if let Some((receipt, _)) = ha
         .leader
@@ -340,6 +347,17 @@ async fn mutate_inner(
     let candidate = tempfile::tempdir().map_err(|_| Error::storage())?;
     restore(candidate.path(), &base)?;
     let mut models = models::Models::with_sources(candidate.path().to_owned(), sources.clone());
+    if let Mutation::Create {
+        yaml,
+        template_model,
+    } = &mutation
+    {
+        models.check_create_input(app, id, yaml, template_model.as_deref(), &principal)?;
+    }
+    let template = match &mutation {
+        Mutation::Create { template_model, .. } => template_model.clone(),
+        _ => None,
+    };
     if let Mutation::Save { yaml, .. } = &mutation {
         models.check_modeler_input(id, yaml, &principal)?;
     }
@@ -378,6 +396,9 @@ async fn mutate_inner(
         .await
         .map_err(|_| control::timeout())?;
     users::check(app, &principal, id, role)?;
+    if let Some(template) = template {
+        users::check(app, &principal, &template, Role::Modeler)?;
+    }
     if tokio::time::Instant::now() >= deadline {
         return Err(control::timeout());
     }

@@ -32,21 +32,21 @@ enum Status {
 
 #[derive(Serialize)]
 pub(super) struct Summary {
-    id: String,
+    pub(super) id: String,
     name: String,
     sources: usize,
     nodes: usize,
     edges: usize,
     status: Status,
-    active_revision: Option<String>,
+    pub(super) active_revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    archive_error: Option<String>,
+    pub(super) archive_error: Option<String>,
 }
 
 #[derive(Serialize)]
 pub(super) struct Model {
     id: String,
-    yaml: String,
+    pub(super) yaml: String,
     pub(super) revision: String,
     status: Status,
     pub(super) active_revision: Option<String>,
@@ -64,6 +64,7 @@ impl Model {
 pub(super) struct Draft {
     id: String,
     yaml: String,
+    template_model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +174,24 @@ impl Models {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn check_create_input(
+        &self,
+        app: &App,
+        id: &str,
+        yaml: &str,
+        template: Option<&str>,
+        principal: &Principal,
+    ) -> ApiResult<()> {
+        if *principal == Principal::Admin {
+            return Ok(());
+        }
+        super::users::check(app, principal, id, super::users::Role::Modeler)?;
+        let template = template
+            .ok_or_else(|| Error::invalid("template_required", "新建模型需要已授权的模板模型"))?;
+        super::users::check(app, principal, template, super::users::Role::Modeler)?;
+        self.check_modeler_input(template, yaml, principal)
     }
 
     pub(super) fn ha_model(&self, id: &str, validated: bool) -> ApiResult<Model> {
@@ -350,7 +369,7 @@ impl Models {
         Ok((revision, yaml, catalog))
     }
 
-    fn list(&self, permits: impl Fn(&str) -> Option<bool>) -> ApiResult<Vec<Summary>> {
+    pub(super) fn list(&self, permits: impl Fn(&str) -> Option<bool>) -> ApiResult<Vec<Summary>> {
         let mut result = Vec::new();
         for id in self.managed_ids()? {
             let Some(published_only) = permits(&id) else {
@@ -750,15 +769,23 @@ pub(super) async fn create(
             draft.id,
             &principal,
             &headers,
-            super::ha::Mutation::Create { yaml: draft.yaml },
+            super::ha::Mutation::Create {
+                yaml: draft.yaml,
+                template_model: draft.template_model,
+            },
         )
         .await;
     }
-    let model = app
-        .models
-        .lock()
-        .unwrap()
-        .save(&draft.id, draft.yaml, None)?;
+    let _policy = app.users.writes.lock().await;
+    let mut models = app.models.lock().unwrap();
+    models.check_create_input(
+        &app,
+        &draft.id,
+        &draft.yaml,
+        draft.template_model.as_deref(),
+        &principal,
+    )?;
+    let model = models.save(&draft.id, draft.yaml, None)?;
     let audited_model = super::access::AuditModel(model.id.clone());
     Ok((
         StatusCode::CREATED,

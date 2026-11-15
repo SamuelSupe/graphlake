@@ -16,6 +16,7 @@ Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremli
 | **Query** | Use Cypher, SQL, or Gremlin. Set a timeout, inspect the model and source versions, cancel a query, or export complete results as Arrow IPC. |
 | **Explore** | Inspect node and relationship properties, expand and page through neighbors, search across batches, and continue loading a truncated graph preview. |
 | **Analyze** | Run bounded traversals, shortest paths, PageRank, weakly connected components, community detection, and Node2Vec. Reuse persisted CSR indexes for supported workloads. |
+| **Connect AI** | Connect Agents through an in-app MCP guide. Personal AI tokens inherit the owner’s live model permissions and tenant scope; administrators set global capability limits. |
 | **Operate** | Manage users, service accounts, and model-level roles. Collect audit events, Prometheus metrics, and OTLP signals. Restore an off-site checkpoint and verify a known business query before enabling traffic. |
 
 ## Install on Linux
@@ -40,7 +41,7 @@ The example returns account `30`, two paths, and a total amount of `600`.
 
 - **Direct connectors** — PostgreSQL, MySQL, Parquet, Iceberg, Delta Lake, Snowflake, BigQuery, ClickHouse, Trino, Spanner, and SAP HANA.
 - **Through Trino** — SQL Server, Oracle, Hive, Hudi, MongoDB, Elasticsearch, and Redshift. The corresponding Trino catalog supplies access to the source.
-- **Clients** — Browser and HTTP API, Bolt and Gremlin WebSocket, command line, embedded Rust, and source-built Python and C bindings. Explicit Bolt transactions are available for PostgreSQL and Parquet.
+- **Clients** — Browser, HTTP API and MCP, Bolt and Gremlin WebSocket, command line, embedded Rust, and source-built Python and C bindings. Explicit Bolt transactions are available for PostgreSQL and Parquet.
 
 See the [technical reference](docs/reference.zh-CN.md#图映射与连接器) for source configuration, query semantics, the API, and the bindings.
 
@@ -72,4 +73,5 @@ Use one `graphlake-admin` process for a standalone deployment. A distributed dep
 | [Cluster reference](deploy/cluster.md) | Coordinator and Worker configuration, distributed execution, failover, and recovery manifests |
 | [Monitoring reference](deploy/monitoring.md) | Service, source, ingress, telemetry, and backup probes |
 | [Technical reference](docs/reference.zh-CN.md) | Modeling, connectors, query behavior, algorithms, APIs, and bindings |
+| [MCP server](docs/mcp.md) | AI client connection, query and modeling tools, permissions, and protocol scope |
 | [Changelog](CHANGELOG.md) | The v1.0.0 release baseline and runtime boundaries |

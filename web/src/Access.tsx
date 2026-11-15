@@ -181,6 +181,7 @@ function RoleEditor({ name, item, models, users, close, saved }: {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [target, setTarget] = useState('');
   const labels = new Map(models.map(model => [model.id, model.name]));
   for (const id of Object.keys(grants)) if (!labels.has(id)) labels.set(id, id);
 
@@ -238,7 +239,7 @@ function RoleEditor({ name, item, models, users, close, saved }: {
       </fieldset>
       <div className="access-scopes">
         <h3>按模型授权</h3>
-        <p className="muted">查询可运行语句和探索图。导出还需同一模型的查询权限。建模可编辑草稿。发布可切换生效版本。只读审计可查看配置和版本历史。</p>
+        <p className="muted">查询可运行语句和探索图。导出还需同一模型的查询权限。建模可编辑草稿。发布可切换生效版本。只读审计可查看配置和版本历史。AI 自动继承所属用户的查询、建模、发布权限及租户范围，无需另行授权。</p>
         {[...labels].map(([id, name]) => <fieldset key={id}>
           <legend>{name} <code>{name !== id && id}</code></legend>
           <div className="access-role-grid">
@@ -265,7 +266,17 @@ function RoleEditor({ name, item, models, users, close, saved }: {
             <p className="muted">节点、边及端点业务键须包含同一租户字段。两项均留空表示查询整个模型。</p>
           </details>}
         </fieldset>)}
-        {!labels.size && <p className="muted">创建图模型后可分配模型权限。</p>}
+        <div className="settings-actions">
+          <label>预授权新模型标识<input name="model_target" value={target} pattern={modelIdPattern} maxLength={64} autoCapitalize="none" spellCheck={false}
+            aria-describedby="model-target-help" onChange={event => setTarget(event.target.value)} /></label>
+          <button type="button" className="button" disabled={busy} onClick={event => {
+            const input = event.currentTarget.form?.elements.namedItem('model_target') as HTMLInputElement | null;
+            if (!target || !input?.reportValidity()) return;
+            if (!Object.hasOwn(grants, target)) change(target, 'modeler', true);
+            setTarget('');
+          }}>添加模型授权</button>
+        </div>
+        <p id="model-target-help" className="muted">MCP 新建模型须同时拥有目标标识和已有模板模型的建模角色。保存角色后授权生效。</p>
       </div>
       {item && <p className="muted">角色变更后，受影响的成员需重新登录。</p>}
       {error && <p className="notice error" role="alert">{error}</p>}

@@ -1,5 +1,8 @@
 #![cfg(feature = "admin")]
 
+#[path = "admin/mcp.rs"]
+mod mcp;
+
 use std::{
     fs,
     io::{BufRead, BufReader},

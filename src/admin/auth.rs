@@ -332,6 +332,9 @@ pub(super) struct Auth {
 }
 
 impl Auth {
+    pub(super) fn ai_owner_key(&self) -> Option<String> {
+        self.hash.as_deref().map(super::models::revision)
+    }
     pub(super) async fn load(
         catalog: &Path,
         port: u16,

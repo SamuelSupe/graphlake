@@ -386,6 +386,21 @@ nodes:
         .json::<Value>()
         .await?;
     assert_eq!(grants, json!({"payments":["modeler"]}));
+    for attempt in 0..31 {
+        let response = server
+            .guest(Method::POST, "auth/login")
+            .json(&json!({"username":format!("missing-{attempt}"),"password":"incorrect test password"}))
+            .send().await?;
+        assert_eq!(
+            response.status(),
+            if attempt == 30 {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        );
+    }
+    member_login().await?;
     for _ in 0..5 {
         assert_eq!(
             server
@@ -1144,6 +1159,12 @@ async fn admin_auth_gates_management_and_revokes_sessions() -> Result<()> {
     let response = server
         .guest(Method::POST, "auth/login")
         .json(&json!({"username": "admin", "password": PASSWORD}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = server
+        .guest(Method::POST, "auth/login")
+        .json(&json!({"username": "admin", "password": "incorrect test password"}))
         .send()
         .await?;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2879,9 +2900,11 @@ edges:
     fs::create_dir(&store)?;
     let etcd = std::env::var("GRAPHLAKE_TEST_ETCD")?;
     let name = format!("test-{}", Uuid::new_v4().simple());
+    let memory_mib =
+        std::env::var("GRAPHLAKE_TEST_CLUSTER_MEMORY_MIB").unwrap_or_else(|_| "32".into());
     let config_text = |workers: &[&str]| {
         format!(
-            "name: {name}\nmetadata: {etcd}\nstorage: {}\ntoken_env: GRAPHLAKE_CLUSTER_TEST_TOKEN\nworkers: {}\ndistributed_partitions: 2\nmemory_mib: 32\n",
+            "name: {name}\nmetadata: {etcd}\nstorage: {}\ntoken_env: GRAPHLAKE_CLUSTER_TEST_TOKEN\nworkers: {}\ndistributed_partitions: 2\nmemory_mib: {memory_mib}\n",
             store.display(),
             serde_json::to_string(workers).unwrap()
         )
@@ -2931,7 +2954,8 @@ edges:
     let mut coordinator = Server::start_with(root.path(), "", 0, &arguments)?;
     coordinator.login().await?;
     let readiness = || coordinator.request(Method::GET, "models/payments/readiness");
-    assert_eq!(readiness().send().await?.status(), StatusCode::OK);
+    let ready = readiness().send().await?;
+    assert_eq!(ready.status(), StatusCode::OK, "{}", ready.text().await?);
     let query = "MATCH (a:Account)-[r:Payment]->(b:Merchant) RETURN a,r,b ORDER BY r.payment_id";
     let first_id = Uuid::new_v4();
     let first: Value = coordinator
@@ -2970,6 +2994,20 @@ edges:
             .unwrap()
             > 0
     );
+    for sql in [
+        r#"SELECT a.from_account_id AS id FROM "Account" a
+            LEFT JOIN "Payment" p ON a.from_account_id = p.from_account_id AND p.payment_id < 0"#,
+        r#"SELECT a.from_account_id AS id FROM "Account" a
+            LEFT ANTI JOIN "Payment" p ON a.from_account_id = p.from_account_id AND p.payment_id < 0"#,
+    ] {
+        let result: Value = coordinator
+            .query(Uuid::new_v4(), "sql", sql)
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(result["rows"], json!([["9007199254740993"]]), "{sql}");
+    }
     let csr = |kind: Value, generation: &Value, revision: &Value| {
         json!({
             "request_id": Uuid::new_v4(),

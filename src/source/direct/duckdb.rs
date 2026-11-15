@@ -51,9 +51,14 @@ impl Driver {
         path: &str,
         runtime: Arc<RuntimeEnv>,
         stats: Arc<ReadStats>,
+        source_count: usize,
     ) -> Result<Self> {
         let path = path.to_owned();
-        let memory = database_budget(&runtime);
+        let memory = database_budget(&runtime) / source_count.max(1);
+        ensure!(
+            memory > 0,
+            "query memory budget is too small for DuckDB sources"
+        );
         let database_memory =
             MemoryConsumer::new("GraphLake DuckDB engine").register(&runtime.memory_pool);
         database_memory.try_grow(memory)?;

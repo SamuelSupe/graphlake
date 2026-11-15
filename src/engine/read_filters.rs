@@ -312,7 +312,7 @@ pub(crate) fn exact_terms(
         .collect()
 }
 
-fn sql_term(
+pub(crate) fn sql_term(
     predicate: &Predicate,
     schema: &Schema,
     ident: impl Fn(&str) -> String,

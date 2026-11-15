@@ -8,12 +8,12 @@ use datafusion::{
     arrow::row::{RowConverter, SortField},
     arrow::{
         array::{
-            Array, ArrayRef, ListArray, MapArray, StringArray, StringBuilder, StringViewBuilder,
-            StructArray,
+            Array, ArrayRef, AsArray, ListArray, MapArray, StringArray, StringBuilder,
+            StringViewBuilder, StructArray,
         },
         buffer::OffsetBuffer,
-        compute::{can_cast_types, cast},
-        datatypes::{DataType, Field, Fields},
+        compute::{CastOptions, can_cast_types, cast, cast_with_options},
+        datatypes::{DataType, Field, Fields, Int64Type},
         util::display::{ArrayFormatter, FormatOptions},
     },
     common::{Result, ScalarValue, exec_err, plan_err},
@@ -51,6 +51,7 @@ pub(crate) fn register(context: &SessionContext) {
     }));
     for name in [
         "__graphlake_gremlin_number",
+        "__graphlake_gremlin_repeat_depth",
         "__graphlake_gremlin_sum_zero",
         "__graphlake_gremlin_key",
         "__graphlake_cypher_index",
@@ -327,6 +328,8 @@ impl ScalarUDFImpl for QueryValue {
                 plan_err!("mean() requires numeric values, got {}", args[0])
             }
             "__graphlake_gremlin_key" => Ok(DataType::Utf8View),
+            "__graphlake_gremlin_repeat_depth" if args[0] == DataType::Int64 => Ok(DataType::Int64),
+            "__graphlake_gremlin_repeat_depth" => plan_err!("repeat depth must be an integer"),
             "__graphlake_numeric_input" => Ok(numeric_type(args)),
             "__graphlake_gremlin_sum_zero" if args[0].is_numeric() => Ok(args[0].clone()),
             "__graphlake_gremlin_sum_zero" => plan_err!("sum() requires numeric values"),
@@ -365,6 +368,17 @@ impl ScalarUDFImpl for QueryValue {
             }
             "__graphlake_cypher_index" => cast(&input, &DataType::Int64)?,
             "__graphlake_gremlin_key" => group_key(&input)?,
+            "__graphlake_gremlin_repeat_depth" => {
+                if input
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .flatten()
+                    .any(|round| round > crate::gremlin::MAX_REPEAT_ROUNDS as i64)
+                {
+                    return exec_err!("repeat() is limited to 256 iterations");
+                }
+                input
+            }
             _ => unreachable!("registered query value function"),
         };
         Ok(ColumnarValue::Array(value))
@@ -415,7 +429,14 @@ fn numeric_array(inputs: Vec<ArrayRef>, ty: &DataType, rows: usize) -> Result<Ar
     let mut values = Vec::new();
     for slot in slots {
         if slot.data_type().is_numeric() {
-            values.push(cast(&slot, ty)?);
+            values.push(cast_with_options(
+                &slot,
+                ty,
+                &CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )?);
         } else if slot.null_count() != slot.len() {
             return exec_err!(
                 "numeric operation requires numeric values, got {}",

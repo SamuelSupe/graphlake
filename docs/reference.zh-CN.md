@@ -21,7 +21,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml traverse \
   --edge Transfer --start 1 --start 10 --max-hops 3 shortest --target 1 --target 30
 ```
 
-两跳查询返回 `{"account":30,"paths":2,"amount":600}`。最短路径返回终点、跳数和有序的边业务键。默认输出 JSON Lines，`--format arrow` 输出 Arrow IPC 流。`--diagnostics` 将物理计划、各来源版本和运行统计写入 stderr。
+两跳查询返回 `{"account":30,"paths":2,"amount":600}`。最短路径返回终点、跳数和有序的边业务键。默认输出 JSON Lines，`--format arrow` 输出 Arrow IPC 流。浮点 `Infinity`、`-Infinity` 和 `NaN` 在 JSON Lines 中以字符串输出，在 CSV 中以对应文本输出。Arrow 保留原浮点值和空值。`--diagnostics` 将物理计划、各来源版本和运行统计写入 stderr。
 
 ## 本机管理后台
 
@@ -69,7 +69,7 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 后台用于受信任主机上的回环 HTTP。后台和凭据命令应在同一操作系统环境运行。使用 OrbStack 共享目录时，请在同一个 Linux 实例里启动和管理凭据，macOS 和虚拟机的文件锁各自生效。会话 Cookie 使用 `HttpOnly`、`SameSite=Strict`，名称包含监听端口。会话闲置 30 分钟、建立满 8 小时、退出或服务重启后失效。会话过期会锁定当前页面，重新登录后可继续编辑留在页面中的草稿，并手动重试失败的操作。退出登录时会提示确认放弃未保存的草稿，并清除页面中的模型和结果。构建产物放在独立的 `--assets-dir` 中，服务只读取入口页和 `assets/` 下的构建资源。
 
-服务提供 `/healthz`、`/readyz` 和 Prometheus `/metrics`。用 `--driver-model <已发布模型>` 可为现有 TinkerPop 客户端开启只读 Gremlin WebSocket；另加 `--bolt-port 7687` 可为 Neo4j 驱动开启只读 Bolt。HTTP、Bolt 和 Gremlin 共用模型授权，独立服务账号通过 `.graphlake-auth/service-accounts.json` 配置，操作审计写入同目录。驱动与 HTTP 查询共享 `--query-slots`（默认 1），过载时进入有界队列。Bolt 支持托管只读事务，两种驱动均提供原生图对象和分批结果。连接示例、协议范围、Linux 打包、systemd 单元和升级恢复步骤见 [单机部署手册](../deploy/README.md)。
+服务提供 `/healthz`、`/readyz` 和 Prometheus `/metrics`。用 `--driver-model <已发布模型>` 可为现有 TinkerPop 客户端开启只读 Gremlin WebSocket；另加 `--bolt-port 7687` 可为 Neo4j 驱动开启只读 Bolt。HTTP、Bolt 和 Gremlin 共用模型授权，独立服务账号通过 `.graphlake-auth/service-accounts.json` 配置，操作审计写入同目录。驱动与 HTTP 查询共享 `--query-slots`（默认 1），过载时进入有界队列。Bolt 支持托管只读事务，两种驱动均提供原生图对象和分批结果。单机结果快照每个身份最多保留 4 个，服务合计最多 32 个、1 GiB。Arrow 下载从开始发送起最多占用传输槽 60 秒。连接示例、协议范围、Linux 打包、systemd 单元和升级恢复步骤见 [单机部署手册](../deploy/README.md)。
 
 桌面从左侧、窄屏从顶部导航切换图模型、数据源和查询。当前模型可在工作区标题栏切换。模型列表在较窄容器中按条目排布，数据源卡片随可用宽度自动换列。图模型列表支持搜索、新建和从 YAML 文件导入草稿。可在编辑器下载当前草稿，也可打开版本历史并排查看归档 YAML 和草稿、下载归档 YAML。导入文件里的相对路径以后台的模型目录解析。打开模型后可在画布选择节点或边。配置面板在桌面位于画布右侧，在窄屏位于画布下方。画布上方保留添加、保存、发布及带数量的节点和边入口。可直接从画布连接端点建边，手动校验、版本历史和 YAML 位于「更多工具」。数据源工作区以卡片展示当前模型已配置的数据源；点击卡片的「配置」打开独立弹窗，可就地保存草稿并查看保存结果；关闭弹窗会保留未保存的编辑，点击「浏览表与字段」读取来源结构，选表后可将来源带入映射。已配置的数据源支持按名称或连接器类型搜索。下方的连接器卡片支持按数据库、文件与数据湖、数仓与分析、通过 Trino 分类筛选，并可组合关键词搜索，显示匹配数量；无匹配时可清除筛选。点击「配置」即可在弹窗填写数据源名称和连接参数，或添加文件表映射与列类型，完成后「添加到草稿」。新建连接的必填项会在提交时校验并聚焦缺失字段；文件路径和列名等已有输入也参与必填校验。取消新建不会修改模型。随后保存草稿、校验并发布，配置才会进入生效版本。PostgreSQL、MySQL、ClickHouse、Trino 及其连接器和 Iceberg 支持逐级浏览，Parquet、CSV、JSON Lines 和 Delta 浏览已配置的表，SQLite、Spanner 可列出数据库内的表。Snowflake、BigQuery 和 SAP HANA 可按已映射或手工输入的限定模式列出表。也可输入完整表名直接读取字段。节点和边可配置多个来源表、逻辑字段到物理列的映射、类型转换、行过滤、优先顺序与重复键策略。当前连接器均可从数据源页配置，凭据填写服务进程的环境变量名。可配置 Delta 表版本、Iceberg 表快照及连接器的高级字段。重命名数据源会更新单表和多表引用，删除前需解除引用。节点和边可在「时态与分区」设置 SCD2 和局部跳过逻辑分区。模型 YAML 仍可查看、导入和导出。
 
@@ -137,7 +137,7 @@ OSS/TOS/COS 自动使用带桶名的虚拟主机访问；S3/MinIO 自定义 endp
 
 普通 SQL 的单层 `SELECT` 及显式 `ON` 连接从源读取查询引用的列，同时保留业务键、关系端点和分区条件使用的列。通配符、CTE、子查询和隐式连接列仍使用完整投影。多输入和 SCD2 继续读取用于去重及冲突判断的完整映射。CSV 和 JSON Lines 仍扫描并校验完整文件。
 
-DuckDB 和 PostgreSQL 可下推单节点表的有序 `LIMIT`（无 `OFFSET`）、标量 `COUNT(*)`、`COUNT(列)` 和整型 `MIN/MAX`。源端须有能够证明整数业务键唯一的约束，有序 LIMIT 须按完整业务键排序。所有 WHERE 条件都须能精确下推，目前覆盖以 AND 连接的整数比较和空值判断。下推仍在原读快照内执行。DuckDB 直接查验映射表的完整主键，结果在预留执行引擎内存后按剩余预算缓冲和溢写。PostgreSQL 聚合和有序 LIMIT 都排除空业务键。业务键无约束、排序存在并列、聚合带分组或 DISTINCT，以及无法证明条件等价的查询使用本地计划。
+DuckDB 和 PostgreSQL 可下推单节点表的有序 `LIMIT`（无 `OFFSET`）、标量 `COUNT(*)`、`COUNT(列)` 和整型 `MIN/MAX`。源端须有能够证明整数业务键唯一的约束，有序 LIMIT 须按完整业务键排序。所有 WHERE 条件都须能精确下推，目前覆盖以 AND 连接的整数比较和空值判断。下推仍在原读快照内执行。DuckDB 直接查验映射表的完整主键。多个 DuckDB 来源共享查询内存的一半，剩余预算用于缓冲、溢写和本地运算。PostgreSQL 聚合和有序 LIMIT 都排除空业务键。业务键无约束、排序存在并列、聚合带分组或 DISTINCT，以及无法证明条件等价的查询使用本地计划。
 
 用 CLI 的 `--diagnostics` 对照 `metrics.reads` 和 `metrics.elapsed_ms`。其中 `warehouse_rows`、`postgres_rows` 与对应的 Arrow 字节数统计进入 GraphLake 的数据，源数据库内部扫描量需用其执行诊断另行测量。
 
@@ -148,6 +148,10 @@ DuckDB 可利用行组的列最小值和最大值裁剪有序 `LIMIT` 的扫描�
 
 Parquet 表显式列出文件，YAML 中的相对路径以配置文件目录为准。同一表各文件的映射列须具有相同的 Arrow 类型。HTTP 服务须支持 HEAD、Range 和强 ETag。S3 使用 `AWS_REGION` 等标准 AWS 配置，也可通过 `AWS_ENDPOINT` 指定兼容服务。
 
+
+通过 Snowflake、Spanner、Trino、SAP HANA 和 SQL Server／Oracle 直连读取的时间戳统一映射为 Arrow 微秒时间戳，可保留 9999-12-31 等源端长时间范围的日期。超出微秒的尾数被截去。TIME 列仍按连接器映射保留其时间精度。
+
+PostgreSQL 无穷日期、无穷时间戳和定点 `NaN` 在读取时报告具体值和类型。需要这些值或无精度约束的 `NUMERIC` 时，可在源端创建只读视图，将相应列转成 `text`，例如 `valid_until::text AS valid_until`。有限日期与定点数继续使用 Arrow 类型。
 
 **CSV / JSON Lines**
 
@@ -252,7 +256,7 @@ sources:
 
 Snowflake 表引用形如 `snow.FINANCE.PUBLIC.TRANSFERS`，按映射中的精确大小写读取数据库、schema、表和列。`role` 可省略。Snowflake 将 `NUMBER(p,0)` 按精度映射为 Int16、Int32、Int64 或 Decimal128。BigQuery 表引用形如 `bq.data-project.finance.accounts`，`maximum_bytes_billed` 限制每个查询作业的计费字节。BigQuery `INT64` 映射为 Int64，`NUMERIC` 保留精度和小数位，嵌套或重复字段、`BIGNUMERIC` 会返回类型错误。单个 API 响应解码上限为 32 MiB，Arrow 批次占用查询内存预算。
 
-ClickHouse 通过 HTTP 读取 ArrowStream，表引用使用 `source.database.table`。配置 `user` 和可选的 `password_env`。投影下推到 ClickHouse，默认以 Arrow Utf8 读取字符串并展开 LowCardinality 字符串。若只读账号禁止更改查询设置，引擎沿用服务器配置的 Arrow 格式和远端执行限制。查询结果按语句记录 ClickHouse 查询 ID。
+ClickHouse 通过 HTTP 读取 ArrowStream，将 Date 和 Nullable(Date) 映射为 Arrow Date32，表引用使用 `source.database.table`。配置 `user` 和可选的 `password_env`。投影下推到 ClickHouse，默认以 Arrow Utf8 读取字符串并展开 LowCardinality 字符串。若只读账号禁止更改查询设置，引擎沿用服务器配置的 Arrow 格式和远端执行限制。查询结果按语句记录 ClickHouse 查询 ID。锁定只读配置需在服务端设置远端执行时限和断连取消，GraphLake 仍按请求超时停止等待。
 
 Trino 通过协调器的 HTTP 查询协议读取 `source.catalog.schema.table`。配置 `user`，并按协调器认证方式配置 `token_env` 或 `password_env`。引擎读取分页结果，保留十进制精度，并启用 Trino 参数化时间类型以保留不超过纳秒的时间精度。带时区时间戳归一为 UTC。数组、Map、Row 等结构化 Trino 列需要先在远端视图中展开或转换。结果按表记录 Trino 查询 ID。
 
@@ -317,7 +321,7 @@ nodes:
         columns: {tenant: tenant_id, id: account_id, name: account_name}
 ```
 
-分区和 SCD2 条件在去重及端点校验前应用。普通单表节点和有键边会拒绝参与查询的重复业务键。整图分析和 CSR 刷新在构建拓扑时校验业务键，包含端点缺失的边。普通查询可复用满足键约束的 PostgreSQL 有效唯一索引。多表映射和 SCD2 折叠完整相同的记录，同键冲突默认报错。键点查和相关子查询可先筛选候选键，再校验各候选键的完整输入记录。候选键之外的冲突由扫描对应键的查询或拓扑构建发现。多表有键标签可配置 `on_conflict: prefer_first`，按输入顺序选择完整记录，优先输入内部仍须满足键唯一性。无键边保留独立的查询内身份。
+分区和 SCD2 条件在去重及端点校验前应用。普通单表节点和有键边会拒绝参与查询的重复业务键。整图分析和 CSR 刷新在构建拓扑时校验业务键，包含端点缺失的边。普通查询可复用满足键约束的 PostgreSQL 有效唯一索引。同一引擎会复用已通过完整校验的 Parquet 业务键证明，文件版本变化时重新校验。多表映射和 SCD2 折叠完整相同的记录，同键冲突默认报错。键点查和相关子查询可先筛选候选键，再校验各候选键的完整输入记录。候选键之外的冲突由扫描对应键的查询或拓扑构建发现。多表有键标签可配置 `on_conflict: prefer_first`，按输入顺序选择完整记录，优先输入内部仍须满足键唯一性。无键边保留独立的查询内身份。
 
 `snapshot_time` 可指定与 SCD2 列同类型的日期、时间戳或整数，历史区间采用 `[valid_from, valid_to)`。空起点表示无下界，空结束值默认表示无上界，可用 `open_end` 配置结束值哨兵。默认读取当前记录，可用 `current_flag` 和 `current_value` 定义当前标记。业务时间和数据源快照版本分别指定。
 
@@ -385,6 +389,8 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml query \
 
 `CALL db.schema.nodeTypeProperties()` 和 `CALL db.schema.relTypeProperties()` 从映射后的表结构返回属性名称、类型和空值约束。它们读取来源表结构或所选 CSR 的结构。`CALL dbms.components()` 返回引擎名称、版本和版本类别，`CALL dbms.info()` 返回图名称。`date()` 和 `datetime()` 支持当前时间及单个字符串或可转换标量参数，如 `date('2025-01-01')`。
 
+Cypher 的 `WITH ... SKIP ... LIMIT ... WHERE ...` 先分页再应用同一子句的过滤条件。整数和定点算术、`sum()` 及 `sum(DISTINCT ...)` 超出结果类型范围时返回错误。Cypher 和 Gremlin 都限制生成的计划大小，Gremlin 也检查 `math()` 公式的解析复杂度。
+
 普通 `EXPLAIN` 只加载规划所需的列类型、文件或快照元数据。需要查询结果来描述列类型的连接器提交零行语句，执行计划中的这些表使用仅包含 schema 的输入。`EXPLAIN ANALYZE` 会执行查询，业务键冲突和数据读取错误在执行时报告。
 
 变长关系用 `*N` 或 `*MIN..MAX`，上界最大为 256。零跳要求同一个节点满足两端的节点条件，关系的类型和方向约束正跳。异构关系的精确零跳模式可从一端显式或已绑定的标签推断另一端。有向和无向模式都保留平行边，每个 `MATCH` 子句内同一条边只能使用一次。`length(p)`、`nodes(p)` 和 `relationships(p)` 读取路径长度及有序身份，变长关系变量可投影为有序边键列表。跨标签或边类型的路径身份包含标签和按列顺序排列的文本键。
@@ -426,7 +432,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml query --language 
 
 `group().by(label()).by(count())` 和 `groupCount().by(label())` 按节点标签计数。Arrow Map 使用文本键保存类型信息，数值 `1` 的键可为 `@Int64:1`，字符串 `"1"` 的键为 `1`，以 `@` 开头的字符串再加一个 `@` 转义。省略 `group()` 的第二个 `by()` 时，每个分组收集原始遍历值。第二个 `by()` 可以收集属性或执行分组内的聚合。空输入产生空映射。`mean()` 返回数值的 Float64 平均值，空输入不产生结果。`sum()` 汇总数值，空输入返回零。整数和十进制数使用相应的精确数值类型，包含浮点数时使用 Float64。`min()` 和 `max()` 返回排序后的极值并保留原值类型，空输入无结果。`fold()` 把结果收成列表，保留已经指定的顺序，空输入产生空列表。`unfold()` 展开列表，也可将分组映射、投影和属性映射展开成 `key`、`value` 条目。
 
-`valueMap('property', ...)` 返回属性映射，省略属性名时返回该类型的所有映射属性。顶点属性是列表，边属性是标量。`repeat(...).until(__.has(...))` 每轮之后检查终止条件，`until(...).repeat(...)` 在进入下一轮之前检查。循环可跨标签，并可在顶点、边与标量之间切换。混合类型循环按轮求值，当前轮与终止结果可按查询预算溢写。条件支持属性、标签、标量和 `simplePath()` 筛选。
+`valueMap('property', ...)` 返回属性映射，省略属性名时返回该类型的所有映射属性。顶点属性是列表，边属性是标量。`repeat(...).until(__.has(...))` 每轮之后检查终止条件，`until(...).repeat(...)` 在进入下一轮之前检查。循环可跨标签，并可在顶点、边与标量之间切换。每个循环最多执行 256 轮，仍需继续时返回查询错误。混合类型循环按轮求值，当前轮与终止结果可按查询预算溢写。条件支持属性、标签、标量和 `simplePath()` 筛选。
 
 `where(out('Transfer').count().is(gt(1)))` 保留子遍历有结果的原始记录。`where('a',neq('b'))` 比较两个步骤标签的元素身份。`repeat(...).times(3).emit()` 输出每轮结果，前置 `emit().repeat(...)` 也可输出起点。`emit(__.has(...))` 筛选中间结果，终止记录仍按循环终止条件返回。
 
@@ -469,7 +475,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml --diagnostics \
 
 同一进程通过 `Engine::new` 创建的实例共享 8 个活动查询、2 GiB 内存预算和 8 GiB 临时磁盘预算。查询进入时预留声明的额度，读取完成或关闭结果流后释放。等待资源计入查询超时，也可以取消。Rust 可通过 `Engine::new_with_limits` 为一个实例及其克隆配置独立预算。CLI 单次执行按命令行参数分配预算。
 
-CSV、JSON Lines、SQLite、MySQL、Trino、ClickHouse、Snowflake、BigQuery、Spanner 和 SAP HANA 的查询结果可以物化到受磁盘配额约束的 Arrow IPC 临时文件。多表映射去重、无键边身份、相关 `CALL` 的分批或逐行求值结果也可溢写。Cypher 诊断的 `spilled_bytes` 包含已完成的批量子查询执行阶段和 `collect()` 的算子溢写。低内存下引擎可降低内部并行度，保留排序归并的工作内存。诊断中的 `reads.snapshot_spilled_bytes` 记录这些物化操作产生的磁盘字节。MySQL、Trino、ClickHouse、Spanner 和 SAP HANA 可把单节点标签查询的整数业务键条件及可安全转换的映射或分区条件下推到源端。引擎仍在本地应用条件，复杂查询仍可能扫描整个源表。
+CSV、JSON Lines、SQLite、MySQL、Trino、ClickHouse、Snowflake、BigQuery、Spanner 和 SAP HANA 的查询结果可以物化到受磁盘配额约束的 Arrow IPC 临时文件。多表映射去重、无键边身份、相关 `CALL` 的分批或逐行求值结果也可溢写。Cypher 诊断的 `spilled_bytes` 包含已完成的批量子查询执行阶段和 `collect()` 的算子溢写。低内存下引擎可降低内部并行度，保留排序归并的工作内存。诊断中的 `reads.snapshot_spilled_bytes` 记录这些物化操作产生的磁盘字节。MySQL、Trino、ClickHouse、Spanner 和 SAP HANA 可把单节点标签查询的整数业务键条件及可安全转换的映射或分区条件下推到源端。引擎仍在本地应用条件，ClickHouse 也支持对原生 String 列下推文本等值条件。复杂查询仍可能扫描整个源表。
 
 ## 整图算法
 
@@ -678,10 +684,11 @@ ClickHouse 只读账号回归使用独立的 ClickHouse 25.8 测试实例。以�
 
 ```sql
 CREATE DATABASE graphlake;
-CREATE TABLE graphlake.nodes (id Int64, name LowCardinality(String), amount Decimal(12, 2))
+CREATE TABLE graphlake.nodes (id Int64, name LowCardinality(String), amount Decimal(12, 2), posted Nullable(Date))
 ENGINE = MergeTree ORDER BY id;
 INSERT INTO graphlake.nodes
-SELECT toInt64(number + 1), concat('node-', toString(number + 1)), toDecimal64(number, 2) + 0.25
+SELECT toInt64(number + 1), concat('node-', toString(number + 1)), toDecimal64(number, 2) + 0.25,
+       if(number % 2 = 0, toDate('2026-01-02'), NULL)
 FROM numbers(3000);
 CREATE USER readonly_reader IDENTIFIED BY 'graphlake-test-password' SETTINGS readonly = 1;
 GRANT SELECT ON graphlake.nodes TO readonly_reader;

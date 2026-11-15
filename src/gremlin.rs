@@ -6,13 +6,13 @@ mod values;
 mod variants;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use opencypher::{ExprKind, parse_expr};
+use opencypher::ExprKind;
 
 use crate::{
     Catalog,
@@ -20,8 +20,10 @@ use crate::{
     cypher::{Plan, literal, string},
 };
 
-use parse::{Step, integer, parse_chain, text};
+use parse::{Step, integer, parse_chain, parse_expr, text};
 use variants::{Kind, Tags};
+
+pub(crate) const MAX_REPEAT_ROUNDS: u64 = 256;
 
 const PATH: &str = "__graphlake_gremlin_path";
 
@@ -104,6 +106,7 @@ struct Traversers<'a> {
     control_columns: Vec<String>,
     group: Option<control::Group>,
     ctes: Vec<String>,
+    inline_copies: Rc<Cell<usize>>,
     repeats: Rc<RefCell<Vec<repeat::Repeat>>>,
 }
 
@@ -217,6 +220,7 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
                 control_columns: Vec::new(),
                 group: None,
                 ctes: Vec::new(),
+                inline_copies: Rc::new(Cell::new(1)),
                 repeats: Rc::default(),
             })
         })

@@ -59,7 +59,10 @@ def main(http, bolt, revision):
                             lambda err: err.code.startswith("Neo.ClientError."))
             assert session.execute_read(lambda tx: tx.run(statement, id=2000).single()["amount"]) == "55.000"
             with session.begin_transaction() as tx:
-                tx.run("RETURN 1").consume()
+                first = tx.run("UNWIND [1,2,3] AS n RETURN n ORDER BY n")
+                second = tx.run("RETURN 4 AS n")
+                assert second.value() == [4]
+                assert first.value() == [1, 2, 3]
                 tx.rollback()
             row = session.run(
                 "MATCH p=(a:CustomerAccount)-[r:Payment]->(b:Merchant) "

@@ -178,13 +178,16 @@ pub(in crate::admin) async fn explore(
         ));
     }
     crate::admin::access::check_query(&app, &principal, &id)?;
-    let engine = {
-        let mut models = app.models.lock().unwrap();
-        if request.csr_generation.is_some() {
-            models.snapshot_engine(&id, &request.model_revision)?
-        } else {
-            models.query_engine(&id, &request.model_revision, &principal)?
-        }
+    let engine = if request.csr_generation.is_some() {
+        let files = app.models.lock().unwrap().read_files();
+        let (id, revision) = (id.clone(), request.model_revision.clone());
+        tokio::task::spawn_blocking(move || files.snapshot_engine(&id, &revision))
+            .await
+            .map_err(|_| Error::storage())??
+    } else {
+        app.query_model(&id, &request.model_revision, &principal)
+            .await?
+            .2
     };
     if let Some(term) = access::partition(&app, &principal, &id)? {
         if request.csr_generation.is_some() {

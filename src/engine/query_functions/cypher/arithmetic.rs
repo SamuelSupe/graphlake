@@ -5,7 +5,7 @@ use datafusion::{
         array::{Array, ArrayRef, ListArray, make_array},
         buffer::{NullBuffer, OffsetBuffer},
         compute::{
-            cast,
+            CastOptions, cast, cast_with_options,
             kernels::{concat_elements::concat_elements_dyn, numeric},
         },
         datatypes::DataType,
@@ -158,17 +158,21 @@ impl ScalarUDFImpl for Arithmetic {
                 // Only the rows where both lanes are active belong to this type pair.
                 let a = make_array(a.to_data().into_builder().nulls(nulls.clone()).build()?);
                 let b = make_array(b.to_data().into_builder().nulls(nulls).build()?);
-                let a = cast(&a, &left_type)?;
-                let b = cast(&b, &right_type)?;
+                let checked = CastOptions {
+                    safe: false,
+                    ..Default::default()
+                };
+                let a = cast_with_options(&a, &left_type, &checked)?;
+                let b = cast_with_options(&b, &right_type, &checked)?;
                 let value = match self.op {
-                    Operator::Plus => numeric::add_wrapping(&a, &b)?,
-                    Operator::Minus => numeric::sub_wrapping(&a, &b)?,
-                    Operator::Multiply => numeric::mul_wrapping(&a, &b)?,
+                    Operator::Plus => numeric::add(&a, &b)?,
+                    Operator::Minus => numeric::sub(&a, &b)?,
+                    Operator::Multiply => numeric::mul(&a, &b)?,
                     Operator::Divide => numeric::div(&a, &b)?,
                     Operator::Modulo => numeric::rem(&a, &b)?,
                     _ => unreachable!("registered arithmetic operator"),
                 };
-                values.push(cast(&value, &result_type)?);
+                values.push(cast_with_options(&value, &result_type, &checked)?);
             }
         }
         Ok(ColumnarValue::Array(merge_values(

@@ -5,6 +5,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Poll, Waker},
     time::Duration,
 };
 
@@ -23,7 +24,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
     sql::parser::Statement,
 };
-use futures::TryStreamExt;
+use futures::{TryStreamExt, stream::poll_fn};
 use serde::Serialize;
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -517,10 +518,89 @@ impl QueryScope {
             graph_context: None,
             #[cfg(feature = "admin")]
             graph_csr: None,
-            batches: Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
+            batches: self.expiring_stream(Box::pin(RecordBatchStreamAdapter::new(schema, stream))),
             scope: Arc::clone(self),
         })
     }
+
+    fn expiring_stream(
+        self: &Arc<Self>,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        let schema = stream.schema();
+        let state = Arc::new(Mutex::new(Output {
+            stream: Some(stream),
+            error: None,
+            waker: None,
+        }));
+        let weak = Arc::downgrade(&state);
+        let scope = Arc::downgrade(self);
+        let deadline = self.deadline;
+        let cancelled = self.options.cancellation.clone();
+        let done = CancellationToken::new();
+        let guard = done.clone().drop_guard();
+        let stop = done.clone();
+        tokio::spawn(async move {
+            let error = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return,
+                _ = cancelled.cancelled() => "query cancelled",
+                _ = tokio::time::sleep_until(deadline) => "query deadline exceeded",
+            };
+            let Some(state) = weak.upgrade() else { return };
+            let (stream, waker) = {
+                let mut state = state.lock().expect("query output");
+                let Some(stream) = state.stream.take() else {
+                    return;
+                };
+                state.error = Some(error);
+                (stream, state.waker.take())
+            };
+            // The consumer may have stopped polling under wire backpressure.
+            // Dropping the stream releases its leases and reservations here.
+            drop(stream);
+            if let Some(scope) = scope.upgrade() {
+                scope
+                    .finished_ms
+                    .lock()
+                    .expect("elapsed time")
+                    .get_or_insert_with(|| scope.start.elapsed().as_millis() as u64);
+            }
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            poll_fn(move |cx| {
+                let _guard = &guard;
+                let mut state = state.lock().expect("query output");
+                if let Some(error) = state.error.take() {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(error.into()))));
+                }
+                let Some(stream) = &mut state.stream else {
+                    return Poll::Ready(None);
+                };
+                let polled = stream.as_mut().poll_next(cx);
+                match &polled {
+                    Poll::Ready(None | Some(Err(_))) => {
+                        state.stream.take();
+                        state.waker.take();
+                        done.cancel();
+                    }
+                    Poll::Pending => state.waker = Some(cx.waker().clone()),
+                    Poll::Ready(Some(Ok(_))) => {}
+                }
+                polled
+            }),
+        ))
+    }
+}
+
+struct Output {
+    stream: Option<SendableRecordBatchStream>,
+    error: Option<&'static str>,
+    waker: Option<Waker>,
 }
 
 pub(crate) fn spilled_bytes(plan: &dyn ExecutionPlan) -> u64 {

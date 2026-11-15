@@ -154,17 +154,22 @@ impl Engine {
             strategy,
             TraversalStrategy::Auto | TraversalStrategy::Cached
         ) && let Some(cache) = &self.cache
-            && let Some(generation) = cache.load(edge, direction, Arc::clone(scope)).await?
         {
-            *scope.csr_generation.lock().expect("CSR metrics") =
-                Some(generation.generation.clone());
-            let prepared = Prepared {
-                aggregate: None,
-                versions: generation.versions.clone(),
-                reservations: Vec::new(),
-                postgres: Default::default(),
-            };
-            return Ok((Input::Cached(generation), prepared));
+            match cache.load(edge, direction, Arc::clone(scope)).await {
+                Ok(Some(generation)) => {
+                    *scope.csr_generation.lock().expect("CSR metrics") =
+                        Some(generation.generation.clone());
+                    let prepared = Prepared {
+                        aggregate: None,
+                        versions: generation.versions.clone(),
+                        reservations: Vec::new(),
+                        postgres: Default::default(),
+                    };
+                    return Ok((Input::Cached(generation), prepared));
+                }
+                Err(error) if strategy == TraversalStrategy::Cached => return Err(error),
+                _ => scope.check()?,
+            }
         }
         ensure!(
             strategy != TraversalStrategy::Cached,

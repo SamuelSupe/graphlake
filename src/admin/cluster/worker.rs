@@ -30,6 +30,7 @@ pub(super) struct Worker {
     probes: Semaphore,
     pub(super) stage_slots: Arc<Semaphore>,
     pub(super) shutdown: CancellationToken,
+    pub(super) arc_cache: super::csr::ArcBlocks,
     metrics: Metrics,
 }
 
@@ -54,6 +55,7 @@ pub(super) fn router(
             config.distributed_partitions > 0,
         ))),
         shutdown: shutdown.clone(),
+        arc_cache: Default::default(),
         metrics: Metrics::new(slots),
     });
     if let Some(meter) = telemetry::meter() {
@@ -296,25 +298,8 @@ impl Worker {
             Ok(state) => (state, true),
             Err(error) => (failure(&error), false),
         };
+        let published = self.publish_result(id, &job, &state).await;
         drop(slot);
-        // Commit only the still-current attempt. Partial results are never visible.
-        let mut published = false;
-        if let Ok(Some(saved)) = self.shared.metadata.get(id).await
-            && saved.job.attempt == job.attempt
-            && saved.job.worker == Some(self.id)
-            && matches!(saved.job.state, JobState::Running)
-        {
-            let mut current = saved.job;
-            current.state = state;
-            // A transport error after the compare-and-swap has an unknown outcome.
-            // Leave the objects for retention cleanup in that case.
-            published = self
-                .shared
-                .metadata
-                .replace(id, saved.revision, &current)
-                .await
-                .unwrap_or(true);
-        }
         if !published || !written {
             self.shared.objects.clean_results(id, job.attempt).await;
         } else {
@@ -327,6 +312,46 @@ impl Worker {
                 .artifact(id, job.attempt, "request.json");
             self.shared.objects.delete(&request).await;
         }
+    }
+
+    async fn publish_result(&self, id: Uuid, job: &Job, state: &JobState) -> bool {
+        let metadata = &self.shared.metadata;
+        let mut ambiguous = false;
+        // Leave time for a transient read/write failure even if computation
+        // consumed the query deadline. A competing attempt still wins its CAS.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                match metadata.get(id).await {
+                    Ok(Some(saved))
+                        if saved.job.attempt == job.attempt
+                            && saved.job.worker == Some(self.id) =>
+                    {
+                        if !matches!(saved.job.state, JobState::Running) {
+                            return ambiguous
+                                && matches!(
+                                    saved.job.state,
+                                    JobState::Done { .. } | JobState::Downloaded
+                                );
+                        }
+                        let mut current = saved.job;
+                        current.state = state.clone();
+                        match metadata.replace(id, saved.revision, &current).await {
+                            Ok(true) => return true,
+                            Ok(false) => {}
+                            Err(_) => ambiguous = true,
+                        }
+                    }
+                    Ok(_) => return false,
+                    Err(_) => {}
+                }
+                tokio::time::sleep(WAIT).await;
+            }
+        })
+        .await
+        // If the CAS response was lost, retention may own a committed result.
+        // Preserve objects until metadata can resolve the outcome.
+        .unwrap_or(true)
     }
 
     async fn maintain_lease(&self, id: Uuid, job: &Job, token: &CancellationToken) {
@@ -494,5 +519,97 @@ impl Worker {
             graph_pages,
             completed_ms: now_ms(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::post;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn terminal_result_survives_a_transient_metadata_read_failure() -> anyhow::Result<()> {
+        let worker_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let job = Job {
+            model: "test".into(),
+            revision: "revision".into(),
+            owner: super::super::Principal::Admin,
+            attempt: Uuid::new_v4(),
+            worker: Some(worker_id),
+            worker_seen_ms: now_ms(),
+            retried: false,
+            fingerprint: [0; 32],
+            export: false,
+            csr_generation: None,
+            deadline_ms: now_ms() + 1000,
+            state: JobState::Running,
+        };
+        let reads = Arc::new(AtomicUsize::new(0));
+        let saved = Arc::new(std::sync::Mutex::new(None));
+        let router = Router::new()
+            .route("/v3/kv/range", post({
+                let reads = reads.clone();
+                let record = STANDARD.encode(serde_json::to_vec(&job)?);
+                move || async move {
+                    if reads.fetch_add(1, Ordering::Relaxed) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        Json(serde_json::json!({ "kvs": [{ "value": record, "mod_revision": "7" }] })).into_response()
+                    }
+                }
+            }))
+            .route("/v3/kv/txn", post({
+                let saved = saved.clone();
+                move |Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(body["compare"][0]["mod_revision"], "7");
+                    let value = body["success"][0]["request_put"]["value"].as_str().unwrap();
+                    let job: Job = serde_json::from_slice(&STANDARD.decode(value).unwrap()).unwrap();
+                    *saved.lock().unwrap() = Some(job);
+                    Json(serde_json::json!({ "succeeded": true, "header": { "revision": "8" } }))
+                }
+            }));
+        let address = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", address.local_addr()?).parse()?;
+        let server = tokio::spawn(async move { axum::serve(address, router).await });
+        let dir = tempfile::tempdir()?;
+        let client = reqwest::Client::new();
+        let worker = Worker {
+            id: worker_id,
+            shared: Shared {
+                client: client.clone(),
+                metadata: Metadata::new(client, vec![endpoint], "worker-test"),
+                objects: Objects::open(dir.path().to_str().unwrap(), "worker-test")?,
+                token: String::new(),
+            },
+            workers: Vec::new(),
+            partitions: 0,
+            memory_bytes: 256 * 1024 * 1024,
+            source_dir: dir.path().to_owned(),
+            token_hash: [0; 32],
+            slots: Arc::new(Semaphore::new(1)),
+            probes: Semaphore::new(0),
+            stage_slots: Arc::new(Semaphore::new(0)),
+            shutdown: CancellationToken::new(),
+            arc_cache: Default::default(),
+            metrics: Metrics::new(1),
+        };
+        let terminal = JobState::Done {
+            arrow: true,
+            graph_pages: 0,
+            completed_ms: now_ms(),
+        };
+        assert!(worker.publish_result(job_id, &job, &terminal).await);
+        server.abort();
+        let persisted = saved.lock().unwrap().take().expect("terminal CAS");
+        assert_eq!(persisted.attempt, job.attempt);
+        assert!(matches!(
+            persisted.state,
+            JobState::Done { arrow: true, .. }
+        ));
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 }

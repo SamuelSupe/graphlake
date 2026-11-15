@@ -1,7 +1,7 @@
 //! Authoritative HA state. Only immutable candidates are uploaded before the
 //! etcd transaction. A former owner cannot change the live catalog pointer.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::time::Instant;
@@ -17,7 +18,7 @@ use uuid::Uuid;
 use super::{Metadata, Objects, now_ms};
 use crate::{
     CancellationToken,
-    admin::{ApiResult, Error},
+    admin::{ApiResult, Error, models},
 };
 
 const LEASE_SECONDS: u64 = 6;
@@ -25,7 +26,10 @@ const LOCAL_VALIDITY: Duration = Duration::from_secs(3);
 const CONFIRM_TIMEOUT: Duration = Duration::from_millis(650);
 const CONFIRM_RETRY: Duration = Duration::from_millis(100);
 const HEARTBEAT: Duration = Duration::from_millis(450);
-const CATALOG_LIMIT: u64 = 128 * 1024 * 1024;
+const LEGACY_CATALOG_LIMIT: u64 = 128 * 1024 * 1024;
+const CATALOG_MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
+const CATALOG_BLOB_LIMIT: u64 = (8 * crate::admin::CATALOG_LIMIT) as u64;
+pub(in crate::admin) const CATALOG_BYTES_LIMIT: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(in crate::admin) struct Control {
@@ -201,6 +205,21 @@ pub(in crate::admin) struct CatalogState {
     pub files: BTreeMap<String, String>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum CatalogSnapshot {
+    Manifest {
+        entries: BTreeMap<String, CatalogObject>,
+    },
+    Inline(CatalogState),
+}
+
+#[derive(Deserialize, Serialize)]
+struct CatalogObject {
+    digest: String,
+    bytes: u64,
+}
+
 pub(in crate::admin) fn lost() -> Error {
     Error::new(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -338,18 +357,59 @@ impl Control {
         Ok(owned)
     }
 
-    async fn load_catalog(&self, generation: &str) -> ApiResult<CatalogState> {
-        if Uuid::parse_str(generation).is_err() {
-            return Err(unavailable());
-        }
+    async fn read_snapshot(&self, generation: &str) -> Result<CatalogSnapshot> {
+        ensure!(
+            Uuid::parse_str(generation).is_ok(),
+            "invalid catalog generation"
+        );
         let key = self.objects.control_catalog(generation);
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            self.objects.get_json(&key, CATALOG_LIMIT),
-        )
-        .await
-        .map_err(|_| timeout())?
-        .map_err(|_| unavailable())
+        self.objects.get_json(&key, LEGACY_CATALOG_LIMIT).await
+    }
+
+    async fn load_catalog(&self, generation: &str) -> ApiResult<CatalogState> {
+        let read = async {
+            match self.read_snapshot(generation).await? {
+                CatalogSnapshot::Inline(state) => Ok(state),
+                CatalogSnapshot::Manifest { entries } => {
+                    ensure!(
+                        entries
+                            .values()
+                            .fold(0u64, |sum, object| sum.saturating_add(object.bytes))
+                            <= CATALOG_BYTES_LIMIT,
+                        "catalog exceeds size limit"
+                    );
+                    let files = stream::iter(entries)
+                        .map(|(name, object)| async move {
+                            ensure!(
+                                models::versions::valid_revision(&object.digest)
+                                    && object.bytes <= CATALOG_BLOB_LIMIT,
+                                "invalid catalog object metadata"
+                            );
+                            let key = self.objects.control_catalog_blob(&object.digest);
+                            let result = self.objects.get(&key).await?;
+                            ensure!(
+                                result.meta.size == object.bytes,
+                                "catalog object length mismatch"
+                            );
+                            let data = result.bytes().await?;
+                            let contents = std::str::from_utf8(&data)?;
+                            ensure!(
+                                models::revision(contents) == object.digest,
+                                "catalog object checksum mismatch"
+                            );
+                            Ok::<_, anyhow::Error>((name, contents.to_owned()))
+                        })
+                        .buffer_unordered(8)
+                        .try_collect()
+                        .await?;
+                    Ok(CatalogState { files })
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), read)
+            .await
+            .map_err(|_| timeout())?
+            .map_err(|_| unavailable())
     }
 
     pub async fn acquire(&self, stop: &CancellationToken) -> Result<Arc<Leadership>> {
@@ -739,7 +799,7 @@ impl Leadership {
             comparisons
                 .push(json!({"key":key,"target":"CREATE","result":"EQUAL","create_revision":"0"}));
         }
-        let generation = self.store_catalog(state).await?;
+        let generation = self.store_catalog(state, None).await?;
         let puts = [
             ("catalog", encoded(&generation)?),
             ("policy", encoded(&policy)?),
@@ -762,26 +822,80 @@ impl Leadership {
         Ok(())
     }
 
-    pub async fn store_catalog(&self, state: &CatalogState) -> ApiResult<String> {
-        if !self.eligible() {
-            return Err(lost());
-        }
-        let data = serde_json::to_vec(state).map_err(|_| unavailable())?;
-        if data.len() as u64 > CATALOG_LIMIT {
+    pub async fn store_catalog(
+        &self,
+        state: &CatalogState,
+        previous: Option<&str>,
+    ) -> ApiResult<String> {
+        self.admission()?;
+        let mut bytes = 0u64;
+        let entries: BTreeMap<_, _> = state
+            .files
+            .iter()
+            .map(|(name, contents)| {
+                let size = contents.len() as u64;
+                bytes = bytes.saturating_add(size);
+                (
+                    name.clone(),
+                    CatalogObject {
+                        digest: models::revision(contents),
+                        bytes: size,
+                    },
+                )
+            })
+            .collect();
+        if bytes > CATALOG_BYTES_LIMIT
+            || entries.values().any(|file| file.bytes > CATALOG_BLOB_LIMIT)
+        {
             return Err(Error::invalid(
                 "cluster_catalog_limit",
-                "集群模型目录超过 128 MiB",
+                "集群模型目录超过 512 MiB 或单个文件超过 8 MiB",
             ));
         }
+        let snapshot = CatalogSnapshot::Manifest { entries };
+        let manifest = serde_json::to_vec(&snapshot).map_err(|_| unavailable())?;
+        if manifest.len() as u64 > CATALOG_MANIFEST_LIMIT {
+            return Err(Error::invalid(
+                "cluster_catalog_limit",
+                "集群模型目录索引超过 32 MiB",
+            ));
+        }
+        let CatalogSnapshot::Manifest { entries } = snapshot else {
+            unreachable!()
+        };
         let generation = Uuid::new_v4().to_string();
-        let key = self.control.objects.control_catalog(&generation);
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            self.control.objects.put_bytes(&key, data),
-        )
-        .await
-        .map_err(|_| timeout())?
-        .map_err(|_| unavailable())?;
+        let upload = async {
+            let mut saved: BTreeSet<String> = match previous {
+                Some(previous) => match self.control.read_snapshot(previous).await? {
+                    CatalogSnapshot::Manifest { entries } => {
+                        entries.into_values().map(|entry| entry.digest).collect()
+                    }
+                    CatalogSnapshot::Inline(_) => BTreeSet::new(),
+                },
+                None => BTreeSet::new(),
+            };
+            let objects = &self.control.objects;
+            stream::iter(
+                entries
+                    .into_iter()
+                    .filter(|(_, entry)| saved.insert(entry.digest.clone())),
+            )
+            .map(|(name, entry)| async move {
+                let key = objects.control_catalog_blob(&entry.digest);
+                objects
+                    .put_immutable(&key, state.files[&name].as_bytes().to_vec())
+                    .await
+            })
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>()
+            .await?;
+            let key = objects.control_catalog(&generation);
+            objects.put_immutable(&key, manifest).await
+        };
+        tokio::time::timeout(Duration::from_secs(10), upload)
+            .await
+            .map_err(|_| timeout())?
+            .map_err(|_| unavailable())?;
         Ok(generation)
     }
 
@@ -830,6 +944,76 @@ impl Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_manifests_keep_legacy_and_previous_receipts_readable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let objects = Objects::open(dir.path().to_str().unwrap(), "catalog-test")?;
+        let leader = Leadership {
+            control: Control::new(
+                Metadata::new(reqwest::Client::new(), Vec::new(), "catalog-test"),
+                objects.clone(),
+            ),
+            lease: "1".into(),
+            value: "test".into(),
+            window: Mutex::new(LeaseWindow {
+                until: Instant::now() + Duration::from_secs(30),
+                uncertain: CancellationToken::new(),
+                generation: 0,
+                loss: None,
+            }),
+            metrics: Arc::default(),
+            elected: false,
+            stop: CancellationToken::new(),
+        };
+        let api = |error: Error| anyhow::anyhow!(error.message);
+        let state = CatalogState {
+            files: BTreeMap::from([
+                ("one.yaml".into(), "first".into()),
+                ("two.yaml".into(), "unchanged".into()),
+            ]),
+        };
+        let legacy = Uuid::new_v4().to_string();
+        objects
+            .put_json(&objects.control_catalog(&legacy), &state)
+            .await?;
+        assert_eq!(
+            leader.load_catalog(&legacy).await.map_err(api)?.files,
+            state.files
+        );
+
+        let first = leader
+            .store_catalog(&state, Some(&legacy))
+            .await
+            .map_err(api)?;
+        let mut next = state.clone();
+        next.files.insert("one.yaml".into(), "second".into());
+        let second = leader
+            .store_catalog(&next, Some(&first))
+            .await
+            .map_err(api)?;
+        assert_eq!(
+            leader.load_catalog(&first).await.map_err(api)?.files,
+            state.files
+        );
+        assert_eq!(
+            leader.load_catalog(&second).await.map_err(api)?.files,
+            next.files
+        );
+        let blobs = dir
+            .path()
+            .join("graphlake-v1/catalog-test/control/catalog-blobs");
+        assert_eq!(std::fs::read_dir(blobs)?.count(), 3);
+
+        let key = objects.control_catalog_blob(&models::revision("second"));
+        objects.put_bytes(&key, b"forged".to_vec()).await?;
+        assert!(leader.load_catalog(&second).await.is_err());
+        assert_eq!(
+            leader.load_catalog(&first).await.map_err(api)?.files,
+            state.files
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn confirmation_failure_pauses_then_resumes_or_fences() -> Result<()> {

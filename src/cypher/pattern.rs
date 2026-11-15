@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     Catalog,
-    catalog::{columns, equal_keys, qualified},
+    catalog::{columns, equal_keys, ident, qualified},
     traversal::{Expansion, HOPS, PATH, PATH_NODES},
 };
 
@@ -350,9 +350,19 @@ pub(super) fn bind_pattern(
                 if !connects {
                     builder.predicates.push("FALSE".into());
                 } else if directed.is_none() && left_type == right_type {
-                    builder
-                        .predicates
-                        .push(format!("({forward} OR {})", keys(to, from)));
+                    let (source, target) = undirected_keys(builder, &alias, from, to);
+                    builder.predicates.push(equal_keys(
+                        &left,
+                        &catalog.nodes[&left_type].key,
+                        &alias,
+                        &source,
+                    ));
+                    builder.predicates.push(equal_keys(
+                        &right,
+                        &catalog.nodes[&right_type].key,
+                        &alias,
+                        &target,
+                    ));
                 } else {
                     builder.predicates.push(forward);
                 }
@@ -451,6 +461,45 @@ pub(super) fn bind_pattern(
         }
     }
     Ok(())
+}
+
+fn undirected_keys(
+    builder: &mut MatchPlan<'_>,
+    alias: &str,
+    from: &crate::Endpoint,
+    to: &crate::Endpoint,
+) -> (Vec<String>, Vec<String>) {
+    let generated = |side: &str| {
+        (0..from.columns.len())
+            .map(|index| format!("__graphlake_oriented_{side}_{index}"))
+            .collect::<Vec<_>>()
+    };
+    let left = generated("from");
+    let right = generated("to");
+    let (relation, _) = builder.relations.last_mut().expect("edge relation");
+    let select = |source: &crate::Endpoint, target: &crate::Endpoint| {
+        let endpoints = source
+            .columns
+            .iter()
+            .zip(&left)
+            .chain(target.columns.iter().zip(&right))
+            .map(|(column, name)| format!("{} AS {}", qualified(alias, column), ident(name)))
+            .collect::<Vec<_>>();
+        format!(
+            "SELECT {}.*, {} FROM {relation}",
+            ident(alias),
+            endpoints.join(", ")
+        )
+    };
+    let forward = select(from, to);
+    let reverse = select(to, from);
+    let same = equal_keys(alias, &from.columns, alias, &to.columns);
+    // A self-loop contributes one orientation. Parallel edge IDs stay intact.
+    *relation = format!(
+        "({forward} UNION ALL {reverse} WHERE NOT ({same})) AS {}",
+        ident(alias)
+    );
+    (left, right)
 }
 
 struct Segment {

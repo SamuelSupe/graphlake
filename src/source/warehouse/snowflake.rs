@@ -124,11 +124,6 @@ struct Column {
 
 impl Column {
     fn field(self) -> Result<Field> {
-        let temporal_unit = if self.scale.unwrap_or(9) <= 6 {
-            TimeUnit::Microsecond
-        } else {
-            TimeUnit::Nanosecond
-        };
         let data_type = match self.kind.to_ascii_lowercase().as_str() {
             "fixed" => match (self.precision, self.scale) {
                 (Some(1..=4), Some(0)) => DataType::Int16,
@@ -145,10 +140,14 @@ impl Column {
             "text" | "variant" | "object" | "array" => DataType::Utf8,
             "binary" => DataType::Binary,
             "date" => DataType::Date32,
-            "time" => DataType::Time64(temporal_unit),
-            "timestamp_ntz" => DataType::Timestamp(temporal_unit, None),
+            "time" => DataType::Time64(if self.scale.unwrap_or(9) <= 6 {
+                TimeUnit::Microsecond
+            } else {
+                TimeUnit::Nanosecond
+            }),
+            "timestamp_ntz" => DataType::Timestamp(TimeUnit::Microsecond, None),
             "timestamp_ltz" | "timestamp_tz" => {
-                DataType::Timestamp(temporal_unit, Some("UTC".into()))
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
             }
             _ => bail!(
                 "unsupported Snowflake column type {} for {}",

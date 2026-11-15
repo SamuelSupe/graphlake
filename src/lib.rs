@@ -8,6 +8,7 @@ mod cypher;
 mod engine;
 mod graph_options;
 mod gremlin;
+mod json_output;
 mod scalar;
 mod source;
 mod traversal;
@@ -20,6 +21,8 @@ pub use catalog::{
 pub use datafusion::{arrow, common::ScalarValue, execution::SendableRecordBatchStream};
 pub use engine::{Engine, EngineLimits, Language, QueryMetrics, QueryOptions, QueryResult};
 pub use graph_options::GraphOptions;
+#[doc(hidden)]
+pub use json_output::json_writer;
 pub use source::{ReadMetrics, SourceVersion};
 pub use tokio_util::sync::CancellationToken;
 pub use traversal::{

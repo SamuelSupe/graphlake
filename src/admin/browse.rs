@@ -125,6 +125,7 @@ async fn read(
                 timeout,
                 Arc::new(runtime),
                 stats,
+                1,
             ))
             .await?;
             if let Some(name) = relation {

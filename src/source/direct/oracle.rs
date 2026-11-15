@@ -214,23 +214,9 @@ fn arrow_schema(columns: &[ColumnInfo]) -> Result<datafusion::arrow::datatypes::
                     OracleType::BinaryFloat => DataType::Float32,
                     OracleType::BinaryDouble => DataType::Float64,
                     OracleType::Date => DataType::Timestamp(TimeUnit::Microsecond, None),
-                    OracleType::Timestamp(p) => DataType::Timestamp(
-                        if *p > 6 {
-                            TimeUnit::Nanosecond
-                        } else {
-                            TimeUnit::Microsecond
-                        },
-                        None,
-                    ),
-                    OracleType::TimestampTZ(p) | OracleType::TimestampLTZ(p) => {
-                        DataType::Timestamp(
-                            if *p > 6 {
-                                TimeUnit::Nanosecond
-                            } else {
-                                TimeUnit::Microsecond
-                            },
-                            Some("UTC".into()),
-                        )
+                    OracleType::Timestamp(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
+                    OracleType::TimestampTZ(_) | OracleType::TimestampLTZ(_) => {
+                        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
                     }
                     OracleType::Raw(_) | OracleType::BLOB => DataType::Binary,
                     OracleType::Varchar2(_)

@@ -752,3 +752,108 @@ async fn postgres_pushdown_preserves_null_keys_and_filtered_order() -> Result<()
     connection.await??;
     checked
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance in GRAPHLAKE_TEST_POSTGRES"]
+async fn postgres_special_values_preserve_float_nulls_and_report_unrepresentable_columns()
+-> Result<()> {
+    use datafusion::arrow::{
+        array::Float64Array,
+        datatypes::{DataType, TimeUnit},
+    };
+
+    let dsn = std::env::var("GRAPHLAKE_TEST_POSTGRES")?;
+    let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls).await?;
+    let connection = tokio::spawn(connection);
+    let schema = format!("graphlake_special_{}", uuid::Uuid::new_v4().simple());
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema};
+         CREATE TABLE {schema}.samples (
+            id bigint PRIMARY KEY, d date, ts timestamp, tz timestamptz,
+            decimal_value numeric(10,2), unrestricted numeric, f double precision
+         );
+         INSERT INTO {schema}.samples VALUES
+            (1,'infinity','infinity','infinity','NaN','Infinity','Infinity'),
+            (2,'-infinity','-infinity','-infinity',-1.5,'-Infinity','-Infinity'),
+            (3,'9999-12-31','9999-12-31 23:59:59.999999',
+                '9999-12-31 23:59:59.999999+00',2,'NaN','NaN'),
+            (4,NULL,NULL,NULL,NULL,NULL,NULL), (5,NULL,NULL,NULL,NULL,NULL,1.25);
+         CREATE VIEW {schema}.texts AS
+            SELECT id,d::text,ts::text,tz::text,decimal_value::text,unrestricted::text
+            FROM {schema}.samples;"
+        ))
+        .await?;
+    let result = async {
+        let yaml = format!(
+            "graph: pg\nsources:\n  db: {{type: postgres, dsn_env: GRAPHLAKE_TEST_POSTGRES}}\nnodes:\n  Sample: {{source: db.{schema}.samples, key: [id], properties: [d,ts,tz,decimal_value,f]}}\n  Text: {{source: db.{schema}.texts, key: [id], properties: [d,ts,tz,decimal_value,unrestricted]}}"
+        );
+        let export_dir = tempfile::tempdir()?;
+        let mut catalog: Catalog = serde_saphyr::from_str(&yaml)?;
+        catalog.export_locations.insert("reports".into(), export_dir.path().to_string_lossy().into_owned());
+        let engine = Engine::new(catalog)?;
+        let float_sql = r#"SELECT f FROM "Sample" ORDER BY id"#;
+        let mut query = engine.query(Language::Sql, float_sql, Default::default()).await?;
+        let mut actual = Vec::new();
+        while let Some(batch) = query.batches.try_next().await? {
+            let floats = batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+            actual.extend(floats.iter());
+        }
+        assert_eq!(actual[0], Some(f64::INFINITY));
+        assert_eq!(actual[1], Some(f64::NEG_INFINITY));
+        assert!(actual[2].unwrap().is_nan());
+        assert_eq!(actual[3..], [None, Some(1.25)]);
+        let config = tempfile::NamedTempFile::new()?;
+        std::fs::write(config.path(), &yaml)?;
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_graphlake"))
+            .arg("--catalog").arg(config.path())
+            .args(["query", "--language", "sql", float_sql])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let json = String::from_utf8(output.stdout)?;
+        let lines = json.lines().map(serde_json::from_str).collect::<serde_json::Result<Vec<serde_json::Value>>>()?;
+        assert_eq!(lines, vec![
+            serde_json::json!({"f":"Infinity"}), serde_json::json!({"f":"-Infinity"}),
+            serde_json::json!({"f":"NaN"}), serde_json::json!({"f":null}),
+            serde_json::json!({"f":1.25}),
+        ]);
+        let mut export = engine.query(Language::Sql,
+            &format!("EXPORT TO 'reports:samples.csv' {float_sql}"), Default::default()).await?;
+        rows(&mut export).await?;
+        assert_eq!(std::fs::read_to_string(export_dir.path().join("samples.csv"))?,
+            "f\nInfinity\n-Infinity\nNaN\n\n1.25\n");
+        for (column, value, id) in [
+            ("d", "infinity", 1), ("ts", "-infinity", 2), ("tz", "infinity", 1), ("decimal_value", "NaN", 1)
+        ] {
+            let sql = format!(r#"SELECT {column} FROM "Sample" WHERE id = {id}"#);
+            let attempt = async {
+                let mut query = engine.query(Language::Sql, &sql, Default::default()).await?;
+                query.batches.try_next().await?;
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            let message = format!("{:#}", attempt.unwrap_err());
+            assert!(message.contains(column) && message.contains(value) && message.contains("PostgreSQL view"), "{message}");
+        }
+        let mut finite = engine.query(Language::Sql,
+            r#"SELECT d,ts,tz,decimal_value FROM "Sample" WHERE id = 3"#, Default::default()).await?;
+        let batch = finite.batches.try_next().await?.unwrap();
+        assert_eq!(
+            batch.schema().fields().iter().map(|f| f.data_type().clone()).collect::<Vec<_>>(),
+            [DataType::Date32, DataType::Timestamp(TimeUnit::Microsecond,None),
+             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), DataType::Decimal128(10,2)]
+        );
+        let mut text = engine.query(Language::Sql,
+            r#"SELECT d,ts,tz,decimal_value,unrestricted FROM "Text" WHERE id in (1,2) ORDER BY id"#,
+            Default::default()).await?;
+        let values = rows(&mut text).await?;
+        assert_eq!(values[0], serde_json::json!({"d":"infinity","ts":"infinity","tz":"infinity","decimal_value":"NaN","unrestricted":"Infinity"}));
+        assert_eq!(values[1], serde_json::json!({"d":"-infinity","ts":"-infinity","tz":"-infinity","decimal_value":"-1.50","unrestricted":"-Infinity"}));
+        Ok(())
+    }.await;
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await?;
+    drop(client);
+    connection.await??;
+    result
+}

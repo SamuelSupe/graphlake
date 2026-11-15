@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -39,10 +39,13 @@ struct Label<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct TopologyFields<'a>(pub Option<&'a str>);
 
+pub(super) type KeyChecks = Mutex<BTreeMap<String, Vec<(String, String)>>>;
+
 pub(super) struct Tables<'a> {
     pub raw: &'a BTreeMap<&'a str, Raw>,
     pub postgres: &'a BTreeMap<String, Arc<PgTable>>,
     pub proven_key_label: Option<&'a str>,
+    pub parquet_keys: &'a KeyChecks,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -216,6 +219,7 @@ pub(super) async fn register(
         let mut table = Raw {
             schema: Arc::clone(frame.schema().inner()),
             alias,
+            parquet_versions: None,
         };
         #[cfg(feature = "admin")]
         let neighbor_read = read.exploration.is_some();
@@ -486,7 +490,17 @@ async fn bind_label(
         && mapping.inputs.is_empty()
         && mapping.scd2.is_none()
     {
-        let unique = if tables.proven_key_label == Some(name) {
+        // Only complete scans may establish a proof for the pinned file set.
+        let full_scan = scope.options.graph.logical_partition.is_empty();
+        #[cfg(feature = "admin")]
+        let full_scan = full_scan && read.exploration.is_none() && read.distributed.is_none();
+        let parquet = tables.raw[mapping.source]
+            .parquet_versions
+            .as_ref()
+            .filter(|_| full_scan);
+        let cached = parquet
+            .is_some_and(|objects| tables.parquet_keys.lock().unwrap().get(name) == Some(objects));
+        let unique = if cached || tables.proven_key_label == Some(name) {
             true
         } else {
             match tables.postgres.get(mapping.source) {
@@ -529,6 +543,13 @@ async fn bind_label(
                     )
                     .context(ValidationSite::field(name, "key", None)));
                 }
+            }
+            if let Some(objects) = parquet {
+                tables
+                    .parquet_keys
+                    .lock()
+                    .unwrap()
+                    .insert(name.into(), objects.clone());
             }
         }
     }

@@ -7,8 +7,7 @@ use datafusion::arrow::{
     array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
         Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray, UInt8Array,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, UInt8Array,
     },
     datatypes::{DataType, SchemaRef, TimeUnit},
 };
@@ -113,24 +112,6 @@ pub(crate) fn batch(
                         TimestampMicrosecondArray::from(cells).with_timezone_opt(timezone.clone()),
                     )
                 }
-                DataType::Timestamp(TimeUnit::Nanosecond, timezone) => {
-                    let cells = values()
-                        .map(|value| {
-                            value
-                                .map(|value| {
-                                    timestamp(value, timezone.is_some(), encoding)?
-                                        .timestamp_nanos_opt()
-                                        .context(
-                                            "warehouse timestamp exceeds Arrow nanosecond range",
-                                        )
-                                })
-                                .transpose()
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Arc::new(
-                        TimestampNanosecondArray::from(cells).with_timezone_opt(timezone.clone()),
-                    )
-                }
                 DataType::Decimal128(precision, scale) => {
                     let cells = values()
                         .map(|value| {
@@ -205,4 +186,45 @@ fn hex(value: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|index| Ok(u8::from_str_radix(&value[index..index + 2], 16)?))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{Field, Schema};
+
+    #[test]
+    fn wide_range_timestamps_keep_microsecond_precision() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "local",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "utc",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let rows = vec![
+            vec![
+                Some("9999-12-31 23:59:59.123456789".into()),
+                Some("9999-12-31T23:59:59.123456789Z".into()),
+            ],
+            vec![None, None],
+        ];
+        let batch = batch(schema, &rows, Encoding::Rfc3339)?;
+        for column in batch.columns() {
+            let values = column
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(
+                values.iter().collect::<Vec<_>>(),
+                [Some(253402300799123456), None]
+            );
+        }
+        Ok(())
+    }
 }

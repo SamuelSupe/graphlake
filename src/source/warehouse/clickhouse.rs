@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::{
@@ -9,10 +9,10 @@ use datafusion::{
         memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
     },
 };
-use reqwest::header::ACCEPT;
+use serde::Deserialize;
 
 use super::{Http, credential};
-use crate::{Source, catalog::ident, source::ReadStats};
+use crate::{Comparison, Source, catalog::ident, source::ReadStats};
 
 pub(crate) struct ClickHouse {
     http: Http,
@@ -87,16 +87,41 @@ impl ClickHouse {
         explain_only: bool,
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, String)> {
         let relation = relation.split('.').map(ident).collect::<Vec<_>>().join(".");
-        let selected = columns
+        let metadata_columns = self.describe(&relation, batch_size).await?;
+        let dates: BTreeSet<_> = metadata_columns
             .iter()
-            .map(|column| ident(column))
+            .filter(|column| {
+                let ty = column.kind.trim_end_matches(')');
+                matches!(
+                    ty,
+                    "Date"
+                        | "Nullable(Date"
+                        | "LowCardinality(Date"
+                        | "LowCardinality(Nullable(Date"
+                )
+            })
+            .map(|column| column.name.as_str())
+            .collect();
+        let selected = if columns.is_empty() {
+            metadata_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+        } else {
+            columns.iter().map(String::as_str).collect()
+        };
+        let selected = selected
+            .into_iter()
+            .map(|name| {
+                let column = ident(name);
+                if dates.contains(name) {
+                    format!("toDate32({column}) AS {column}")
+                } else {
+                    column
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        let selected = if explain_only && columns.is_empty() {
-            "*".into()
-        } else {
-            selected
-        };
         let mut sql = format!("SELECT {selected} FROM {relation}");
         let expected = if filters.is_empty() && !explain_only {
             None
@@ -113,9 +138,39 @@ impl ClickHouse {
                 return Ok(metadata);
             }
             let schema = metadata.0.schema();
-            sql.push_str(&crate::engine::read_filters::where_clause(
-                filters, &schema, ident,
-            ));
+            let terms = filters
+                .iter()
+                .filter_map(|filter| {
+                    crate::engine::read_filters::sql_term(filter, &schema, ident).or_else(|| {
+                        // ClickHouse String uses byte equality. FixedString and Enum
+                        // have different comparison semantics.
+                        if filter.op != Comparison::Eq
+                            || !metadata_columns.iter().any(|col| {
+                                col.name == filter.column
+                                    && matches!(
+                                        col.kind.as_str(),
+                                        "String"
+                                            | "Nullable(String)"
+                                            | "LowCardinality(String)"
+                                            | "LowCardinality(Nullable(String))"
+                                    )
+                            })
+                        {
+                            return None;
+                        }
+                        let value = filter.value.as_str()?;
+                        let mut hex = String::with_capacity(value.len() * 2);
+                        for byte in value.as_bytes() {
+                            use std::fmt::Write;
+                            write!(hex, "{byte:02x}").expect("writing to String");
+                        }
+                        Some(format!("{} = unhex('{hex}')", ident(&filter.column)))
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !terms.is_empty() {
+                sql.push_str(&format!(" WHERE {}", terms.join(" AND ")));
+            }
             Some(schema)
         };
         let result = self
@@ -133,13 +188,35 @@ impl ClickHouse {
         Ok(result)
     }
 
-    async fn read(
+    async fn describe(&mut self, relation: &str, batch_size: usize) -> Result<Vec<Column>> {
+        let (mut response, _) = self
+            .request(
+                format!("DESCRIBE TABLE {relation} FORMAT JSONEachRow"),
+                batch_size,
+            )
+            .await?;
+        let mut bytes = Vec::new();
+        let budget = MemoryConsumer::new("GraphLake ClickHouse schema").register(&self.http.pool);
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= 1024 * 1024,
+                "ClickHouse schema exceeds 1 MiB"
+            );
+            budget.try_grow(chunk.len())?;
+            bytes.extend_from_slice(&chunk);
+        }
+        let columns = serde_json::Deserializer::from_slice(&bytes)
+            .into_iter()
+            .collect::<std::result::Result<Vec<Column>, _>>()?;
+        ensure!(!columns.is_empty(), "ClickHouse table has no columns");
+        Ok(columns)
+    }
+
+    async fn request(
         &mut self,
         sql: String,
-        columns: &[String],
         batch_size: usize,
-        disk: Option<&Arc<DiskManager>>,
-    ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, String)> {
+    ) -> Result<(reqwest::Response, String)> {
         let id = uuid::Uuid::new_v4().to_string();
         let timeout = self.timeout.as_secs_f64().to_string();
         let batch = batch_size.to_string();
@@ -148,13 +225,8 @@ impl ClickHouse {
                 .http
                 .client
                 .post(self.http.base.clone())
-                .header(ACCEPT, "application/vnd.apache.arrow.stream")
                 .basic_auth(&self.user, Some(self.password.as_deref().unwrap_or("")))
-                .query(&[
-                    ("query_id", id.as_str()),
-                    ("readonly", "1"),
-                    ("wait_end_of_query", "1"),
-                ]);
+                .query(&[("query_id", id.as_str()), ("readonly", "1")]);
             let request = if server_settings {
                 request
             } else {
@@ -198,6 +270,17 @@ impl ClickHouse {
             response.headers().get(EXCEPTION_CODE).is_none(),
             "ClickHouse query failed"
         );
+        Ok((response, id))
+    }
+
+    async fn read(
+        &mut self,
+        sql: String,
+        columns: &[String],
+        batch_size: usize,
+        disk: Option<&Arc<DiskManager>>,
+    ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, String)> {
+        let (mut response, id) = self.request(sql, batch_size).await?;
         let raw = MemoryConsumer::new("GraphLake ClickHouse IPC input").register(&self.http.pool);
         let mut decoder = StreamDecoder::new();
         let mut snapshot = crate::source::snapshot::Buffer::new(&self.http.pool, disk);
@@ -242,4 +325,11 @@ impl ClickHouse {
         };
         Ok((table, budget, id))
     }
+}
+
+#[derive(Deserialize)]
+struct Column {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
 }

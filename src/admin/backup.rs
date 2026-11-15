@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -18,7 +18,9 @@ use super::{
 };
 use crate::CancellationToken;
 
-const LIMIT: usize = 132 * 1024 * 1024;
+// The backup still uses the portable v1 JSON format, including the files
+// rather than references into the HA object store.
+const LIMIT: u64 = 2 * super::cluster::control::CATALOG_BYTES_LIMIT + 4 * 1024 * 1024;
 const FORMAT: u32 = 1;
 
 #[derive(Deserialize, Serialize)]
@@ -264,7 +266,22 @@ fn format_error(error: Error) -> anyhow::Error {
 }
 
 fn checksum(state: &State) -> Result<String> {
-    Ok(Sha256::digest(serde_json::to_vec(state)?)
+    struct HashWriter(Sha256);
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, state)?;
+    Ok(writer
+        .0
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
@@ -295,14 +312,13 @@ pub(super) fn read(file: &Path) -> Result<Backup> {
     let file = options.open(file)?;
     let metadata = file.metadata()?;
     ensure!(
-        metadata.is_file() && metadata.len() <= LIMIT as u64,
+        metadata.is_file() && metadata.len() <= LIMIT,
         "invalid backup file"
     );
     super::auth::private_permissions(&metadata, true)?;
-    let mut bytes = Vec::new();
-    file.take(LIMIT as u64 + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= LIMIT, "backup exceeds size limit");
-    let backup: Backup = serde_json::from_slice(&bytes).context("invalid HA backup")?;
+    let mut reader = BufReader::new(file.take(LIMIT + 1));
+    let backup: Backup = serde_json::from_reader(&mut reader).context("invalid HA backup")?;
+    ensure!(reader.into_inner().limit() > 0, "backup exceeds size limit");
     ensure!(backup.format == FORMAT, "unsupported HA backup format");
     ensure!(
         checksum(&backup.state)? == backup.sha256,
@@ -338,7 +354,7 @@ fn write(path: &Path, state: State) -> Result<u64> {
     serde_json::to_writer(&mut temp, &backup)?;
     temp.flush()?;
     ensure!(
-        temp.as_file().metadata()?.len() <= LIMIT as u64,
+        temp.as_file().metadata()?.len() <= LIMIT,
         "backup exceeds size limit"
     );
     temp.as_file().sync_all()?;

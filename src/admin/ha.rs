@@ -121,7 +121,7 @@ impl Ha {
                     .map_err(|e| anyhow::anyhow!(e.message))?;
                 let state = capture(local).map_err(|e| anyhow::anyhow!(e.message))?;
                 let generation = leader
-                    .store_catalog(&state)
+                    .store_catalog(&state, None)
                     .await
                     .map_err(|e| anyhow::anyhow!(e.message))?;
                 ensure!(
@@ -378,7 +378,7 @@ async fn mutate_inner(
     let generation = if state.files == base.files {
         pointer.0.clone()
     } else {
-        ha.leader.store_catalog(&state).await?
+        ha.leader.store_catalog(&state, Some(&pointer.0)).await?
     };
     let mut receipt = Receipt {
         fingerprint,

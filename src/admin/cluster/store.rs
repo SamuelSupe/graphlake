@@ -400,6 +400,14 @@ impl Objects {
             .join(generation)
     }
 
+    pub fn control_catalog_blob(&self, digest: &str) -> Key {
+        self.prefix
+            .clone()
+            .join("control")
+            .join("catalog-blobs")
+            .join(digest)
+    }
+
     pub fn artifact(&self, id: Uuid, attempt: Uuid, name: &str) -> Key {
         self.prefix
             .clone()
@@ -421,6 +429,17 @@ impl Objects {
     pub async fn put_bytes(&self, key: &Key, bytes: Vec<u8>) -> Result<()> {
         self.store.put(key, bytes.into()).await?;
         Ok(())
+    }
+
+    pub async fn put_immutable(&self, key: &Key, bytes: Vec<u8>) -> Result<()> {
+        match self
+            .store
+            .put_opts(key, bytes.into(), PutMode::Create.into())
+            .await
+        {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub async fn model(&self, model: &str, revision: &str, yaml: String) -> Result<()> {

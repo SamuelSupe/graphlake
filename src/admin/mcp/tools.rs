@@ -256,7 +256,7 @@ pub(super) async fn call(
         "get_schema" => {
             let arg: ModelArg = parse(args)?;
             access::check_query(app, principal, &arg.model)?;
-            let revision = app.models.lock().unwrap().require_published(&arg.model)?;
+            let revision = app.published_model_revision(&arg.model).await?;
             let Json(schema) =
                 models::schema(state, Path((arg.model, revision.clone())), actor).await?;
             Ok(Json(json!({"model_revision":revision, "schema":schema})).into_response())
@@ -285,7 +285,7 @@ pub(super) async fn call(
             }
             let revision = match arg.model_revision {
                 Some(value) => value,
-                None => app.models.lock().unwrap().require_published(&arg.model)?,
+                None => app.published_model_revision(&arg.model).await?,
             };
             let request = parse(
                 json!({"request_id":uuid::Uuid::new_v4().to_string(),"model_revision":revision,"language":arg.language,"query":arg.query,

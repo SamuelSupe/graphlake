@@ -74,6 +74,28 @@ async fn duckdb_reads_exact_values_from_a_read_only_file_and_keeps_materialized_
             .sum::<usize>(),
         1
     );
+    std::fs::copy(&path, dir.path().join("other.duckdb"))?;
+    let multi = std::fs::read_to_string(&model)?.replace(
+        "nodes:\n",
+        "  other: {type: duckdb, path: other.duckdb}\nnodes:\n",
+    ) + "  Mirror: {source: other.main.accounts, key: [id], properties: [amount]}\n";
+    std::fs::write(&model, multi)?;
+    let multi = Engine::new(Catalog::load(&model)?)?;
+    let mut result = multi
+        .query(
+            Language::Cypher,
+            "MATCH (a:Account {id:9007199254740993}), (b:Mirror {id:9007199254740993})
+         RETURN a.id AS left, b.id AS right",
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut result).await?,
+        [serde_json::json!({
+            "left": 9007199254740993i64, "right": 9007199254740993i64
+        })]
+    );
+
     let mut old = engine
         .query(
             Language::Sql,

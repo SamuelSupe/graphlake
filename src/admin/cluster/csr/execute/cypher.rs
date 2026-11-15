@@ -997,10 +997,13 @@ fn walks<'a>(
                 frontier = next;
             }
         } else {
-            let root = [start];
+            let memo = WalkAdjacency {
+                links: Default::default(),
+                budget: graph.budget.new_empty(),
+            };
             let mut nodes = vec![start];
             let mut edges = Vec::new();
-            let mut stack = vec![adjacency(execution, &root, if max == 1 { targets } else { None }, filters)];
+            let mut stack = vec![memo.read(execution, start, if max == 1 { targets } else { None }, filters)];
             if expansion.min == 0 && targets.is_none_or(|targets| targets.contains(&start)) { yield (nodes.clone(), Vec::new()); }
             if max == 0 { return; }
             while let Some(next) = stack.last_mut() {
@@ -1011,7 +1014,7 @@ fn walks<'a>(
                     if edges.len() >= expansion.min && targets.is_none_or(|targets| targets.contains(&to)) { yield (nodes.clone(), edges.clone()); }
                     if edges.len() < max {
                         let terminal = if edges.len()+1 == max { targets } else { None };
-                        stack.push(adjacency(execution, &nodes[nodes.len()-1..], terminal, filters));
+                        stack.push(memo.read(execution, to, terminal, filters));
                     } else {
                         nodes.pop();
                         edges.pop();
@@ -1026,12 +1029,62 @@ fn walks<'a>(
     })
 }
 
+type Link = (Vertex, Vertex, u64);
+
+struct WalkAdjacency {
+    links: std::sync::Mutex<BTreeMap<(Vertex, bool), Arc<Vec<Link>>>>,
+    budget: MemoryReservation,
+}
+
+impl WalkAdjacency {
+    fn read<'a>(
+        &'a self,
+        execution: &'a Execution<'a>,
+        vertex: Vertex,
+        targets: Option<&'a BTreeSet<Vertex>>,
+        filters: &'a [(u32, Vec<String>)],
+    ) -> futures::stream::BoxStream<'a, Result<Link>> {
+        const MAX_VERTICES: usize = 128;
+        const MAX_LINKS: usize = 64;
+        let key = (vertex, targets.is_some());
+        let cached = self.links.lock().unwrap().get(&key).cloned();
+        Box::pin(async_stream::try_stream! {
+            if let Some(links) = cached {
+                for &link in links.iter() { yield link; }
+                return;
+            }
+            let mut stream = adjacency(execution, &[vertex], targets, filters);
+            let mut saved = Some(Vec::new());
+            let temp = self.budget.new_empty();
+            while let Some(link) = stream.try_next().await? {
+                if let Some(batch) = &mut saved {
+                    if batch.len() < MAX_LINKS && temp.try_grow(2 * std::mem::size_of::<Link>()).is_ok() {
+                        batch.push(link);
+                    } else {
+                        saved = None;
+                        temp.free();
+                    }
+                }
+                yield link;
+            }
+            if let Some(batch) = saved {
+                let mut links = self.links.lock().unwrap();
+                if links.len() < MAX_VERTICES && !links.contains_key(&key)
+                    && self.budget.try_grow(temp.size() + 160).is_ok()
+                {
+                    links.insert(key, Arc::new(batch));
+                }
+            }
+        })
+    }
+}
+
 fn adjacency<'a>(
     execution: &'a Execution<'a>,
     vertices: &[Vertex],
     targets: Option<&'a BTreeSet<Vertex>>,
     filters: &'a [(u32, Vec<String>)],
-) -> futures::stream::BoxStream<'a, Result<(Vertex, Vertex, u64)>> {
+) -> futures::stream::BoxStream<'a, Result<Link>> {
     let mut groups = BTreeMap::<usize, BTreeSet<Vertex>>::new();
     for &vertex in vertices {
         groups

@@ -47,25 +47,15 @@ pub(crate) struct Plan {
     pub graph_output: crate::engine::query_graph::GraphOutput,
 }
 
+const MAX_EXPRESSION_SQL_BYTES: usize = 256 * 1024;
+
 pub(crate) fn plan(
     catalog: &Catalog,
     query: &str,
     partitioned_csr: bool,
     indexed_csr: bool,
 ) -> Result<Plan> {
-    // Bound recursive AST depth in the third-party Cypher parser and renderer.
-    let complexity = query
-        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
-        .filter(|word| !word.is_empty())
-        .count()
-        + query
-            .chars()
-            .filter(|ch| matches!(ch, '(' | '[' | '{' | '+' | '-' | '^' | '/'))
-            .count();
-    ensure!(
-        complexity <= 384,
-        "Cypher statement exceeds the supported expression complexity"
-    );
+    check_expression_complexity(query, "Cypher statement")?;
     let wrapped = paths::rewrite_count_subqueries(query)?;
     let (text, mut extensions) = paths::parse_wrappers(&wrapped)?;
     extensions.partitioned_csr = partitioned_csr;
@@ -136,6 +126,10 @@ pub(crate) fn plan(
         extensions.shortest.is_empty(),
         "shortest path function must wrap a MATCH path pattern"
     );
+    ensure!(
+        result.sql.len() <= 1024 * 1024,
+        "Cypher plan exceeds the generated SQL size limit"
+    );
     result.has_row_expressions = exists.0;
     result.has_row_expression_lambda = result.sql.contains("__graphlake_row_expression_")
         && result.sql.contains("array_transform(");
@@ -196,6 +190,46 @@ impl OrderKey {
             sort_term(&column, self.descending)
         }
     }
+}
+
+// Bound recursive descent in the expression parser and subsequent AST walks.
+pub(crate) fn check_expression_complexity(input: &str, context: &str) -> Result<()> {
+    let input = input.as_bytes();
+    let mut cost = 0;
+    let mut cursor = 0;
+    let mut word = false;
+    while cursor < input.len() {
+        let ch = input[cursor];
+        if let Some(end) = paths::skip_literal(input, cursor)? {
+            cost += usize::from(matches!(ch, b'\'' | b'"' | b'`'));
+            cursor = end;
+            word = false;
+        } else {
+            let next_word = ch.is_ascii_alphanumeric() || ch == b'_' || !ch.is_ascii();
+            cost += usize::from(
+                next_word && !word
+                    || matches!(
+                        ch,
+                        b'(' | b'[' | b'{' | b'+' | b'-' | b'^' | b'/' | b'*' | b'%' | b'.'
+                    ),
+            );
+            word = next_word;
+            cursor += 1;
+        }
+        ensure!(
+            cost <= 384,
+            "{context} exceeds the supported expression complexity"
+        );
+    }
+    Ok(())
+}
+
+fn bounded_expression(sql: String) -> Result<String> {
+    ensure!(
+        sql.len() <= MAX_EXPRESSION_SQL_BYTES,
+        "Cypher expression exceeds the generated SQL size limit"
+    );
+    Ok(sql)
 }
 
 fn sort_term(expression: &str, descending: bool) -> String {
@@ -595,6 +629,10 @@ impl<'a> MatchPlan<'a> {
     }
 
     fn expr_with_aliases(&self, expression: &Expr, aliases: &Aliases) -> Result<String> {
+        bounded_expression(self.render_expression(expression, aliases)?)
+    }
+
+    fn render_expression(&self, expression: &Expr, aliases: &Aliases) -> Result<String> {
         let render = |expr: &Expr| self.expr_with_aliases(expr, aliases);
         match &expression.kind {
             ExprKind::Property { base, key } => {
@@ -1223,8 +1261,13 @@ impl<'a> MatchPlan<'a> {
                 } else {
                     arg
                 };
+                let aggregate_function = if function == "sum" {
+                    "__graphlake_cypher_sum"
+                } else {
+                    &function
+                };
                 let aggregate = format!(
-                    "{function}({}{arg})",
+                    "{aggregate_function}({}{arg})",
                     if *distinct { "DISTINCT " } else { "" }
                 );
                 if function == "sum" {
@@ -1284,7 +1327,7 @@ impl<'a> MatchPlan<'a> {
         } else {
             len
         };
-        Ok(format!(
+        bounded_expression(format!(
             "CASE WHEN {} THEN NULL ELSE array_slice({list}, ({start}) + 1, {end}) END",
             nulls.join(" OR ")
         ))

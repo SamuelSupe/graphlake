@@ -190,8 +190,7 @@ fn field(meta: &FieldMetadata) -> Result<Field> {
         TypeId::BINARY | TypeId::VARBINARY | TypeId::BSTRING => DataType::Binary,
         TypeId::DAYDATE => DataType::Date32,
         TypeId::SECONDTIME => DataType::Time64(TimeUnit::Microsecond),
-        TypeId::SECONDDATE => DataType::Timestamp(TimeUnit::Microsecond, None),
-        TypeId::LONGDATE => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        TypeId::SECONDDATE | TypeId::LONGDATE => DataType::Timestamp(TimeUnit::Microsecond, None),
         kind => bail!(
             "unsupported SAP HANA type {kind:?} for {}",
             meta.displayname()

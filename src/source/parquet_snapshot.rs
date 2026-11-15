@@ -144,8 +144,15 @@ pub(crate) fn select_rows(
     rows: usize,
     deleted: &[usize],
 ) -> PartitionedFile {
+    match row_selection(rows, deleted) {
+        Some(selection) => file.with_extension(ParquetRowSelection::new(selection)),
+        None => file,
+    }
+}
+
+pub(crate) fn row_selection(rows: usize, deleted: &[usize]) -> Option<RowSelection> {
     if deleted.is_empty() {
-        return file;
+        return None;
     }
     let mut selectors = Vec::with_capacity(deleted.len() * 2 + 1);
     let mut next = 0;
@@ -159,5 +166,5 @@ pub(crate) fn select_rows(
     if next < rows {
         selectors.push(RowSelector::select(rows - next));
     }
-    file.with_extension(ParquetRowSelection::new(RowSelection::from(selectors)))
+    Some(RowSelection::from(selectors))
 }

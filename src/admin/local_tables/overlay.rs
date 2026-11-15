@@ -8,23 +8,32 @@ use anyhow::{Result, ensure};
 use datafusion::arrow::{
     array::{Array, Int64Array},
     compute::cast,
-    datatypes::DataType,
+    datatypes::{DataType, Schema},
 };
 use parquet::arrow::{
-    ProjectionMask,
+    ArrowWriter, ProjectionMask,
     arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
 };
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-use super::{load::staging_file, row_groups::signed_bounds};
+use super::{
+    load::{staging_file, writer_properties},
+    row_groups::signed_bounds,
+};
 use crate::{
     engine::QueryScope,
-    source::parquet_snapshot::{MAX_DELETED, MAX_PARTS, Part, Snapshot, parts_dir},
+    source::parquet_snapshot::{MAX_DELETED, MAX_PARTS, Part, Snapshot, parts_dir, row_selection},
 };
 
 pub(super) const MAX_DELTA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_COMPACTED_BYTES: u64 = 64 * 1024 * 1024;
 const SCATTERED_GROUPS: usize = 8;
+
+pub(super) struct Prepared {
+    pub snapshot: Snapshot,
+    pub compacted: Option<NamedTempFile>,
+}
 
 pub(super) fn prepare(
     anchor: &Path,
@@ -32,7 +41,7 @@ pub(super) fn prepare(
     delta: File,
     key: &str,
     scope: &QueryScope,
-) -> Result<Option<Snapshot>> {
+) -> Result<Option<Prepared>> {
     scope.check()?;
     let delta_meta = metadata(&delta)?;
     let Some(leaf) = key_leaf(&delta_meta, key) else {
@@ -41,10 +50,11 @@ pub(super) fn prepare(
     let delta_rows = row_count(&delta_meta)?;
     let mut keys = Vec::with_capacity(delta_rows);
     let projection = ProjectionMask::leaves(delta_meta.parquet_schema(), [leaf]);
-    for batch in ParquetRecordBatchReaderBuilder::new_with_metadata(delta, delta_meta.clone())
-        .with_projection(projection)
-        .with_batch_size(scope.options.batch_size)
-        .build()?
+    for batch in
+        ParquetRecordBatchReaderBuilder::new_with_metadata(delta.try_clone()?, delta_meta.clone())
+            .with_projection(projection)
+            .with_batch_size(scope.options.batch_size)
+            .build()?
     {
         scope.check()?;
         let array = cast(batch?.column(0), &DataType::Int64)?;
@@ -53,9 +63,6 @@ pub(super) fn prepare(
     keys.sort_unstable();
 
     let mut changed = if let Some(previous) = &previous {
-        if previous.parts.len() >= MAX_PARTS {
-            return Ok(None);
-        }
         previous.parts.clone()
     } else {
         vec![Part {
@@ -65,7 +72,7 @@ pub(super) fn prepare(
         }]
     };
     let mut total_deleted = 0;
-    for part in &mut changed {
+    for (index, part) in changed.iter_mut().enumerate() {
         scope.check()?;
         let file = File::open(if previous.is_some() {
             part.path(anchor)
@@ -122,19 +129,111 @@ pub(super) fn prepare(
         part.deleted.sort_unstable();
         part.deleted.dedup();
         total_deleted += part.deleted.len();
-        if total_deleted > MAX_DELETED {
+        if index == 0 && total_deleted > MAX_DELETED {
             return Ok(None);
         }
     }
+
+    let (rows, compacted) = if changed.len() >= MAX_PARTS || total_deleted > MAX_DELETED {
+        let Some((rows, file)) = compact_deltas(anchor, &changed[1..], delta, &delta_meta, scope)?
+        else {
+            return Ok(None);
+        };
+        changed.truncate(1);
+        (rows, Some(file))
+    } else {
+        (delta_rows, None)
+    };
     changed.push(Part {
         id: Uuid::new_v4(),
-        rows: delta_rows,
+        rows,
         deleted: Vec::new(),
     });
-    Ok(Some(Snapshot {
-        generation: Uuid::new_v4(),
-        parts: changed,
+    Ok(Some(Prepared {
+        snapshot: Snapshot {
+            generation: Uuid::new_v4(),
+            parts: changed,
+        },
+        compacted,
     }))
+}
+
+fn compact_deltas(
+    anchor: &Path,
+    deltas: &[Part],
+    incoming: File,
+    incoming_meta: &ArrowReaderMetadata,
+    scope: &QueryScope,
+) -> Result<Option<(usize, NamedTempFile)>> {
+    let file = staging_file(anchor.parent().expect("managed local table path"))?;
+    // A previous delta may allow nulls in a field that the latest source
+    // declares non-null. The logical field types have already been checked.
+    let schema = incoming_meta.schema();
+    let schema = std::sync::Arc::new(Schema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ));
+    let mut writer = ArrowWriter::try_new(file.reopen()?, schema, Some(writer_properties()))?;
+    let mut rows = 0;
+    // The masks already include all incoming keys. Reading the surviving rows
+    // preserves exactly one version of each key, without visiting the base.
+    for part in deltas {
+        let live = part.rows - part.deleted.len();
+        if live == 0 {
+            continue;
+        }
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(part.path(anchor))?)?
+            .with_batch_size(scope.options.batch_size);
+        if let Some(selection) = row_selection(part.rows, &part.deleted) {
+            reader = reader.with_row_selection(selection);
+        }
+        if !append_batches(&mut writer, reader.build()?, &mut rows, scope)? {
+            return Ok(None);
+        }
+    }
+    let reader =
+        ParquetRecordBatchReaderBuilder::new_with_metadata(incoming, incoming_meta.clone())
+            .with_batch_size(scope.options.batch_size)
+            .build()?;
+    if !append_batches(&mut writer, reader, &mut rows, scope)? {
+        return Ok(None);
+    }
+    let expected = deltas
+        .iter()
+        .map(|part| part.rows - part.deleted.len())
+        .sum::<usize>()
+        + row_count(incoming_meta)?;
+    ensure!(
+        rows == expected,
+        "local Parquet delta compaction row count changed"
+    );
+    writer.close()?;
+    Ok((file.as_file().metadata()?.len() <= MAX_COMPACTED_BYTES).then_some((rows, file)))
+}
+
+fn append_batches(
+    writer: &mut ArrowWriter<File>,
+    reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+    rows: &mut usize,
+    scope: &QueryScope,
+) -> Result<bool> {
+    for batch in reader {
+        scope.check()?;
+        let batch = batch?;
+        writer.write(&batch)?;
+        *rows += batch.num_rows();
+        if writer.memory_size() > scope.options.memory_bytes / 8 {
+            writer.flush()?;
+        }
+        if writer.bytes_written() as u64 > MAX_COMPACTED_BYTES {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn metadata(file: &File) -> Result<ArrowReaderMetadata> {

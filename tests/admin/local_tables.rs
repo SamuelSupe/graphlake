@@ -417,7 +417,10 @@ async fn local_tables_scattered_overlay_reads_recovers_and_compacts() -> Result<
     assert_eq!(run["total_rows"], last + 1);
     let committed = fs::read(path)?;
     assert!(committed.starts_with(b"GLPQ1\n"));
+    let first_manifest: Value = serde_json::from_slice(&committed[6..])?;
+    let base_id = first_manifest["parts"][0]["id"].as_str().unwrap();
     let parts = Path::new(path).with_extension("parts");
+    let base_path = parts.join(format!("{base_id}.parquet"));
     let files = fs::read_dir(&parts)?.collect::<std::io::Result<Vec<_>>>()?;
     assert_eq!(files.len(), 2);
     #[cfg(unix)]
@@ -474,20 +477,44 @@ async fn local_tables_scattered_overlay_reads_recovers_and_compacts() -> Result<
     );
     assert_eq!(fs::read(path)?, committed);
 
-    // Repeated writes of key 1 must mask its older delta-file positions. At
-    // the part limit a full merge compacts the live rows and reclaims old files.
+    // Repeated writes of key 1 mask its older delta-file positions. Compaction
+    // streams the surviving delta rows, including inserts absent from the base.
     for version in last + 2..=last + 16 {
         parquet_rows(&source, &[(1, "again", version)])?;
         let run = load(&server, "overlay", "incremental").await?;
         assert_eq!(run["status"], "succeeded", "{run}");
         assert_eq!(run["total_rows"], last + 1);
     }
-    assert!(fs::read(path)?.starts_with(b"PAR1"));
-    assert_eq!(fs::read_dir(parts)?.count(), 0);
+    let compacted = fs::read(path)?;
+    assert!(compacted.starts_with(b"GLPQ1\n"));
+    let compacted: Value = serde_json::from_slice(&compacted[6..])?;
+    assert_eq!(compacted["parts"].as_array().unwrap().len(), 2);
+    assert_eq!(compacted["parts"][0], first_manifest["parts"][0]);
+    assert_eq!(compacted["parts"][1]["rows"], changed.len());
+    assert_eq!(fs::read_dir(&parts)?.count(), 2);
+    #[cfg(unix)]
+    assert_eq!(fs::metadata(&base_path)?.ino(), base.metadata()?.ino());
+
+    // The consolidated part also carries the latest committed watermark.
+    drop(server);
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    parquet_rows(
+        &source,
+        &[
+            (1, "again", last + 16),
+            (last + 2, "next", last + 16),
+            (last + 3, "old", last + 15),
+        ],
+    )?;
+    let replay = load(&server, "overlay", "incremental").await?;
+    assert_eq!(replay["status"], "succeeded", "{replay}");
+    assert_eq!(replay["loaded_rows"], 2);
     let result = rows(root.path(), path).await?;
-    assert_eq!(result.len(), (last + 1) as usize);
+    assert_eq!(result.len(), (last + 2) as usize);
     assert_eq!(result[0], (1, "again".into(), last + 16));
-    assert_eq!(result.last(), Some(&(last + 1, "new".into(), last + 1)));
+    assert_eq!(result[(last) as usize], (last + 1, "new".into(), last + 1));
+    assert_eq!(result.last(), Some(&(last + 2, "next".into(), last + 16)));
     Ok(())
 }
 

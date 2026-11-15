@@ -297,10 +297,16 @@ async fn load(
                     overlay::prepare(&anchor, previous, staged, &key, &worker_scope)
                 })
                 .await??
-                    && overlay::publish(path, &delta, snapshot.is_none(), &next, scope)?
+                    && overlay::publish(
+                        path,
+                        next.compacted.as_ref().unwrap_or(&delta),
+                        snapshot.is_none(),
+                        &next.snapshot,
+                        scope,
+                    )?
                 {
                     clean_parts(path);
-                    return Ok((loaded, next.rows()));
+                    return Ok((loaded, next.snapshot.rows()));
                 }
             }
             if snapshot.is_none() {
@@ -328,7 +334,18 @@ async fn load(
                 .map(|name| format!("p.{} = i.{}", ident(name), ident(name)))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            let merged = context.sql(&format!("SELECT p.* FROM previous p LEFT ANTI JOIN incoming i ON {keys} UNION ALL SELECT * FROM incoming")).await?;
+            // Manifest scans have no exact row statistics. Build the hash
+            // table on the known-small input when compacting the whole base.
+            let join = if snapshot.is_some() && loaded <= scope.options.batch_size as u64 {
+                "incoming i RIGHT ANTI JOIN previous p"
+            } else {
+                "previous p LEFT ANTI JOIN incoming i"
+            };
+            let merged = context
+                .sql(&format!(
+                    "SELECT p.* FROM {join} ON {keys} UNION ALL SELECT * FROM incoming"
+                ))
+                .await?;
             let output = staging_file(root)?;
             let total = write(merged, output.as_file().try_clone()?, scope).await?;
             (output, total)

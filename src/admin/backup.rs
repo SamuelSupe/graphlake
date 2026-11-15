@@ -22,6 +22,7 @@ use crate::CancellationToken;
 // rather than references into the HA object store.
 const LIMIT: u64 = 2 * super::cluster::control::CATALOG_BYTES_LIMIT + 4 * 1024 * 1024;
 const FORMAT: u32 = 1;
+const MANUAL_BACKUPS: usize = 16;
 
 #[derive(Deserialize, Serialize)]
 struct State {
@@ -223,15 +224,34 @@ fn persist_export(dir: PathBuf, state: ApiResult<State>) -> ApiResult<Exported> 
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
         uuid::Uuid::new_v4().simple()
     );
-    let result = state.and_then(|state| {
-        write(&dir.join(&file), state).map_err(|_| {
-            Error::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "backup_write_failed",
-                "校验或写入备份失败，请检查模型归档和目录权限",
-            )
-        })
-    });
+    let result =
+        state.and_then(|state| {
+            let files = fs::read_dir(&dir).map_err(|_| Error::storage())?;
+            let mut count = 0;
+            for entry in files {
+                let entry = entry.map_err(|_| Error::storage())?;
+                if entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("control-manual-") && name.ends_with(".json")
+                }) && entry.file_type().map_err(|_| Error::storage())?.is_file()
+                {
+                    count += 1;
+                    if count >= MANUAL_BACKUPS {
+                        return Err(Error::new(
+                            StatusCode::INSUFFICIENT_STORAGE,
+                            "backup_retention_limit",
+                            "手动备份目录已保留 16 份备份，请移走已有备份后重试",
+                        ));
+                    }
+                }
+            }
+            write(&dir.join(&file), state).map_err(|_| {
+                Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "backup_write_failed",
+                    "校验或写入备份失败，请检查模型归档和目录权限",
+                )
+            })
+        });
     let status = record_export_status(
         &dir.join(MANUAL_STATUS),
         result

@@ -665,6 +665,11 @@ where
         let in_transaction = self.transaction.is_some();
         if in_transaction {
             self.results.ensure_capacity()?;
+            for pending in self.results.results.values_mut() {
+                if let Some(buffered) = pending.records.buffer_for_next_run().await? {
+                    pending.records = buffered;
+                }
+            }
         }
 
         let result = self
@@ -686,7 +691,7 @@ where
         );
         meta.insert("t_first".into(), BoltValue::Integer(0));
 
-        // Buffer results for PULL. Auto-commit mode has a single result.
+        // Retain results for PULL. Auto-commit mode has a single result.
         if !in_transaction {
             self.results.clear();
         }

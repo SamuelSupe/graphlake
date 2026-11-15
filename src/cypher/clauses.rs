@@ -160,6 +160,19 @@ impl Value {
     }
 
     pub(super) fn inferred(plan: &MatchPlan, expr: &Expr, aliases: &Aliases) -> Self {
+        if !super::expression_step() {
+            return Self::Scalar;
+        }
+        if matches!(
+            expr.kind,
+            ExprKind::ListComprehension { .. } | ExprKind::PatternComprehension { .. }
+        ) {
+            return match plan.list_item(expr, aliases) {
+                Self::Entity(binding) => Self::EntityList(binding),
+                value if value.is_nested_item() => Self::NestedList(Box::new(value)),
+                _ => Self::Scalar,
+            };
+        }
         if let ExprKind::Variable(name) = &expr.kind
             && let Some((_, value)) = aliases.get(&name.0)
         {
@@ -204,6 +217,9 @@ impl Value {
     }
 
     pub(super) fn nested_item(plan: &MatchPlan, expr: &Expr, aliases: &Aliases) -> Option<Self> {
+        if !super::expression_step() {
+            return None;
+        }
         match &expr.kind {
             ExprKind::Variable(name) => match aliases.get(&name.0) {
                 Some((_, Self::NestedList(item))) => Some(*item.clone()),
@@ -211,8 +227,8 @@ impl Value {
                 None => plan.nested_lists.get(&name.0).cloned(),
             },
             ExprKind::Slice { base, .. } => Self::nested_item(plan, base, aliases),
-            ExprKind::PatternComprehension { .. } => {
-                let (_, item) = pattern_list(plan.catalog?, plan, aliases, expr, false).ok()?;
+            ExprKind::PatternComprehension { .. } | ExprKind::ListComprehension { .. } => {
+                let item = plan.list_item(expr, aliases);
                 item.is_nested_item().then_some(item)
             }
             ExprKind::List(items) => {
@@ -243,23 +259,6 @@ impl Value {
                     .into_iter(),
             )
             .filter(Self::is_nested_item),
-            ExprKind::ListComprehension {
-                variable,
-                list,
-                projection,
-                ..
-            } => {
-                let Some(projection) = projection else {
-                    return Self::nested_item(plan, list, aliases);
-                };
-                let mut scope = aliases.clone();
-                scope.insert(
-                    variable.0.clone(),
-                    (String::new(), plan.list_item(list, aliases)),
-                );
-                let value = Self::inferred(plan, projection, &scope);
-                value.is_nested_item().then_some(value)
-            }
             ExprKind::FunctionCall { name, args, .. } if name.0.eq_ignore_ascii_case("collect") => {
                 let [item] = args.as_slice() else { return None };
                 let item = Self::inferred(plan, item, aliases);
@@ -1591,41 +1590,54 @@ fn join_match(
         }
     }
     let mut filter = None;
-    let mut predicate_scope = MatchPlan::new(catalog);
-    predicate_scope.call_imports = extensions.call_imports.clone();
-    predicate_scope.indexed_csr = plan.indexed_csr;
-    predicate_scope.partitioned_csr = extensions.partitioned_csr;
+    let new_predicate_scope = || {
+        let mut scope = MatchPlan::new(catalog);
+        scope.call_imports = extensions.call_imports.clone();
+        scope.indexed_csr = plan.indexed_csr;
+        scope.partitioned_csr = extensions.partitioned_csr;
+        scope
+    };
+    let mut predicate_scope = new_predicate_scope();
+    let mut optional_filter = None;
     if !consume_predicate && let Some(where_clause) = &pattern.where_clause {
-        left.scope.bind("l", &mut predicate_scope);
-        if let Some(anchor) = &bound_anchor {
-            let mut matched = right_columns.clone();
-            matched.columns.remove(anchor);
-            matched.bind("r", &mut predicate_scope);
-        } else {
-            right_columns.bind("r", &mut predicate_scope);
-        }
-        let expression = predicate_scope.expr(where_clause)?;
         let mut exists = HasExists(false);
         opencypher::Visitor::visit_expr(&mut exists, where_clause);
-        if exists.0 || !predicate_scope.expression_joins.borrow().is_empty() {
-            filter = Some(expression);
+        if pattern.optional && exists.0 {
+            optional_filter = Some(where_clause);
         } else {
-            join.push(expression);
+            left.scope.bind("l", &mut predicate_scope);
+            if let Some(anchor) = &bound_anchor {
+                let mut matched = right_columns.clone();
+                matched.columns.remove(anchor);
+                matched.bind("r", &mut predicate_scope);
+            } else {
+                right_columns.bind("r", &mut predicate_scope);
+            }
+            let expression = predicate_scope.expr(where_clause)?;
+            let uses_joins = !predicate_scope.expression_joins.borrow().is_empty();
+            if pattern.optional && uses_joins {
+                optional_filter = Some(where_clause);
+                predicate_scope = new_predicate_scope();
+            } else if exists.0 || uses_joins {
+                filter = Some(expression);
+            } else {
+                join.push(expression);
+            }
         }
     }
     if join.is_empty() {
         join.push("TRUE".into());
     }
     let join = join.join(" AND ");
-    let sql = if let Some(filter) = filter.as_ref().filter(|_| pattern.optional) {
+    let sql = if let Some(predicate) = optional_filter {
         // Correlated predicates must be evaluated on the matched candidates.
         // Left joining those candidates by input row keeps one null row for
         // unmatched inputs, including duplicate rows from an earlier UNWIND.
-        let mut row = format!("__graphlake_optional_row_{}", pattern.span.start);
-        while scope.columns.contains_key(&row) {
-            row.push('_');
+        let mut row_name = format!("__graphlake_optional_row_{}", pattern.span.start);
+        while scope.columns.contains_key(&row_name) {
+            row_name.push('_');
         }
-        let row = ident(&row);
+        let row = ident(&row_name);
         let table = format!("__graphlake_optional_input_{}", pattern.span.start);
         plan.calls.push(super::apply::Apply {
             table: table.clone(),
@@ -1644,18 +1656,59 @@ fn join_match(
             .columns
             .keys()
             .filter(|name| !left.scope.columns.contains_key(*name))
-            .map(|name| format!(", {}", qualified("r", name)))
+            .map(|name| format!(", {}", qualified("c", name)))
             .collect::<String>();
         if project.is_empty() {
             project.push("1 AS __graphlake_seed".into());
         }
-        let from = predicate_scope.join_expressions(&format!(
-            " FROM {table} AS l JOIN ({right_sql}) AS r ON {join}"
-        ));
+        let mut candidates = scope.clone();
+        let mut fields = vec![qualified("l", &row_name)];
+        for name in candidates.columns.keys() {
+            let right =
+                right_columns.columns.contains_key(name) && bound_anchor.as_ref() != Some(name);
+            fields.push(qualified(if right { "r" } else { "l" }, name));
+        }
+        candidates.columns.extend(
+            right_columns
+                .columns
+                .iter()
+                .filter(|(name, _)| bound_anchor.as_ref() != Some(*name))
+                .map(|(name, kind)| (name.clone(), kind.clone())),
+        );
+        candidates.bind("c", &mut predicate_scope);
+        let filter = predicate_scope.expr(predicate)?;
+        let candidate_sql = format!(
+            "SELECT {} FROM {table} AS l JOIN ({right_sql}) AS r ON {join}",
+            fields.join(", "),
+        );
+        let from = if predicate_scope
+            .expression_joins
+            .borrow()
+            .iter()
+            .any(|expression| !expression.captures.is_empty())
+        {
+            // The predicate joins read candidates separately to form their
+            // distinct capture keys. Reuse one join result for both reads.
+            let candidate_table = format!("__graphlake_optional_candidates_{}", pattern.span.start);
+            plan.calls.push(super::apply::Apply {
+                table: candidate_table.clone(),
+                seed: String::new(),
+                outer: candidate_sql,
+                inner: String::new(),
+                nested: Vec::new(),
+                lookups: Vec::new(),
+                limit: None,
+                mode: super::apply::Mode::Materialize,
+            });
+            format!(" FROM {} AS c", ident(&candidate_table))
+        } else {
+            format!(" FROM ({candidate_sql}) AS c")
+        };
+        let from = predicate_scope.join_expressions(&from);
         format!(
             "SELECT {projection} FROM {table} AS l
              LEFT JOIN (
-               SELECT l.{row}{right_fields}{from} WHERE {filter}
+               SELECT c.{row}{right_fields}{from} WHERE {filter}
              ) AS r ON l.{row} = r.{row}",
             projection = project.join(", "),
         )

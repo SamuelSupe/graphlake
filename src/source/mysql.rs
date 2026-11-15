@@ -332,12 +332,28 @@ fn field(
     Ok(Field::new(name, data_type, true))
 }
 
-fn values<T: FromValue>(rows: &mut [Row], column: usize) -> Result<Vec<Option<T>>> {
+fn values<T: FromValue>(rows: &mut [Row], column: usize, field: &Field) -> Result<Vec<Option<T>>> {
     rows.iter_mut()
         .map(|row| {
             row.take_opt::<Option<T>, _>(column)
                 .context("missing MySQL value")?
-                .map_err(|_| anyhow::anyhow!("cannot decode MySQL column at index {column}"))
+                .map_err(|error| {
+                    let name = field.name();
+                    let temporal = matches!(field.data_type(), DataType::Date32 | DataType::Timestamp(_, _));
+                    let zero_date = match error.0 {
+                        Value::Date(year, month, day, ..) => year == 0 || month == 0 || day == 0,
+                        Value::Bytes(text) if temporal && text.len() >= 10 => {
+                            text[4] == b'-' && text[7] == b'-'
+                                && (&text[..4] == b"0000" || &text[5..7] == b"00" || &text[8..10] == b"00")
+                        }
+                        _ => false,
+                    };
+                    if zero_date && temporal {
+                        anyhow::anyhow!("MySQL column {name} contains a zero date; expose it as a text column in the source table")
+                    } else {
+                        anyhow::anyhow!("cannot decode MySQL column {name}")
+                    }
+                })
         })
         .collect()
 }
@@ -350,7 +366,7 @@ fn to_batch(schema: SchemaRef, rows: &mut [Row]) -> Result<RecordBatch> {
         .map(|(i, field)| -> Result<ArrayRef> {
             macro_rules! collect {
                 ($ty:ty, $array:ty) => {
-                    Arc::new(<$array>::from(values::<$ty>(rows, i)?))
+                    Arc::new(<$array>::from(values::<$ty>(rows, i, field)?))
                 };
             }
             let array: ArrayRef = match field.data_type() {
@@ -367,19 +383,19 @@ fn to_batch(schema: SchemaRef, rows: &mut [Row]) -> Result<RecordBatch> {
                 DataType::Float64 => collect!(f64, Float64Array),
                 DataType::Utf8 => collect!(String, StringArray),
                 DataType::Binary => {
-                    let cells = values::<Vec<u8>>(rows, i)?;
+                    let cells = values::<Vec<u8>>(rows, i, field)?;
                     Arc::new(BinaryArray::from_iter(cells.iter().map(Option::as_deref)))
                 }
                 DataType::Date32 => {
                     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("Unix epoch");
                     Arc::new(Date32Array::from_iter(
-                        values::<NaiveDate>(rows, i)?
+                        values::<NaiveDate>(rows, i, field)?
                             .into_iter()
                             .map(|date| date.map(|date| (date - epoch).num_days() as i32)),
                     ))
                 }
                 DataType::Timestamp(_, timezone) => {
-                    let timestamps = values::<NaiveDateTime>(rows, i)?
+                    let timestamps = values::<NaiveDateTime>(rows, i, field)?
                         .into_iter()
                         .map(|value| value.map(|value| value.and_utc().timestamp_micros()));
                     Arc::new(
@@ -388,7 +404,7 @@ fn to_batch(schema: SchemaRef, rows: &mut [Row]) -> Result<RecordBatch> {
                     )
                 }
                 DataType::Decimal128(precision, scale) => {
-                    let decimals = values::<String>(rows, i)?
+                    let decimals = values::<String>(rows, i, field)?
                         .into_iter()
                         .map(|value| value.map(|value| decimal128(&value, *scale)).transpose())
                         .collect::<Result<Vec<_>>>()?;

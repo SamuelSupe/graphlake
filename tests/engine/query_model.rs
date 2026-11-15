@@ -656,16 +656,43 @@ async fn gremlin_branches_and_until_operate_on_each_traverser() -> Result<()> {
 async fn graph_queries_bound_expanded_expressions_before_sql_planning() -> Result<()> {
     let (_files, engine) = local_fixture("key: [tenant, id]")?;
     let slices = format!("RETURN [1,2,3]{} AS value", "[1..]".repeat(16));
+    let subscripts = format!("RETURN [1]{} AS value", "[0]".repeat(1500));
     let math = format!(
         "g.V().limit(1).math('{}_{}')",
         "(".repeat(2000),
         ")".repeat(2000)
     );
     let filters = format!("g.V(){}.count()", ".filter(__.has('id'))".repeat(25));
+    let union = format!(
+        "g.V(){}.count()",
+        ".union(__.identity(),__.identity())".repeat(25)
+    );
+    let coalesce = format!(
+        "g.V(){}.count()",
+        ".coalesce(__.identity(),__.identity())".repeat(20)
+    );
+    let choose = format!(
+        "g.V(){}.count()",
+        ".choose(__.has('id'),__.identity(),__.identity())".repeat(20)
+    );
+    let using = format!("USING {{SnapShotTime:{}1}} RETURN 1", "-".repeat(6000));
     for (language, query, expected) in [
         (Language::Cypher, slices, "generated SQL size limit"),
+        (
+            Language::Cypher,
+            subscripts,
+            "Cypher statement exceeds the supported expression complexity",
+        ),
         (Language::Gremlin, math, "expression complexity"),
         (Language::Gremlin, filters, "correlated plan size limit"),
+        (Language::Gremlin, union, "correlated plan size limit"),
+        (Language::Gremlin, coalesce, "correlated plan size limit"),
+        (Language::Gremlin, choose, "correlated plan size limit"),
+        (
+            Language::Cypher,
+            using,
+            "USING options exceeds the supported expression complexity",
+        ),
     ] {
         let error = engine
             .query(language, &query, Default::default())
@@ -678,6 +705,64 @@ async fn graph_queries_bound_expanded_expressions_before_sql_planning() -> Resul
 }
 
 #[tokio::test]
+async fn flat_lists_wide_projections_and_independent_branch_filters_remain_valid() -> Result<()> {
+    let (_files, engine) = local_fixture("key: [tenant, id]")?;
+    let ids = (1..=800).collect::<Vec<_>>();
+    let options = QueryOptions::default().with_parameters_json(&json!({"ids":ids}).to_string())?;
+    let columns = (0..130)
+        .map(|i| format!("a.id AS col{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            &format!("MATCH (a:Account) WHERE a.id IN $ids RETURN {columns}"),
+            options,
+        )
+        .await?;
+    assert_eq!(result.batches.schema().fields().len(), 130);
+    assert_eq!(rows(&mut result).await?.len(), 4);
+    let list = format!("{}[17]{}", "[x IN ".repeat(40), " | x]".repeat(40));
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            &format!("RETURN {list} AS xs"),
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(rows(&mut result).await?, [json!({"xs":[17]})]);
+    let values = (1..=800)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            &format!("RETURN 797 IN [{values}] AS hit, -1 IN [{values}] AS miss"),
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(rows(&mut result).await?, [json!({"hit":true,"miss":false})]);
+    let filters = vec!["__.filter(__.has('id'))"; 12].join(", ");
+    for (query, expected) in [
+        (
+            format!("g.V().hasLabel('Account').has('id',within({values})).count()"),
+            4,
+        ),
+        (
+            format!("g.V().hasLabel('Account').union({filters}).count()"),
+            48,
+        ),
+    ] {
+        let mut result = engine
+            .query(Language::Gremlin, &query, Default::default())
+            .await?;
+        assert_eq!(rows(&mut result).await?, [json!({"value":expected})]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn cypher_reports_arithmetic_and_sum_overflow() -> Result<()> {
     let (_files, engine) = local_fixture("key: [tenant, id]")?;
     for query in [
@@ -685,6 +770,7 @@ async fn cypher_reports_arithmetic_and_sum_overflow() -> Result<()> {
         "MATCH (a:Account) RETURN a.tenant * 9223372036854775807 AS value",
         "UNWIND [9223372036854775807, 1] AS n RETURN sum(n) AS value",
         "UNWIND [9223372036854775807, 1, 1] AS n RETURN sum(DISTINCT n) AS value",
+        "UNWIND [[3,9223372036854775807],[3,1],[5,7]] AS pair RETURN pair[0] AS bucket, sum(pair[1]) AS value",
     ] {
         let result = async {
             let mut result = engine
@@ -707,6 +793,57 @@ async fn cypher_reports_arithmetic_and_sum_overflow() -> Result<()> {
             "{query}: {error:#}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn narrow_cypher_integers_widen_and_gremlin_sum_reports_overflow() -> Result<()> {
+    use graphlake::arrow::array::{ArrayRef, Int8Array, Int32Array, StringArray};
+    let (files, engine) = local_fixture("key: [tenant, id]")?;
+    for (tenant, operator, expected) in [
+        (
+            Arc::new(Int8Array::from(vec![100; 2])) as ArrayRef,
+            "+",
+            200_i64,
+        ),
+        (
+            Arc::new(Int32Array::from(vec![50_000; 2])) as ArrayRef,
+            "*",
+            2_500_000_000,
+        ),
+    ] {
+        let batch = RecordBatch::try_from_iter([
+            ("tenant", tenant),
+            ("id", Arc::new(Int64Array::from(vec![1, i64::MAX])) as _),
+            (
+                "status",
+                Arc::new(StringArray::from(vec!["active"; 2])) as _,
+            ),
+        ])?;
+        let path = files.path().join("replacement.parquet");
+        std::fs::write(&path, super::parquet(&batch)?)?;
+        std::fs::rename(path, files.path().join("accounts.parquet"))?;
+        let mut result = engine
+            .query(
+                Language::Cypher,
+                &format!("MATCH (a:Account) RETURN a.tenant {operator} a.tenant AS value"),
+                Default::default(),
+            )
+            .await?;
+        assert_eq!(rows(&mut result).await?, vec![json!({"value":expected}); 2]);
+    }
+    let result = async {
+        let mut sum = engine
+            .query(
+                Language::Gremlin,
+                "g.V().hasLabel('Account').values('id').sum()",
+                Default::default(),
+            )
+            .await?;
+        rows(&mut sum).await
+    }
+    .await;
+    assert!(format!("{:#}", result.expect_err("checked Gremlin sum")).contains("overflow"));
     Ok(())
 }
 

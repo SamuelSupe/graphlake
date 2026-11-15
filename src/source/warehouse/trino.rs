@@ -318,14 +318,8 @@ impl Column {
             "varbinary" | "ObjectId" | "objectid" => DataType::Binary,
             "date" => DataType::Date32,
             "time" => DataType::Time64(units()?),
-            "timestamp" => {
-                units()?;
-                DataType::Timestamp(TimeUnit::Microsecond, None)
-            }
-            "timestamp with time zone" => {
-                units()?;
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-            }
+            "timestamp" => DataType::Timestamp(units()?, None),
+            "timestamp with time zone" => DataType::Timestamp(units()?, Some("UTC".into())),
             "decimal" => {
                 let (p, s) = precision
                     .and_then(|value| value.split_once(','))

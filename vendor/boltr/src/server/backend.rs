@@ -59,6 +59,11 @@ pub trait RecordStream: Send {
     async fn next(&mut self) -> Result<Option<BoltRecord>, BoltError>;
     fn summary(&self) -> BoltDict;
     fn discard(&mut self);
+    /// Optionally release backend resources before another RUN in the
+    /// transaction while retaining this result for a subsequent PULL.
+    async fn buffer_for_next_run(&mut self) -> Result<Option<Box<dyn RecordStream>>, BoltError> {
+        Ok(None)
+    }
     /// When a retained result must release its backend resources.
     fn deadline(&self) -> Option<tokio::time::Instant> {
         None

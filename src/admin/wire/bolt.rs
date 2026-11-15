@@ -302,7 +302,7 @@ impl BoltBackend for Backend {
         } else {
             timeout(extra)?
         };
-        let mut result = super::execute(
+        let result = super::execute(
             &self.app,
             target,
             Language::Cypher,
@@ -319,22 +319,10 @@ impl BoltBackend for Backend {
             columns: result.columns.clone(),
             extra: BoltDict::new(),
         };
-        let records: Box<dyn RecordStream> =
-            if let Some(tx) = pinned.filter(|_| self.app.options.spill_bytes > 0) {
-                // A client can RUN again before it PULLs this result. Finish the
-                // engine stream now to release admission and its memory reservation.
-                let limit = self.app.options.spill_bytes.min(64 * 1024 * 1024);
-                let spool = tokio::time::timeout_at(
-                    tx.deadline.into(),
-                    TransactionResult::capture(&mut result, limit, tx.deadline),
-                )
-                .await
-                .map_err(|_| result_expired())??;
-                Box::new(spool)
-            } else {
-                Box::new(result)
-            };
-        Ok(ResultStream { metadata, records })
+        Ok(ResultStream {
+            metadata,
+            records: Box::new(result),
+        })
     }
 
     async fn begin_transaction(
@@ -440,6 +428,23 @@ impl Backend {
 
 #[async_trait::async_trait]
 impl RecordStream for Rows {
+    async fn buffer_for_next_run(&mut self) -> Result<Option<Box<dyn RecordStream>>, BoltError> {
+        let limit = self.app.options.spill_bytes.min(64 * 1024 * 1024);
+        if limit == 0 || self.finished {
+            return Ok(None);
+        }
+        // Only a second RUN needs to free the first stream's query slot.
+        // The normal RUN/PULL sequence can stream directly from the engine.
+        let deadline = self.deadline;
+        let spool = tokio::time::timeout_at(
+            deadline.into(),
+            TransactionResult::capture(self, limit, deadline),
+        )
+        .await
+        .map_err(|_| result_expired())??;
+        Ok(Some(Box::new(spool)))
+    }
+
     fn deadline(&self) -> Option<tokio::time::Instant> {
         Some(self.deadline.into())
     }

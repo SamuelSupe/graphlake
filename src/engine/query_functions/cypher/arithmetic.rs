@@ -69,7 +69,30 @@ fn result_type(a: &DataType, op: Operator, b: &DataType) -> Result<DataType> {
     {
         return Ok(ty);
     }
+    let (a, b) = integer_lanes(a, b);
     BinaryTypeCoercer::new(a, &op, b).get_result_type()
+}
+
+fn integer_lanes<'a>(a: &'a DataType, b: &'a DataType) -> (&'a DataType, &'a DataType) {
+    fn narrow(ty: &DataType) -> bool {
+        matches!(
+            ty,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+        )
+    }
+    if (a.is_integer() || a.is_null()) && (b.is_integer() || b.is_null()) {
+        (
+            if narrow(a) { &DataType::Int64 } else { a },
+            if narrow(b) { &DataType::Int64 } else { b },
+        )
+    } else {
+        (a, b)
+    }
 }
 
 fn concatenate(
@@ -152,7 +175,8 @@ impl ScalarUDFImpl for Arithmetic {
                     values.push(concatenate(a.clone(), b.clone(), &ty, nulls)?);
                     continue;
                 }
-                let coercer = BinaryTypeCoercer::new(a.data_type(), &self.op, b.data_type());
+                let (left, right) = integer_lanes(a.data_type(), b.data_type());
+                let coercer = BinaryTypeCoercer::new(left, &self.op, right);
                 let (left_type, right_type) = coercer.get_input_types()?;
                 let result_type = coercer.get_result_type()?;
                 // Only the rows where both lanes are active belong to this type pair.

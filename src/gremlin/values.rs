@@ -274,7 +274,7 @@ impl Traversers<'_> {
             name: "limit",
             args: vec!["1"],
         });
-        let (table, row, cte) = self.seed_rows(2)?;
+        let (table, row, cte) = self.seed_rows();
         let mut matches = self.per_row(&table, &row, &cte);
         matches.apply(&steps, depth + 1)?;
         self.absorb(&matches);
@@ -396,15 +396,7 @@ impl Traversers<'_> {
         self.record_values(fields, &by, true, false, depth)
     }
 
-    fn seed_rows(&mut self, references: usize) -> Result<(String, String, String)> {
-        // The SQL planner inlines this CTE once per reference. A small SQL
-        // string can otherwise produce an exponentially large logical plan.
-        let copies = self.inline_copies.get().saturating_mul(references);
-        ensure!(
-            copies <= 256,
-            "Gremlin traversal exceeds the correlated plan size limit"
-        );
-        self.inline_copies.set(copies);
+    fn seed_rows(&mut self) -> (String, String, String) {
         let table = ident(&self.fresh("seed"));
         let row = self.fresh("row");
         let cte = format!(
@@ -413,7 +405,7 @@ impl Traversers<'_> {
             ident(&row),
             self.sql
         );
-        Ok((table, row, cte))
+        (table, row, cte)
     }
 
     fn per_row(&self, table: &str, row: &str, cte: &str) -> Self {
@@ -447,7 +439,7 @@ impl Traversers<'_> {
             names.iter().collect::<BTreeSet<_>>().len() == names.len(),
             "duplicate output field"
         );
-        let (table, row, cte) = self.seed_rows(names.len() + 1)?;
+        let (table, row, cte) = self.seed_rows();
         let mut joins = Vec::new();
         let mut items = Vec::new();
         let mut fields = Vec::new();
@@ -629,7 +621,7 @@ impl Traversers<'_> {
         } else if let Some(rows) = self.group_property_rows(key_by, &key, &mut ctes)? {
             rows
         } else {
-            let (seed, row, seed_cte) = self.seed_rows(2)?;
+            let (seed, row, seed_cte) = self.seed_rows();
             let mut keys = self.per_row(&seed, &row, &seed_cte);
             keys.modulate(key_by, depth)?;
             let value = keys.group_key();

@@ -53,6 +53,7 @@ pub(crate) fn using<'a>(text: &'a str, options: &mut GraphOptions) -> Result<&'a
     ensure!(rest.starts_with('{'), "expected USING {{...}}");
     let end = map_end(rest)?;
     ensure!(end <= 8 * 1024, "USING options exceed 8 KiB");
+    crate::cypher::check_expression_complexity(&rest[..end], "USING options")?;
     let ExprKind::Map(items) = parse_expr(&rest[..end])?.kind else {
         bail!("expected USING options map");
     };

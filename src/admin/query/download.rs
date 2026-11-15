@@ -10,7 +10,7 @@ use super::*;
 
 const SNAPSHOTS_PER_OWNER: usize = 4;
 const SNAPSHOTS_TOTAL: usize = 32;
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SNAPSHOT_BUDGET: u64 = 1024 * 1024 * 1024;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30 * 60);
 const TICKET_TTL: Duration = Duration::from_secs(60);
@@ -391,36 +391,67 @@ pub(in crate::admin) fn download_body<E>(
 where
     E: Into<axum::BoxError> + Send + 'static,
 {
-    use futures::StreamExt;
     let Some(permit) = permit else {
         return Body::empty();
     };
-    let expires = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
-    let permit = Arc::new(std::sync::Mutex::new(Some(permit)));
-    let watchdog = Arc::downgrade(&permit);
+    download_stream(stream, permit, DOWNLOAD_IDLE_TIMEOUT)
+}
+
+fn download_stream<E>(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    permit: OwnedSemaphorePermit,
+    idle: Duration,
+) -> Body
+where
+    E: Into<axum::BoxError> + Send + 'static,
+{
+    use futures::StreamExt;
+    use tokio::{sync::watch, time::Instant};
+    let (progress, mut deadline) = watch::channel(Instant::now() + idle);
+    let expired = tokio_util::sync::CancellationToken::new();
+    let watchdog = expired.clone();
     tokio::spawn(async move {
-        tokio::time::sleep_until(expires).await;
-        // Hyper may stop polling this body entirely under TCP backpressure.
-        if let Some(permit) = watchdog.upgrade() {
-            permit.lock().unwrap().take();
+        let _permit = permit;
+        loop {
+            let next = *deadline.borrow_and_update();
+            tokio::select! {
+                biased;
+                changed = deadline.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep_until(next) => {
+                    // The watchdog also runs if TCP backpressure stops Hyper
+                    // from polling the response body.
+                    watchdog.cancel();
+                    return;
+                }
+            }
         }
     });
     Body::from_stream(async_stream::stream! {
-        let _permit = permit;
         let mut stream = Box::pin(stream);
         loop {
             let chunk = tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(expires) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Arrow download timed out")),
-                chunk = stream.next() => Ok(chunk),
+                _ = expired.cancelled() => Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut, "Arrow download made no progress"
+                ).into())),
+                chunk = stream.next() => chunk.map(|chunk| chunk.map_err(Into::into)),
             };
             match chunk {
-                Ok(Some(chunk)) => yield chunk.map_err(Into::<axum::BoxError>::into),
-                Ok(None) => break,
-                Err(error) => {
-                    yield Err(error.into());
+                Some(Ok(chunk)) => {
+                    if !chunk.is_empty() {
+                        progress.send_replace(Instant::now() + idle);
+                    }
+                    yield Ok::<_, axum::BoxError>(chunk);
+                }
+                Some(Err(error)) => {
+                    yield Err(error);
                     break;
                 }
+                None => break,
             }
         }
     })
@@ -451,5 +482,45 @@ impl Write for Bounded {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn download_progress_extends_deadline_and_unpolled_body_releases_permit()
+    -> Result<(), axum::Error> {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let chunks = futures::stream::iter(0..4).then(|_| async {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"a"))
+        });
+        let mut stream =
+            download_stream(chunks, permit, Duration::from_millis(350)).into_data_stream();
+        for _ in 0..4 {
+            assert_eq!(
+                stream.next().await.unwrap()?,
+                bytes::Bytes::from_static(b"a")
+            );
+        }
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let blocked =
+            futures::stream::pending::<std::result::Result<bytes::Bytes, std::io::Error>>();
+        let mut stream =
+            download_stream(blocked, permit, Duration::from_millis(25)).into_data_stream();
+        let released = tokio::time::timeout(Duration::from_secs(2), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stream.next().await.unwrap().is_err());
+        drop(released);
+        Ok(())
     }
 }

@@ -343,7 +343,9 @@ thead th { font-weight: 700; white-space: nowrap; }
 .connector-card > footer { border-block-start: 1px solid #edf0f6; padding-block-start: 12px; }
 .connector-card > footer .button { inline-size: 100%; }
 .connector-card:has(button:not(:disabled):hover) { border-color: #a9b7d0; }
-.connector-card .model-icon { background: #f1f4f9; color: #52647f; }
+.connector-icon { display: inline-grid; place-items: center; inline-size: 40px; block-size: 40px; flex: none; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: #52647f; }
+.connector-icon img { object-fit: contain; }
+.storage-provider-select { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; }
 .connector-section { padding-block-start: 20px; border-block-start: 1px solid var(--line); }
 .connector-gallery { display: grid; gap: 16px; }
 .connector-gallery .search { inline-size: min(100%, 480px); }

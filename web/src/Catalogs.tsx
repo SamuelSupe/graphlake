@@ -1,7 +1,8 @@
 import { useId, useState } from 'react';
-import { Database, FileStack, FolderOpen, Plus, Search, Settings2 } from 'lucide-react';
+import { Database, FolderOpen, Plus, Search, Settings2 } from 'lucide-react';
+import { ConnectorIcon } from './ConnectorIcon';
 import { connectorChoices, connectorDetails } from './connectors';
-import { sourceLabel, sourceUsers, text, type Model } from './model';
+import { record, sourceLabel, sourceUsers, text, type Model } from './model';
 
 export function Catalogs({ model, selected, configure, browse }: {
   model: Model;
@@ -25,7 +26,7 @@ export function Catalogs({ model, selected, configure, browse }: {
       {matches.map(([name, source]) => {
         const uses = sourceUsers(model, name).length;
         return <article className="source-card" key={name} data-selected={selected === name || undefined}>
-          <header><span className="model-icon"><Database size={20} aria-hidden="true" /></span>
+          <header><ConnectorIcon type={text(source.type)} provider={text(record(source.storage).provider)} />
             <div><h3>{name}</h3><span className="muted small">{sourceLabel(text(source.type))}</span></div></header>
           <p className="muted small">{uses ? `用于 ${uses} 个节点或边类型` : '尚未用于节点或边类型'}</p>
           <footer>
@@ -65,9 +66,8 @@ export function ConnectorGallery({ add, disabled = false }: { add: (type: string
     <div className="source-card-grid">
       {choices.map(([type, label]) => {
         const details = connectorDetails[type];
-        const Icon = details?.group === '文件与数据湖' ? FileStack : Database;
         return <article className="source-card connector-card" key={type}>
-          <header><span className="model-icon"><Icon size={20} aria-hidden="true" /></span><div><h3>{label}</h3><span className="muted small">{details?.group}</span></div></header>
+          <header><ConnectorIcon type={type} /><div><h3>{label}</h3><span className="muted small">{details?.group}</span></div></header>
           <p className="muted small">{details?.description}</p>
           <footer><button className="button compact" aria-haspopup="dialog" disabled={disabled} onClick={() => add(type)}>
             <Plus size={15} aria-hidden="true" />配置<span className="sr-only"> {label}</span></button></footer>

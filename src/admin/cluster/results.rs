@@ -9,6 +9,88 @@ use super::*;
 use crate::admin::access::AuditModel;
 
 impl Coordinator {
+    pub(super) async fn result_freshness(
+        &self,
+        app: &App,
+        job: &Job,
+    ) -> ApiResult<Vec<freshness::Observation>> {
+        if !matches!(job.state, JobState::Done { .. }) {
+            return Ok(Vec::new());
+        }
+        let files = app.models.lock().unwrap().read_files();
+        let model = job.model.clone();
+        let model = tokio::task::spawn_blocking(move || files.published_catalog(&model))
+            .await
+            .map_err(|_| Error::storage())?;
+        let (revision, _, catalog) = match model {
+            Ok(model) => model,
+            Err(error) if job.freshness.is_some() => return Err(error),
+            Err(_) => return Ok(Vec::new()),
+        };
+        if revision != job.revision {
+            if job.freshness.is_some() {
+                return Err(freshness::conflict("已发布模型版本变化"));
+            }
+            return Ok(Vec::new());
+        }
+        let inputs = freshness::observe(app, &catalog).await;
+        if let Some(proof) = &job.freshness {
+            freshness::check(&proof.policy, &inputs, job.csr_generation.is_some())?;
+            if freshness::generations(&inputs) != proof.generations {
+                return Err(freshness::conflict("查询期间本地副本代次已更新"));
+            }
+            if let Some(generation) = job.csr_generation {
+                csr::verify_freshness(
+                    self,
+                    &job.model,
+                    &job.revision,
+                    generation,
+                    &proof.policy,
+                    &inputs,
+                )
+                .await?;
+            }
+        }
+        Ok(inputs)
+    }
+
+    pub(super) async fn response_with_freshness(
+        &self,
+        app: &App,
+        id: Uuid,
+        job: &Job,
+    ) -> ApiResult<Response> {
+        let mut inputs = self.result_freshness(app, job).await?;
+        if job.export || inputs.is_empty() {
+            return self.response(id, job).await;
+        }
+        if matches!(job.state, JobState::Done { completed_ms, .. } if now_ms().saturating_sub(completed_ms) < job.retention_ms())
+        {
+            let key = self
+                .shared
+                .objects
+                .artifact(id, job.attempt, "preview.json");
+            let mut page: Value = self
+                .shared
+                .objects
+                .get_json(&key, JOB_LIMIT)
+                .await
+                .map_err(storage)?;
+            for item in &mut inputs {
+                item.used(|path| {
+                    page["sources"]
+                        .as_array()?
+                        .iter()
+                        .find(|version| version["source"] == path)?["version"]
+                        .as_str()
+                        .map(str::to_owned)
+                });
+            }
+            page["freshness"] = serde_json::to_value(inputs).map_err(|_| Error::storage())?;
+            return Ok(Json(page).into_response());
+        }
+        self.response(id, job).await
+    }
     pub(super) async fn response(&self, id: Uuid, job: &Job) -> ApiResult<Response> {
         let response = match &job.state {
             JobState::Running if now_ms() >= job.deadline_ms => return Err(timeout()),
@@ -44,6 +126,9 @@ impl Coordinator {
             .await?
             .filter(|saved| saved.job.model == model)
             .ok_or_else(expired)?;
+        if saved.job.freshness.is_some() {
+            self.result_freshness(app, &saved.job).await?;
+        }
         let JobState::Done {
             graph_pages,
             completed_ms,
@@ -88,6 +173,9 @@ impl Coordinator {
                 })
             })
             .ok_or_else(expired)?;
+        if saved.job.freshness.is_some() {
+            self.result_freshness(app, &saved.job).await?;
+        }
         let mut job = saved.job;
         crate::admin::access::check_export(app, principal, &job.model)?;
         if !matches!(job.state, JobState::Done { arrow: true, completed_ms, .. } if now_ms().saturating_sub(completed_ms) < job.retention_ms())
@@ -170,7 +258,9 @@ pub(in crate::admin) async fn resume(
     if saved.job.export {
         crate::admin::access::check_export(&app, &principal, &saved.job.model)?;
     }
-    let mut response = cluster.response(id, &saved.job).await?;
+    let mut response = cluster
+        .response_with_freshness(&app, id, &saved.job)
+        .await?;
     response
         .extensions_mut()
         .insert(AuditModel(saved.job.model));

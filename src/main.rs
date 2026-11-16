@@ -110,6 +110,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum Algorithm {
+    /// List algorithm execution paths and workspace requirements.
+    Capabilities,
     #[command(name = "pagerank")]
     PageRank {
         #[arg(long, default_value_t = 0.85)]
@@ -326,6 +328,13 @@ async fn main() -> Result<()> {
             } => {
                 let projection = GraphProjection::from(graph);
                 let (algorithm, original) = match algorithm {
+                    Algorithm::Capabilities => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(graphlake::ALGORITHM_CAPABILITIES)?
+                        );
+                        return Ok(());
+                    }
                     Algorithm::PageRank {
                         damping,
                         tolerance,

@@ -31,6 +31,8 @@ pub(super) struct Gate {
     pub approved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_checkpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -38,7 +40,8 @@ pub(super) struct Gate {
 struct Manifest {
     format: u32,
     control_sha256: String,
-    postgres: Postgres,
+    postgres: Option<Postgres>,
+    #[serde(default)]
     parquet: BTreeMap<String, String>,
     canaries: Vec<Canary>,
 }
@@ -75,7 +78,7 @@ fn digest(value: &[u8]) -> String {
         .collect()
 }
 
-fn valid_digest(value: &str) -> bool {
+pub(super) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -97,15 +100,13 @@ fn versioned_manifest(dir: &Path) -> Result<(Manifest, String)> {
     ensure!(
         manifest.format == 1
             && valid_digest(&manifest.control_sha256)
-            && valid_digest(&manifest.postgres.dump_sha256)
-            && !manifest.postgres.dsn_env.is_empty()
-            && !manifest.postgres.relations.is_empty()
             && manifest
                 .postgres
-                .relations
-                .values()
-                .all(|sha| valid_digest(sha))
-            && !manifest.parquet.is_empty()
+                .as_ref()
+                .is_none_or(|pg| valid_digest(&pg.dump_sha256)
+                    && !pg.dsn_env.is_empty()
+                    && !pg.relations.is_empty()
+                    && pg.relations.values().all(|sha| valid_digest(sha)))
             && manifest
                 .parquet
                 .iter()
@@ -158,15 +159,18 @@ pub(super) async fn prepare(dir: &Path, control_sha256: &str) -> Result<Gate> {
         manifest.control_sha256 == control_sha256,
         "control checkpoint does not match recovery manifest"
     );
-    ensure!(
-        checksum(dir, "postgres.dump").await? == manifest.postgres.dump_sha256,
-        "PostgreSQL dump does not match recovery manifest"
-    );
+    if let Some(pg) = manifest.postgres {
+        ensure!(
+            checksum(dir, "postgres.dump").await? == pg.dump_sha256,
+            "PostgreSQL dump does not match recovery manifest"
+        );
+    }
     Ok(Gate {
         manifest_sha256,
         token_sha256: configured_token()?,
         approved: false,
         bundle: None,
+        local_checkpoint: None,
     })
 }
 
@@ -301,7 +305,10 @@ pub(super) async fn preflight(
         .map_err(|_| timed_out())??;
     Ok(Json(ManifestStatus {
         manifest_sha256: gate.manifest_sha256,
-        postgres_relations: manifest.postgres.relations.len(),
+        postgres_relations: manifest
+            .postgres
+            .as_ref()
+            .map_or(0, |pg| pg.relations.len()),
         parquet_files: manifest.parquet.len(),
         canaries: manifest.canaries.len(),
     }))
@@ -377,9 +384,10 @@ async fn artifacts(app: &App, gate: &Gate) -> ApiResult<Manifest> {
     if sha != gate.manifest_sha256 {
         return Err(failed("恢复清单与控制版本不匹配"));
     }
-    if checksum(&dir, "postgres.dump").await.ok().as_deref() != Some(&manifest.postgres.dump_sha256)
-    {
-        return Err(failed("PostgreSQL 备份摘要不匹配"));
+    if let Some(pg) = &manifest.postgres {
+        if checksum(&dir, "postgres.dump").await.ok().as_deref() != Some(&pg.dump_sha256) {
+            return Err(failed("PostgreSQL 备份摘要不匹配"));
+        }
     }
     let source_dir = app.models.lock().unwrap().source_directory().to_owned();
     for (path, expected) in &manifest.parquet {
@@ -387,17 +395,29 @@ async fn artifacts(app: &App, gate: &Gate) -> ApiResult<Manifest> {
             return Err(failed(format!("Parquet 摘要不匹配 · {path}")));
         }
     }
+    if let Some(expected) = gate.local_checkpoint.clone() {
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let backup = super::backup::read(&dir.join("control.json"))?;
+            ensure!(backup.sha256 == expected, "本地表备份和控制状态摘要不匹配");
+            backup.verify_local_destination(&source_dir)
+        })
+        .await
+        .map_err(|_| failed("无法验证已恢复的本地表"))?
+        .map_err(|error| failed(error.to_string()))?;
+    }
     Ok(manifest)
 }
 
 async fn check(app: &Arc<App>, gate: &Gate) -> ApiResult<()> {
     let manifest = artifacts(app, gate).await?;
-    let relations: Vec<_> = manifest.postgres.relations.keys().cloned().collect();
-    let actual = fingerprint_postgres(&manifest.postgres.dsn_env, &relations)
-        .await
-        .map_err(|_| failed("无法读取已恢复的 PostgreSQL 数据"))?;
-    if actual != manifest.postgres.relations {
-        return Err(failed("PostgreSQL 数据与清单中的恢复点不匹配"));
+    if let Some(pg) = manifest.postgres {
+        let relations: Vec<_> = pg.relations.keys().cloned().collect();
+        let actual = fingerprint_postgres(&pg.dsn_env, &relations)
+            .await
+            .map_err(|_| failed("无法读取已恢复的 PostgreSQL 数据"))?;
+        if actual != pg.relations {
+            return Err(failed("PostgreSQL 数据与清单中的恢复点不匹配"));
+        }
     }
     let cluster = app.cluster.as_ref().ok_or_else(blocked)?;
     for canary in manifest.canaries {

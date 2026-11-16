@@ -61,9 +61,9 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 侧边栏独立的「AI」页面默认展示 Agent 接入指南，用户可生成、轮换或撤销个人 AI 令牌，查看自身可用模型并测试连接。AI 继承令牌所属用户当前的查询、建模、发布权限及租户范围，审计记录归属实际用户。查询与建模各有一个 MCP 地址（`/mcp/query` 和 `/mcp/modeling`），管理员在「运行配置 → MCP 服务」中独立启停。详见 [MCP 接入与能力边界](mcp.md)。
 
-后台和 Worker 提供 Prometheus 指标。「运行配置」包括日志与遥测、健康检查、备份与恢复及 MCP 服务。管理员可编辑日志和 OpenTelemetry 配置、检查发布模型的数据源、查看最近备份状态和配置 MCP 服务。从「备份与恢复 → 恢复备份」进入目标站 HTTPS 恢复页，可选择并检查已同步的恢复点，确认恢复后查看各阶段进度、执行验收并核对切流状态。[恢复操作](../deploy/cluster.md#绑定恢复点并开放入口) · [OpenTelemetry 配置](../deploy/README.md#opentelemetry-上报)
+后台和 Worker 提供 Prometheus 指标。 模型观察与对账年龄、CSR 新鲜度、磁盘空间和托管快照清理可通过部署侧规则监控。 [监控与告警](../deploy/monitoring.md#本地表csr-与磁盘预算)「运行配置」包括日志与遥测、健康检查、备份与恢复及 MCP 服务。管理员可编辑日志和 OpenTelemetry 配置、检查发布模型的数据源、查看最近备份状态和配置 MCP 服务。从「备份与恢复 → 恢复备份」进入目标站 HTTPS 恢复页，可选择并检查已同步的恢复点，确认恢复后查看各阶段进度、执行验收并核对切流状态。[恢复操作](../deploy/cluster.md#绑定恢复点并开放入口) · [OpenTelemetry 配置](../deploy/README.md#opentelemetry-上报)
 
-启用 Coordinator 故障接管并配置私有目录后，管理员可在「备份与恢复」选择「立即备份」，在服务器生成已校验的控制状态文件。PostgreSQL 与 Parquet 源数据另行备份。[配置手动备份](../deploy/cluster.md#在线控制状态备份与恢复)
+启用 Coordinator 故障接管并配置私有目录后，管理员可在「备份与恢复」选择「立即备份」，在服务器保存校验过的控制状态和本地表文件。未纳入本地副本的 PostgreSQL 与 Parquet 源数据按恢复清单另行备份。[配置手动备份](../deploy/cluster.md#在线控制状态备份与恢复)
 
 在浏览器打开 [本机管理后台](http://127.0.0.1:7337/)。使用 `--port` 可指定端口，`--timeout-ms` 可将默认 60 秒的执行期限调短。服务绑定 IPv4 回环地址，页面和 API 共用同一个来源。模型文件命名为 `<标识>.yaml`，标识以 ASCII 字母或数字开头，可包含下划线和连字符，长度最多 64。模型目录中的文件继续使用原有 YAML 格式和相对路径规则。启动服务前，在同一进程环境中设置 Catalog 引用的凭据变量。
 
@@ -342,6 +342,20 @@ RETURN a.id AS id, outgoing
 
 默认按来源分别固定读取版本。需要统一快照时，在 Rust `QueryOptions.graph`、Python `Engine` 构造参数或 C 的图选项 JSON 中设置 `require_consistent_snapshot`，在 CLI 传入 `--require-consistent-snapshot`，或在 Cypher 开头写 `USING {requireConsistentSnapshot: true}`。该模式允许单个物理读取，如一个 Parquet 对象、一个 Iceberg 或 Delta 表快照、或一条 Trino、ClickHouse 或 SAP HANA 查询。同一个 PostgreSQL、MySQL 或 Spanner 来源可在单个事务中读取多表。同一个 Snowflake 或 BigQuery 来源可使用同一个时间旅行时间点。PostgreSQL 视图和外部表、多个独立快照以及跨来源组合会返回错误。严格模式使用独立的 CSR 代次。
 
+发布模型可配置 `freshness`。以下例子允许集群自动刷新 CSR，并为此模型的查询 API 和 MCP 设置观察与对账上限。
+
+```yaml
+freshness:
+  auto_refresh_csr: true
+  policy:
+    max_observation_age_seconds: 60
+    max_reconciliation_age_seconds: 3600
+```
+
+REST 查询和 MCP 的 `freshness` 请求对象可收紧模型策略，字段为 `max_observation_age_seconds`、`max_reconciliation_age_seconds`、`require_current_csr` 和 `require_consistent_snapshot`。年龄约束保守地检查模型映射用到的本地副本，未知观察或对账时间会拒绝。要求追平 CSR 时提供 `csr_generation` 或 `csr`。要求统一快照的 CSR 需以 `graph_options.require_consistent_snapshot: true` 构建。严格请求必须指向当前发布模型，并在交付前复核本地代次。Bolt、Gremlin 驱动入口和图邻居探索要求采用查询 API 或 MCP 执行这类模型的严格策略。
+
+`GET /api/v1/models/{id}/freshness` 返回当前发布模型的观察、对账、删除覆盖、CSR 构建时间和刷新状态。查询结果的 `freshness` 区分副本当前代次和结果使用的 `result_generation`。普通查询可读取刷新失败时保留的 CSR，并可从代次差异看出落后。自动刷新每两秒观察相关本地代次，每个 Coordinator 同时运行一个 CSR 构建；失败保留原代次，30 秒后重试。构建过程中来源更新时，已构建代次仍标记落后，下一次构建捕获最新输入。来源代次一致仅说明读到相同副本版本，统一事务的证明由快照策略提供。
+
 ## 查询语义与资源控制
 
 Cypher 支持串接 `MATCH`、`OPTIONAL MATCH`、`WITH`、`UNWIND` 和 `RETURN`，以及 `UNION [ALL]` 和返回结果的只读 `CALL {}`。相关子查询支持 `CALL (a) { ... }` 和首条 `WITH` 两种导入方式。`CALL (a)` 导入的变量在整个子查询中可见。由 `MATCH`、`OPTIONAL MATCH`、`UNWIND` 和 `WITH` 组成的相关子查询，可按导入的实体身份和标量值分组批量执行。中间 `WITH` 的聚合、去重、排序和分页分别作用于每个关联组。符合这些条件的嵌套 `CALL` 和 `UNION [ALL]` 分支也可批量执行。`UNION` 在各自的关联组内去重。最终 `RETURN` 可投影或聚合，并可对每组独立排序和分页。重复的外层输入保留各自的结果。分批执行时，查询内缓存保留近期、符合预算的关联组，并跨批次复用已求值的键。其余子查询按行求值，并在查询预算内复用重复导入键的结果。两条路径共享来源快照，输出可按查询预算溢写。紧随 `CALL` 且无排序、去重或聚合的最终 `RETURN` 可以用 `SKIP` 和 `LIMIT` 提前停止求值。相关子查询保留已有的外层排序，跨分区读取时也用该顺序分页。批量路径分批读取外层输入。可提前停止的外层分页只读取每个新关联组所需的结果前缀，已缓存的组仍可成批复用。显式排序和聚合仍需处理满足语义的输入。对于固定方向的相关 MATCH，如果分页只依赖排序键和其他窄字段，Cypher 先选出页面，再用命中行的业务键批量读取仅用于返回的目标节点属性。支持外层和子查询内分页，优化可穿过保留目标身份的 WITH、按实体去重或分组、嵌套 CALL，以及各分支从同一标签读取同名属性的 UNION ALL。排序、过滤或聚合使用的属性在对应阶段读取。`LIMIT 0` 只准备结果模式，跳过数据扫描。SQL 提供映射后的图表，大小写敏感的表名使用双引号。三种查询入口都支持 `EXPLAIN` 和 `EXPLAIN ANALYZE`。
@@ -396,6 +410,12 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml query \
 Cypher 的 `WITH ... SKIP ... LIMIT ... WHERE ...` 先分页再应用同一子句的过滤条件。整数和定点算术、`sum()` 及 `sum(DISTINCT ...)` 超出结果类型范围时返回错误。Cypher 和 Gremlin 都限制生成的计划大小，Gremlin 也检查 `math()` 公式的解析复杂度。
 
 普通 `EXPLAIN` 只加载规划所需的列类型、文件或快照元数据。需要查询结果来描述列类型的连接器提交零行语句，执行计划中的这些表使用仅包含 schema 的输入。`EXPLAIN ANALYZE` 会执行查询，业务键冲突和数据读取错误在执行时报告。
+
+直接映射到单张来源表的节点查询，可以在只读快照内证明业务键唯一后下推普通属性过滤与 LIMIT。SQLite 对 STRICT 表使用主键证明，旧式表仅投影整数 rowid 别名时也可使用快速路径。MySQL 和 MariaDB 的新路径要求 InnoDB 主键及兼容的读取类型。字符串等值按字节比较，整数 Top-N 要求按完整业务键排序。复杂映射、无法证明唯一性或存在残余过滤时继续执行原校验和查询计划。无 ORDER BY 的 LIMIT 允许返回任意满足条件的行。
+
+符合上述证明条件的 SQLite、MySQL 单表单消费者扫描按批读取。已证明业务键安全、仍需本地求值的条件也可按批过滤，达到 LIMIT 后停止读取。需要本地排序、分组、重扫、共享输入或校验业务键的路径继续使用可溢写快照。可安全下推的 Top-N 仍由来源限制结果。ClickHouse 在本地表加载等单消费者读取中，按 Arrow IPC 批次解码 HTTP 流。MergeTree 的排序键不提供唯一性保证，普通图查询仍可能需要全量校验。ClickHouse 的只读账户若锁定逐查询设置，应在服务端账户配置启用 `cancel_http_readonly_queries_on_client_close`，以便客户端关闭连接时终止远端计算。
+
+CLI 的 `--diagnostics` 提供连接器接收行数和 Arrow 内存字节数。SQLite 的 `sqlite_fullscan_steps` 统计数据语句内部的全表扫描步数，可用于区分物化量与无索引属性查询的源端扫描成本。
 
 变长关系用 `*N` 或 `*MIN..MAX`，上界最大为 256。零跳要求同一个节点满足两端的节点条件，关系的类型和方向约束正跳。异构关系的精确零跳模式可从一端显式或已绑定的标签推断另一端。有向和无向模式都保留平行边，每个 `MATCH` 子句内同一条边只能使用一次。`length(p)`、`nodes(p)` 和 `relationships(p)` 读取路径长度及有序身份，变长关系变量可投影为有序边键列表。跨标签或边类型的路径身份包含标签和按列顺序排列的文本键。
 
@@ -475,7 +495,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml --diagnostics \
 
 刷新从新快照构建正反向 CSR，连同 Arrow 业务键、边身份和来源版本写入同一校验文件。同步文件后原子替换当前代次，随后同步目录。同一映射与权限范围内的刷新串行执行，已启动的查询保留原代次。读取时校验文件完整性，刷新会回收该映射的中断暂存文件。调用方按来源权限隔离缓存目录和 `cache-scope`，授权或来源身份变化时使用新的权限范围。已发布的代次由显式刷新推进，可离线遍历。Cypher 属性查询从来源快照读取。
 
-可通过 `--timeout-ms`、`--memory-mib`、`--spill-mib`、`--partitions` 和 `--batch-size` 控制每次查询。内存上限用于 DataFusion 追踪的算子、PostgreSQL 读取批次、Parquet 范围缓冲、查询内物化和图遍历状态。进程 RSS 还包含运行时开销、解码中的临时缓冲和调用方持有的批次。图状态达到预算时返回资源错误。关闭结果流会释放本地状态和来源连接，CLI 支持 Ctrl-C。诊断记录前沿请求、扫描回退、CSR 代次和各深度访问数。PostgreSQL、MySQL、SQLite、Iceberg 和数仓字节数为已解码的 Arrow 批次大小，Parquet、CSV、JSON Lines 的 `object_bytes` 为读取的对象范围大小。Iceberg 请求数按 Catalog 加载和扫描调用统计，Delta 请求数按快照加载统计。Delta 扫描的文件和行级执行统计可通过 `EXPLAIN ANALYZE` 查看。
+可通过 `--timeout-ms`、`--memory-mib`、`--spill-mib`、`--partitions` 和 `--batch-size` 控制每次查询。内存上限用于 DataFusion 追踪的算子、来源读取批次、Parquet 范围缓冲、查询内物化和图遍历状态。进程 RSS 还包含运行时开销、解码中的临时缓冲和调用方持有的批次。图状态达到预算时返回资源错误。关闭结果流会释放本地状态和来源连接，CLI 支持 Ctrl-C。诊断记录前沿请求、扫描回退、CSR 代次和各深度访问数。`first_batch_ms` 从查询开始计到结果流交付首批，首批尚未到达时为空。PostgreSQL、MySQL、SQLite、Iceberg 和数仓的通用字节数为已解码的 Arrow 批次大小。`clickhouse_http_bytes` 统计已消费的 Arrow IPC HTTP 响应体，Parquet、CSV、JSON Lines 的 `object_bytes` 统计读取的对象范围。连接器的接收行数与数据库内部扫描量分别计量，后者以来源执行计划或服务端指标为准。Iceberg 请求数按 Catalog 加载和扫描调用统计，Delta 请求数按快照加载统计。Delta 扫描的文件和行级执行统计可通过 `EXPLAIN ANALYZE` 查看。
 
 同一进程通过 `Engine::new` 创建的实例共享 8 个活动查询、2 GiB 内存预算和 8 GiB 临时磁盘预算。查询进入时预留声明的额度，读取完成或关闭结果流后释放。等待资源计入查询超时，也可以取消。Rust 可通过 `Engine::new_with_limits` 为一个实例及其克隆配置独立预算。CLI 单次执行按命令行参数分配预算。
 
@@ -524,6 +544,8 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml \
 ### Cypher 算法过程与查询导出
 
 可在 Cypher 中调用 `algo.pagerank`、`algo.wcc`、`algo.labelPropagation`、`algo.louvain`、`algo.leiden`、`algo.node2vec`、`algo.shortestPath` 和 `algo.dagLongestPath`。过程接收配置对象，可指定 `labels`、`relationshipTypes`、`relationshipWeightProperty` 和 `direction`，结果通过 `YIELD` 进入后续查询。顶点身份 `id` 包含 `label` 以及按映射顺序排列的 `key`。路径过程的 `start` 和 `target` 使用相同的身份结构。
+
+`graphlake --catalog graph.yaml analyze capabilities` 查看执行路径和工作区类型。集群 CSR 的分区算法包括 PageRank 和弱连通分量。Louvain、Leiden、Node2Vec 和标签传播使用执行节点上的整图投影，结果诊断提供 `execution`，投影算法也提供 `workspace_bytes`、`projection_ready_ms` 和 `kernel_ms`。社区检测按投影顶点和内部 links 计算预留，Node2Vec 包含两份 Float32 嵌入矩阵。超出预算时诊断给出实际 V/E、工作区和查询预算。Ctrl-C 可取消 CLI 查询，服务查询使用取消接口。
 
 ```cypher
 CALL algo.labelPropagation({relationshipTypes: ['Transfer'], direction: 'undirected'})

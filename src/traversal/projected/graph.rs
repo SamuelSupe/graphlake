@@ -115,6 +115,7 @@ impl Graph {
     ) -> Result<Self> {
         let routes = matches!(read, GraphRead::Routes { .. });
         let needs_adjacency = !matches!(read, GraphRead::Edges);
+        let transient_ids = budget.new_empty();
         let mut vertices = Vec::new();
         let mut indexes = BTreeMap::new();
         for name in &labels.nodes {
@@ -140,12 +141,14 @@ impl Graph {
                 let encoded = converter.convert_columns(batch.columns())?;
                 for (i, row) in encoded.iter().enumerate() {
                     let key = key_text(batch.columns(), i)?;
-                    budget.try_grow(
-                        row.data()
-                            .len()
-                            .saturating_add(identity_bytes(&key))
-                            .saturating_add(128),
-                    )?;
+                    let index_bytes = row.data().len().saturating_add(64);
+                    let identity = identity_bytes(&key).saturating_add(64);
+                    if routes {
+                        budget.try_grow(index_bytes)?;
+                    } else {
+                        transient_ids.try_grow(index_bytes)?;
+                    }
+                    budget.try_grow(identity)?;
                     ensure!(
                         ids.insert(row.data().into(), vertices.len()).is_none(),
                         "duplicate business key in {name}"
@@ -333,6 +336,9 @@ impl Graph {
         }
         for neighbors in &mut adjacency {
             neighbors.sort_unstable_by_key(|neighbor| (neighbor.vertex, neighbor.edge));
+        }
+        if !routes {
+            indexes.clear();
         }
         Ok(Self {
             vertices,

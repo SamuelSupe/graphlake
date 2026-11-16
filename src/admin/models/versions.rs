@@ -338,7 +338,7 @@ pub(crate) async fn publish(
     if model.active_revision != request.active_revision {
         return Err(active_conflict());
     }
-    if let Err(error) = inspect(&model.yaml, &path, &app.options, true).await {
+    if let Err(error) = inspect(&model.yaml, &path, &app.options, true, &app, &id).await {
         app.models
             .lock()
             .unwrap()
@@ -399,7 +399,7 @@ pub(crate) async fn rollback(
             models.source_path(&id)?,
         )
     };
-    inspect(&yaml, &path, &app.options, true).await?;
+    inspect(&yaml, &path, &app.options, true, &app, &id).await?;
     let _policy = app.users.writes.lock().await;
     super::super::users::check(&app, &principal, &id, super::super::users::Role::Publisher)?;
     let models = app.models.lock().unwrap();
@@ -454,6 +454,7 @@ impl Models {
         id: &str,
         mutation: crate::admin::ha::Mutation,
         options: &crate::QueryOptions,
+        app: &crate::admin::App,
     ) -> ApiResult<(StatusCode, Model)> {
         use crate::admin::ha::Mutation;
         let model = match mutation {
@@ -471,7 +472,7 @@ impl Models {
                 if model.active_revision != request.active_revision {
                     return Err(active_conflict());
                 }
-                inspect(&model.yaml, &self.source_path(id)?, options, true).await?;
+                inspect(&model.yaml, &self.source_path(id)?, options, true, app, id).await?;
                 let mut model = self.activate(model, request, Action::Publish)?;
                 model.status = Status::Passed;
                 self.checks
@@ -484,7 +485,7 @@ impl Models {
                     return Err(active_conflict());
                 }
                 let yaml = self.archived(id, &request.revision)?;
-                inspect(&yaml, &self.source_path(id)?, options, true).await?;
+                inspect(&yaml, &self.source_path(id)?, options, true, app, id).await?;
                 self.activate(model, request, Action::Rollback)?
             }
             Mutation::Unpublish(request) => self.deactivate(id, request)?,

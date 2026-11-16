@@ -60,6 +60,7 @@ struct Transaction {
     revision: String,
     engine: Engine,
     snapshots: ReadTransaction,
+    managed: Option<Arc<crate::admin::local_tables::managed::Selection>>,
     deadline: Instant,
 }
 
@@ -309,9 +310,14 @@ impl BoltBackend for Backend {
             query,
             params,
             timeout,
-            pinned
-                .as_ref()
-                .map(|tx| (tx.revision.as_str(), &tx.engine, &tx.snapshots)),
+            pinned.as_ref().map(|tx| {
+                (
+                    tx.revision.as_str(),
+                    &tx.engine,
+                    &tx.snapshots,
+                    tx.managed.as_ref(),
+                )
+            }),
         )
         .await
         .map_err(query_error)?;
@@ -338,13 +344,25 @@ impl BoltBackend for Backend {
             + timeout(extra)?
                 .unwrap_or(self.app.options.timeout)
                 .min(self.app.options.timeout);
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.get_mut(handle).ok_or_else(closed)?;
-        let target = session.target(&self.app)?;
-        let (revision, engine) = target
+        let target = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.get(handle).ok_or_else(closed)?.target(&self.app)?
+        };
+        let (revision, mut engine) = target
             .engine(&self.app)
             .inspect_err(|error| target.audit(&self.app, "begin", "error", error.status.as_u16()))
             .map_err(query_error)?;
+        let managed = crate::admin::local_tables::managed::resolve(
+            &self.app,
+            &mut engine,
+            &target.model,
+            deadline.saturating_duration_since(Instant::now()).as_secs() + 120,
+        )
+        .await
+        .map_err(query_error)?
+        .map(Arc::new);
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(handle).ok_or_else(closed)?;
         let handle = TransactionHandle(uuid::Uuid::new_v4().to_string());
         session.transaction = Some(Arc::new(Transaction {
             handle: handle.clone(),
@@ -352,6 +370,7 @@ impl BoltBackend for Backend {
             revision,
             engine,
             snapshots: ReadTransaction::default(),
+            managed,
             deadline,
         }));
         target.audit(&self.app, "begin", "ok", 200);

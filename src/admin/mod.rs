@@ -5,6 +5,7 @@ mod auth;
 mod backup;
 mod browse;
 pub(crate) mod cluster;
+mod freshness;
 mod ha;
 mod local_tables;
 mod mcp;
@@ -41,6 +42,7 @@ pub use auth::setup as setup_auth;
 pub use backup::{check as check_backup, ingress as check_ingress, run as cluster_backup};
 pub use backup::{
     check_checkpoint as verify_backup_checkpoint, record_status as record_backup_status,
+    run_with_catalog as cluster_backup_with_catalog,
 };
 pub use cluster::serve_worker;
 pub use recovery::fingerprint_postgres as recovery_fingerprint_postgres;
@@ -237,6 +239,13 @@ pub async fn serve_clustered_with_status(
         .as_deref()
         .map(cluster::Coordinator::load)
         .transpose()?;
+    let managed_tables = cluster
+        .as_ref()
+        .is_some_and(|cluster| cluster.managed.is_some());
+    ensure!(
+        !managed_tables || coordinator_failover,
+        "managed local tables require Coordinator failover"
+    );
     let ha_cache = coordinator_failover
         .then(tempfile::tempdir)
         .transpose()?
@@ -282,6 +291,7 @@ pub async fn serve_clustered_with_status(
                 public_url.origin().ascii_serialization(),
                 catalog_dir.clone(),
                 shutdown.clone(),
+                cluster.as_ref().and_then(|cluster| cluster.managed.clone()),
             )
             .await
             {
@@ -290,7 +300,13 @@ pub async fn serve_clustered_with_status(
             }
             listener = Some(TcpListener::bind(bound).await?);
         }
-        let ha = ha::Ha::open(leader, &catalog_dir, metadata_dir).await?;
+        let ha = match ha::Ha::open(leader.clone(), &catalog_dir, metadata_dir).await {
+            Ok(ha) => ha,
+            Err(error) => {
+                leader.release().await;
+                return Err(error);
+            }
+        };
         ha::credentials(&ha.leader, &catalog_dir, metadata_dir).await?;
         Some(ha)
     } else {
@@ -365,7 +381,8 @@ pub async fn serve_clustered_with_status(
         .map_or_else(query::Sessions::default, |cluster| {
             query::Sessions::with_cursor_key(cluster.cursor_key())
         });
-    let local_tables = local_tables::LocalTables::open(models.source_directory().to_owned())?;
+    let local_tables =
+        local_tables::LocalTables::open(models.source_directory().to_owned(), managed_tables)?;
     let app = Arc::new(App {
         auth,
         users,
@@ -416,6 +433,8 @@ pub async fn serve_clustered_with_status(
     }
     tokio::spawn(access::Policy::watch(Arc::downgrade(&app)));
     tokio::spawn(local_tables::watch(Arc::downgrade(&app)));
+    tokio::spawn(local_tables::managed::watch(Arc::downgrade(&app)));
+    tokio::spawn(cluster::csr::watch(Arc::downgrade(&app)));
     let api = Router::new()
         .route("/v1/models/{id}/local-tables", get(local_tables::list).post(local_tables::create))
         .route("/v1/models/{id}/local-tables/{name}", axum::routing::put(local_tables::schedule))
@@ -426,6 +445,7 @@ pub async fn serve_clustered_with_status(
         .route("/v1/models/{id}", get(models::read).put(models::update))
         .route("/v1/models/{id}/schema/{revision}", get(models::schema))
         .route("/v1/models/{id}/query", post(query::run))
+        .route("/v1/models/{id}/freshness", get(cluster::csr::health))
         .route(
             "/v1/models/{id}/csr",
             get(cluster::csr::current).post(cluster::csr::refresh),

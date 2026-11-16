@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, mem::size_of, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime};
 use datafusion::{
     arrow::{
         array::{
@@ -12,21 +12,30 @@ use datafusion::{
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     },
     catalog::TableProvider,
+    common::{DataFusionError, ScalarValue},
     execution::{
         memory_pool::{MemoryConsumer, MemoryReservation},
         runtime_env::RuntimeEnv,
     },
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
-use futures::TryStreamExt;
+use futures::{TryStreamExt, stream::BoxStream};
 use mysql_async::{
     Conn, Opts, OptsBuilder, Row, Value,
     prelude::{FromValue, Queryable},
 };
 
 use super::{ReadStats, decimal128};
+use crate::{
+    Comparison,
+    engine::{
+        read_filters,
+        sql_read::{Native, Pushdown},
+    },
+};
 
 pub(crate) struct Snapshot {
-    conn: Conn,
+    conn: Option<Conn>,
     stats: Arc<ReadStats>,
     pub(crate) version: String,
     transactional: bool,
@@ -37,12 +46,12 @@ impl Snapshot {
     pub(crate) async fn browse(&mut self, database: Option<&str>) -> Result<Vec<String>> {
         self.stats.request();
         Ok(if let Some(database) = database {
-            self.conn.query(format!(
+            self.conn.as_mut().expect("open connection").query(format!(
                 "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA={}{} ORDER BY TABLE_NAME LIMIT 2001",
                 literal(database), if self.transactional { " AND ENGINE='InnoDB'" } else { "" },
             )).await?
         } else {
-            self.conn.query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME LIMIT 2001").await?
+            self.conn.as_mut().expect("open connection").query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME LIMIT 2001").await?
         })
     }
 
@@ -52,7 +61,7 @@ impl Snapshot {
             .split_once('.')
             .context("expected MySQL database.table")?;
         self.stats.request();
-        let columns = self.conn.query_map(
+        let columns = self.conn.as_mut().expect("open connection").query_map(
             format!("SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA={} AND TABLE_NAME={} ORDER BY ORDINAL_POSITION", literal(database), literal(table)),
             |(name, kind, nullable): (String, String, String)| (name, kind, nullable == "YES"),
         ).await?;
@@ -137,7 +146,7 @@ impl Snapshot {
                 .context("initializing read connection")?;
         }
         Ok(Self {
-            conn,
+            conn: Some(conn),
             stats,
             transactional,
             version: format!("session-{}", uuid::Uuid::new_v4()),
@@ -149,10 +158,15 @@ impl Snapshot {
         reference: &str,
         columns: &[String],
         filters: &[crate::Predicate],
+        native: Option<(&[String], &Pushdown)>,
+        watermark: Option<(&str, &ScalarValue)>,
+        stream: bool,
+        raw_table: bool,
         runtime: &RuntimeEnv,
         batch_size: usize,
         explain_only: bool,
-    ) -> Result<(Arc<dyn TableProvider>, MemoryReservation)> {
+    ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, bool)> {
+        let conn = self.conn.as_mut().context("MySQL read session closed")?;
         let (database, table) = reference
             .split_once('.')
             .context("expected MySQL database.table")?;
@@ -165,13 +179,12 @@ impl Snapshot {
         let scan = format!("SELECT {selected} FROM {relation}");
         self.stats.request();
         // Transactional MySQL/MariaDB reads retain this metadata lock until rollback.
-        self.conn
-            .query_drop(format!("{scan} LIMIT 0"))
+        conn.query_drop(format!("{scan} LIMIT 0"))
             .await
             .with_context(|| format!("binding MySQL relation {relation}"))?;
         self.stats.request();
         if self.transactional {
-            let engine: Option<Option<String>> = self.conn.query_first(format!(
+            let engine: Option<Option<String>> = conn.query_first(format!(
                 "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA={} AND TABLE_NAME={}", literal(database), literal(table),
             )).await?;
             ensure!(
@@ -182,22 +195,22 @@ impl Snapshot {
             );
         }
         self.stats.request();
-        let metadata = self
-            .conn
+        let metadata = conn
             .query_map(
                 format!(
-                    "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE
+                "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_SET_NAME
              FROM information_schema.COLUMNS WHERE TABLE_SCHEMA={} AND TABLE_NAME={}",
                     literal(database),
                     literal(table)
                 ),
-                |(name, kind, declared, precision, scale): (
+                |(name, kind, declared, precision, scale, charset): (
                     String,
                     String,
                     String,
                     Option<u64>,
                     Option<u64>,
-                )| { (name, (kind, declared, precision, scale)) },
+                    Option<String>,
+                )| { (name, (kind, declared, precision, scale, charset)) },
             )
             .await?
             .into_iter()
@@ -205,7 +218,7 @@ impl Snapshot {
         let fields = columns
             .iter()
             .map(|name| {
-                let (kind, declared, precision, scale) = metadata
+                let (kind, declared, precision, scale, _) = metadata
                     .get(name)
                     .with_context(|| format!("missing MySQL column {relation}.{}", ident(name)))?;
                 field(name, kind, declared, *precision, *scale)
@@ -213,59 +226,265 @@ impl Snapshot {
             .collect::<Result<Vec<_>>>()?;
         let schema = Arc::new(Schema::new(fields));
         if explain_only {
-            return super::snapshot::Buffer::new(&runtime.memory_pool, None).finish_schema(schema);
+            let (table, budget) =
+                super::snapshot::Buffer::new(&runtime.memory_pool, None).finish_schema(schema)?;
+            return Ok((table, budget, false));
         }
-        let scan = format!(
-            "{scan}{}",
-            crate::engine::read_filters::where_clause(filters, &schema, ident)
-        );
-        let raw = MemoryConsumer::new("GraphLake MySQL batch rows").register(&runtime.memory_pool);
+        let mut pushed = None;
+        if self.transactional
+            && let Some((keys, plan)) = native
+        {
+            let exact_text = |name: &str| {
+                metadata.get(name).is_some_and(|(kind, _, _, _, charset)| {
+                    matches!(
+                        kind.as_str(),
+                        "varchar" | "tinytext" | "text" | "mediumtext" | "longtext"
+                    ) && charset.as_deref() == Some("utf8mb4")
+                })
+            };
+            if schema.fields().iter().all(|field| {
+                field.data_type().is_integer()
+                    || field.data_type() == &DataType::Binary
+                    || exact_text(field.name())
+            }) && let Some(statement) = native_scan(&schema, keys, plan, exact_text)
+            {
+                self.stats.request();
+                let primary = conn
+                    .exec_map(
+                        "SELECT COLUMN_NAME FROM information_schema.STATISTICS
+                     WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME='PRIMARY' AND SUB_PART IS NULL ORDER BY SEQ_IN_INDEX",
+                        (database, table),
+                        |column: String| column,
+                    )
+                    .await?;
+                if primary.len() == keys.len() && primary.iter().all(|key| keys.contains(key)) {
+                    pushed = Some(statement);
+                }
+            }
+        }
+        let proven = pushed.is_some();
+        let (suffix, mut params) = pushed.unwrap_or_else(|| {
+            (
+                read_filters::where_clause(filters, &schema, ident),
+                Vec::new(),
+            )
+        });
+        let mut scan = format!("{scan}{suffix}");
+        if self.transactional
+            && let Some((column, checkpoint)) = watermark
+            && let Some(value) = watermark_param(&schema, column, checkpoint)
+        {
+            debug_assert!(
+                !proven,
+                "local-table sync does not provide a native query plan"
+            );
+            let conjunction = if suffix.is_empty() {
+                " WHERE "
+            } else {
+                " AND "
+            };
+            let column = ident(column);
+            // Keep legacy zero dates visible to the decoder even below the watermark.
+            let minimum = if matches!(checkpoint, ScalarValue::TimestampMicrosecond(_, Some(_))) {
+                "1970-01-01 00:00:01"
+            } else {
+                "1000-01-01"
+            };
+            scan.push_str(&format!(
+                "{conjunction}({column} >= ? OR {column} < '{minimum}')"
+            ));
+            params.push(value);
+        }
+        let query = Scan {
+            sql: scan,
+            params,
+            schema: schema.clone(),
+            batch_size,
+            stats: self.stats.clone(),
+        };
+        if self.transactional && stream && (proven || raw_table) {
+            let conn = OwnedConnection(self.conn.take());
+            let provider = super::snapshot::stream_once(schema, move |context| {
+                let schema = query.schema.clone();
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    async_stream::try_stream! {
+                        let mut conn = conn;
+                        let mut batches = query.batches(
+                            conn.0.as_mut().expect("owned read connection"),
+                            context.runtime_env().memory_pool.clone(),
+                        );
+                        while let Some(batch) = batches.try_next().await.map_err(external)? {
+                            yield batch;
+                        }
+                        drop(batches);
+                        conn.0.take().expect("owned read connection").disconnect().await
+                            .map_err(|error| DataFusionError::External(error.into()))?;
+                    },
+                ))
+            })?;
+            let budget =
+                MemoryConsumer::new("GraphLake MySQL stream").register(&runtime.memory_pool);
+            return Ok((provider, budget, proven));
+        }
         let mut snapshot =
             super::snapshot::Buffer::new(&runtime.memory_pool, Some(&runtime.disk_manager));
-        let mut rows = Vec::new();
-        self.stats.request();
-        let mut stream = self
-            .conn
-            .query_stream::<Row, _>(scan)
-            .await
-            .with_context(|| format!("reading MySQL relation {relation}"))?;
-        loop {
-            let row = stream.try_next().await?;
-            let done = row.is_none();
-            if let Some(row) = row {
-                let payload = (0..row.len())
-                    .map(|i| match row.as_ref(i) {
-                        Some(Value::Bytes(bytes)) => bytes.len(),
-                        _ => 0,
-                    })
-                    .sum::<usize>();
-                raw.try_grow(
-                    payload.saturating_add(size_of::<Row>() + row.len() * size_of::<Value>()),
-                )?;
-                rows.push(row);
-            }
-            if !rows.is_empty() && (done || rows.len() >= batch_size) {
-                let batch = to_batch(Arc::clone(&schema), &mut rows)?;
-                self.stats.mysql_batch(&batch);
-                snapshot.push(batch)?;
-                rows.clear();
-                raw.free();
-                tokio::task::yield_now().await;
-            }
-            if done {
-                break;
-            }
+        let mut batches = query.batches(conn, runtime.memory_pool.clone());
+        while let Some(batch) = batches.try_next().await? {
+            snapshot.push(batch)?;
         }
-        snapshot.finish(schema, &self.stats)
+        let (table, budget) = snapshot.finish(schema, &self.stats)?;
+        Ok((table, budget, proven))
     }
 
     pub(crate) async fn close(mut self) -> Result<()> {
-        self.stats.request();
-        if self.transactional {
-            self.conn.query_drop("ROLLBACK").await?;
+        if let Some(mut conn) = self.conn.take() {
+            self.stats.request();
+            if self.transactional {
+                conn.query_drop("ROLLBACK").await?;
+            }
+            conn.disconnect().await?;
         }
-        self.conn.disconnect().await?;
         Ok(())
+    }
+}
+
+struct Scan {
+    sql: String,
+    params: Vec<Value>,
+    schema: SchemaRef,
+    batch_size: usize,
+    stats: Arc<ReadStats>,
+}
+
+impl Scan {
+    fn batches(
+        self,
+        conn: &mut Conn,
+        pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) -> BoxStream<'_, Result<RecordBatch>> {
+        Box::pin(async_stream::try_stream! {
+            let raw = MemoryConsumer::new("GraphLake MySQL batch rows").register(&pool);
+            let output = MemoryConsumer::new("GraphLake MySQL batch output").register(&pool);
+            let mut rows = Vec::new();
+            self.stats.request();
+            let mut stream: BoxStream<'_, mysql_async::Result<Row>> = if self.params.is_empty() {
+                Box::pin(conn.query_stream::<Row, _>(self.sql).await?)
+            } else {
+                Box::pin(conn.exec_stream::<Row, _, _>(self.sql, self.params).await?)
+            };
+            loop {
+                let row = stream.try_next().await?;
+                let done = row.is_none();
+                if let Some(row) = row {
+                    let payload = (0..row.len())
+                        .map(|i| match row.as_ref(i) {
+                            Some(Value::Bytes(bytes)) => bytes.len(),
+                            _ => 0,
+                        })
+                        .sum::<usize>();
+                    raw.try_grow(payload.saturating_add(size_of::<Row>() + row.len() * size_of::<Value>()))?;
+                    rows.push(row);
+                }
+                if !rows.is_empty() && (done || rows.len() >= self.batch_size) {
+                    let batch = to_batch(self.schema.clone(), &mut rows)?;
+                    self.stats.mysql_batch(&batch);
+                    rows.clear();
+                    raw.free();
+                    output.try_resize(batch.get_array_memory_size())?;
+                    yield batch;
+                    output.free();
+                }
+                if done { break; }
+            }
+        })
+    }
+}
+
+struct OwnedConnection(Option<Conn>);
+
+impl Drop for OwnedConnection {
+    fn drop(&mut self) {
+        let Some(conn) = self.0.take() else { return };
+        // mysql_async normally drains unread rows on drop. Terminate this
+        // dedicated connection through the same account before closing it.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let id = conn.id();
+                let options = conn.opts().clone();
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    let mut cancel = Conn::new(options).await?;
+                    cancel.query_drop(format!("KILL CONNECTION {id}")).await?;
+                    cancel.disconnect().await
+                })
+                .await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), conn.disconnect()).await;
+            });
+        }
+    }
+}
+
+fn external(error: anyhow::Error) -> DataFusionError {
+    DataFusionError::External(error.into())
+}
+
+fn native_scan(
+    schema: &Schema,
+    keys: &[String],
+    plan: &Pushdown,
+    exact_text: impl Fn(&str) -> bool,
+) -> Option<(String, Vec<Value>)> {
+    let suffix = match &plan.operation {
+        Native::Filter => String::new(),
+        Native::Top { order, limit }
+            if order.iter().all(|(name, _)| {
+                schema
+                    .field_with_name(name)
+                    .is_ok_and(|field| field.data_type().is_integer())
+            }) =>
+        {
+            format!("{} LIMIT {limit}", super::order_by(order, ident))
+        }
+        _ => return None,
+    };
+    let mut terms = keys
+        .iter()
+        .map(|key| format!("{} IS NOT NULL", ident(key)))
+        .collect::<Vec<_>>();
+    let mut params = Vec::new();
+    for filter in &plan.filters {
+        if let Some(term) = read_filters::sql_term(filter, schema, ident) {
+            terms.push(term);
+        } else if filter.op == Comparison::Eq && exact_text(&filter.column) {
+            let value = filter.value.as_str()?;
+            terms.push(format!("CAST({} AS BINARY) = ?", ident(&filter.column)));
+            params.push(Value::Bytes(value.as_bytes().to_vec()));
+        } else {
+            return None;
+        }
+    }
+    Some((format!(" WHERE {}{suffix}", terms.join(" AND ")), params))
+}
+
+fn watermark_param(schema: &Schema, column: &str, checkpoint: &ScalarValue) -> Option<Value> {
+    if schema.field_with_name(column).ok()?.data_type() != &checkpoint.data_type() {
+        return None;
+    }
+    match checkpoint {
+        ScalarValue::Date32(Some(days)) => {
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+            let date = epoch.checked_add_signed(chrono::Duration::days(i64::from(*days)))?;
+            (1000..=9999)
+                .contains(&date.year())
+                .then(|| Value::from(date))
+        }
+        ScalarValue::TimestampMicrosecond(Some(value), _) => {
+            let date = DateTime::from_timestamp_micros(*value)?.naive_utc();
+            (1000..=9999)
+                .contains(&date.year())
+                .then(|| Value::from(date))
+        }
+        _ => None,
     }
 }
 

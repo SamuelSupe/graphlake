@@ -60,32 +60,35 @@ pub(super) async fn browse(
         .ok_or_else(Error::not_found)?;
     let listing_objects =
         request.object_prefix.is_some() && matches!(source, Source::ObjectStorage { .. });
-    let result = tokio::time::timeout(app.options.timeout, read(&catalog, source, &request, &app))
-        .await
-        .map_err(|_| {
-            Error::new(
-                axum::http::StatusCode::GATEWAY_TIMEOUT,
-                "timeout",
-                if listing_objects {
-                    "读取对象列表超时"
-                } else {
-                    "读取表结构超时"
-                },
-            )
-        })?
-        .map_err(|_| {
+    let result = tokio::time::timeout(
+        app.options.timeout,
+        read(&catalog, source, &request, &app, &id),
+    )
+    .await
+    .map_err(|_| {
+        Error::new(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
             if listing_objects {
-                Error::invalid(
-                    "object_list_failed",
-                    "无法读取对象列表，请检查存储端点、桶或容器名称，以及列出对象的权限",
-                )
+                "读取对象列表超时"
             } else {
-                Error::invalid(
-                    "browse_failed",
-                    "无法读取表结构，请检查数据源配置、权限和表名",
-                )
-            }
-        })?;
+                "读取表结构超时"
+            },
+        )
+    })?
+    .map_err(|_| {
+        if listing_objects {
+            Error::invalid(
+                "object_list_failed",
+                "无法读取对象列表，请检查存储端点、桶或容器名称，以及列出对象的权限",
+            )
+        } else {
+            Error::invalid(
+                "browse_failed",
+                "无法读取表结构，请检查数据源配置、权限和表名",
+            )
+        }
+    })?;
     Ok(Json(result))
 }
 
@@ -94,6 +97,7 @@ async fn read(
     source: &Source,
     request: &Request,
     app: &App,
+    model: &str,
 ) -> anyhow::Result<Listing> {
     let mut listing = Listing::default();
     let stats = Arc::new(ReadStats::default());
@@ -217,11 +221,22 @@ async fn read(
             }
         }
         Source::Sqlite { path } => {
-            let snapshot = crate::source::sqlite::Snapshot::open(path, timeout, stats).await?;
+            let snapshot =
+                Arc::new(crate::source::sqlite::Snapshot::open(path, timeout, stats).await?);
             if let Some(name) = relation {
                 provider = Some(
                     snapshot
-                        .table(name, &[], &[], &Arc::new(runtime), size, true)
+                        .table(
+                            name,
+                            &[],
+                            &[],
+                            None,
+                            false,
+                            false,
+                            &Arc::new(runtime),
+                            size,
+                            true,
+                        )
                         .await?
                         .0,
                 );
@@ -255,8 +270,30 @@ async fn read(
                 let files = tables
                     .get(table)
                     .ok_or_else(|| anyhow::anyhow!("unknown Parquet table"))?;
-                let (table, _) =
-                    ParquetTable::open(files, &[], Arc::clone(pool), stats, false).await?;
+                let ids: std::collections::BTreeSet<_> = files
+                    .iter()
+                    .filter_map(|p| crate::source::parquet_snapshot::logical_id(p))
+                    .collect();
+                let (snapshots, _selection) = if ids.is_empty() {
+                    (Default::default(), None)
+                } else {
+                    let managed = super::local_tables::managed::backend(app)
+                        .ok_or_else(|| anyhow::anyhow!("managed local tables are disabled"))?;
+                    let selected = managed
+                        .pin_model(ids, model, timeout.as_secs() + 30)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.message))?;
+                    (managed.snapshots(&selected.pins()?).await?, Some(selected))
+                };
+                let (table, _) = ParquetTable::open_with_managed(
+                    files,
+                    &snapshots,
+                    &[],
+                    Arc::clone(pool),
+                    stats,
+                    false,
+                )
+                .await?;
                 provider = Some(Arc::new(table));
             } else {
                 listing.tables = tables.keys().take(2001).cloned().collect();
@@ -407,7 +444,12 @@ async fn read(
                 stats,
             )?;
             if let Some(name) = relation {
-                provider = Some(session.table(name, &[], &[], size, disk, true).await?.0);
+                provider = Some(
+                    session
+                        .table(name, &[], &[], size, disk, true, false)
+                        .await?
+                        .0,
+                );
             } else {
                 let context = datafusion::prelude::SessionContext::new();
                 let names = session

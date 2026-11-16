@@ -39,7 +39,7 @@ use parquet::{
 };
 use url::Url;
 
-use super::parquet_snapshot::{self, Part, Snapshot};
+use super::parquet_snapshot::{self, Part, RemoteFile, RemoteSnapshot, Snapshot};
 use super::{ReadStats, SourceVersion};
 
 #[cfg(feature = "admin")]
@@ -75,6 +75,7 @@ pub(super) struct PinnedFile {
     pool: Arc<dyn MemoryPool>,
     stats: Arc<ReadStats>,
     footer: Option<Arc<ParquetMetaData>>,
+    _snapshot_lease: Option<Arc<std::fs::File>>,
 }
 
 impl PinnedFile {
@@ -177,6 +178,7 @@ impl PinnedFile {
             pool,
             stats,
             footer: None,
+            _snapshot_lease: None,
         })
     }
     #[cfg(unix)]
@@ -423,13 +425,18 @@ pub(crate) struct ParquetTable {
     parallel_ranges: bool,
 }
 
-type PartInput = (String, Option<Arc<Part>>);
+type PartInput = (
+    String,
+    Option<Arc<Part>>,
+    Option<Arc<std::fs::File>>,
+    Option<RemoteFile>,
+);
 
 #[derive(Debug)]
 enum ParquetInput {
     Open(OpenedParquet),
     Snapshot {
-        key: String,
+        key: Option<String>,
         parts: Vec<PartInput>,
         pool: Arc<dyn MemoryPool>,
         stats: Arc<ReadStats>,
@@ -524,6 +531,26 @@ impl ParquetTable {
         Self::open_storage(locations, columns, None, pool, stats, prune_snapshot).await
     }
 
+    pub(crate) async fn open_with_managed(
+        locations: &[String],
+        snapshots: &BTreeMap<uuid::Uuid, RemoteSnapshot>,
+        columns: &[String],
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+        prune_snapshot: bool,
+    ) -> Result<(Self, Vec<SourceVersion>)> {
+        Self::open_inner(
+            locations,
+            columns,
+            None,
+            pool,
+            stats,
+            prune_snapshot,
+            snapshots,
+        )
+        .await
+    }
+
     pub(crate) async fn open_storage(
         locations: &[String],
         columns: &[String],
@@ -532,28 +559,106 @@ impl ParquetTable {
         stats: Arc<ReadStats>,
         prune_snapshot: bool,
     ) -> Result<(Self, Vec<SourceVersion>)> {
+        Self::open_inner(
+            locations,
+            columns,
+            storage,
+            pool,
+            stats,
+            prune_snapshot,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    async fn open_inner(
+        locations: &[String],
+        columns: &[String],
+        storage: Option<&crate::StorageConfig>,
+        pool: Arc<dyn MemoryPool>,
+        stats: Arc<ReadStats>,
+        prune_snapshot: bool,
+        snapshots: &BTreeMap<uuid::Uuid, RemoteSnapshot>,
+    ) -> Result<(Self, Vec<SourceVersion>)> {
         let store = storage.map(super::storage::open).transpose()?;
         let mut versions = Vec::new();
         let mut inputs = Vec::new();
         for location in locations {
-            if store.is_none()
-                && let Some(path) = parquet_snapshot::managed_location(location)
+            if let Some(id) = parquet_snapshot::logical_id(location) {
+                let frozen = snapshots
+                    .get(&id)
+                    .context("managed local table has no pinned generation")?;
+                versions.push(SourceVersion {
+                    source: location.clone(),
+                    version: frozen.generation.to_string(),
+                    consistency: "pinned object",
+                });
+                if let Some(snapshot) = &frozen.snapshot {
+                    for part in &snapshot.parts {
+                        let file = frozen
+                            .files
+                            .get(&part.id)
+                            .context("managed snapshot is missing a part")?;
+                        inputs.push((
+                            file.location.clone(),
+                            Some(Arc::new(part.clone())),
+                            None,
+                            Some(file.clone()),
+                        ));
+                    }
+                } else {
+                    let file = frozen
+                        .files
+                        .get(&uuid::Uuid::nil())
+                        .context("managed snapshot is missing its Parquet file")?;
+                    inputs.push((file.location.clone(), None, None, Some(file.clone())));
+                }
+                continue;
+            }
+            let managed = if store.is_none() {
+                parquet_snapshot::managed_location(location)
+            } else {
+                None
+            };
+            let lease = managed
+                .as_deref()
+                .map(parquet_snapshot::pin)
+                .transpose()?
+                .flatten();
+            if let Some(path) = managed
                 && let Some(snapshot) = Snapshot::read(&path)?
             {
+                // A publisher may have created the lock on the first conversion
+                // from an ordinary Parquet file after our initial open.
+                let (snapshot, lease) = if lease.is_none()
+                    && let Some(lease) = parquet_snapshot::pin(&path)?
+                {
+                    (
+                        Snapshot::read(&path)?.context("local snapshot changed while pinning")?,
+                        Some(lease),
+                    )
+                } else {
+                    (snapshot, lease)
+                };
+
                 versions.push(snapshot_version(location, &snapshot));
                 // A singleton managed snapshot carries a validated schema and can
                 // postpone pinning its parts until DataFusion passes scan filters.
-                let mut snapshot = snapshot;
+                let logical = snapshot
+                    .pruning
+                    .as_ref()
+                    .map(|index| (Some(index.key.clone()), &index.schema))
+                    .or_else(|| snapshot.indexed.as_ref().map(|index| (None, &index.schema)));
                 if prune_snapshot
                     && locations.len() == 1
-                    && let Some(pruning) = snapshot.pruning.take()
+                    && let Some((key, schema)) = logical
                 {
                     return Ok((
                         Self {
-                            schema: selected_schema(&pruning.schema, columns, location)?,
+                            schema: selected_schema(schema, columns, location)?,
                             input: ParquetInput::Snapshot {
-                                key: pruning.key,
-                                parts: snapshot_inputs(&path, snapshot),
+                                key,
+                                parts: snapshot_inputs(&path, snapshot, lease),
                                 pool,
                                 stats,
                             },
@@ -562,9 +667,9 @@ impl ParquetTable {
                         versions,
                     ));
                 }
-                inputs.extend(snapshot_inputs(&path, snapshot));
+                inputs.extend(snapshot_inputs(&path, snapshot, lease));
             } else {
-                inputs.push((location.clone(), None));
+                inputs.push((location.clone(), None, None, None));
             }
         }
         let (schema, open, physical_versions) =
@@ -587,7 +692,21 @@ impl ParquetTable {
         pool: Arc<dyn MemoryPool>,
         stats: Arc<ReadStats>,
     ) -> Result<Self> {
-        let inputs = snapshot_inputs(path, snapshot);
+        let lease = parquet_snapshot::pin(path)?;
+        if let Some(index) = &snapshot.indexed {
+            let schema = selected_schema(&index.schema, &[], &path.display().to_string())?;
+            return Ok(Self {
+                schema,
+                input: ParquetInput::Snapshot {
+                    key: None,
+                    parts: snapshot_inputs(path, snapshot, lease),
+                    pool,
+                    stats,
+                },
+                parallel_ranges: false,
+            });
+        }
+        let inputs = snapshot_inputs(path, snapshot, lease);
         let (schema, open, _) =
             OpenedParquet::open(inputs, &[], None, &pool, &stats, false).await?;
         Ok(Self {
@@ -614,27 +733,44 @@ impl OpenedParquet {
         let mut metadata = Vec::new();
         #[cfg(feature = "admin")]
         let mut scan_objects = Vec::new();
-        let parallelism = if inputs.iter().all(|(_, part)| part.is_some()) {
+        let parallelism = if inputs.iter().all(|(_, part, _, _)| part.is_some()) {
             8
         } else {
             1
         };
         let mut inputs = futures::stream::iter(inputs.into_iter().enumerate().map(
-            |(index, (location, mask))| {
+            |(index, (location, mask, lease, expected))| {
                 let pool = Arc::clone(pool);
                 let stats = Arc::clone(stats);
                 async move {
                     let mut file = PinnedFile::open_storage(&location, store, pool, stats).await?;
+                    if let Some(expected) = &expected {
+                        ensure!(
+                            file.version(&location).version == expected.version
+                                && file.len() == expected.size,
+                            "managed Parquet object changed"
+                        );
+                    }
                     file.parallel_ranges = parallel_ranges;
+                    file._snapshot_lease = lease;
                     let builder = ParquetRecordBatchStreamBuilder::new(file.clone())
                         .await
                         .with_context(|| format!("reading Parquet schema for {location}"))?;
-                    Ok::<_, anyhow::Error>((index, location, mask, file, builder))
+                    Ok::<_, anyhow::Error>((
+                        index,
+                        location,
+                        mask,
+                        file,
+                        builder,
+                        expected.is_some(),
+                    ))
                 }
             },
         ))
         .buffered(parallelism);
-        while let Some((index, location, mask, mut file, builder)) = inputs.try_next().await? {
+        while let Some((index, location, mask, mut file, builder, managed)) =
+            inputs.try_next().await?
+        {
             let footer = builder.metadata();
             metadata.push(Arc::clone(footer));
             if let Some(mask) = &mask {
@@ -643,7 +779,7 @@ impl OpenedParquet {
                     "local Parquet snapshot part row count changed"
                 );
                 file.footer = Some(Arc::clone(footer));
-            } else {
+            } else if !managed {
                 versions.push(file.version(&location));
             }
             #[cfg(feature = "admin")]
@@ -741,7 +877,11 @@ fn check_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_inputs(path: &Path, snapshot: Snapshot) -> Vec<PartInput> {
+fn snapshot_inputs(
+    path: &Path,
+    snapshot: Snapshot,
+    lease: Option<Arc<std::fs::File>>,
+) -> Vec<PartInput> {
     snapshot
         .parts
         .into_iter()
@@ -749,6 +889,8 @@ fn snapshot_inputs(path: &Path, snapshot: Snapshot) -> Vec<PartInput> {
             (
                 part.path(path).to_string_lossy().into_owned(),
                 Some(Arc::new(part)),
+                lease.clone(),
+                None,
             )
         })
         .collect()
@@ -816,10 +958,10 @@ impl TableProvider for ParquetTable {
                 pool,
                 stats,
             } => {
-                let point = snapshot_point(filters, key);
+                let point = key.as_deref().and_then(|key| snapshot_point(filters, key));
                 let candidates = parts
                     .iter()
-                    .filter(|(_, part)| {
+                    .filter(|(_, part, _, _)| {
                         let bounds = part.as_ref().and_then(|part| part.key_range);
                         match (point, bounds) {
                             (Some(key), Some([min, max])) => (min..=max).contains(&key),

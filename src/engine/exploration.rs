@@ -55,6 +55,15 @@ impl Engine {
                     version
                 }
                 "pinned object" => {
+                    if let Some(id) = crate::source::parquet_snapshot::logical_id(name) {
+                        let Some(current) = self.managed_parquet.get(&id) else {
+                            return Ok(false);
+                        };
+                        if current.generation.to_string() != source.version {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
                     parquet::object_version(
                         name,
                         Arc::clone(&scope.runtime.memory_pool),

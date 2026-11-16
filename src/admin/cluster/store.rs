@@ -30,10 +30,14 @@ pub(super) struct Job {
     pub worker_seen_ms: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub retried: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed_only: bool,
     pub fingerprint: [u8; 32],
     pub export: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csr_generation: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<crate::admin::freshness::Proof>,
     pub deadline_ms: u64,
     pub state: JobState,
 }
@@ -76,11 +80,11 @@ pub(super) struct VersionedJob {
 }
 
 #[derive(Clone)]
-pub(super) struct Metadata {
+pub(in crate::admin) struct Metadata {
     client: reqwest::Client,
     endpoints: Arc<[url::Url]>,
     preferred: Arc<AtomicUsize>,
-    pub(super) prefix: String,
+    pub(in crate::admin) prefix: String,
 }
 
 impl Metadata {
@@ -93,8 +97,8 @@ impl Metadata {
         }
     }
 
-    pub(super) async fn call(&self, path: &str, body: Value) -> Result<Value> {
-        let read_only = path == "/v3/kv/range"
+    pub(in crate::admin) async fn call(&self, path: &str, body: Value) -> Result<Value> {
+        let read_only = matches!(path, "/v3/kv/range" | "/v3/lease/timetolive")
             || path == "/v3/kv/txn"
                 && ["success", "failure"].iter().all(|branch| {
                     body[*branch].is_null()
@@ -215,7 +219,7 @@ impl Metadata {
         STANDARD.encode(format!("{}/jobs/{id}", self.prefix))
     }
 
-    pub async fn get(&self, id: Uuid) -> Result<Option<VersionedJob>> {
+    pub(in crate::admin::cluster) async fn get(&self, id: Uuid) -> Result<Option<VersionedJob>> {
         let response = self
             .call("/v3/kv/range", json!({"key":self.key(id)}))
             .await?;
@@ -233,7 +237,7 @@ impl Metadata {
         }))
     }
 
-    pub async fn create(
+    pub(in crate::admin::cluster) async fn create(
         &self,
         id: Uuid,
         job: &Job,
@@ -259,7 +263,12 @@ impl Metadata {
         Ok(created)
     }
 
-    pub async fn replace(&self, id: Uuid, revision: i64, job: &Job) -> Result<bool> {
+    pub(in crate::admin::cluster) async fn replace(
+        &self,
+        id: Uuid,
+        revision: i64,
+        job: &Job,
+    ) -> Result<bool> {
         self.write(
             id,
             job,
@@ -344,9 +353,10 @@ impl Metadata {
 }
 
 #[derive(Clone)]
-pub(super) struct Objects {
+pub(in crate::admin) struct Objects {
     store: Arc<dyn ObjectStore>,
     remote: bool,
+    bucket: Option<String>,
     prefix: Key,
 }
 
@@ -384,8 +394,66 @@ impl Objects {
         Ok(Self {
             store,
             remote: location.starts_with("s3://"),
+            bucket: location
+                .strip_prefix("s3://")
+                .and_then(|uri| uri.split('/').next())
+                .map(str::to_owned),
             prefix: prefix.join("graphlake-v1").join(cluster),
         })
+    }
+
+    pub fn local_table(&self, table: Uuid) -> Key {
+        self.prefix
+            .clone()
+            .join("local-tables")
+            .join(table.to_string())
+    }
+
+    pub fn object_url(&self, key: &Key) -> Result<String> {
+        Ok(format!(
+            "s3://{}/{}",
+            self.bucket
+                .as_deref()
+                .context("managed store requires S3")?,
+            key
+        ))
+    }
+
+    pub fn local_key(&self, table: Uuid, url: &str) -> Result<Key> {
+        let relative = url
+            .strip_prefix(&format!(
+                "s3://{}/",
+                self.bucket
+                    .as_deref()
+                    .context("managed store requires S3")?
+            ))
+            .context("unexpected managed object bucket")?;
+        let key = Key::parse(relative)?;
+        ensure!(
+            key.prefix_matches(&self.local_table(table)),
+            "unexpected managed object prefix"
+        );
+        Ok(key)
+    }
+
+    pub async fn local_objects(&self, table: Uuid) -> Result<Vec<object_store::ObjectMeta>> {
+        use futures::TryStreamExt;
+        Ok(self
+            .store
+            .list(Some(&self.local_table(table)))
+            .try_collect()
+            .await?)
+    }
+
+    pub async fn object_meta(&self, key: &Key) -> Result<object_store::ObjectMeta> {
+        Ok(self.store.head(key).await?)
+    }
+
+    pub async fn delete_local(&self, key: &Key) -> Result<()> {
+        match self.store.delete(key).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn remote(&self) -> bool {

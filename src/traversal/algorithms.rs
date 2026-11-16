@@ -35,6 +35,59 @@ pub struct GraphAlgorithmMetrics {
     pub iterations: Option<usize>,
     pub converged: Option<bool>,
     pub components: Option<usize>,
+    pub execution: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_ready_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct AlgorithmCapability {
+    pub name: &'static str,
+    pub distributed_csr: bool,
+    pub working_memory: &'static str,
+    pub cooperative_cancellation: bool,
+}
+
+pub const ALGORITHM_CAPABILITIES: &[AlgorithmCapability] = &[
+    capability("pagerank", true, "vertex rank vectors"),
+    capability("weak_components", true, "vertex component vectors"),
+    capability(
+        "label_propagation",
+        false,
+        "adjacency and vertex label vectors",
+    ),
+    capability(
+        "louvain",
+        false,
+        "projected topology plus vertex and link workspace",
+    ),
+    capability(
+        "leiden",
+        false,
+        "projected topology plus vertex and link workspace",
+    ),
+    capability(
+        "node2vec",
+        false,
+        "projected adjacency and two Float32 embedding matrices",
+    ),
+];
+
+const fn capability(
+    name: &'static str,
+    distributed_csr: bool,
+    working_memory: &'static str,
+) -> AlgorithmCapability {
+    AlgorithmCapability {
+        name,
+        distributed_csr,
+        working_memory,
+        cooperative_cancellation: true,
+    }
 }
 
 impl Engine {
@@ -138,6 +191,10 @@ impl GraphAlgorithm {
             iterations: None,
             converged: None,
             components: None,
+            execution: "local_topology",
+            workspace_bytes: None,
+            projection_ready_ms: None,
+            kernel_ms: None,
         };
         let scores = match self {
             Self::PageRank {

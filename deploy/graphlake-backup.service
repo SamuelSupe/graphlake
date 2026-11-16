@@ -1,5 +1,5 @@
 [Unit]
-Description=GraphLake online control-state backup
+Description=GraphLake online backup
 After=network-online.target
 Wants=network-online.target
 
@@ -9,11 +9,12 @@ User=graphlake
 Group=graphlake
 UMask=0077
 EnvironmentFile=/etc/graphlake/graphlake.env
+Environment=GRAPHLAKE_BACKUP_CATALOG_DIR=/var/lib/graphlake/catalog
 StateDirectory=graphlake-backups
 StateDirectoryMode=0700
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-TimeoutStartSec=60
+TimeoutStartSec=4h
 ExecStart=/bin/sh -ec 'exec /opt/graphlake/current/bin/graphlake-admin --cluster-config /etc/graphlake/cluster.yaml backup export --status-file /var/lib/graphlake-backups/export-status.json --file "/var/lib/graphlake-backups/control-$(date -u +%%Y%%m%%dT%%H%%M%%S)-$$$$.json"'

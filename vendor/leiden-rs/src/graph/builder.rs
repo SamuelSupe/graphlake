@@ -123,19 +123,14 @@ fn build_undirected_csr(
 ) -> Result<GraphData> {
     edges.sort_by_key(|a| (a.0, a.1));
     // Merge consecutive duplicate edges by summing weights
-    edges = {
-        let mut merged: Vec<(usize, usize, f64)> = Vec::with_capacity(edges.len());
-        for edge in edges {
-            if let Some(last) = merged.last_mut() {
-                if last.0 == edge.0 && last.1 == edge.1 {
-                    last.2 += edge.2;
-                    continue;
-                }
-            }
-            merged.push(edge);
+    edges.dedup_by(|next, first| {
+        if (first.0, first.1) == (next.0, next.1) {
+            first.2 += next.2;
+            true
+        } else {
+            false
         }
-        merged
-    };
+    });
     let mut neighbor_count: Vec<usize> = vec![0; n];
     for &(u, v, _) in &edges {
         neighbor_count[u] += 1;

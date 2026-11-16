@@ -1,6 +1,9 @@
 mod bounds;
 mod build;
 mod execute;
+mod freshness;
+
+pub(in crate::admin) use freshness::{RefreshStatus, health, watch};
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -162,6 +165,10 @@ struct Manifest {
     model_revision: String,
     graph_options: GraphOptions,
     sources: Vec<Version>,
+    #[serde(default)]
+    built_at_ms: Option<u64>,
+    #[serde(default)]
+    local_generations: BTreeMap<String, String>,
     schemas: BTreeMap<String, String>,
     edge_types: Vec<String>,
     partitions: Vec<Partition>,
@@ -181,6 +188,39 @@ struct Manifest {
     bytes: u64,
     build_ms: u64,
     reads: serde_json::Value,
+}
+
+pub(super) async fn verify_freshness(
+    cluster: &super::Coordinator,
+    model: &str,
+    revision: &str,
+    generation: Uuid,
+    policy: &crate::FreshnessPolicy,
+    inputs: &[crate::admin::freshness::Observation],
+) -> ApiResult<()> {
+    use crate::admin::freshness;
+    if policy.require_current_csr
+        && cluster
+            .shared
+            .metadata
+            .graph(model, revision)
+            .await
+            .map_err(storage)?
+            .map(|(head, _)| head)
+            != Some(generation)
+    {
+        return Err(freshness::conflict("CSR 已发布更新代次"));
+    }
+    let cached = manifest(&cluster.shared.objects, model, revision, generation)
+        .await
+        .map_err(storage)?;
+    if policy.require_consistent_snapshot && !cached.graph_options.require_consistent_snapshot {
+        return Err(freshness::conflict("CSR 构建没有使用可证明的一致快照"));
+    }
+    if !inputs.is_empty() && !self::freshness::is_current(&cached, inputs) {
+        return Err(freshness::conflict("CSR 依赖的本地副本代次已落后或未知"));
+    }
+    Ok(())
 }
 
 struct Generation<'a> {
@@ -280,19 +320,32 @@ pub(in crate::admin) async fn refresh(
     Extension(principal): Extension<Principal>,
     Json(request): Json<Refresh>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(
+        freshness::refresh_model(&app, &model, &principal, request)
+            .await?
+            .summary(),
+    ))
+}
+
+async fn build_and_publish(
+    app: &Arc<App>,
+    model: &str,
+    principal: &Principal,
+    request: Refresh,
+) -> ApiResult<Manifest> {
     let cluster = app
         .cluster
         .as_ref()
         .filter(|c| c.graph_partitions > 0)
         .ok_or_else(Error::not_found)?;
     let _slot = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let (_, _, engine) = app
-        .query_model(&model, &request.model_revision, &principal)
+    let (_, _, mut engine) = app
+        .query_model(model, &request.model_revision, principal)
         .await?;
     let (_, prior) = cluster
         .shared
         .metadata
-        .graph(&model, &request.model_revision)
+        .graph(model, &request.model_revision)
         .await
         .map_err(storage)?
         .unwrap_or((Uuid::nil(), 0));
@@ -303,6 +356,9 @@ pub(in crate::admin) async fn refresh(
             "构建超时必须为 1 至 600000 毫秒",
         ));
     }
+    let _selection =
+        crate::admin::local_tables::managed::resolve(app, &mut engine, model, timeout / 1000 + 120)
+            .await?;
     let scope = engine
         .scope(crate::QueryOptions {
             timeout: Duration::from_millis(timeout),
@@ -317,7 +373,7 @@ pub(in crate::admin) async fn refresh(
     let prefix = cluster
         .shared
         .objects
-        .graph(&model, &request.model_revision, generation);
+        .graph(model, &request.model_revision, generation);
     let built = scope
         .run(build::build(
             &engine,
@@ -338,7 +394,7 @@ pub(in crate::admin) async fn refresh(
             return Err(query::query_error(error));
         }
     };
-    let active = app.models.lock().unwrap().active_revision(&model)?;
+    let active = app.models.lock().unwrap().active_revision(model)?;
     if active.as_deref() != Some(request.model_revision.as_str()) {
         cluster.shared.objects.clean_prefix(&prefix).await;
         return Err(Error::new(
@@ -351,7 +407,7 @@ pub(in crate::admin) async fn refresh(
         .shared
         .metadata
         .publish_graph(
-            &model,
+            model,
             &request.model_revision,
             prior,
             generation,
@@ -367,7 +423,7 @@ pub(in crate::admin) async fn refresh(
             "CSR 已被另一轮刷新替换",
         ));
     }
-    Ok(Json(built.summary()))
+    Ok(built)
 }
 
 impl Manifest {
@@ -376,7 +432,7 @@ impl Manifest {
             "generation": self.generation, "model_revision": self.model_revision, "format": self.format,
             "graph_options": self.graph_options, "sources": self.sources,
             "partitions": self.partitions.len(), "vertices": self.vertices, "edges": self.edges,
-            "bytes": self.bytes, "build_ms": self.build_ms, "source_reads": self.reads
+            "bytes": self.bytes, "build_ms": self.build_ms, "built_at_ms": self.built_at_ms, "source_reads": self.reads
         })
     }
 

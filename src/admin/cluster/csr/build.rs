@@ -459,6 +459,16 @@ pub(super) async fn build(
                 consistency: source.consistency.to_owned(),
             })
             .collect(),
+        built_at_ms: None,
+        local_generations: prepared
+            .versions
+            .iter()
+            .filter(|source| {
+                crate::source::parquet_snapshot::managed_location(&source.source).is_some()
+                    || crate::source::parquet_snapshot::logical_id(&source.source).is_some()
+            })
+            .map(|source| (source.source.clone(), source.version.clone()))
+            .collect(),
         schemas: BTreeMap::new(),
         edge_types: engine.catalog.edges.keys().cloned().collect(),
         partitions: (0..partitions).map(|_| Partition::default()).collect(),
@@ -790,6 +800,7 @@ pub(super) async fn build(
         })
         .sum();
     manifest.build_ms = scope.elapsed_ms();
+    manifest.built_at_ms = Some(super::super::store::now_ms());
     manifest.reads = serde_json::to_value(scope.reads.metrics())?;
     let bytes = serde_json::to_vec(&manifest)?;
     ensure!(

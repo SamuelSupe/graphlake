@@ -178,7 +178,7 @@ pub(in crate::admin) async fn explore(
         ));
     }
     crate::admin::access::check_query(&app, &principal, &id)?;
-    let engine = if request.csr_generation.is_some() {
+    let mut engine = if request.csr_generation.is_some() {
         let files = app.models.lock().unwrap().read_files();
         let (id, revision) = (id.clone(), request.model_revision.clone());
         tokio::task::spawn_blocking(move || files.snapshot_engine(&id, &revision))
@@ -189,6 +189,18 @@ pub(in crate::admin) async fn explore(
             .await?
             .2
     };
+    let selection = crate::admin::local_tables::managed::resolve(
+        &app,
+        &mut engine,
+        &id,
+        app.options.timeout.as_secs() + 120,
+    )
+    .await?;
+    if engine.catalog.freshness.policy != crate::FreshnessPolicy::default() {
+        return Err(super::freshness::conflict(
+            "此模型的严格查询策略需通过查询 API 或 MCP 执行",
+        ));
+    }
     if let Some(term) = access::partition(&app, &principal, &id)? {
         if request.csr_generation.is_some() {
             return Err(access::forbidden());
@@ -401,6 +413,7 @@ pub(in crate::admin) async fn explore(
     let (send, ready) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let _producer = producer;
+        let _selection = selection;
         let mut published = None;
         let result = Box::pin(read(
             &engine,

@@ -726,7 +726,7 @@ impl Leadership {
         self.control.revoke(&self.lease).await;
     }
 
-    pub(super) fn owner(&self) -> Value {
+    pub(in crate::admin) fn owner(&self) -> Value {
         json!({"key":self.control.key("leader"),"target":"VALUE","result":"EQUAL","value":self.value})
     }
 

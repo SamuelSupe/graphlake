@@ -22,7 +22,7 @@ const TARGET_PART_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) fn reclaim(
     anchor: &Path,
-    key: &str,
+    key: Option<&str>,
     base: &mut Vec<Part>,
     mut deleted: usize,
     staged: &mut Vec<(Uuid, NamedTempFile)>,
@@ -101,7 +101,8 @@ pub(super) fn reclaim(
         part.id = Uuid::new_v4();
         part.rows = rows;
         part.deleted.clear();
-        part.key_range = key_leaf(meta.file_metadata().schema_descr(), key)
+        part.key_range = key
+            .and_then(|key| key_leaf(meta.file_metadata().schema_descr(), key))
             .and_then(|leaf| key_range(meta.row_groups(), leaf));
         staged.push((part.id, output));
     }
@@ -114,7 +115,7 @@ pub(super) fn reclaim(
 
 fn split(
     anchor: &Path,
-    key: &str,
+    key: Option<&str>,
     part: &Part,
     count: usize,
     staged: &mut Vec<(Uuid, NamedTempFile)>,
@@ -126,7 +127,7 @@ fn split(
         ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
     )?;
     let groups = meta.metadata().num_row_groups();
-    let leaf = key_leaf(meta.parquet_schema(), key);
+    let leaf = key.and_then(|key| key_leaf(meta.parquet_schema(), key));
     if groups < 2 {
         return Ok(Some(vec![part.clone()]));
     }

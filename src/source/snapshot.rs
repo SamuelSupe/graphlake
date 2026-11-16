@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fmt, fs::File, ptr::NonNull, sync::Arc};
+use std::{
+    collections::HashSet,
+    fmt,
+    fs::File,
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result, ensure};
 use datafusion::{
@@ -24,6 +30,53 @@ use datafusion::{
 };
 
 use super::ReadStats;
+
+type StartScan = Box<dyn FnOnce(Arc<TaskContext>) -> SendableRecordBatchStream + Send>;
+
+/// Only use this provider for a plan with one consumer and no validation rescan.
+pub(crate) fn stream_once(
+    schema: SchemaRef,
+    start: impl FnOnce(Arc<TaskContext>) -> SendableRecordBatchStream + Send + 'static,
+) -> Result<Arc<dyn TableProvider>> {
+    Ok(Arc::new(StreamingTable::try_new(
+        schema.clone(),
+        vec![Arc::new(OneScan {
+            schema,
+            start: Mutex::new(Some(Box::new(start))),
+        })],
+    )?))
+}
+
+struct OneScan {
+    schema: SchemaRef,
+    start: Mutex<Option<StartScan>>,
+}
+
+impl fmt::Debug for OneScan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GraphLake source stream")
+    }
+}
+
+impl PartitionStream for OneScan {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, context: Arc<TaskContext>) -> SendableRecordBatchStream {
+        if let Some(start) = self.start.lock().unwrap().take() {
+            return start(context);
+        }
+        Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            futures::stream::once(async {
+                Err(datafusion::common::DataFusionError::Execution(
+                    "single-consumer source was scanned again".into(),
+                ))
+            }),
+        ))
+    }
+}
 
 /// Store a statement's rows once, so local rescans see the same remote result.
 pub(crate) struct Buffer {

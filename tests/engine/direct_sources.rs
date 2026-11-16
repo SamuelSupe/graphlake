@@ -448,3 +448,41 @@ nodes:
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable MySQL 8.4 server in GRAPHLAKE_TEST_MYSQL"]
+async fn mysql_single_scan_is_lazy_and_releases_the_read_connection() -> Result<()> {
+    use mysql_async::{Conn, Opts, prelude::Queryable};
+    let opts = Opts::from_url(&std::env::var("GRAPHLAKE_TEST_MYSQL")?)?;
+    let mut server = Conn::new(opts).await?;
+    let schema = format!("graphlake_{}", uuid::Uuid::new_v4().simple());
+    server
+        .query_drop(format!("CREATE DATABASE {schema} DEFAULT CHARSET=utf8mb4"))
+        .await?;
+    let test = async {
+        server.query_drop(format!("CREATE TABLE {schema}.items (id BIGINT PRIMARY KEY, payload VARCHAR(2048)) ENGINE=InnoDB")).await?;
+        server.query_drop("SET cte_max_recursion_depth=30000").await?;
+        server.query_drop(format!("INSERT INTO {schema}.items WITH RECURSIVE n(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM n WHERE id<20000) SELECT id, REPEAT('x',2048) FROM n")).await?;
+        let model: Catalog = serde_saphyr::from_str(&format!("graph: stream\nsources:\n  mysql: {{type: mysql, dsn_env: GRAPHLAKE_TEST_MYSQL, tls: false}}\nnodes:\n  Item: {{source: mysql.{schema}.items, key: [id], properties: [payload]}}\n"))?;
+        let engine = Engine::new(model)?;
+        let options = QueryOptions { batch_size: 32, ..Default::default() };
+        let cancel = options.cancellation.clone();
+        let mut query = engine.query(Language::Sql, r#"SELECT id, payload FROM "Item""#, options).await?;
+        assert_eq!(query.metrics().reads.mysql_rows, 0);
+        let batch = query.batches.try_next().await?.expect("first MySQL batch");
+        assert_eq!(batch.num_rows(), 32);
+        assert!(query.metrics().reads.mysql_rows < 20000);
+        cancel.cancel();
+        assert!(query.batches.try_next().await.is_err());
+        drop(query);
+        // ALTER must acquire the metadata lock that the cancelled snapshot held.
+        server.query_drop("SET SESSION lock_wait_timeout=5").await?;
+        server.query_drop(format!("ALTER TABLE {schema}.items ADD COLUMN extra INT")).await?;
+        let mut next = engine.query(Language::Sql, r#"SELECT id FROM "Item" WHERE id=20000"#, Default::default()).await?;
+        assert_eq!(rows(&mut next).await?, [serde_json::json!({"id":20000})]);
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    server.query_drop(format!("DROP DATABASE {schema}")).await?;
+    server.disconnect().await?;
+    test
+}

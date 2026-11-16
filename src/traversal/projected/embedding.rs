@@ -1,5 +1,4 @@
 use anyhow::{Result, ensure};
-use datafusion::execution::memory_pool::MemoryReservation;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use super::{Node2VecOptions, cooperate, graph::Graph};
@@ -34,24 +33,11 @@ pub(super) async fn train(
     graph: &Graph,
     options: Node2VecOptions,
     scope: &QueryScope,
-    budget: &MemoryReservation,
 ) -> Result<Vec<f32>> {
     let vertices = graph.vertices.len();
     let size = vertices
         .checked_mul(options.dimensions)
         .ok_or_else(|| anyhow::anyhow!("Node2Vec embedding size overflow"))?;
-    let bytes = size
-        .checked_mul(2 * std::mem::size_of::<f32>())
-        .ok_or_else(|| anyhow::anyhow!("Node2Vec embedding allocation overflow"))?;
-    budget.try_grow(
-        bytes
-            .saturating_add(vertices.saturating_mul(2 * std::mem::size_of::<f64>()))
-            .saturating_add(
-                options
-                    .walk_length
-                    .saturating_mul(std::mem::size_of::<usize>()),
-            ),
-    )?;
     let mut rng = SmallRng::seed_from_u64(options.seed);
     let initial = 0.5 / options.dimensions as f32;
     let mut input = Vec::with_capacity(size);
@@ -144,6 +130,18 @@ pub(super) async fn train(
         "Node2Vec produced non-finite embeddings"
     );
     Ok(input)
+}
+
+pub(super) fn workspace(vertices: usize, options: Node2VecOptions) -> usize {
+    vertices
+        .saturating_mul(options.dimensions)
+        .saturating_mul(2 * std::mem::size_of::<f32>())
+        .saturating_add(vertices.saturating_mul(2 * std::mem::size_of::<f64>()))
+        .saturating_add(
+            options
+                .walk_length
+                .saturating_mul(std::mem::size_of::<usize>()),
+        )
 }
 
 async fn step(

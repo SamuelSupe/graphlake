@@ -92,6 +92,14 @@ impl Ha {
         if recovery.is_none() {
             ensure!(
                 leader
+                    .get::<String>(super::backup::CLI_RESTORE_KEY)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.message))?
+                    .is_none(),
+                "this namespace is reserved for CLI recovery; retry backup restore"
+            );
+            ensure!(
+                leader
                     .get::<serde_json::Value>(super::recovery::import::JOB_KEY)
                     .await
                     .map_err(|e| anyhow::anyhow!(e.message))?
@@ -369,7 +377,7 @@ async fn mutate_inner(
         {
             return Err(control::timeout());
         }
-        models.apply_ha(id, mutation, &options).await
+        models.apply_ha(id, mutation, &options, app).await
     };
     let (status, model) = tokio::time::timeout_at(deadline, prepared)
         .await

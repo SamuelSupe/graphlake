@@ -8,7 +8,7 @@ type Job = { state: 'not_recorded' | 'unavailable' } | { state: 'recorded'; resu
   ok: boolean; attempted_ms: number; last_success_ms: number | null; checkpoint_ms: number | null; artifact?: string;
 } };
 type Manual = { state: 'unsupported' | 'not_configured' } | { state: 'enabled'; running: boolean; job: Job };
-type Exported = { file: string; status_recorded: boolean };
+type Exported = { file: string; status_recorded: boolean; local_directory?: string };
 export type BackupSnapshot = { export: Job; offline: Job; recovery_configured: boolean; manual?: Manual };
 
 function JobFacts({ job }: { job: Job }) {
@@ -88,7 +88,7 @@ export default function BackupStatus({ visible }: { visible: boolean }) {
     {error && <p role="alert" className="notice error">{error}</p>}
     {data && !error && <>
       <section className="settings-card">
-        <div className="settings-section-title"><h2>{t('手动控制状态备份')}</h2>
+        <div className="settings-section-title"><h2>{t('手动备份')}</h2>
           {manual?.state === 'enabled' && <button type="button" className="button primary compact"
             aria-disabled={exporting || running || loading || !visible}
             onClick={() => { if (!loading) void startBackup(); }}>
@@ -102,6 +102,7 @@ export default function BackupStatus({ visible }: { visible: boolean }) {
           </p>
           {exported && !(manual.job.state === 'recorded' && manual.job.result.artifact === exported.file) &&
             <p className="settings-hint">{t('本次文件 ')}<code>{exported.file}</code></p>}
+          {exported?.local_directory && <p className="settings-hint">{t('本地表目录 ')}<code>{exported.local_directory}</code></p>}
           {exportError && <p className="notice error" role="alert">{exportError}</p>}
           {manual.job.state === 'recorded' && <span className={'status ' + (manual.job.result.ok ? 'passed' : 'failed')}>
             {manual.job.result.ok ? t('最近任务成功') : t('最近任务失败')}
@@ -112,7 +113,7 @@ export default function BackupStatus({ visible }: { visible: boolean }) {
           : t('此操作适用于启用故障接管的 Coordinator。当前部署可按部署手册备份模型目录。')}</p>}
       </section>
       <div className="settings-grid">
-        <JobSummary title={t('定时控制状态备份')} job={data.export} />
+        <JobSummary title={t('定时备份')} job={data.export} />
         <JobSummary title={t('异地副本校验')} job={data.offline} />
       </div>
     </>}

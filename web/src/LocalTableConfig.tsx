@@ -14,6 +14,9 @@ export default function Configure({ saved, table, close, done }: { saved: SavedM
   const [selected, setSelected] = useState<string[]>([]);
   const [keys, setKeys] = useState<string[]>([]);
   const [watermark, setWatermark] = useState('');
+  const [deleted, setDeleted] = useState('');
+  const [lookback, setLookback] = useState('0');
+  const [reconcile, setReconcile] = useState(String(table?.reconcile_interval_seconds ?? ''));
   const [mode, setMode] = useState<Mode>(table?.mode ?? 'full');
   const [periodic, setPeriodic] = useState(Boolean(table?.interval_seconds));
   const [interval, setInterval] = useState(String(table?.interval_seconds ?? 3600));
@@ -28,18 +31,18 @@ export default function Configure({ saved, table, close, done }: { saved: SavedM
 
   async function submit(event: FormEvent) {
     event.preventDefault(); setError('');
-    if (!table && (!source || !selected.length || mode === 'incremental' && (!keys.length || !watermark))) {
+    if (!table && (!source || !selected.length || (mode === 'incremental' || deleted || Number(lookback)) && (!keys.length || !watermark))) {
       setError(t('请选择源表和字段；增量更新还需要主键和增量字段。'));
       requestAnimationFrame(() => errorSummary.current?.focus()); return;
     }
     setSaving(true);
     const base = '/models/' + saved.id + '/local-tables';
     try {
-      const settings = { mode, interval_seconds: periodic ? Number(interval) : null, timeout_seconds: Number(timeout) };
+      const settings = { mode, interval_seconds: periodic ? Number(interval) : null, timeout_seconds: Number(timeout), reconcile_interval_seconds: reconcile ? Number(reconcile) : null };
       if (table) await api(base + '/' + table.name, { method: 'PUT', body: JSON.stringify({ revision: table.revision, ...settings }) });
       else {
         if (!created) {
-          await api(base, { method: 'POST', body: JSON.stringify({ name, source_table: source, columns: selected, key_columns: keys, watermark_column: watermark || null, model_revision: saved.revision, ...settings }) });
+          await api(base, { method: 'POST', body: JSON.stringify({ name, source_table: source, columns: selected, key_columns: keys, watermark_column: watermark || null, lookback: Number(lookback), deleted_column: deleted || null, model_revision: saved.revision, ...settings }) });
           setCreated(true);
         }
         if (loadNow) await api(base + '/' + name + '/load', { method: 'POST', body: JSON.stringify({ mode }) });
@@ -63,7 +66,7 @@ export default function Configure({ saved, table, close, done }: { saved: SavedM
             {columns.length > 0 && <fieldset className="local-column-picker"><legend>{t('加载字段与主键')}</legend><div className="sync-columns-heading"><span>{t('加载字段 · 已选 {0}', selected.length)}</span><span><KeyRound size={12} />{t('主键')}</span></div>{columns.map(column => <div className="sync-column-row" key={column.name}>
               <label><input type="checkbox" checked={selected.includes(column.name)} onChange={e => {
                 setSelected(previous => e.target.checked ? [...previous, column.name] : previous.filter(name => name !== column.name));
-                if (!e.target.checked) { setKeys(previous => previous.filter(name => name !== column.name)); if (watermark === column.name) setWatermark(''); }
+                if (!e.target.checked) { setKeys(previous => previous.filter(name => name !== column.name)); if (watermark === column.name) setWatermark(''); if (deleted === column.name) setDeleted(''); }
               }} /><code>{column.name}</code><small>{column.data_type}</small></label>
               <input type="checkbox" aria-label={t('{0} 作为主键', column.name)} disabled={!selected.includes(column.name)} checked={keys.includes(column.name)} onChange={e => setKeys(previous => e.target.checked ? [...previous, column.name] : previous.filter(name => name !== column.name))} />
             </div>)}</fieldset>}
@@ -75,14 +78,19 @@ export default function Configure({ saved, table, close, done }: { saved: SavedM
               {canIncrement && <label data-selected={mode === 'incremental' || undefined}><span><ArrowRight size={17} /><input type="radio" name="sync-mode" value="incremental" checked={mode === 'incremental'} onChange={() => setMode('incremental')} /></span><strong>{t('增量更新')}</strong><small>{t('按水位读取变化，按主键覆盖')}</small></label>}
             </div>
             {!table && <label>{t('增量字段{0}', mode === 'incremental' ? t('（必选）') : t('（可选）'))}<select value={watermark} onChange={e => setWatermark(e.target.value)}><option value="">{t('选择增量字段')}</option>{selected.map(name => <option key={name}>{name}</option>)}</select></label>}
+            {!table && watermark && keys.length > 0 && <div className="sync-timing-fields">
+              <label>{t('重读窗口（增量字段单位）')}<input type="number" min={0} max={Number.MAX_SAFE_INTEGER} step={1} required value={lookback} onChange={e => setLookback(e.target.value)} /></label>
+              <label>{t('软删除字段')}<select value={deleted} onChange={e => setDeleted(e.target.value)}><option value="">{t('未设置')}</option>{selected.filter(name => name !== watermark && !keys.includes(name)).map(name => <option key={name}>{name}</option>)}</select></label>
+            </div>}
             {table?.watermark_column && <p className="sync-config-keys"><KeyRound size={14} /><span>{t('主键 ')}<code>{table.key_columns.join(' + ')}</code></span><span>{t('增量字段 ')}<code>{table.watermark_column}</code></span></p>}
-            <p className="field-help">{mode === 'incremental' ? t('首次自动全量加载。主键需唯一、非空；增量字段需为整数、日期或时间戳，并随每次新增或更新推进。删除和旧水位数据需全量刷新。') : t('完整反映源表的新增、更新与删除。加载成功后再替换，失败时保留已有副本。')}</p>
+            <p className="field-help">{mode === 'incremental' ? t('软删除字段为 true 或非零整数时删除对应主键。物理删除和窗口外变更由全量对账捕获。') : t('完整反映源表的新增、更新与删除。加载成功后再替换，失败时保留已有副本。')}</p>
           </section>
           <section className="sync-form-section">
             <div className="sync-section-title"><Clock3 size={17} aria-hidden="true" /><h3>{t('运行计划')}</h3><span>{table ? '02' : '03'}</span></div>
             <label className="sync-toggle-row"><span><strong>{t('启用定时刷新')}</strong><small>{t('按固定间隔，自动保持副本更新')}</small></span><input type="checkbox" checked={periodic} onChange={e => setPeriodic(e.target.checked)} /></label>
             <div className="sync-timing-fields">{periodic && <label>{t('刷新间隔')}<span className="sync-input-unit"><input aria-label={t('间隔（秒）')} type="number" min={30} max={2592000} step={1} required value={interval} onChange={e => setInterval(e.target.value)} /><span>{t('秒')}</span></span></label>}
-              <label>{t('加载超时')}<span className="sync-input-unit"><input aria-label={t('单次加载超时（秒）')} type="number" min={1} max={43200} step={1} required value={timeout} onChange={e => setTimeoutValue(e.target.value)} /><span>{t('秒')}</span></span></label></div>
+              <label>{t('加载超时')}<span className="sync-input-unit"><input aria-label={t('单次加载超时（秒）')} type="number" min={1} max={43200} step={1} required value={timeout} onChange={e => setTimeoutValue(e.target.value)} /><span>{t('秒')}</span></span></label>
+              <label>{t('全量对账间隔')}<span className="sync-input-unit"><input aria-label={t('全量对账间隔（秒）')} type="number" min={30} max={2592000} step={1} placeholder={t('手动触发')} value={reconcile} onChange={e => setReconcile(e.target.value)} /><span>{t('秒')}</span></span></label></div>
             <p className="field-help">{periodic ? t('每次任务结束后开始计时，失败按相同间隔重试；同一张表不会重叠运行。最小间隔为 30 秒。') : t('关闭定时刷新后，可随时手动同步；已运行的任务需要单独取消。')}</p>
             {!table && <label className="sync-toggle-row"><span><strong>{t('创建后立即加载')}</strong><small>{t('在后台准备第一份本地副本')}</small></span><input type="checkbox" checked={loadNow} onChange={e => setLoadNow(e.target.checked)} /></label>}
           </section>
@@ -92,7 +100,7 @@ export default function Configure({ saved, table, close, done }: { saved: SavedM
       <footer className="panel-footer"><button type="button" className="button" onClick={close}>{t('关闭')}</button><button type="submit" className="button primary" disabled={saving}>{saving ? t('提交中…') : created ? t('重试加载') : table ? t('保存配置') : t('创建本地表')}</button></footer>
     </form>
     {browse && <SourceBrowser id={saved.id} yaml={saved.yaml} model={modelOf(saved.yaml)} close={() => setBrowse(false)} choose={selection => {
-      setSource(selection.table); setColumns(selection.columns); setSelected(selection.columns.map(c => c.name)); setKeys([]); setWatermark('');
+      setSource(selection.table); setColumns(selection.columns); setSelected(selection.columns.map(c => c.name)); setKeys([]); setWatermark(''); setDeleted(''); setLookback('0');
     }} />}
   </Modal>;
 }

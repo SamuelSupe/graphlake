@@ -1,0 +1,34 @@
+rule_files:
+  - ../deploy/prometheus-rules.yaml
+evaluation_interval: 30s
+
+tests:
+  - interval: 30s
+    input_series:
+      - series: 'graphlake_monitor_freshness_check_failed{model="accounts",source="replica.accounts",reason="reconciliation_stale"}'
+        values: '1 1 1 1 stale'
+      - series: 'graphlake_monitor_volume_low{volume="backups"}'
+        values: '1 1 1 1 1 0'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: GraphLakeFreshnessBudgetExceeded
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: GraphLakeFreshnessBudgetExceeded
+        exp_alerts:
+          - exp_labels: {model: accounts, source: replica.accounts, reason: reconciliation_stale, severity: critical}
+            exp_annotations:
+              summary: GraphLake model accounts failed the reconciliation_stale freshness check
+              description: 'Source replica.accounts. Check the committed observation, reconciliation and CSR state via the model freshness endpoint.'
+      - eval_time: 2m
+        alertname: GraphLakeFreshnessBudgetExceeded
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: GraphLakeVolumeLow
+        exp_alerts:
+          - exp_labels: {volume: backups, severity: warning}
+            exp_annotations:
+              summary: GraphLake volume backups is below its free-byte budget
+      - eval_time: 2m30s
+        alertname: GraphLakeVolumeLow
+        exp_alerts: []

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub(crate) const MAGIC: &[u8] = b"GLPQ1\n";
+const INDEXED_MAGIC: &[u8] = b"GLPQ2\n";
 pub(crate) const MAX_DELTA_PARTS: usize = 15;
 pub(crate) const MAX_BASE_PARTS: usize = 16;
 pub(crate) const MAX_DELETED: usize = 65_536;
@@ -30,6 +31,19 @@ pub(crate) struct Snapshot {
     pub parts: Vec<Part>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pruning: Option<SnapshotPruning>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed: Option<IndexedSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IndexedSnapshot {
+    pub keys: Vec<String>,
+    pub schema: Schema,
+    pub watermark_column: String,
+    pub checkpoint: Vec<u8>,
+    pub committed_at_ms: u64,
+    pub run_id: Uuid,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,6 +69,28 @@ pub(crate) struct Part {
     pub deleted: Vec<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_range: Option<[i64; 2]>,
+}
+
+pub(crate) const LOCAL_TABLE_SCHEME: &str = "local-table://";
+
+pub(crate) fn logical_id(location: &str) -> Option<Uuid> {
+    let id = location.strip_prefix(LOCAL_TABLE_SCHEME)?;
+    Uuid::parse_str(id).ok().filter(|v| v.to_string() == id)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RemoteFile {
+    pub location: String,
+    pub size: u64,
+    pub version: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RemoteSnapshot {
+    pub generation: Uuid,
+    pub snapshot: Option<Snapshot>,
+    pub files: std::collections::BTreeMap<Uuid, RemoteFile>,
 }
 
 pub(crate) fn managed_location(location: &str) -> Option<PathBuf> {
@@ -84,6 +120,21 @@ pub(crate) fn parts_dir(path: &Path) -> PathBuf {
     path.with_extension("parts")
 }
 
+pub(crate) fn reader_lock(anchor: &Path) -> PathBuf {
+    anchor.with_extension("readers.lock")
+}
+
+pub(crate) fn pin(anchor: &Path) -> Result<Option<std::sync::Arc<File>>> {
+    match File::open(reader_lock(anchor)) {
+        Ok(file) => {
+            file.lock_shared()?;
+            Ok(Some(std::sync::Arc::new(file)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Part {
     pub(crate) fn path(&self, anchor: &Path) -> PathBuf {
         parts_dir(anchor).join(format!("{}.parquet", self.id))
@@ -97,9 +148,13 @@ impl Snapshot {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        Self::read_file(&mut file)
+    }
+
+    pub(crate) fn read_file(file: &mut File) -> Result<Option<Self>> {
         let mut header = [0; MAGIC.len()];
         match file.read_exact(&mut header) {
-            Ok(()) if header == MAGIC => {}
+            Ok(()) if header == MAGIC || header == INDEXED_MAGIC => {}
             Ok(()) => return Ok(None),
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -112,6 +167,10 @@ impl Snapshot {
         );
         let snapshot: Self =
             serde_json::from_slice(&body).context("invalid local Parquet snapshot manifest")?;
+        ensure!(
+            snapshot.indexed.is_some() == (header == INDEXED_MAGIC),
+            "invalid local Parquet snapshot version"
+        );
         snapshot.validate()?;
         Ok(Some(snapshot))
     }
@@ -121,11 +180,27 @@ impl Snapshot {
         ensure!(
             (1..=MAX_BASE_PARTS).contains(&self.base_parts)
                 && self.parts.len() >= self.base_parts
-                && self.parts.len() >= 2
+                && (self.indexed.is_some() || self.parts.len() >= 2)
                 && self.parts.len() - self.base_parts <= MAX_DELTA_PARTS,
             "invalid local Parquet snapshot part count"
         );
         let mut deleted = 0;
+        if let Some(index) = &self.indexed {
+            ensure!(
+                self.pruning.is_none()
+                    && !index.keys.is_empty()
+                    && index
+                        .keys
+                        .iter()
+                        .all(|key| index.schema.field_with_name(key).is_ok())
+                    && index
+                        .schema
+                        .field_with_name(&index.watermark_column)
+                        .is_ok()
+                    && !index.checkpoint.is_empty(),
+                "invalid indexed local Parquet snapshot"
+            );
+        }
         if let Some(pruning) = &self.pruning {
             ensure!(
                 pruning
@@ -150,7 +225,7 @@ impl Snapshot {
                 && self
                     .parts
                     .last()
-                    .is_some_and(|p| p.rows > 0 && p.deleted.is_empty()),
+                    .is_some_and(|p| (p.rows > 0 || self.indexed.is_some()) && p.deleted.is_empty()),
             "invalid local Parquet snapshot deletions"
         );
         Ok(())
@@ -159,7 +234,12 @@ impl Snapshot {
     #[cfg(feature = "admin")]
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let mut body = MAGIC.to_vec();
+        let mut body = if self.indexed.is_some() {
+            INDEXED_MAGIC
+        } else {
+            MAGIC
+        }
+        .to_vec();
         serde_json::to_writer(&mut body, self)?;
         if body.len() as u64 > MAX_MANIFEST && self.pruning.is_some() {
             let mut unindexed = self.clone();

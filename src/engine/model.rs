@@ -56,6 +56,9 @@ pub(super) struct ReadKind<'a> {
     pub lazy_validation: bool,
     pub check_data: bool,
     pub sql: Option<&'a super::sql_read::Read>,
+    pub stream_raw: bool,
+    #[cfg(feature = "admin")]
+    pub watermark: Option<(&'a str, &'a ScalarValue)>,
     #[cfg(feature = "admin")]
     pub probe_source: Option<&'a str>,
     #[cfg(feature = "admin")]

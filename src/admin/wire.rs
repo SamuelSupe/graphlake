@@ -65,6 +65,11 @@ impl Target {
         super::access::check_query(app, &self.principal, &self.model)?;
         let files = app.models.lock().unwrap().read_files();
         let (revision, _, engine) = files.query_engine(app, &self.model, None, &self.principal)?;
+        if engine.catalog.freshness.policy != crate::FreshnessPolicy::default() {
+            return Err(super::freshness::conflict(
+                "此模型的严格查询策略需通过查询 API 或 MCP 执行",
+            ));
+        }
         Ok((revision, engine))
     }
 
@@ -80,6 +85,13 @@ impl Target {
     }
 }
 
+type DriverTransaction<'a> = (
+    &'a str,
+    &'a Engine,
+    &'a ReadTransaction,
+    Option<&'a Arc<super::local_tables::managed::Selection>>,
+);
+
 struct Rows {
     app: Arc<App>,
     target: Target,
@@ -87,6 +99,7 @@ struct Rows {
     active: query::Active,
     engine: Engine,
     result: QueryResult,
+    _managed: Option<Arc<super::local_tables::managed::Selection>>,
     batch: Option<RecordBatch>,
     offset: usize,
     finished: bool,
@@ -105,7 +118,7 @@ async fn execute(
     statement: &str,
     parameters: BTreeMap<String, Value>,
     timeout: Option<Duration>,
-    transaction: Option<(&str, &Engine, &ReadTransaction)>,
+    transaction: Option<DriverTransaction<'_>>,
 ) -> ApiResult<Rows> {
     let started = Instant::now();
     let span = telemetry::start_span("query", target.protocol, None);
@@ -216,7 +229,7 @@ async fn execute_inner(
     statement: &str,
     parameters: BTreeMap<String, Value>,
     timeout: Option<Duration>,
-    transaction: Option<(&str, &Engine, &ReadTransaction)>,
+    transaction: Option<DriverTransaction<'_>>,
     started: Instant,
 ) -> ApiResult<Rows> {
     super::access::check_query(app, &target.principal, &target.model)?;
@@ -247,13 +260,27 @@ async fn execute_inner(
         &mut options,
     )
     .await?;
-    let (revision, engine, pinned) = if let Some((revision, engine, pinned)) = transaction {
-        app.published_model_revision(&target.model).await?;
-        (revision.to_owned(), engine.clone(), Some(pinned))
-    } else {
-        let (revision, engine) = target.engine(app)?;
-        (revision, engine, None)
-    };
+    let (revision, engine, pinned, managed) =
+        if let Some((revision, engine, pinned, managed)) = transaction {
+            app.published_model_revision(&target.model).await?;
+            (
+                revision.to_owned(),
+                engine.clone(),
+                Some(pinned),
+                managed.cloned(),
+            )
+        } else {
+            let (revision, mut engine) = target.engine(app)?;
+            let managed = super::local_tables::managed::resolve(
+                app,
+                &mut engine,
+                &target.model,
+                options.timeout.as_secs() + 120,
+            )
+            .await?
+            .map(Arc::new);
+            (revision, engine, None, managed)
+        };
     if let Some(term) = super::access::partition(app, &target.principal, &target.model)? {
         super::users::apply_partition(&engine.catalog, &mut options.graph, &term)?;
     }
@@ -274,6 +301,7 @@ async fn execute_inner(
         active,
         engine,
         result,
+        _managed: managed,
         batch: None,
         offset: 0,
         finished: false,

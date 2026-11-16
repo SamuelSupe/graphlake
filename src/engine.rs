@@ -74,6 +74,7 @@ pub struct Engine {
     pub(crate) cache: Option<crate::traversal::Cache>,
     admission: Arc<query::Admission>,
     parquet_keys: Arc<model::KeyChecks>,
+    pub(crate) managed_parquet: Arc<BTreeMap<uuid::Uuid, source::parquet_snapshot::RemoteSnapshot>>,
     spanner: Arc<BTreeMap<String, source::warehouse::spanner::Client>>,
 }
 
@@ -105,6 +106,7 @@ impl Engine {
             admission,
             parquet_keys: Arc::new(Mutex::new(BTreeMap::new())),
             spanner: Arc::new(spanner),
+            managed_parquet: Arc::default(),
         })
     }
 
@@ -402,6 +404,18 @@ impl Engine {
                     {
                         sql_read::hint(stmt, &self.catalog)
                     }
+                    Statement::Statement(stmt)
+                        if !exporting
+                            && !schema_only
+                            && labels.len() == 1
+                            && calls.is_empty()
+                            && expansions.is_empty()
+                            && repeats.is_empty()
+                            && procedures.is_empty()
+                            && schema_procedures.is_empty() =>
+                    {
+                        sql_read::graph_hint(stmt, &self.catalog)
+                    }
                     _ => None,
                 };
                 if !scope.options.graph.logical_partition.is_empty()
@@ -427,6 +441,7 @@ impl Engine {
                     && let Some(sql) = sql.as_mut()
                 {
                     sql.native = None;
+                    sql.single = None;
                 }
                 #[cfg(feature = "admin")]
                 let snapshot = if let Some(csr) = csr {
@@ -837,8 +852,16 @@ impl Engine {
             verify_consistent_snapshot(catalog, required.keys().copied())?;
         }
         let filters = read_filters::for_labels(catalog, &labels, &scope.options.graph, filter);
-        let (private, tables, mut prepared, proven_key_label) =
-            sources::prepare(catalog, &self.spanner, scope, required, &filters, read).await?;
+        let (private, tables, mut prepared, proven_key_label) = sources::prepare(
+            catalog,
+            &self.spanner,
+            &self.managed_parquet,
+            scope,
+            required,
+            &filters,
+            read,
+        )
+        .await?;
         #[cfg(feature = "admin")]
         if read.probe_source.is_some() {
             return Ok(prepared);

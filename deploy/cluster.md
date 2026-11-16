@@ -49,9 +49,11 @@ Worker 固定监听 IPv4 回环地址。跨主机时在 Worker 前部署只开�
 
 ## 单条查询跨节点执行
 
-`distributed_partitions` 省略或设为 `0` 时，每条查询交给一台 Worker。启用时可设置 `2` 至 `8`，至少配置两台 Worker。所有 Worker 使用同一构建版本。按压缩字节估算，将 Parquet 文件和行组分配到扫描分区。接单 Worker 在原 PostgreSQL 只读事务中读取数据，并将 Join 需要的分区提交到共享存储。远端 Worker 可以读取已提交的 Shuffle 分区来执行 Join、局部聚合和排序，最终分页和全局归并由接单 Worker 执行。可下推的业务键校验和多表映射也使用同一路径。没有可拆分扫描的查询，以及含预执行路径扩展、循环、过程或相关 `CALL` 的查询，继续由接单 Worker 处理。
+`distributed_partitions` 省略或设为 `0` 时，每条查询交给一台 Worker。启用时可设置 `2` 至 `8`。一台 Worker 也可执行同一分区计划和 CSR，分区全部在本机执行。所有 Worker 使用同一构建版本。按压缩字节估算，将 Parquet 文件和行组分配到扫描分区。接单 Worker 在原 PostgreSQL 只读事务中读取数据，并将 Join 需要的分区提交到共享存储。远端 Worker 可以读取已提交的 Shuffle 分区来执行 Join、局部聚合和排序，最终分页和全局归并由接单 Worker 执行。可下推的业务键校验和多表映射也使用同一路径。没有可拆分扫描的查询，以及含预执行路径扩展、循环、过程或相关 `CALL` 的查询，继续由接单 Worker 处理。
 
-Shuffle 使用压缩 Arrow IPC，先写 Worker 本机临时文件，再发布到共享存储。查询结束清理中间对象，异常终止遗留的对象由现有结果保留策略清理。`memory_mib` 为单次 Worker 执行的内存预算，支持 `16` 至 `256`，默认 `256`。分布式阶段按分区构建 Hash Join，共享构建侧状态的 Join 留在单个 Worker 上执行。`64 MiB` 及以下优先规划可溢写的排序归并 Join。单条查询的累计已提交 Shuffle 上限沿用引擎的 1 GiB 溢写预算。
+Shuffle 使用压缩 Arrow IPC，先写 Worker 本机临时文件，再发布到共享存储。查询结束清理中间对象，异常终止遗留的对象由现有结果保留策略清理。`memory_mib` 为单次 Worker 执行或 CSR 构建的内存预算，默认 `256`。Worker 的 `process_memory_mib` 默认 `2048`，支持 `16` 至 `2048`。分区执行开启时会为一个远端任务保留 `memory_mib`，其余空间决定可同时接受的查询数上限。内存预算统计引擎申请，会话、网络、文件缓存和运行时也会占用进程内存。分布式阶段按分区构建 Hash Join，共享构建侧状态的 Join 留在单个 Worker 上执行。`64 MiB` 及以下优先规划可溢写的排序归并 Join。单条查询的累计已提交 Shuffle 上限沿用引擎的 1 GiB 溢写预算。
+
+`distributed_min_rows` 是可选的本机执行门槛，默认 `0` 表示保持分区配置。非零时，CSR 以清单中的顶点加边数判定，小于门槛的分区直接在接单 Worker 运行。查询计划多输入的统计已知且尚未进行分区暂存时，用输入行数估计作相同判断。统计缺失或已有已提交分区的路径沿用分区计划。设置 `0` 可复现强制分区对照。链接数、端点倾斜和来源 I/O 环境会改变成本。
 
 每次分区尝试使用独立对象前缀。下游只读取已确认完成的输出。远端 Worker 断连后，未提交的分区可由其他 Worker 或接单 Worker 重试。Parquet 重试核对原对象版本，Shuffle 重试读取原已提交分区。对象已经变化时返回 `graph_sources_changed`。接单 Worker 丢失 PostgreSQL 事务时，沿用 `worker_lost` 语义。
 
@@ -291,6 +293,24 @@ Bolt 客户端使用 `bolt+s://graphlake.example:7687`，Gremlin 使用 `wss://g
 
 S3 的 `control/catalog/` 保留不可变目录索引，`control/catalog-blobs/` 按内容摘要保存目录文件。目录提交只上传上一代没有引用的内容，写齐后由 etcd 更新生效指针。目录文件总量上限为 512 MiB，单文件上限为 8 MiB，索引上限为 32 MiB。清理前须保留当前快照和未过期回执引用的索引及其全部文件。新版本可读取旧的内联目录，旧版本无法读取新索引。切换前先升级备用 Coordinator 和备份工具，并保留切换前的便携检查点供回退。
 
+### S3 托管本地表
+
+在启用 Coordinator 故障接管、已有 etcd 与 S3 兼容集群存储的部署中，可在集群配置启用托管本地表。候选 Coordinator 与 Worker 使用同一集群名和对象存储前缀，并可访问同一 etcd。Worker 的 `--source-dir` 仍用于普通文件源。只查询托管副本时，可以为它传一个节点私有的空目录。
+
+```yaml
+managed_local_tables: true
+local_snapshot_retention_seconds: 86400
+local_snapshot_gc_grace_seconds: 300
+```
+
+新建本地表返回稳定的 `local-table://<表 UUID>`，编辑器将它加入 Parquet 映射。旧文件路径可继续读取。迁移时用原始来源创建新的托管表，加载并检查后改用托管引用发布模型。切换期间，新旧版本各用自己的来源。
+
+同步仍在 Coordinator 私有临时目录暂存。候选代次的清单和新增数据先上传，未变化的数据文件可被多代引用。上传完成后，单个 etcd 事务核对活动租约持有者、表记录版本和任务归属，并同时发布代次、水位和任务结果。新主可以读原代，并按已提交水位重试中断的同步。切主后的首次写入可能需要下载上一代并重建派生键索引。
+
+Coordinator 在派发前固定输入并登记 etcd 租约。Worker 校验租约剩余时间、清单摘要和 Parquet 对象版本，按这些引用读取。仅依赖托管表的查询在 Worker 丢失时可用原代次重试一次。CSR 构建过程固定代次，完成后使用自身的 CSR 数据块，来源代次仍用于新鲜度校验。备份也登记独立租约，读取固定代次并验证文件 SHA-256。恢复到托管模式时，在提交控制状态前将副本重新上传到目标站的 S3 前缀，保留表 ID 和代次。
+
+保留期从代次退出生效状态起算。达到保留期、且没有查询或备份持有租约的代次先标记，再等待回收宽限期。仍被其他代次引用的数据文件保留。失败上传遗留的完整对象在宽限期后回收。etcd 或必要清单不可读时，本轮回收停止。对象存储若启用版本管理，非当前对象版本和未完成的分段上传由桶的生命周期策略处理。不要对 GraphLake 活跃对象前缀设置按对象年龄删除的规则。
+
 ### 入口协议探测
 
 HAProxy 对 HTTPS 后端检查 `/coordinator/active`，对 Bolt 后端通过实际转发端口发送 Bolt 5.4 握手。Coordinator 在回复版本前校验主权。仅 Bolt 转发中断时，入口的 `/bolt` 返回 503，Keepalived 可将 VIP 移至健康入口。Gremlin WebSocket 与 HTTPS 共用转发路径。验收时应分别中断 HTTPS 和 Bolt 转发，并使用真实 WebSocket 客户端校验入口的升级配置。
@@ -304,23 +324,26 @@ HAProxy 对 HTTPS 后端检查 `/coordinator/active`，对 Bolt 后端通过实�
 导出时 Coordinator 可持续接单。命令在同一 etcd 事务读取模型指针、用户角色和服务账号，随后下载该代次的不可变归档。输出为经过校验的 `0600` 文件，包含草稿、历史、授权以及密码哈希，按凭据备份保管。安装随包提供的 `graphlake-backup.service` 与 `graphlake-backup.timer` 可每小时导出一次。配置独立目录同步与保留策略，将备份副本迁出 etcd 与对象存储所在故障域。监控进程根据导出和异地校验状态触发故障与过期告警。[生产监控与恢复检查](monitoring.md)
 
 ```sh
-graphlake-admin --cluster-config /etc/graphlake/cluster.yaml backup export \
+graphlake-admin --catalog-dir /var/lib/graphlake/catalog \
+  --cluster-config /etc/graphlake/cluster.yaml backup export \
   --file /srv/graphlake-backups/control.json
 ```
+
+有本地表时，`control.json` 包含 `state.local_tables`，其中记录备份标识、定义、刷新策略、历史及每个文件的 SHA-256。将控制 JSON 和其同级的 `local-<state.local_tables.id>` 目录作为一组同步和保留。复制期间已发布代次持续可读，定时、手动和 CLI 导出均读取已提交版本。派生键索引在恢复后的第一次需要时自动重建，可能读取完整键列。定时单元默认从 `/var/lib/graphlake/catalog` 读取，定制部署可用 `GRAPHLAKE_BACKUP_CATALOG_DIR` 指定与活动 Coordinator 一致的目录。导出已引用本地表的模型需要提供该目录。
 
 恢复时为配置选择全新的集群名和 S3 前缀，准备 etcd、对象存储、Worker 和源路径。控制备份包含凭据哈希。异地传输后先对副本执行 `graphlake-admin backup verify --file control.json` 验证档案。
 
 #### 绑定恢复点并开放入口
 
-目标站可在 HTTPS 的 `/recovery` 从异地副本恢复。准备与主站隔离的目标集群名、S3 前缀、可写的共享来源目录和一个空 PostgreSQL 数据库。所有候选 Coordinator 使用相同恢复配置，目标站的管理员密码单独初始化。安装能读取对应 PostgreSQL 自定义归档的 `pg_restore`。可通过 `GRAPHLAKE_RESTORE_PG_RESTORE` 指定客户端的绝对路径，恢复前会检查归档版本兼容性。
+目标站可在 HTTPS 的 `/recovery` 从异地副本恢复。准备与主站隔离的目标集群名、S3 前缀、可写的共享来源目录。清单包含 PostgreSQL 时还需准备一个空数据库。所有候选 Coordinator 使用相同恢复配置，目标站的管理员密码单独初始化。安装能读取对应 PostgreSQL 自定义归档的 `pg_restore`。可通过 `GRAPHLAKE_RESTORE_PG_RESTORE` 指定客户端的绝对路径，恢复前会检查归档版本兼容性。
 
-- `GRAPHLAKE_RESTORE_INBOX` 指向可信、只读的异地副本目录，可由异地对象存储同步或挂载。每个检查点用一个以字母或数字开头的子目录，目录名可含连字符和下划线。子目录根下放置 `control.json`、`manifest.json` 和 `postgres.dump`，Parquet 文件沿用清单的相对路径。各站点需保留这些只读副本供验收重验。
-- `GRAPHLAKE_RESTORE_POSTGRES_DSN_ENV` 填目标站 DSN 的环境变量名，须与清单的 `postgres.dsn_env` 一致。该变量在目标站解析到专用空库，使用单一 TCP 地址并明确给出数据库和用户。开启 TLS 时会验证主机名与 CA，可为 `pg_restore` 通过 `GRAPHLAKE_RESTORE_PG_CA_FILE` 指定 CA。
-- `GRAPHLAKE_RECOVERY_TOKEN` 使用 `openssl rand -hex 32` 生成并在所有候选 Coordinator 上配置。部署随包 HAProxy 配置并启动 Worker、Coordinator。保持源数据冻结，在管理后台选择「运行配置 → 备份与恢复 → 恢复备份」，输入目标站 HTTPS 地址。也可以直接访问目标站 `/recovery`。在目标站输入恢复令牌，选择并检查恢复点。检查会读取控制备份和清单，显示检查点、表和文件数量。确认后，服务会再次核对清单摘要及数据归档，然后写入 Parquet、在单事务中恢复 PostgreSQL，再提交控制状态。已有 Parquet 文件仅在摘要一致时复用。开始写入后重试须使用同一检查点。普通业务入口会保持关闭，直到验收通过。页面还会检查同一 HTTPS 地址的业务入口是否就绪。
+- `GRAPHLAKE_RESTORE_INBOX` 指向可信、只读的异地副本目录，可由异地对象存储同步或挂载。每个检查点用一个以字母或数字开头的子目录，目录名可含连字符和下划线。子目录根下放置 `control.json`、`manifest.json`，有本地表时放入同级 `local-<id>` 目录。外部 Parquet 沿用清单的相对路径，含 PostgreSQL 时放入 `postgres.dump`。各站点需保留这些只读副本供验收重验。
+- 清单含 PostgreSQL 时，`GRAPHLAKE_RESTORE_POSTGRES_DSN_ENV` 填目标站 DSN 的环境变量名，须与清单的 `postgres.dsn_env` 一致。该变量在目标站解析到专用空库，使用单一 TCP 地址并明确给出数据库和用户。开启 TLS 时会验证主机名与 CA，可为 `pg_restore` 通过 `GRAPHLAKE_RESTORE_PG_CA_FILE` 指定 CA。
+- `GRAPHLAKE_RECOVERY_TOKEN` 使用 `openssl rand -hex 32` 生成并在所有候选 Coordinator 上配置。部署随包 HAProxy 配置并启动 Worker、Coordinator。保持源数据冻结，在管理后台选择「运行配置 → 备份与恢复 → 恢复备份」，输入目标站 HTTPS 地址。也可以直接访问目标站 `/recovery`。在目标站输入恢复令牌，选择并检查恢复点。检查会读取控制备份和清单，显示检查点、表和文件数量。确认后，服务会再次核对清单摘要及数据归档，然后校验并写入外部 Parquet 和本地副本，有 PostgreSQL 时在单事务中恢复数据库，再提交控制状态。已安装的文件仅在摘要一致时复用。开始写入后重试须使用同一检查点。普通业务入口会保持关闭，直到验收通过。验收重查本地文件和状态摘要，并执行清单中的业务查询。恢复保留原刷新策略，定时同步和定时对账暂停，验收后在本地表页面保存刷新配置即可恢复。CLI 恢复中断后，目标命名空间只能用同一清单重试。页面还会检查同一 HTTPS 地址的业务入口是否就绪。
 
 以下步骤适用于手工准备检查点和使用现有 CLI 恢复。UI 恢复使用步骤 1 生成的同格式检查点。
 
-1. 在同一个业务检查点暂停控制写入、PostgreSQL 写入和 Parquet 替换。导出控制备份和 PostgreSQL 自定义格式归档 `pg_dump -Fc`，把归档命名为 `postgres.dump`。用下列命令取得源库每张恢复表的内容摘要。把控制备份中的 `sha256`、PostgreSQL 归档的 SHA-256、表摘要和每个 Parquet 文件的 SHA-256 写入 `manifest.json`。用生产业务查询记录期望结果和实际生效的模型版本。多行结果须使用确定性排序。归档的内容摘要标识这份逻辑恢复点。
+1. 在同一个业务检查点暂停控制写入、PostgreSQL 写入和 Parquet 替换。导出控制备份和 PostgreSQL 自定义格式归档 `pg_dump -Fc`，把归档命名为 `postgres.dump`。部署使用的 `pg_dump`、`pg_restore` 和目标数据库应选用相互兼容的版本。用下列命令取得源库每张恢复表的内容摘要。把控制备份中的 `sha256`、PostgreSQL 归档的 SHA-256、表摘要和每个 Parquet 文件的 SHA-256 写入 `manifest.json`。用生产业务查询记录期望结果和实际生效的模型版本。多行结果须使用确定性排序。归档的内容摘要标识这份逻辑恢复点。
 2. 在异地使用 `pg_restore --single-transaction --no-owner --no-acl` 恢复到空数据库，将清单中的 Parquet 文件恢复到目录对应的相对路径。Coordinator 和 Worker 使用相同的恢复数据，优先使用共用的只读快照。恢复期间保持业务来源冻结，直到验收和切流完成。模型的来源环境变量应指向目标站。管理员凭据单独恢复或重新初始化。
 3. 全部目标 Coordinator 停止时运行下方恢复命令。目标已有控制状态时拒绝导入。新实例统一用本版软件并设 `GRAPHLAKE_RECOVERY_DIR` 为下方清单目录。此时正常 HTTPS、Gremlin 和 Bolt 入口保持关闭，内部状态端口可用于监控。
 4. 使用随包 HAProxy 配置。从验证客户端打开目标站 HTTPS 地址的 `/recovery`，输入此次恢复专用令牌。页面先校验清单、备份与 Parquet 摘要，之后可确认执行恢复验收。CLI 也可通过同一 HTTPS 入口发送 `POST /recovery/verify`。VIP 尚未启用时，可把生产域名临时解析到目标 HAProxy 的可达地址，保留生产 Host 和 TLS 校验。只有清单、数据摘要、生效模型和查询行逐项通过时，Coordinator 才会提交开放标记。同一 etcd 命名空间内接管的节点遵守同一门槛。失败时检查响应原因，修正目标数据后重试。清单本身错误时从经复核的新备份和新命名空间重做演练。页面通过同一个 HTTPS 地址检查业务入口的 `/readyz`。显示「允许切流」时，验收已通过且业务入口已就绪。可重新读取状态核对，之后清除操作端保存的专用令牌。
@@ -330,7 +353,8 @@ graphlake-admin backup fingerprint-postgres --dsn-env LEDGER_DSN \
   --relation ledger.accounts --relation ledger.merchants
 # 在备份目录中保存 manifest.json 和 postgres.dump
 export GRAPHLAKE_RECOVERY_TOKEN="$(openssl rand -hex 32)"
-graphlake-admin --cluster-config /etc/graphlake/recovery.yaml backup restore \
+graphlake-admin --catalog-dir /var/lib/graphlake/catalog \
+  --cluster-config /etc/graphlake/recovery.yaml backup restore \
   --file /srv/graphlake-restore/control.json --recovery-dir /srv/graphlake-restore
 # curl 从 stdin 读令牌，避免把它放到进程参数
 printf 'X-GraphLake-Recovery-Token: %s\n' "$GRAPHLAKE_RECOVERY_TOKEN" | \
@@ -338,7 +362,7 @@ printf 'X-GraphLake-Recovery-Token: %s\n' "$GRAPHLAKE_RECOVERY_TOKEN" | \
     -X POST -H @- https://graphlake.example/recovery/verify
 ```
 
-`manifest.json` 示例中的摘要应替换为 64 位小写十六进制值，模型版本直接使用管理 API 返回的 `active_revision`。清单包含至少一张 PostgreSQL 表、一个 Parquet 文件、一条实际业务查询及其完整结果。结果单元格填写 API 返回的文本或 `null`。
+`manifest.json` 示例中的摘要应替换为 64 位小写十六进制值，模型版本直接使用管理 API 返回的 `active_revision`。清单包含至少一条实际业务查询及其完整结果。按需提供 `postgres` 和外部 `parquet`。只使用本地副本的模型可省略这两项，本地副本文件清单已经在控制 JSON 内。结果单元格填写 API 返回的文本或 `null`。
 
 ```json
 {

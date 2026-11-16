@@ -38,7 +38,9 @@ use crate::{
 };
 use datafusion::prelude::SessionContext;
 
-pub use algorithms::{GraphAlgorithm, GraphAlgorithmMetrics};
+pub use algorithms::{
+    ALGORITHM_CAPABILITIES, AlgorithmCapability, GraphAlgorithm, GraphAlgorithmMetrics,
+};
 pub(crate) use cache::Cache;
 pub use cache::RefreshReport;
 pub(crate) use expand::{Expansion, MixedExpansion, text_key};

@@ -31,7 +31,7 @@ use crate::{
     engine::QueryScope,
     source::parquet_snapshot::{
         MAX_BASE_PARTS, MAX_DELETED, MAX_DELTA_PARTS, Part, Snapshot, SnapshotPruning, parts_dir,
-        row_selection,
+        reader_lock, row_selection,
     },
 };
 
@@ -42,7 +42,7 @@ const SCATTERED_GROUPS: usize = 8;
 
 pub(super) struct Prepared {
     pub snapshot: Snapshot,
-    staged: Vec<(Uuid, NamedTempFile)>,
+    pub(super) staged: Vec<(Uuid, NamedTempFile)>,
 }
 
 pub(super) fn prepare(
@@ -57,8 +57,7 @@ pub(super) fn prepare(
     let Some(leaf) = key_leaf(delta_meta.parquet_schema(), key) else {
         return Ok(None);
     };
-    let delta_rows = row_count(&delta_meta)?;
-    let mut keys = Vec::with_capacity(delta_rows);
+    let mut keys = Vec::with_capacity(row_count(&delta_meta)?);
     let projection = ProjectionMask::leaves(delta_meta.parquet_schema(), [leaf]);
     for batch in
         ParquetRecordBatchReaderBuilder::new_with_metadata(delta.try_clone()?, delta_meta.clone())
@@ -82,7 +81,7 @@ pub(super) fn prepare(
             key_range: None,
         }]
     };
-    let mut base_parts = previous.as_ref().map_or(1, |snapshot| snapshot.base_parts);
+    let base_parts = previous.as_ref().map_or(1, |snapshot| snapshot.base_parts);
     for part in &mut changed {
         scope.check()?;
         let file = File::open(if previous.is_some() {
@@ -142,6 +141,26 @@ pub(super) fn prepare(
         part.deleted.dedup();
     }
 
+    finish(
+        anchor,
+        changed,
+        base_parts,
+        delta,
+        &delta_meta,
+        Some(key),
+        scope,
+    )
+}
+
+pub(super) fn finish(
+    anchor: &Path,
+    mut changed: Vec<Part>,
+    mut base_parts: usize,
+    delta: File,
+    delta_meta: &ArrowReaderMetadata,
+    key: Option<&str>,
+    scope: &QueryScope,
+) -> Result<Option<Prepared>> {
     let mut staged = Vec::new();
     let base_deleted = changed[..base_parts]
         .iter()
@@ -163,7 +182,7 @@ pub(super) fn prepare(
         || base_deleted > MAX_DELETED
     {
         let Some((file, meta)) =
-            compact_deltas(anchor, &changed[base_parts..], delta, &delta_meta, scope)?
+            compact_deltas(anchor, &changed[base_parts..], delta, delta_meta, scope)?
         else {
             return Ok(None);
         };
@@ -177,14 +196,16 @@ pub(super) fn prepare(
             base_parts += 1;
         }
         let rows = usize::try_from(meta.file_metadata().num_rows())?;
-        let bounds = key_leaf(meta.file_metadata().schema_descr(), key)
+        let bounds = key
+            .and_then(|key| key_leaf(meta.file_metadata().schema_descr(), key))
             .and_then(|leaf| key_range(meta.row_groups(), leaf));
         staged.push((id, file));
         (rows, bounds)
     } else {
         (
-            delta_rows,
-            key_range(delta_meta.metadata().row_groups(), leaf),
+            row_count(delta_meta)?,
+            key.and_then(|key| key_leaf(delta_meta.parquet_schema(), key))
+                .and_then(|leaf| key_range(delta_meta.metadata().row_groups(), leaf)),
         )
     };
     changed.push(Part {
@@ -198,7 +219,8 @@ pub(super) fn prepare(
             generation: Uuid::new_v4(),
             base_parts,
             parts: changed,
-            pruning: Some(SnapshotPruning {
+            indexed: None,
+            pruning: key.map(|key| SnapshotPruning {
                 key: key.to_owned(),
                 schema: Schema::new(delta_meta.schema().fields().clone()),
             }),
@@ -331,11 +353,18 @@ pub(super) fn publish(
     first: bool,
     prepared: &Prepared,
     scope: &QueryScope,
+    before_manifest: impl FnOnce() -> Result<()>,
 ) -> Result<bool> {
     let root = anchor.parent().expect("managed local table path");
     let directory = parts_dir(anchor);
     let snapshot = &prepared.snapshot;
     fs::create_dir_all(&directory)?;
+    File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(reader_lock(anchor))?
+        .sync_all()?;
     scope.check()?;
     if first {
         match fs::hard_link(anchor, snapshot.parts[0].path(anchor)) {
@@ -372,6 +401,8 @@ pub(super) fn publish(
     manifest.write_all(&snapshot.encode()?)?;
     manifest.as_file().sync_all()?;
     scope.check()?;
+    before_manifest()?;
+    scope.check()?;
     manifest.persist(anchor)?;
     File::open(root)?.sync_all()?;
     Ok(true)
@@ -387,6 +418,20 @@ fn links_unavailable(error: &io::Error) -> bool {
 }
 
 pub(super) fn clean(anchor: &Path) -> Result<()> {
+    let lock = match File::options()
+        .read(true)
+        .write(true)
+        .open(reader_lock(anchor))
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
     let directory = parts_dir(anchor);
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,

@@ -71,7 +71,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum BackupAction {
-    /// Export the active metadata and model archives from a running or stopped cluster.
+    /// Export control state and local tables from a running or stopped cluster.
     Export {
         #[arg(long)]
         file: PathBuf,
@@ -82,7 +82,7 @@ enum BackupAction {
     Restore {
         #[arg(long)]
         file: PathBuf,
-        /// Directory containing manifest.json and postgres.dump.
+        /// Directory containing manifest.json and the recovery artifacts.
         #[arg(long)]
         recovery_dir: PathBuf,
     },
@@ -176,8 +176,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     let config = args
                         .cluster_config
                         .context("backup requires --cluster-config")?;
-                    graphlake::admin::cluster_backup(&config, &file, None).await?;
-                    Ok(Some(chrono::Utc::now().timestamp_millis() as u64))
+                    let catalog = args.catalog_dir.or_else(|| {
+                        std::env::var_os("GRAPHLAKE_BACKUP_CATALOG_DIR").map(PathBuf::from)
+                    });
+                    graphlake::admin::cluster_backup_with_catalog(
+                        &config,
+                        &file,
+                        None,
+                        catalog.as_deref(),
+                    )
+                    .await
                 }
                 .await;
                 (result, status_file)
@@ -192,7 +200,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 let config = args
                     .cluster_config
                     .context("backup requires --cluster-config")?;
-                return graphlake::admin::cluster_backup(&config, &file, Some(&recovery_dir)).await;
+                return graphlake::admin::cluster_backup_with_catalog(
+                    &config,
+                    &file,
+                    Some(&recovery_dir),
+                    args.catalog_dir.as_deref(),
+                )
+                .await
+                .map(|_| ());
             }
             BackupAction::Verify { file, status_file } => (
                 graphlake::admin::verify_backup_checkpoint(&file),

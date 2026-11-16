@@ -23,6 +23,7 @@ pub(super) struct Worker {
     pub(super) shared: Shared,
     pub(super) workers: Vec<url::Url>,
     partitions: usize,
+    pub(super) distributed_min_rows: usize,
     pub(super) memory_bytes: usize,
     source_dir: PathBuf,
     token_hash: [u8; 32],
@@ -41,19 +42,20 @@ pub(super) fn router(
     slots: usize,
 ) -> (Router, CancellationToken) {
     let shutdown = CancellationToken::new();
+    let remote = usize::from(config.distributed_partitions > 0);
+    let slots = slots.min(config.process_memory_mib / config.memory_mib - remote);
     let worker = Arc::new(Worker {
         id: Uuid::new_v4(),
         token_hash: Sha256::digest(shared.token.as_bytes()).into(),
         shared,
         workers: config.workers,
         partitions: config.distributed_partitions,
+        distributed_min_rows: config.distributed_min_rows,
         memory_bytes: config.memory_mib * 1024 * 1024,
         source_dir,
         slots: Arc::new(Semaphore::new(slots)),
         probes: Semaphore::new(2),
-        stage_slots: Arc::new(Semaphore::new(usize::from(
-            config.distributed_partitions > 0,
-        ))),
+        stage_slots: Arc::new(Semaphore::new(remote)),
         shutdown: shutdown.clone(),
         arc_cache: Default::default(),
         metrics: Metrics::new(slots),
@@ -102,6 +104,7 @@ async fn metrics(State(worker): State<Arc<Worker>>) -> impl IntoResponse {
         0,
         None,
         None,
+        false,
     )
 }
 
@@ -128,7 +131,21 @@ async fn readiness(
     let probe = tokio::time::timeout(Duration::from_secs(5), async {
         worker.shared.metadata.ping().await.map_err(storage)?;
         let catalog = worker.catalog(&model, &revision).await?;
-        SourceProbe::run(catalog, options).await
+        let ids = crate::admin::local_tables::managed::referenced(&catalog);
+        let mut engine = Engine::new(catalog).map_err(query::query_error)?;
+        let managed = crate::admin::local_tables::managed::Managed::reader(
+            worker.shared.metadata.clone(),
+            worker.shared.objects.clone(),
+        );
+        let selection = managed.pin_model(ids, &model, 30).await?;
+        use crate::admin::local_tables::managed::error;
+        engine.managed_parquet = Arc::new(
+            managed
+                .snapshots(&selection.pins().map_err(error)?)
+                .await
+                .map_err(error)?,
+        );
+        SourceProbe::run(engine, options).await
     })
     .await
     .map_err(|_| unavailable())??;
@@ -267,7 +284,7 @@ impl Worker {
             let lease = tokio::spawn(async move {
                 worker.maintain_lease(id, &lease_job, &lease_token).await;
             });
-            let operation = self.compute(id, &job, &dispatch.request, token.clone(), deadline);
+            let operation = self.compute(id, &job, &dispatch, token.clone(), deadline);
             let result = tokio::select! {
                 biased;
                 _ = token.cancelled() => Err(cancelled()),
@@ -393,13 +410,35 @@ impl Worker {
         self: &Arc<Self>,
         id: Uuid,
         job: &Job,
-        request: &query::Request,
+        dispatch: &Dispatch,
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> ApiResult<JobState> {
         let mut catalog = self.catalog(&job.model, &job.revision).await?;
         catalog.export_locations.clear();
-        let engine = Engine::new(catalog).map_err(query::query_error)?;
+        let mut engine = Engine::new(catalog).map_err(query::query_error)?;
+        let request = &dispatch.request;
+        if let Some(pin) = dispatch.managed.first() {
+            let managed = crate::admin::local_tables::managed::Managed::reader(
+                self.shared.metadata.clone(),
+                self.shared.objects.clone(),
+            );
+            engine.managed_parquet = Arc::new(
+                managed
+                    .snapshots(&dispatch.managed)
+                    .await
+                    .map_err(crate::admin::local_tables::managed::error)?,
+            );
+            let remaining = managed
+                .remaining(pin)
+                .await
+                .map_err(crate::admin::local_tables::managed::error)?;
+            if remaining
+                <= deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(5)
+            {
+                return Err(timeout());
+            }
+        }
         let (_, language, mut options) = query::validate_request(request, QueryOptions::default())?;
         if let Some(term) = &request.tenant_partition {
             crate::admin::users::apply_partition(&engine.catalog, &mut options.graph, term)?;
@@ -421,6 +460,7 @@ impl Worker {
                 self.id,
                 job.deadline_ms,
                 self.partitions,
+                self.distributed_min_rows,
             )
         });
         let cypher_csr = if let Some(generation) = request.csr_generation {
@@ -451,6 +491,9 @@ impl Worker {
             .map_err(query::query_error)?;
             (result, None)
         };
+        if let Some(proof) = &job.freshness {
+            proof.verify(&result.versions)?;
+        }
         let (arrow, graph_pages) = if job.export {
             let arrow = query::download::capture_all(result, options.spill_bytes).await?;
             (Some(arrow), 0)
@@ -541,9 +584,11 @@ mod tests {
             worker: Some(worker_id),
             worker_seen_ms: now_ms(),
             retried: false,
+            managed_only: false,
             fingerprint: [0; 32],
             export: false,
             csr_generation: None,
+            freshness: None,
             deadline_ms: now_ms() + 1000,
             state: JobState::Running,
         };
@@ -587,6 +632,7 @@ mod tests {
             workers: Vec::new(),
             partitions: 0,
             memory_bytes: 256 * 1024 * 1024,
+            distributed_min_rows: 0,
             source_dir: dir.path().to_owned(),
             token_hash: [0; 32],
             slots: Arc::new(Semaphore::new(1)),

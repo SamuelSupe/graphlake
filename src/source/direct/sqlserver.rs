@@ -17,7 +17,7 @@ use datafusion::{
     },
 };
 use futures::TryStreamExt;
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -26,6 +26,7 @@ pub(crate) struct Driver {
     client: Client<Compat<TcpStream>>,
     runtime: Arc<RuntimeEnv>,
     stats: Arc<ReadStats>,
+    truncate_datetime2_to_microseconds: bool,
 }
 
 fn ident(name: &str) -> String {
@@ -57,6 +58,7 @@ impl Driver {
             password_env,
             tls,
             ca_file,
+            truncate_datetime2_to_microseconds,
         } = source
         else {
             bail!("expected SQL Server source")
@@ -98,6 +100,7 @@ impl Driver {
             client,
             runtime,
             stats,
+            truncate_datetime2_to_microseconds: *truncate_datetime2_to_microseconds,
         })
     }
 
@@ -139,12 +142,16 @@ impl Driver {
             "SQL Server table has no visible columns"
         );
         let mut fields = Vec::new();
+        let mut microsecond_casts = BTreeSet::new();
         for row in &metadata {
             let name = row.try_get::<&str, _>(0)?.context("missing column name")?;
             if !columns.is_empty() && !columns.iter().any(|c| c == name) {
                 continue;
             }
             let kind = row.try_get::<&str, _>(1)?.context("missing column type")?;
+            if self.truncate_datetime2_to_microseconds && kind == "datetime2" {
+                microsecond_casts.insert(name);
+            }
             let precision = row.try_get::<i32, _>(2)?.unwrap_or(0);
             let scale = row.try_get::<i32, _>(3)?.unwrap_or(0);
             let ty = arrow_type(kind, precision, scale)?;
@@ -189,7 +196,13 @@ impl Driver {
                     DataType::Float32 | DataType::Float64 => 3,
                     _ => 127,
                 };
-                format!("CONVERT(nvarchar(max), {name}, {style}) AS {name}")
+                let value = if microsecond_casts.contains(field.name().as_str()) {
+                    // Remove the tail before casting so rounding cannot overflow year 9999.
+                    format!("CAST(DATEADD(nanosecond, -(DATEPART(nanosecond, {name}) % 1000), {name}) AS datetime2(6))")
+                } else {
+                    name.clone()
+                };
+                format!("CONVERT(nvarchar(max), {value}, {style}) AS {name}")
             })
             .collect::<Vec<_>>()
             .join(", ");

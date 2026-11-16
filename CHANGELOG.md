@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## v1.1.1
+
+- Keep both branches of a paged Gremlin traversal on the same input. Allow Gremlin queries to use published CSR snapshots and combine equivalent traversers in eligible count queries without losing multiplicity.
+- Reuse stable Cypher correlated `CALL` plans and preserve aggregate `ORDER BY` expressions. Use the live graph for SCD2 validity evaluated against the current clock, or build a CSR with an explicit historical time.
+- Use PostgreSQL indexes for eligible frontier and text key lookups while preserving exact comparisons. Reuse Trino timestamp schema information, Delta snapshots and S3 clients, and decode SQLite rows directly into Arrow builders.
+- Add an opt-in SQL Server `datetime2` microsecond truncation setting. The default preserves strict precision checks and supports the full date range.
+- Apply configured execution budgets across foreground queries, data validation, sync, CSR builds and Worker stages. Keep bounded Coordinator capacity for schema probes and graph exploration. Reuse verified model archives and retry transient etcd read failures.
+- Retire CSR pointers for inactive model revisions and skip block inventories for live generations. Preserve leased query and catalog receipt references during cleanup.
+- Default the console to English and improve responsive workflows.
 
 - Add published-model observation, reconciliation and CSR checks, free-space alerts, and S3 snapshot GC metrics to the production monitoring setup.
 - Preserve healthy legacy local-table state on startup so a readers-first rollout can return to the previous release before activating new writers.

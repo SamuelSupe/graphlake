@@ -70,6 +70,13 @@ impl Plan {
     }
 
     pub(super) fn execute(&self, seed: RecordBatch) -> Result<SendableRecordBatchStream> {
+        self.execute_with_plan(seed).map(|(stream, _)| stream)
+    }
+
+    pub(super) fn execute_with_plan(
+        &self,
+        seed: RecordBatch,
+    ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
         // Each task owns its seed, even when cancellation leaves upstream work
         // unwinding while the next key starts.
         let config = self
@@ -78,9 +85,8 @@ impl Plan {
             .clone()
             .with_extension(Arc::new(Seed(seed)));
         let task = TaskContext::from(&self.state).with_session_config(config);
-        Ok(execute_stream(
-            reset_plan_states(Arc::clone(&self.physical))?,
-            Arc::new(task),
-        )?)
+        let plan = reset_plan_states(self.physical.clone())?;
+        let stream = execute_stream(plan.clone(), Arc::new(task))?;
+        Ok((stream, plan))
     }
 }

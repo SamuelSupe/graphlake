@@ -2267,3 +2267,38 @@ async fn gremlin_typed_comparison_order_and_traversal_steps() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn gremlin_branches_use_the_same_limited_edge_and_count_parallel_walks() -> Result<()> {
+    let (_dir, engine, _) = fixture()?;
+    let mut result = engine
+        .query(
+            Language::Gremlin,
+            "g.E().hasLabel('Owns').limit(1).bothV().limit(2).id().order()",
+            QueryOptions {
+                batch_size: 1,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let endpoints = rows(&mut result).await?;
+    assert!(
+        endpoints == [json!({"value":"Account[2]"}), json!({"value":"Device[1]"})]
+            || endpoints == [json!({"value":"Account[3]"}), json!({"value":"Device[1]"})]
+    );
+    let traversal = "g.V('Account[1]').out('Transfer').out('Transfer').out('Transfer')";
+    let run = |suffix| {
+        let query = format!("{traversal}{suffix}");
+        let engine = &engine;
+        async move {
+            let mut result = engine
+                .query(Language::Gremlin, &query, Default::default())
+                .await?;
+            rows(&mut result).await
+        }
+    };
+    let count = run(".count()").await?;
+    assert!(count[0]["value"].as_u64().is_some_and(|value| value > 1));
+    assert_eq!(count, run(".values('id').count()").await?);
+    Ok(())
+}

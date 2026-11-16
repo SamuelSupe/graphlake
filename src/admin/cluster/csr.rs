@@ -5,7 +5,11 @@ mod freshness;
 
 pub(in crate::admin) use freshness::{RefreshStatus, health, watch};
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -102,6 +106,17 @@ impl ExplorationSnapshot {
 }
 
 const MANIFEST_LIMIT: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(in crate::admin) struct CurrentValidity;
+
+impl std::fmt::Display for CurrentValidity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("current SCD2 validity requires live data or an explicit CSR snapshot_time")
+    }
+}
+
+impl std::error::Error for CurrentValidity {}
 const BLOCK_BYTES: usize = 256 * 1024;
 const MAX_HOPS: u32 = 1024;
 const LOOKUP_ID: &str = "__graphlake_csr_lookup_id";
@@ -164,6 +179,8 @@ struct Manifest {
     generation: Uuid,
     model_revision: String,
     graph_options: GraphOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clock_labels: Option<BTreeSet<String>>,
     sources: Vec<Version>,
     #[serde(default)]
     built_at_ms: Option<u64>,

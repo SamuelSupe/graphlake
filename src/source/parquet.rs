@@ -24,7 +24,7 @@ use datafusion_datasource::{PartitionedFile, source::DataSourceExec};
 use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture};
 use object_store::{
     ClientOptions, GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt,
-    aws::AmazonS3Builder, http::HttpBuilder, path::Path as ObjectPath,
+    http::HttpBuilder, path::Path as ObjectPath,
 };
 use parquet::{
     arrow::{
@@ -134,10 +134,9 @@ impl PinnedFile {
             "Parquet URLs must be object locations without credentials, query parameters or fragments"
         );
         let (store, path): (Arc<dyn ObjectStore>, ObjectPath) = if url.scheme() == "s3" {
-            let store = AmazonS3Builder::from_env()
-                .with_bucket_name(url.host_str().context("S3 URL requires a bucket")?)
-                .build()?;
-            (Arc::new(store), ObjectPath::from_url_path(url.path())?)
+            let store =
+                super::storage::s3_from_env(url.host_str().context("S3 URL requires a bucket")?)?;
+            (store, ObjectPath::from_url_path(url.path())?)
         } else if matches!(url.scheme(), "http" | "https") {
             let store = HttpBuilder::new()
                 .with_url(&url[..url::Position::BeforePath])

@@ -1,6 +1,7 @@
 mod frontier;
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -561,11 +562,7 @@ impl PgTable {
                     {
                         return None;
                     }
-                    Some(format!(
-                        "{} COLLATE \"C\" = E'{}'",
-                        ident(&filter.column),
-                        value.replace('\\', "\\\\").replace('\'', "''")
-                    ))
+                    Some(text_equality(&ident(&filter.column), &text_literal(value)))
                 })
             })
             .collect::<Option<Vec<_>>>()
@@ -682,6 +679,42 @@ impl PgTable {
             |alias| crate::catalog::qualified(alias, name),
         );
         key_operand(&name_sql, &self.types[self.schema.index_of(name).ok()?])
+    }
+
+    pub(crate) fn column_type(&self, name: &str) -> Option<&Type> {
+        self.types.get(self.schema.index_of(name).ok()?)
+    }
+
+    pub(crate) async fn key_collations(&self) -> Result<BTreeMap<String, String>> {
+        if !self
+            .types
+            .iter()
+            .any(|ty| matches!(*ty, Type::TEXT | Type::VARCHAR))
+        {
+            return Ok(BTreeMap::new());
+        }
+        self.snapshot.stats.request();
+        let rows = self
+            .snapshot
+            .client
+            .query(
+                "SELECT a.attname::text, n.nspname::text, c.collname::text
+             FROM pg_catalog.pg_attribute a
+             JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace
+             WHERE a.attrelid = $1::text::regclass AND a.attnum > 0 AND NOT a.attisdropped",
+                &[&self.relation],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let name: &str = row.try_get(0)?;
+                Ok((
+                    name.into(),
+                    format!("{}.{}", ident(row.try_get(1)?), ident(row.try_get(2)?)),
+                ))
+            })
+            .collect()
     }
 
     pub(crate) async fn verify_local_snapshot(&self) -> Result<()> {
@@ -930,6 +963,14 @@ fn key_operand(name: &str, ty: &Type) -> Option<String> {
     }
 }
 
+fn text_literal(value: &str) -> String {
+    format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn text_equality(name: &str, literal: &str) -> String {
+    format!("({name} = {literal} AND ({name} COLLATE \"C\") = {literal})")
+}
+
 fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
     let column = |expr: &Expr| match expr {
         Expr::Column(column) => schema.field_with_name(&column.name).ok(),
@@ -950,10 +991,7 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
                 | ScalarValue::Utf8View(Some(value))
                 | ScalarValue::LargeUtf8(Some(value)),
                 _,
-            ) if !value.contains('\0') => Some(format!(
-                "E'{}'",
-                value.replace('\\', "\\\\").replace('\'', "''")
-            )),
+            ) if !value.contains('\0') => Some(text_literal(value)),
             _ => None,
         }
     };
@@ -1033,9 +1071,7 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
                             return Some(format!("({name} = {lit}::uuid)"));
                         }
                         Type::TEXT | Type::VARCHAR => {
-                            let exact =
-                                key_operand(&name, &types[schema.index_of(field.name()).ok()?])?;
-                            return Some(format!("({name} = {lit} AND {exact} = {lit})"));
+                            return Some(text_equality(&name, &lit));
                         }
                         _ => {}
                     }

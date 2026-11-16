@@ -103,7 +103,36 @@ pub(super) struct Models {
     sources: PathBuf,
     snapshot: Option<Arc<tempfile::TempDir>>,
     checks: BTreeMap<String, (String, Status)>,
-    engines: Arc<Mutex<VecDeque<(String, String, Engine)>>>,
+    engines: Arc<Mutex<VecDeque<CachedEngine>>>,
+}
+
+struct CachedEngine {
+    id: String,
+    revision: String,
+    archive: ArchiveStamp,
+    yaml: Arc<str>,
+    engine: Engine,
+}
+
+#[derive(PartialEq, Eq)]
+struct ArchiveStamp {
+    modified: std::time::SystemTime,
+    size: u64,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl ArchiveStamp {
+    fn new(meta: &fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            modified: meta.modified().ok()?,
+            size: meta.len(),
+            #[cfg(unix)]
+            identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+        })
+    }
 }
 
 pub(super) fn valid_id(id: &str) -> bool {
@@ -364,7 +393,7 @@ impl Models {
         Ok(active)
     }
 
-    fn published_revision(&self, id: &str) -> ApiResult<String> {
+    pub(super) fn published_revision(&self, id: &str) -> ApiResult<String> {
         let path = self.path(id)?;
         metadata(&path)?.ok_or_else(Error::not_found)?;
         self.active_revision(id)?.ok_or_else(unpublished)
@@ -477,7 +506,7 @@ impl Models {
             dir: self.dir.clone(),
             sources: self.sources.clone(),
             snapshot: self.snapshot.clone(),
-            checks: BTreeMap::new(),
+            checks: self.checks.clone(),
             engines: Arc::clone(&self.engines),
         }
     }
@@ -490,15 +519,14 @@ impl Models {
         principal: &Principal,
     ) -> ApiResult<(String, String, Engine)> {
         let path = self.path(id)?;
-        let (active, yaml) = match self.version_state(id)? {
+        let active = match self.version_state(id)? {
             Some(state) => {
                 metadata(&path)?.ok_or_else(Error::not_found)?;
                 let active = state.active.ok_or_else(unpublished)?;
                 if expected.is_some_and(|expected| active != expected) {
                     return Err(versions::active_conflict());
                 }
-                let yaml = self.archived(id, &active)?;
-                (active, yaml)
+                active
             }
             None if *principal == Principal::Admin
                 && self.dir == self.sources
@@ -515,20 +543,20 @@ impl Models {
             }
             None => return Err(Error::not_found()),
         };
-        let engine = self.cached_engine(id, &active, &yaml)?;
+        let (yaml, engine) = self.cached_engine(id, &active, &app.admission)?;
         if self.active_revision(id)?.as_deref() != Some(&active) {
             return Err(versions::active_conflict());
         }
         Ok((active, yaml, engine))
     }
 
-    fn adopt_for_query(&mut self, id: &str, expected: &str) -> ApiResult<(String, String)> {
+    fn adopt_for_query(&mut self, id: &str, expected: &str) -> ApiResult<String> {
         if self.version_state(id)?.is_some() {
             let active = self.published_revision(id)?;
             if active != expected {
                 return Err(versions::active_conflict());
             }
-            return Ok((active, self.archived(id, expected)?));
+            return Ok(active);
         }
         let model = self.get(id)?;
         if model.revision != expected {
@@ -536,58 +564,93 @@ impl Models {
         }
         parse(&model.yaml, &self.source_path(id)?)?;
         self.adopt(id, &model)?;
-        Ok((model.revision, model.yaml))
+        Ok(model.revision)
     }
 
-    fn cached_engine(&self, id: &str, active: &str, yaml: &str) -> ApiResult<Engine> {
-        {
+    pub(super) fn cached_engine(
+        &self,
+        id: &str,
+        revision: &str,
+        admission: &Arc<crate::engine::Admission>,
+    ) -> ApiResult<(String, Engine)> {
+        let path = self.archive_path(id, revision)?;
+        let stamp = metadata(&path)
+            .map_err(|error| versions::archive_error(id, revision, &error.message))?
+            .as_ref()
+            .and_then(ArchiveStamp::new);
+        #[cfg(unix)]
+        if let Some(stamp) = &stamp {
             let mut engines = self.engines.lock().unwrap();
-            if let Some(index) = engines
-                .iter()
-                .position(|(key, version, _)| key == id && version == active)
-            {
+            if let Some(index) = engines.iter().position(|entry| {
+                entry.id == id && entry.revision == revision && entry.archive == *stamp
+            }) {
                 let entry = engines.remove(index).expect("cached engine");
-                let engine = entry.2.clone();
+                let cached = (entry.yaml.clone(), entry.engine.clone());
                 engines.push_back(entry);
-                return Ok(engine);
+                drop(engines);
+                return Ok((cached.0.to_string(), cached.1));
             }
         }
-        let mut catalog = parse(yaml, &self.source_path(id)?)?;
-        // The engine refuses EXPORT to any unregistered destination.
-        catalog.export_locations.clear();
-        let engine =
-            Engine::new(catalog).map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
-        let mut engines = self.engines.lock().unwrap();
-        if let Some((_, _, already_cached)) = engines
-            .iter()
-            .find(|(key, revision, _)| key == id && revision == active)
-        {
-            return Ok(already_cached.clone());
-        }
-        engines.retain(|(key, _, _)| key != id);
-        if engines.len() == 4 {
-            engines.pop_front();
-        }
-        engines.push_back((id.into(), active.into(), engine.clone()));
-        Ok(engine)
-    }
-
-    pub(super) fn snapshot_engine(&self, id: &str, revision: &str) -> ApiResult<Engine> {
-        self.require_published(id)?;
         let yaml = self.archived(id, revision)?;
         let mut catalog = parse(&yaml, &self.source_path(id)?)?;
+        // The engine refuses EXPORT to any unregistered destination.
         catalog.export_locations.clear();
-        Engine::new(catalog).map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))
+        let engine = Engine::with_admission(catalog, admission.clone())
+            .map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
+        if let Some(archive) = stamp {
+            let mut engines = self.engines.lock().unwrap();
+            engines.retain(|entry| entry.id != id || entry.revision != revision);
+            if engines.len() == 4 {
+                engines.pop_front();
+            }
+            engines.push_back(CachedEngine {
+                id: id.into(),
+                revision: revision.into(),
+                archive,
+                yaml: Arc::from(yaml.as_str()),
+                engine: engine.clone(),
+            });
+        }
+        Ok((yaml, engine))
+    }
+
+    pub(super) fn snapshot_engine(
+        &self,
+        id: &str,
+        revision: &str,
+        admission: &Arc<crate::engine::Admission>,
+    ) -> ApiResult<Engine> {
+        let active = self.published_revision(id)?;
+        if active != revision {
+            self.cached_engine(id, &active, admission)?;
+        }
+        self.cached_engine(id, revision, admission)
+            .map(|(_, engine)| engine)
     }
 }
 
 impl App {
-    pub(super) async fn published_model_revision(&self, id: &str) -> ApiResult<String> {
+    pub(super) async fn read_models<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(Models) -> ApiResult<T> + Send + 'static,
+    ) -> ApiResult<T> {
         let files = self.models.lock().unwrap().read_files();
-        let id = id.to_owned();
-        tokio::task::spawn_blocking(move || files.require_published(&id))
+        tokio::task::spawn_blocking(move || read(files))
             .await
             .map_err(|_| Error::storage())?
+    }
+
+    pub(super) async fn published_model_revision(&self, id: &str) -> ApiResult<String> {
+        let files = self.models.lock().unwrap().read_files();
+        let admission = self.admission.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let revision = files.published_revision(&id)?;
+            files.cached_engine(&id, &revision, &admission)?;
+            Ok(revision)
+        })
+        .await
+        .map_err(|_| Error::storage())?
     }
 
     pub(super) async fn query_model(
@@ -760,28 +823,34 @@ pub(super) async fn list(
     axum::Extension(principal): axum::Extension<Principal>,
 ) -> ApiResult<Json<Vec<Summary>>> {
     use super::users::Role;
-    Ok(Json(app.models.lock().unwrap().list(
-        |id| match &principal {
-            Principal::Admin => Some(false),
-            Principal::Service(_) | Principal::ServiceMember { .. } => {
-                super::access::query_allowed(&app, &principal, id).then_some(true)
-            }
-            Principal::User { .. } => {
-                let roles = app.users.roles(&principal, id);
-                let config = [Role::Modeler, Role::Publisher, Role::Auditor]
-                    .iter()
-                    .any(|role| roles.contains(role));
-                (config || roles.contains(&Role::Query)).then_some(!config)
-            }
-        },
-    )?))
+    let access = app.clone();
+    let summaries = app
+        .read_models(move |models| {
+            models.list(|id| match &principal {
+                Principal::Admin => Some(false),
+                Principal::Service(_) | Principal::ServiceMember { .. } => {
+                    super::access::query_allowed(&access, &principal, id).then_some(true)
+                }
+                Principal::User { .. } => {
+                    let roles = access.users.roles(&principal, id);
+                    let config = [Role::Modeler, Role::Publisher, Role::Auditor]
+                        .iter()
+                        .any(|role| roles.contains(role));
+                    (config || roles.contains(&Role::Query)).then_some(!config)
+                }
+            })
+        })
+        .await?;
+    Ok(Json(summaries))
 }
 
 pub(super) async fn read(
     State(app): State<Arc<App>>,
     RoutePath(id): RoutePath<String>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
-    Ok(model_response(app.models.lock().unwrap().get(&id)?))
+    Ok(model_response(
+        app.read_models(move |models| models.get(&id)).await?,
+    ))
 }
 
 #[derive(Serialize)]
@@ -998,8 +1067,16 @@ async fn inspect(
     model: &str,
 ) -> ApiResult<BTreeMap<String, crate::arrow::datatypes::SchemaRef>> {
     let catalog = parse(yaml, path)?;
-    let mut engine =
-        Engine::new(catalog).map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
+    let mut options = options.clone();
+    let admission = if check_data {
+        &app.admission
+    } else {
+        // Metadata checks must still run while a query waits on a source lock.
+        super::ops::limit_model_probe(&mut options);
+        &app.probe_admission
+    };
+    let mut engine = Engine::with_admission(catalog, admission.clone())
+        .map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
     let _selection = super::local_tables::managed::resolve(
         app,
         &mut engine,
@@ -1007,7 +1084,7 @@ async fn inspect(
         options.timeout.as_secs() + 30,
     )
     .await?;
-    Box::pin(engine.inspect_model(options.clone(), check_data))
+    Box::pin(engine.inspect_model(options, check_data))
         .await
         .map_err(|error| {
             let mut response =

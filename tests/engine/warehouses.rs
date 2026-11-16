@@ -220,12 +220,14 @@ nodes:
     assert_eq!(records[0]["recorded"], "2026-01-01T19:04:05.123456789Z");
     assert_eq!(records[0]["recorded"], records[1]["recorded"]);
     assert_ne!(records[0]["payload"], records[1]["payload"]);
-    let mut folded = engine(&catalog("dst_fold"))?
-        .query(Language::Sql, sql, Default::default())
-        .await?;
-    let folded = rows(&mut folded).await?;
-    assert_eq!(folded[0]["recorded"], "2026-11-01T05:30:00.123456789Z");
-    assert_eq!(folded[1]["recorded"], "2026-11-01T06:30:00.123456789Z");
+    let folded = engine(&catalog("dst_fold"))?;
+    let mut cold = folded.query(Language::Sql, sql, Default::default()).await?;
+    let expected = rows(&mut cold).await?;
+    assert_eq!(expected[0]["recorded"], "2026-11-01T05:30:00.123456789Z");
+    assert_eq!(expected[1]["recorded"], "2026-11-01T06:30:00.123456789Z");
+    let mut warm = folded.query(Language::Sql, sql, Default::default()).await?;
+    assert_eq!(rows(&mut warm).await?, expected);
+    assert!(warm.metrics().reads.requests < cold.metrics().reads.requests);
     let Err(error) = engine(&catalog("foreign"))?
         .query(Language::Sql, sql, Default::default())
         .await

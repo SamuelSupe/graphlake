@@ -1,8 +1,12 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::{
-    arrow::datatypes::{DataType, Field, Schema, TimeUnit},
+    arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     catalog::TableProvider,
     execution::{
         disk_manager::DiskManager,
@@ -28,6 +32,37 @@ pub(crate) struct Trino {
     user: String,
     password: Option<String>,
     timeout: Duration,
+}
+
+type SchemaKey = (String, String, Vec<String>);
+type CachedSchema = (SchemaKey, Instant, SchemaRef);
+
+#[derive(Default)]
+pub(crate) struct SchemaCache(Mutex<VecDeque<CachedSchema>>);
+
+impl SchemaCache {
+    fn get(&self, key: &SchemaKey) -> Option<SchemaRef> {
+        let mut entries = self.0.lock().unwrap();
+        entries.retain(|(_, at, _)| at.elapsed() < Duration::from_secs(60));
+        let index = entries.iter().position(|(entry, _, _)| entry == key)?;
+        let entry = entries.remove(index).expect("located schema");
+        let schema = entry.2.clone();
+        entries.push_back(entry);
+        Some(schema)
+    }
+
+    fn put(&self, key: SchemaKey, schema: SchemaRef) {
+        let mut entries = self.0.lock().unwrap();
+        entries.retain(|(entry, _, _)| entry != &key);
+        if entries.len() >= 128 {
+            entries.pop_front();
+        }
+        entries.push_back((key, Instant::now(), schema));
+    }
+
+    fn remove(&self, key: &SchemaKey) {
+        self.0.lock().unwrap().retain(|(entry, _, _)| entry != key);
+    }
 }
 
 impl Trino {
@@ -143,15 +178,23 @@ impl Trino {
         batch_size: usize,
         disk: &Arc<DiskManager>,
         explain_only: bool,
+        cache: &SchemaCache,
+        source: &str,
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, String)> {
         let relation = self.qualified_relation(relation)?;
+        let key = (source.to_owned(), relation.clone(), columns.to_vec());
         let selected = columns
             .iter()
             .map(|column| ident(column))
             .collect::<Vec<_>>()
             .join(", ");
         let mut metadata_id = None;
-        let expected = if !explain_only && !crate::engine::read_filters::needs_sql_types(filters) {
+        // A fresh schema is needed before pushing predicates based on its types.
+        let use_cache = !explain_only && !crate::engine::read_filters::needs_sql_types(filters);
+        let cached = use_cache.then(|| cache.get(&key)).flatten();
+        let expected = if let Some(schema) = cached.as_ref() {
+            schema.clone()
+        } else if use_cache {
             let mut id = None;
             let mut pages = self.pages(format!("SELECT {selected} FROM {relation}"), &mut id);
             let first = pages
@@ -231,7 +274,7 @@ impl Trino {
         let where_clause = crate::engine::read_filters::where_clause(filters, &expected, ident);
         let sql = format!("SELECT {projection} FROM {relation}{where_clause}");
         let mut id = None;
-        let (schema, buffer) = {
+        let result = {
             let mut pages = self.pages(sql, &mut id);
             collect_pages(
                 &self.http,
@@ -242,13 +285,29 @@ impl Trino {
                 Encoding::Trino,
                 Some(disk),
             )
-            .await?
+            .await
         };
+        if cached.is_some()
+            && !result
+                .as_ref()
+                .is_ok_and(|(schema, _)| schema.fields() == expected.fields())
+        {
+            cache.remove(&key);
+        }
+        let (schema, buffer) = result?;
         ensure!(
             expected.fields() == schema.fields(),
             "Trino result schema changed after describing the table"
         );
         let (table, budget) = buffer.finish(schema, &self.http.stats)?;
+        if cached.is_none()
+            && expected
+                .fields()
+                .iter()
+                .any(|field| matches!(field.data_type(), DataType::Timestamp(_, Some(_))))
+        {
+            cache.put(key, expected);
+        }
         Ok((table, budget, id.context("Trino response has no query ID")?))
     }
 

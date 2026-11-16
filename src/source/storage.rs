@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use object_store::{
@@ -10,6 +14,46 @@ use object_store::{
 };
 
 use crate::StorageConfig;
+use sha2::{Digest, Sha256};
+
+type S3Connection = (String, [u8; 32], Instant, Arc<dyn ObjectStore>);
+
+pub(super) fn s3_from_env(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+    static CONNECTIONS: OnceLock<Mutex<VecDeque<S3Connection>>> = OnceLock::new();
+    let mut settings = std::env::vars_os()
+        .filter(|(key, _)| key.as_encoded_bytes().starts_with(b"AWS_"))
+        .collect::<Vec<_>>();
+    settings.sort_unstable();
+    let mut fingerprint = Sha256::new();
+    for (key, value) in settings {
+        for part in [key.as_encoded_bytes(), value.as_encoded_bytes()] {
+            fingerprint.update(part.len().to_le_bytes());
+            fingerprint.update(part);
+        }
+    }
+    let fingerprint: [u8; 32] = fingerprint.finalize().into();
+    let mut connections = CONNECTIONS.get_or_init(Mutex::default).lock().unwrap();
+    connections.retain(|(_, _, opened, _)| opened.elapsed() < Duration::from_secs(300));
+    if let Some(index) = connections
+        .iter()
+        .position(|(name, env, _, _)| name == bucket && env == &fingerprint)
+    {
+        let entry = connections.remove(index).expect("located S3 connection");
+        let store = entry.3.clone();
+        connections.push_back(entry);
+        return Ok(store);
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(
+        AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .build()?,
+    );
+    if connections.len() == 32 {
+        connections.pop_front();
+    }
+    connections.push_back((bucket.into(), fingerprint, Instant::now(), store.clone()));
+    Ok(store)
+}
 
 pub(crate) fn validate(config: &StorageConfig) -> Result<()> {
     ensure!(

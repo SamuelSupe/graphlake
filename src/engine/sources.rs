@@ -3,6 +3,8 @@ use super::*;
 pub(super) async fn prepare<'a, 'q>(
     catalog: &'a Catalog,
     spanner: &BTreeMap<String, source::warehouse::spanner::Client>,
+    trino_schemas: &source::warehouse::trino::SchemaCache,
+    delta_snapshots: Option<&source::delta::SnapshotCache>,
     managed: &BTreeMap<uuid::Uuid, source::parquet_snapshot::RemoteSnapshot>,
     scope: &QueryScope,
     required: BTreeMap<&'a str, BTreeSet<String>>,
@@ -518,6 +520,8 @@ pub(super) async fn prepare<'a, 'q>(
                         scope.options.batch_size,
                         &scope.runtime.disk_manager,
                         read.explain_only,
+                        trino_schemas,
+                        name,
                     )
                     .await
                     .with_context(|| format!("reading Trino table {reference}"))?;
@@ -610,9 +614,14 @@ pub(super) async fn prepare<'a, 'q>(
                 let (table, version) = match deltas.entry((&mapping.path, mapping.version)) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                        source::delta::open(mapping, &private, &scope.reads)
-                            .await
-                            .with_context(|| format!("opening Delta table {reference}"))?,
+                        source::delta::open_cached(
+                            mapping,
+                            &private,
+                            &scope.reads,
+                            delta_snapshots,
+                        )
+                        .await
+                        .with_context(|| format!("opening Delta table {reference}"))?,
                     ),
                 };
                 versions.insert(
@@ -777,6 +786,8 @@ pub(crate) async fn table(
     let (context, _, prepared, _) = prepare(
         catalog,
         &spanner,
+        &Default::default(),
+        None,
         &BTreeMap::new(),
         scope,
         BTreeMap::from([(reference, columns.iter().cloned().collect())]),

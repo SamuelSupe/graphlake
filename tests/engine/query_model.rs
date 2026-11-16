@@ -442,8 +442,10 @@ async fn cypher_correlated_call_reads_keys_and_columns_and_reuses_batches_postgr
          INSERT INTO {schema}.mapped_delta VALUES (1, repeat('x',2048)), (2,'conflicting');
          ANALYZE {schema}.nodes;
          ANALYZE {schema}.edges;
-         CREATE TABLE {schema}.names (tenant bigint, id text, PRIMARY KEY (tenant,id));
-         CREATE TABLE {schema}.links (id bigint PRIMARY KEY, st bigint, si text, dt bigint, di text);
+         CREATE TABLE {schema}.names (tenant bigint, id text COLLATE \"C\", PRIMARY KEY (tenant,id));
+         CREATE TABLE {schema}.links (
+             id bigint PRIMARY KEY, st bigint, si text COLLATE \"POSIX\", dt bigint, di text COLLATE \"POSIX\"
+         );
          CREATE INDEX ON {schema}.links (st,si);"
     )).await?;
     let text_id = "a'\\甲";

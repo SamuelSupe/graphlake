@@ -61,6 +61,9 @@ struct App {
     models: Mutex<models::Models>,
     local_tables: local_tables::LocalTables,
     work: Arc<Semaphore>,
+    admission: Arc<crate::engine::Admission>,
+    probe_admission: Arc<crate::engine::Admission>,
+    exploration_admission: Arc<crate::engine::Admission>,
     query_waiters: Semaphore,
     export_waiters: Semaphore,
     explore_work: Semaphore,
@@ -373,12 +376,6 @@ pub async fn serve_clustered_with_status(
         Some(port) => Some(TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?),
         None => None,
     };
-    if let Some(cluster) = &cluster {
-        cluster.start_cleanup(
-            shutdown.clone(),
-            ha.as_ref().map(|ha| Arc::clone(&ha.leader)),
-        );
-    }
     let explorations = cluster
         .as_ref()
         .map_or_else(query::Sessions::default, |cluster| {
@@ -386,6 +383,12 @@ pub async fn serve_clustered_with_status(
         });
     let local_tables =
         local_tables::LocalTables::open(models.source_directory().to_owned(), managed_tables)?;
+    let exploration_slots = (query_slots + 1).min(4);
+    let query_memory = cluster
+        .as_ref()
+        .map_or(QueryOptions::default().memory_bytes, |cluster| {
+            cluster.max_coordinator_query_bytes()
+        });
     let app = Arc::new(App {
         auth,
         users,
@@ -394,6 +397,23 @@ pub async fn serve_clustered_with_status(
         models: Mutex::new(models),
         local_tables,
         work: Arc::new(Semaphore::new(query_slots)),
+        admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
+            max_queries: query_slots,
+            memory_bytes: query_slots
+                .saturating_mul(query_memory)
+                .min(crate::EngineLimits::default().memory_bytes),
+            spill_bytes: query_slots as u64 * QueryOptions::default().spill_bytes,
+        })?),
+        probe_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
+            max_queries: 2,
+            memory_bytes: 2 * ops::MODEL_PROBE_MEMORY_BYTES,
+            spill_bytes: 0,
+        })?),
+        exploration_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
+            max_queries: exploration_slots,
+            memory_bytes: exploration_slots * QueryOptions::default().memory_bytes,
+            spill_bytes: exploration_slots as u64 * QueryOptions::default().spill_bytes,
+        })?),
         query_waiters: Semaphore::new(16),
         export_waiters: Semaphore::new(4),
         explore_work: Semaphore::new(8),
@@ -428,6 +448,9 @@ pub async fn serve_clustered_with_status(
         _ha_bootstrap: ha_cache,
         ha_ready: std::sync::atomic::AtomicBool::new(false),
     });
+    if let Some(cluster) = &app.cluster {
+        cluster.start_cleanup(shutdown.clone(), Arc::downgrade(&app));
+    }
     if let Some(status) = status {
         *status.lock().unwrap() = Arc::downgrade(&app);
     }

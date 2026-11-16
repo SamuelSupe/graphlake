@@ -450,6 +450,7 @@ pub(super) async fn build(
         generation: generation.id,
         model_revision: generation.revision.into(),
         graph_options: scope.options.graph.clone(),
+        clock_labels: Some(scope.clock_labels.lock().unwrap().clone()),
         sources: prepared
             .versions
             .iter()

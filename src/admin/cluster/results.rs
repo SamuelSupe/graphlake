@@ -14,15 +14,23 @@ impl Coordinator {
         app: &App,
         job: &Job,
     ) -> ApiResult<Vec<freshness::Observation>> {
-        if !matches!(job.state, JobState::Done { .. }) {
+        if !matches!(job.state, JobState::Done { completed_ms, .. }
+            if now_ms().saturating_sub(completed_ms) < job.retention_ms())
+            || job.export && job.freshness.is_none()
+        {
             return Ok(Vec::new());
         }
         let files = app.models.lock().unwrap().read_files();
+        let admission = app.admission.clone();
         let model = job.model.clone();
-        let model = tokio::task::spawn_blocking(move || files.published_catalog(&model))
-            .await
-            .map_err(|_| Error::storage())?;
-        let (revision, _, catalog) = match model {
+        let model = tokio::task::spawn_blocking(move || {
+            let revision = files.published_revision(&model)?;
+            let (_, engine) = files.cached_engine(&model, &revision, &admission)?;
+            Ok((revision, engine.catalog))
+        })
+        .await
+        .map_err(|_| Error::storage())?;
+        let (revision, catalog) = match model {
             Ok(model) => model,
             Err(error) if job.freshness.is_some() => return Err(error),
             Err(_) => return Ok(Vec::new()),

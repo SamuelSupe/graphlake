@@ -1,5 +1,8 @@
 use super::*;
-use crate::{QueryOptions, engine::stage_scope};
+use crate::{
+    EngineLimits, QueryOptions,
+    engine::{Admission, QueryScope},
+};
 use datafusion::arrow::array::{Int64Array, StringArray};
 use parquet::arrow::ArrowWriter;
 use std::fs;
@@ -23,7 +26,8 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
     let keys = vec!["id".to_owned()];
     let old_value = ScalarValue::Int64(Some(5));
     let next_value = ScalarValue::Int64(Some(6));
-    let current = stage_scope(QueryOptions::default()).await?;
+    let admission = Arc::new(Admission::new(EngineLimits::default())?);
+    let current = QueryScope::new(QueryOptions::default(), &admission).await?;
     full(
         &anchor,
         &stage(root.path(), 5)?,
@@ -66,7 +70,7 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
     assert_eq!(ahead, generation(interrupted.snapshot.generation));
     drop(conn);
 
-    let retry = stage_scope(QueryOptions::default()).await?;
+    let retry = QueryScope::new(QueryOptions::default(), &admission).await?;
     assert_eq!(
         incremental(
             &anchor,

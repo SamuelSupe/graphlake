@@ -27,6 +27,7 @@ use variants::{Kind, Tags};
 pub(crate) const MAX_REPEAT_ROUNDS: u64 = 256;
 
 const PATH: &str = "__graphlake_gremlin_path";
+const BULK: &str = "__graphlake_gremlin_bulk";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Entity {
@@ -102,8 +103,10 @@ struct Traversers<'a> {
     tags: Tags,
     labels: BTreeSet<String>,
     path: bool,
+    bulk: bool,
     next_column: usize,
     order: Vec<(String, bool)>,
+    sliced: bool,
     control_columns: Vec<String>,
     group: Option<control::Group>,
     ctes: Vec<String>,
@@ -173,6 +176,7 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
         .into_iter()
         .collect::<Option<BTreeSet<_>>>();
     let mixed = selected.is_none();
+    let bulk = start.name == "V" && !mixed && bulk_count(rest);
     let labels = selected.into_iter().collect::<Vec<_>>();
     let labels: Vec<_> = if mixed {
         names
@@ -204,6 +208,9 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
             } else {
                 format!("SELECT v.* FROM {} AS v", ident(label))
             };
+            if bulk {
+                sql = format!("SELECT v.*, CAST(1 AS DECIMAL(38, 0)) AS {BULK} FROM ({sql}) AS v");
+            }
             if !start.args.is_empty() {
                 let keys = start
                     .args
@@ -221,8 +228,10 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
                 tags: BTreeMap::new(),
                 labels: BTreeSet::from([label.clone()]),
                 path,
+                bulk,
                 next_column: 0,
                 order: Vec::new(),
+                sliced: false,
                 control_columns: Vec::new(),
                 group: None,
                 ctes: Vec::new(),
@@ -269,6 +278,21 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
         graph_output,
         ..Default::default()
     })
+}
+
+fn bulk_count(steps: &[Step<'_>]) -> bool {
+    let Some((last, steps)) = steps.split_last() else {
+        return false;
+    };
+    if last.name != "count" || !last.args.is_empty() {
+        return false;
+    }
+    let mut hops = steps
+        .iter()
+        .skip_while(|step| matches!(step.name, "has" | "hasLabel" | "hasId" | "hasKey"))
+        .peekable();
+    hops.peek().is_some()
+        && hops.all(|step| matches!(step.name, "out" | "in" | "both") && step.args.len() == 1)
 }
 
 fn needs_path(steps: &[Step<'_>], depth: usize) -> Result<bool> {
@@ -318,6 +342,7 @@ impl Traversers<'_> {
         while let Some(step) = steps.next() {
             let early_limit = self.order.is_empty()
                 && self.group.is_none()
+                && !self.sliced
                 && steps.peek().is_some_and(|next| next.name == "limit");
             if !self.variants.is_empty()
                 && matches!(
@@ -739,7 +764,10 @@ impl Traversers<'_> {
                 .iter()
                 .map(|field| qualified("r", field))
                 .collect::<Vec<_>>();
-            let carry = self.carry("l", Some(&result.identity("r")));
+            let mut carry = self.carry("l", Some(&result.identity("r")));
+            if self.bulk {
+                carry.push_str(&format!(", l.{BULK}"));
+            }
             self.sql = format!(
                 "SELECT {}{carry} FROM ({}) AS l CROSS JOIN {} AS r WHERE FALSE",
                 selected.join(", "),
@@ -792,8 +820,22 @@ impl Traversers<'_> {
             );
         } else {
             let end = equal_keys("r", &result.key, "e", end_keys);
+            let (output, group) = if self.bulk {
+                let keys = result
+                    .key
+                    .iter()
+                    .map(|key| qualified("r", key))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!("{keys}, SUM(l.{BULK}) AS {BULK}"),
+                    format!(" GROUP BY {keys}"),
+                )
+            } else {
+                (format!("r.*{carry}"), String::new())
+            };
             self.sql = format!(
-                "SELECT r.*{carry} FROM ({}) AS l JOIN ({oriented}) AS e ON {start} JOIN {} AS r ON {end}",
+                "SELECT {output} FROM ({}) AS l JOIN ({oriented}) AS e ON {start} JOIN {} AS r ON {end}{group}",
                 self.sql,
                 ident(&result.label)
             );

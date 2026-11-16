@@ -123,7 +123,7 @@ impl Models {
         atomic_write(&self.state_path(id)?, &content, false)
     }
 
-    fn archive_path(&self, id: &str, revision: &str) -> ApiResult<PathBuf> {
+    pub(super) fn archive_path(&self, id: &str, revision: &str) -> ApiResult<PathBuf> {
         self.path(id)?;
         if !valid_revision(revision) {
             return Err(Error::invalid("invalid_revision", "模型版本无效"));
@@ -303,7 +303,7 @@ impl Models {
         }
         if self.archived(id, expected).is_err() {
             atomic_write(&path, yaml.as_bytes(), false)?;
-            self.engines.lock().unwrap().retain(|(key, _, _)| key != id);
+            self.engines.lock().unwrap().retain(|entry| entry.id != id);
         }
         self.get(id)
     }
@@ -444,7 +444,7 @@ impl Models {
         state.active = None;
         state.offline_at_ms = Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
         self.write_state(id, &state)?;
-        self.engines.lock().unwrap().retain(|(key, _, _)| key != id);
+        self.engines.lock().unwrap().retain(|entry| entry.id != id);
         model.active_revision = None;
         Ok(model)
     }

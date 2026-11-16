@@ -249,6 +249,7 @@ impl<'a> Traversers<'a> {
             .collect::<Vec<_>>();
         let mut tags = Tags::new();
         for state in states {
+            self.sliced |= state.sliced;
             self.labels.extend(state.labels.iter().cloned());
             self.next_column = self.next_column.max(state.next_column);
             extend_tags(&mut tags, &state.tags);

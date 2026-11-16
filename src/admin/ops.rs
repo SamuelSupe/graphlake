@@ -43,10 +43,11 @@ impl SourceProbe {
     pub(super) async fn run(
         engine: crate::Engine,
         mut options: crate::QueryOptions,
+        admission: &Arc<crate::engine::Admission>,
     ) -> ApiResult<Self> {
         options.timeout = options.timeout.min(Duration::from_secs(5));
-        options.memory_bytes = options.memory_bytes.min(32 * 1024 * 1024);
-        let (sources, mapping) = Box::pin(engine.probe_model_sources(options))
+        limit_model_probe(&mut options);
+        let (sources, mapping) = Box::pin(engine.probe_model_sources(options, admission))
             .await
             .map_err(|_| {
                 Error::new(
@@ -71,6 +72,13 @@ impl SourceProbe {
             location,
         })
     }
+}
+
+pub(super) const MODEL_PROBE_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+
+pub(super) fn limit_model_probe(options: &mut crate::QueryOptions) {
+    options.memory_bytes = options.memory_bytes.min(MODEL_PROBE_MEMORY_BYTES);
+    options.spill_bytes = 0;
 }
 
 pub(super) struct Metrics {
@@ -433,13 +441,21 @@ pub(super) async fn model_ready(
     ) {
         super::access::check_query(&app, &principal, &id)?;
     }
-    let (revision, yaml, catalog) = app.models.lock().unwrap().published_catalog(&id)?;
+    let files = app.models.lock().unwrap().read_files();
+    let admission = app.admission.clone();
+    let model = id.clone();
+    let (revision, yaml, mut engine) = tokio::task::spawn_blocking(move || {
+        let revision = files.published_revision(&model)?;
+        let (yaml, engine) = files.cached_engine(&model, &revision, &admission)?;
+        Ok::<_, Error>((revision, yaml, engine))
+    })
+    .await
+    .map_err(|_| Error::storage())??;
     let deadline = app.options.timeout.min(Duration::from_secs(5));
-    let mut engine = crate::Engine::new(catalog)
-        .map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
     let _selection = super::local_tables::managed::resolve(&app, &mut engine, &id, 30).await?;
-    let (coordinator, workers) =
-        tokio::join!(SourceProbe::run(engine, app.options.clone()), async {
+    let (coordinator, workers) = tokio::join!(
+        SourceProbe::run(engine, app.options.clone(), &app.probe_admission),
+        async {
             match &app.cluster {
                 Some(cluster) => cluster
                     .probe_workers(&id, &revision, yaml, deadline)
@@ -447,14 +463,13 @@ pub(super) async fn model_ready(
                     .map(Some),
                 None => Ok(None),
             }
-        });
+        }
+    );
     let coordinator = coordinator?;
     let workers = workers?;
-    let models = app.models.lock().unwrap();
-    if models.active_revision(&id)?.as_deref() != Some(revision.as_str()) {
+    if app.published_model_revision(&id).await? != revision {
         return Err(versions::active_conflict());
     }
-    models.archived(&id, &revision)?;
     let workers_ready = workers
         .as_ref()
         .is_none_or(|workers| workers.iter().all(|worker| worker.ready()));

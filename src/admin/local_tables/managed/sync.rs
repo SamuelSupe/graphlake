@@ -302,6 +302,7 @@ impl Managed {
                 timeout: Duration::from_secs(record.table.config.timeout_seconds),
                 ..app.options.clone()
             },
+            &app.admission,
         )
         .await?;
         ensure!(!cancel.is_cancelled(), "managed sync cancelled");

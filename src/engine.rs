@@ -16,6 +16,8 @@ pub(crate) mod read_filters;
 pub(crate) mod sql_read;
 
 #[cfg(feature = "admin")]
+pub(crate) use query::Admission;
+#[cfg(feature = "admin")]
 pub(crate) use query::spilled_bytes as execution_spill;
 pub use query::{EngineLimits, QueryMetrics, QueryOptions, QueryResult};
 pub(crate) use query::{QueryScope, graph_frame, gremlin_frame};
@@ -75,15 +77,13 @@ pub struct Engine {
     parquet_keys: Arc<model::KeyChecks>,
     pub(crate) managed_parquet: Arc<BTreeMap<uuid::Uuid, source::parquet_snapshot::RemoteSnapshot>>,
     spanner: Arc<BTreeMap<String, source::warehouse::spanner::Client>>,
+    trino_schemas: Arc<source::warehouse::trino::SchemaCache>,
+    delta_snapshots: Arc<source::delta::SnapshotCache>,
 }
 
 impl Engine {
     pub fn new(catalog: Catalog) -> Result<Self> {
-        static DEFAULT_ADMISSION: OnceLock<Arc<query::Admission>> = OnceLock::new();
-        let admission = DEFAULT_ADMISSION.get_or_init(|| {
-            Arc::new(query::Admission::new(EngineLimits::default()).expect("default engine limits"))
-        });
-        Self::with_admission(catalog, Arc::clone(admission))
+        Self::with_admission(catalog, Arc::clone(default_admission()))
     }
 
     /// Create an engine with a dedicated resource budget shared by its clones.
@@ -91,7 +91,10 @@ impl Engine {
         Self::with_admission(catalog, Arc::new(query::Admission::new(limits)?))
     }
 
-    fn with_admission(catalog: Catalog, admission: Arc<query::Admission>) -> Result<Self> {
+    pub(crate) fn with_admission(
+        catalog: Catalog,
+        admission: Arc<query::Admission>,
+    ) -> Result<Self> {
         catalog.validate()?;
         let spanner = catalog
             .sources
@@ -105,12 +108,19 @@ impl Engine {
             admission,
             parquet_keys: Arc::new(Mutex::new(BTreeMap::new())),
             spanner: Arc::new(spanner),
+            trino_schemas: Arc::default(),
+            delta_snapshots: Arc::default(),
             managed_parquet: Arc::default(),
         })
     }
 
     pub(crate) async fn scope(&self, options: QueryOptions) -> Result<Arc<QueryScope>> {
         Ok(Arc::new(QueryScope::new(options, &self.admission).await?))
+    }
+
+    #[cfg(feature = "admin")]
+    pub(crate) fn use_admission(&mut self, admission: Arc<query::Admission>) {
+        self.admission = admission;
     }
 
     /// Start a read-only query. The deadline covers planning, source reads and stream consumption.
@@ -698,10 +708,11 @@ impl Engine {
     pub(crate) async fn probe_model_sources(
         &self,
         options: QueryOptions,
+        admission: &Arc<query::Admission>,
     ) -> Result<(BTreeMap<String, bool>, Result<()>)> {
         use futures::{StreamExt, stream};
 
-        let scope = self.scope(options).await?;
+        let scope = QueryScope::new(options, admission).await?;
         let mut labels: BTreeSet<_> = self
             .catalog
             .nodes
@@ -862,6 +873,8 @@ impl Engine {
         let (private, tables, mut prepared, proven_key_label) = sources::prepare(
             catalog,
             &self.spanner,
+            &self.trino_schemas,
+            Some(&self.delta_snapshots),
             &self.managed_parquet,
             scope,
             required,
@@ -1122,11 +1135,9 @@ fn select_statement(statement: &Statement) -> bool {
     }
 }
 
-#[cfg(feature = "admin")]
-pub(crate) async fn stage_scope(options: QueryOptions) -> Result<Arc<QueryScope>> {
-    static STAGE_ADMISSION: OnceLock<Arc<query::Admission>> = OnceLock::new();
-    let admission = STAGE_ADMISSION.get_or_init(|| {
+fn default_admission() -> &'static Arc<query::Admission> {
+    static ADMISSION: OnceLock<Arc<query::Admission>> = OnceLock::new();
+    ADMISSION.get_or_init(|| {
         Arc::new(query::Admission::new(EngineLimits::default()).expect("default engine limits"))
-    });
-    Ok(Arc::new(QueryScope::new(options, admission).await?))
+    })
 }

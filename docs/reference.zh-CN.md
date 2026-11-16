@@ -99,7 +99,7 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 参见[图模型列表稿](../web/design/model-list.png)、[图模型编辑器稿](../web/design/model-editor.png)和[实库与 Chrome 验证记录](../web/design/verification.md)。
 
-集群模式可将管理 API 的查询和 Arrow 导出分发到多个 Worker，也可配置单条查询跨 Worker 扫描 Parquet、执行跨源 Join 和聚合。发布分区 CSR 后，普通 Cypher 查询可通过 `csr_generation` 运行变长路径和无权最短路。第 5 版快照压缩身份块和属性页。`UNWIND relationships(p)` 后可按关系 ID 和多个属性键选页，再批量读取页内边的属性。含 `DISTINCT` 或聚合时，先读取表达式依赖的属性列、完成去重或分组，再为页内仍可按身份定位的边回填属性。Worker 可按列读取关系属性来过滤邻接候选。PageRank 和弱连通分量的顶点状态按分区由 Worker 计算。查询结果可跨 Coordinator 重启取回。参见[多 Worker 部署手册](../deploy/cluster.md)。
+集群模式可将管理 API 的查询和 Arrow 导出分发到多个 Worker，也可配置单条查询跨 Worker 扫描 Parquet、执行跨源 Join 和聚合。发布分区 CSR 后，普通 Cypher 查询可通过 `csr_generation` 运行变长路径和无权最短路。Gremlin 查询也可通过 API 传入 `csr_generation`，在代次的顶点、边和属性快照上执行。CSR 代次固定构建时的图范围。用日期或时间戳有效期计算当前记录的 SCD2 查询请读取在线图，或先用明确的 `graph_options.snapshot_time` 构建历史代次。显式当前标记和按空结束值判断当前记录的业务整数仍可读取快照。旧清单若缺少时间类型记录，需要重建以确认业务整数范围。第 5 版快照压缩身份块和属性页。`UNWIND relationships(p)` 后可按关系 ID 和多个属性键选页，再批量读取页内边的属性。含 `DISTINCT` 或聚合时，先读取表达式依赖的属性列、完成去重或分组，再为页内仍可按身份定位的边回填属性。Worker 可按列读取关系属性来过滤邻接候选。PageRank 和弱连通分量的顶点状态按分区由 Worker 计算。查询结果可跨 Coordinator 重启取回。参见[多 Worker 部署手册](../deploy/cluster.md)。
 
 集群查询页可在 Cypher 编辑器选择「使用已发布 CSR」。结果显示实际执行的代次，属性查看、邻居展开、翻页和搜索均读取同一代次。刷新页面或连接中断后，可用「找回原查询」读取原任务状态和结果。浏览器会话存储保留待找回的请求标识和模型版本，已执行语句及参数仍按现有编辑器和历史规则处理。
 
@@ -153,7 +153,7 @@ DuckDB 可利用行组的列最小值和最大值裁剪有序 `LIMIT` 的扫描�
 Parquet 表显式列出文件，YAML 中的相对路径以配置文件目录为准。同一表各文件的映射列须具有相同的 Arrow 类型。HTTP 服务须支持 HEAD、Range 和强 ETag。S3 使用 `AWS_REGION` 等标准 AWS 配置，也可通过 `AWS_ENDPOINT` 指定兼容服务。
 
 
-Snowflake、Spanner、SAP HANA 和 Oracle 直连使用 Arrow 微秒时间戳。SQL Server 时间戳使用微秒，覆盖 `datetime2` 和 `datetimeoffset` 的完整日期范围。第七位小数非零时返回精度错误，可在源视图中以文本读取原值。`datetimeoffset` 以 UTC 表示，独立的 `time` 列使用纳秒。Trino 按声明精度选择微秒或纳秒，并在服务端将带时区值转为 UTC。ClickHouse 的 `DateTime` 以时间戳读取。当值超出对应 Arrow 类型的范围或精度时，查询返回对应列的错误，例如 9999-12-31 超过纳秒时间戳的范围；可在源视图中选择微秒精度或显式读取文本。
+Snowflake、Spanner、SAP HANA 和 Oracle 直连使用 Arrow 微秒时间戳。SQL Server 时间戳使用微秒，覆盖 `datetime2` 和 `datetimeoffset` 的完整日期范围。默认在第七位小数非零时返回精度错误，可在源视图中以文本读取原值。在 `sqlserver_native` 数据源上设置 `truncate_datetime2_to_microseconds: true` 可让 SQL Server 截去 `datetime2` 的第七位小数，覆盖完整日期范围。`datetimeoffset` 以 UTC 表示，独立的 `time` 列使用纳秒。Trino 按声明精度选择微秒或纳秒，并在服务端将带时区值转为 UTC。ClickHouse 的 `DateTime` 以时间戳读取。当值超出对应 Arrow 类型的范围或精度时，查询返回对应列的错误，例如 9999-12-31 超过纳秒时间戳的范围；可在源视图中选择微秒精度或显式读取文本。
 
 PostgreSQL 无穷日期、无穷时间戳和定点 `NaN` 在读取时报告具体值和类型。需要这些值或无精度约束的 `NUMERIC` 时，可在源端创建只读视图，将相应列转成 `text`，例如 `valid_until::text AS valid_until`。有限日期与定点数继续使用 Arrow 类型。
 

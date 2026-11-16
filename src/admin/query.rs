@@ -284,12 +284,12 @@ pub(super) fn validate_request(
         .map_err(|_| Error::invalid("invalid_request_id", "查询请求标识必须是 UUID"))?;
     if request.csr_generation.is_some()
         && (request.csr.is_some()
-            || !matches!(request.language, Some(Dialect::Cypher))
+            || !matches!(request.language, Some(Dialect::Cypher | Dialect::Gremlin))
             || request.graph_options.is_some())
     {
         return Err(Error::invalid(
             "invalid_csr_scope",
-            "CSR 代次适用于普通 Cypher，图范围由代次确定",
+            "CSR 代次适用于 Cypher 和 Gremlin，图范围由代次确定",
         ));
     }
     if request.csr.is_some()
@@ -805,6 +805,13 @@ pub(super) async fn cancel(
 }
 
 pub(super) fn query_error(error: anyhow::Error) -> Error {
+    if error.is::<super::cluster::csr::CurrentValidity>() {
+        return Error::new(
+            StatusCode::CONFLICT,
+            "csr_current_validity",
+            "SCD2 当前有效期查询需要读取在线图，或指定 snapshot_time 构建历史 CSR",
+        );
+    }
     let message = explain_error(&error);
     if let Some(detail) = error
         .chain()

@@ -458,9 +458,11 @@ pub(super) async fn run_task(
         partitions: 1,
         ..Default::default()
     };
-    let scope = crate::engine::stage_scope(options)
-        .await
-        .map_err(super::query::query_error)?;
+    let scope = Arc::new(
+        crate::engine::QueryScope::new(options, &worker.admission)
+            .await
+            .map_err(super::query::query_error)?,
+    );
     let context = if task.graph {
         scope.graph_session()
     } else {

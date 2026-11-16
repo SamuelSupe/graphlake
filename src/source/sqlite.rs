@@ -6,11 +6,14 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::{
     arrow::{
-        array::RecordBatch,
+        array::{
+            ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, RecordBatch,
+            StringBuilder,
+        },
         datatypes::{DataType, Field, Schema, SchemaRef},
     },
     catalog::TableProvider,
-    common::{DataFusionError, ScalarValue},
+    common::DataFusionError,
     execution::{
         memory_pool::{MemoryConsumer, MemoryReservation},
         runtime_env::RuntimeEnv,
@@ -231,7 +234,12 @@ impl Scan {
         let mut statement = connection.prepare(&self.sql)?;
         let mut rows = statement.query(params_from_iter(self.params))?;
         let raw = MemoryConsumer::new("GraphLake SQLite batch").register(pool);
-        let mut columns = vec![Vec::new(); self.schema.fields().len()];
+        let mut columns = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| ColumnBuilder::new(field.data_type()))
+            .collect::<Result<Vec<_>>>()?;
         let mut count = 0;
         loop {
             ensure!(!snapshot.cancelled.is_cancelled(), "SQLite read cancelled");
@@ -244,16 +252,13 @@ impl Scan {
                         ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
                         _ => 0,
                     };
-                    raw.try_grow(bytes.saturating_add(2 * size_of::<ScalarValue>()))?;
-                    columns[index].push(scalar(value, field)?);
+                    raw.try_grow(bytes.saturating_mul(2).saturating_add(32))?;
+                    columns[index].push(value, field)?;
                 }
                 count += 1;
             }
             if count > 0 && (done || count == self.batch_size) {
-                let arrays = columns
-                    .iter_mut()
-                    .map(|values| ScalarValue::iter_to_array(values.drain(..)))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let arrays = columns.iter_mut().map(ColumnBuilder::finish).collect();
                 let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
                 snapshot.stats.sqlite_batch(&batch);
                 if let Some(statement) = rows.as_ref() {
@@ -408,31 +413,69 @@ fn schema(connection: &Connection, relation: &str, columns: &[String]) -> Result
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn scalar(value: ValueRef<'_>, field: &Field) -> Result<ScalarValue> {
-    Ok(match (value, field.data_type()) {
-        (ValueRef::Null, kind) => {
+enum ColumnBuilder {
+    Int64(Int64Builder),
+    Float64(Float64Builder),
+    Boolean(BooleanBuilder),
+    String(StringBuilder),
+    Binary(BinaryBuilder),
+}
+
+impl ColumnBuilder {
+    fn new(kind: &DataType) -> Result<Self> {
+        Ok(match kind {
+            DataType::Int64 => Self::Int64(Int64Builder::with_capacity(0)),
+            DataType::Float64 => Self::Float64(Float64Builder::with_capacity(0)),
+            DataType::Boolean => Self::Boolean(BooleanBuilder::with_capacity(0)),
+            DataType::Utf8 => Self::String(StringBuilder::with_capacity(0, 0)),
+            DataType::Binary => Self::Binary(BinaryBuilder::with_capacity(0, 0)),
+            _ => bail!("unsupported SQLite column type {kind}"),
+        })
+    }
+
+    fn push(&mut self, value: ValueRef<'_>, field: &Field) -> Result<()> {
+        if matches!(value, ValueRef::Null) {
             ensure!(
                 field.is_nullable(),
                 "NULL in required SQLite column {}",
                 field.name()
             );
-            ScalarValue::try_from(kind)?
         }
-        (ValueRef::Integer(value), DataType::Int64) => ScalarValue::Int64(Some(value)),
-        (ValueRef::Integer(value @ (0 | 1)), DataType::Boolean) => {
-            ScalarValue::Boolean(Some(value == 1))
+        match (self, value) {
+            (Self::Int64(builder), ValueRef::Integer(value)) => builder.append_value(value),
+            (Self::Boolean(builder), ValueRef::Integer(value @ (0 | 1))) => {
+                builder.append_value(value == 1)
+            }
+            (Self::Float64(builder), ValueRef::Real(value)) => builder.append_value(value),
+            (Self::Float64(builder), ValueRef::Integer(value)) => {
+                builder.append_value(value as f64)
+            }
+            (Self::String(builder), ValueRef::Text(value)) => {
+                builder.append_value(std::str::from_utf8(value)?)
+            }
+            (Self::Binary(builder), ValueRef::Blob(value)) => builder.append_value(value),
+            (Self::Int64(builder), ValueRef::Null) => builder.append_null(),
+            (Self::Float64(builder), ValueRef::Null) => builder.append_null(),
+            (Self::Boolean(builder), ValueRef::Null) => builder.append_null(),
+            (Self::String(builder), ValueRef::Null) => builder.append_null(),
+            (Self::Binary(builder), ValueRef::Null) => builder.append_null(),
+            _ => bail!(
+                "SQLite value does not match declared type for column {}",
+                field.name()
+            ),
         }
-        (ValueRef::Real(value), DataType::Float64) => ScalarValue::Float64(Some(value)),
-        (ValueRef::Integer(value), DataType::Float64) => ScalarValue::Float64(Some(value as f64)),
-        (ValueRef::Text(value), DataType::Utf8) => {
-            ScalarValue::Utf8(Some(std::str::from_utf8(value)?.to_owned()))
+        Ok(())
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Int64(builder) => Arc::new(builder.finish()),
+            Self::Float64(builder) => Arc::new(builder.finish()),
+            Self::Boolean(builder) => Arc::new(builder.finish()),
+            Self::String(builder) => Arc::new(builder.finish()),
+            Self::Binary(builder) => Arc::new(builder.finish()),
         }
-        (ValueRef::Blob(value), DataType::Binary) => ScalarValue::Binary(Some(value.to_vec())),
-        _ => bail!(
-            "SQLite value does not match declared type for column {}",
-            field.name()
-        ),
-    })
+    }
 }
 
 #[cfg(test)]

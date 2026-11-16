@@ -11,8 +11,8 @@ import tempfile
 from urllib.request import urlopen
 
 from cluster_scaling_benchmark import ok
-from local_backup_recovery import process_with_env
-from release_lifecycle import ReleaseSite, activate, local, load
+from local_backup_recovery import Site, process_with_env
+from release_lifecycle import activate, local, load
 
 
 def verify(root):
@@ -41,7 +41,7 @@ def smoke(args, root):
     for binary in [cli, admin]:
         assert subprocess.check_output([binary, '--version'], text=True).strip().endswith(build)
     args.cli = admin
-    with ReleaseSite(args, root / 'catalog', '') as site:
+    with Site(args, root / 'catalog', '') as site:
         site.public = site.base
         db = sqlite3.connect(site.root / 'accounts.db', isolation_level=None)
         try:

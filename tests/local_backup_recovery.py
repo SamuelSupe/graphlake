@@ -73,6 +73,7 @@ class Site:
         self.public = f'https://127.0.0.1:{self.port}'
         self.base = f'http://127.0.0.1:{self.port}'
         self.cookie = ''
+        self.read_retries = []
         self.password = secrets.token_hex(16)
         self.token = secrets.token_hex(32)
         self.env = {**os.environ, 'S6_WORKER_TOKEN': secrets.token_hex(32),
@@ -140,13 +141,29 @@ distributed_partitions: 2
     def login(self):
         ok(self.call('/api/v1/auth/login', {'username': 'admin', 'password': self.password}, login=True))
 
+    def read(self, path, request=None):
+        start = time.monotonic()
+        retries = 0
+        while True:
+            status, result = self.call(path, request)
+            if (status != 503 or not isinstance(result, dict) or result.get('code') != 'coordinator_leadership_uncertain'
+                    or time.monotonic() - start >= 5):
+                result = ok((status, result))
+                if retries:
+                    self.read_retries.append((retries, time.monotonic() - start))
+                return result
+            retries += 1
+            if request is not None:
+                request = {**request, 'request_id': str(uuid4())}
+            time.sleep(.1)
+
     def table(self):
-        return ok(self.call(MODEL + '/local-tables'))[0]
+        return self.read(MODEL + '/local-tables')[0]
 
     def query(self, revision):
-        return ok(self.call(MODEL + '/query', {
+        return self.read(MODEL + '/query', {
             'request_id': str(uuid4()), 'model_revision': revision, 'language': 'sql', 'query': GRAPH_QUERY,
-        }))['rows']
+        })['rows']
 
     def load(self, mode='incremental', *, wait=True):
         task = ok(self.call(TABLE + '/load', {'mode': mode}))
@@ -161,7 +178,7 @@ distributed_partitions: 2
 
     def csr(self, previous=None):
         def current():
-            csr = ok(self.call(MODEL + '/freshness'))['csr']
+            csr = self.read(MODEL + '/freshness')['csr']
             return csr if csr and csr['current'] and csr['generation'] != previous else None
         return until(current)
 

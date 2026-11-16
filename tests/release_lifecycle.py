@@ -30,33 +30,6 @@ def local(site, name):
     return next(table for table in site.read(MODEL + '/local-tables') if table['name'] == name)
 
 
-class ReleaseSite(Site):
-    def __enter__(self):
-        self.read_retries = []
-        return super().__enter__()
-
-    def read(self, path, request=None):
-        start = time.monotonic()
-        retries = 0
-        while True:
-            status, result = self.call(path, request)
-            if (status != 503 or (result or {}).get('code') != 'coordinator_leadership_uncertain'
-                    or time.monotonic() - start >= 5):
-                result = ok((status, result))
-                if retries:
-                    self.read_retries.append((retries, time.monotonic() - start))
-                return result
-            retries += 1
-            if request is not None:
-                request = {**request, 'request_id': str(uuid4())}
-            time.sleep(.1)
-
-    def query(self, revision):
-        return self.read(MODEL + '/query', {
-            'request_id': str(uuid4()), 'model_revision': revision, 'language': 'sql', 'query': GRAPH_QUERY,
-        })['rows']
-
-
 def load(site, name, mode='incremental', *, wait=True):
     run = ok(site.call(MODEL + '/local-tables/' + name + '/load', {'mode': mode}))
     if not wait:
@@ -141,7 +114,7 @@ edges:
 
     def upgrade(self):
         args, root = self.args, self.root
-        with ExitStack() as processes, ReleaseSite(args, root / 'catalog', self.dsn) as site:
+        with ExitStack() as processes, Site(args, root / 'catalog', self.dsn) as site:
             ports = [site.worker_port, *allocate_ports(1)]
             site.config.write_text(re.sub(r'^workers:.*$', 'workers: ' +
                 json.dumps([f'http://127.0.0.1:{port}' for port in ports]), site.config.read_text(), flags=re.M))
@@ -285,7 +258,7 @@ edges:
             self.report('soak_backup_verified', generation=state['archived_generation'], rows_sha256=digest(self.rows))
 
             if args.previous:
-                with ReleaseSite(args, root / 'rollback-site', self.dsn) as recovery:
+                with Site(args, root / 'rollback-site', self.dsn) as recovery:
                     recovery.cli = args.previous
                     recovery.config.write_text(recovery.config.read_text().replace('distributed_partitions: 2', 'distributed_partitions: 0'))
                     shutil.copytree(saved / '.graphlake-local', recovery.root / '.graphlake-local')

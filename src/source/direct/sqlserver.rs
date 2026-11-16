@@ -133,7 +133,7 @@ impl Driver {
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation)> {
         let (namespace, name) = table.split_once('.').context("expected schema.table")?;
         self.stats.request();
-        let metadata = self.client.simple_query(format!("SELECT COLUMN_NAME, DATA_TYPE, CAST(NUMERIC_PRECISION AS INT), CAST(NUMERIC_SCALE AS INT), IS_NULLABLE, CAST(DATETIME_PRECISION AS INT) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA={} AND TABLE_NAME={} ORDER BY ORDINAL_POSITION", literal(namespace), literal(name))).await?.into_first_result().await?;
+        let metadata = self.client.simple_query(format!("SELECT COLUMN_NAME, DATA_TYPE, CAST(NUMERIC_PRECISION AS INT), CAST(NUMERIC_SCALE AS INT), IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA={} AND TABLE_NAME={} ORDER BY ORDINAL_POSITION", literal(namespace), literal(name))).await?.into_first_result().await?;
         ensure!(
             !metadata.is_empty(),
             "SQL Server table has no visible columns"
@@ -147,32 +147,7 @@ impl Driver {
             let kind = row.try_get::<&str, _>(1)?.context("missing column type")?;
             let precision = row.try_get::<i32, _>(2)?.unwrap_or(0);
             let scale = row.try_get::<i32, _>(3)?.unwrap_or(0);
-            let temporal_unit = if row.try_get::<i32, _>(5)?.unwrap_or(7) > 6 {
-                TimeUnit::Nanosecond
-            } else {
-                TimeUnit::Microsecond
-            };
-            let ty = match kind {
-                "bit" => DataType::Boolean,
-                "tinyint" => DataType::UInt8,
-                "smallint" => DataType::Int16,
-                "int" => DataType::Int32,
-                "bigint" => DataType::Int64,
-                "real" => DataType::Float32,
-                "float" => DataType::Float64,
-                "decimal" | "numeric" => types::numeric(precision as u8, scale as i8)?,
-                "money" => DataType::Decimal128(19, 4),
-                "smallmoney" => DataType::Decimal128(10, 4),
-                "date" => DataType::Date32,
-                "time" => DataType::Time64(TimeUnit::Nanosecond),
-                "datetime" | "smalldatetime" => DataType::Timestamp(TimeUnit::Microsecond, None),
-                "datetime2" => DataType::Timestamp(temporal_unit, None),
-                "datetimeoffset" => DataType::Timestamp(temporal_unit, Some("UTC".into())),
-                "binary" | "varbinary" | "image" | "timestamp" | "rowversion" => DataType::Binary,
-                "char" | "varchar" | "nchar" | "nvarchar" | "text" | "ntext"
-                | "uniqueidentifier" | "xml" => DataType::Utf8,
-                _ => bail!("unsupported SQL Server type {kind}; expose it as a scalar view column"),
-            };
+            let ty = arrow_type(kind, precision, scale)?;
             fields.push(Field::new(
                 name,
                 ty,
@@ -270,5 +245,62 @@ impl Driver {
                 return buffer.finish(schema, &self.stats);
             }
         }
+    }
+}
+
+fn arrow_type(kind: &str, precision: i32, scale: i32) -> Result<DataType> {
+    Ok(match kind {
+        "bit" => DataType::Boolean,
+        "tinyint" => DataType::UInt8,
+        "smallint" => DataType::Int16,
+        "int" => DataType::Int32,
+        "bigint" => DataType::Int64,
+        "real" => DataType::Float32,
+        "float" => DataType::Float64,
+        "decimal" | "numeric" => types::numeric(precision as u8, scale as i8)?,
+        "money" => DataType::Decimal128(19, 4),
+        "smallmoney" => DataType::Decimal128(10, 4),
+        "date" => DataType::Date32,
+        "time" => DataType::Time64(TimeUnit::Nanosecond),
+        "datetime" | "smalldatetime" | "datetime2" => {
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        }
+        "datetimeoffset" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        "binary" | "varbinary" | "image" | "timestamp" | "rowversion" => DataType::Binary,
+        "char" | "varchar" | "nchar" | "nvarchar" | "text" | "ntext" | "uniqueidentifier"
+        | "xml" => DataType::Utf8,
+        _ => bail!("unsupported SQL Server type {kind}; expose it as a scalar view column"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_keep_scd2_sentinels_and_reject_fractional_truncation() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("start", arrow_type("datetime2", 0, 0)?, false),
+            Field::new("end", arrow_type("datetimeoffset", 0, 0)?, false),
+        ]));
+        let mut rows = vec![vec![
+            Some("0001-01-01T00:00:00.0000000".into()),
+            Some("9999-12-31T23:59:59.9999990+00:00".into()),
+        ]];
+        let batch = types::batch(Arc::clone(&schema), &rows, Encoding::Snowflake)?;
+        for (index, expected) in [-62_135_596_800_000_000, 253_402_300_799_999_999]
+            .into_iter()
+            .enumerate()
+        {
+            let values = batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(values.value(0), expected);
+        }
+        rows[0][0] = Some("2026-01-01T00:00:00.0000001".into());
+        assert!(types::batch(schema, &rows, Encoding::Snowflake).is_err());
+        Ok(())
     }
 }

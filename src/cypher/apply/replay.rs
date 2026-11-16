@@ -60,11 +60,10 @@ impl Plan {
         let mut state = context.state();
         // Dynamic filters share state with their original producer and cannot
         // be rebound by DataFusion's physical plan reset.
-        state
-            .config_mut()
-            .options_mut()
-            .optimizer
-            .enable_dynamic_filter_pushdown = false;
+        state.config_mut().options_mut().set(
+            "datafusion.optimizer.enable_dynamic_filter_pushdown",
+            "false",
+        )?;
         let frame = DataFrame::new(state.clone(), frame.logical_plan().clone());
         let physical = frame.create_physical_plan().await?;
         Ok(Self { physical, state })

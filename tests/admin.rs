@@ -443,6 +443,30 @@ nodes:
                 && event["action"] == "save_model"
                 && event["outcome"] == "ok")
     );
+    assert_eq!(
+        server
+            .guest(Method::POST, "models/payments/unpublish")
+            .json(&json!({}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let anonymous = fs::read_to_string(root.path().join(".graphlake-auth/audit-anonymous.jsonl"))?;
+    let logged_denial = |contents: &str| {
+        contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|entry| {
+                entry["status"] == 401
+                    && entry["subject"] == "anonymous"
+                    && entry["action"] == "unpublish"
+            })
+    };
+    assert!(logged_denial(&anonymous), "{anonymous}");
+    assert!(!logged_denial(&fs::read_to_string(
+        root.path().join(".graphlake-auth/audit.jsonl")
+    )?));
     Ok(())
 }
 
@@ -452,6 +476,114 @@ fn setup_assets(root: &Path) -> Result<()> {
         root.join("assets/index.html"),
         "<!doctype html><title>GraphLake</title>",
     )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_scd2_exploration_starts_fresh_and_keeps_cursor_time() -> Result<()> {
+    use graphlake::arrow::array::TimestampMillisecondArray;
+
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let write_parquet = |name: &str, batch: &RecordBatch| -> Result<()> {
+        let staging = root.path().join(format!("{name}.staging"));
+        let mut writer = ArrowWriter::try_new(fs::File::create(&staging)?, batch.schema(), None)?;
+        writer.write(batch)?;
+        writer.close()?;
+        fs::rename(staging, root.path().join(format!("{name}.parquet")))?;
+        Ok(())
+    };
+    write_parquet(
+        "nodes",
+        &RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(vec![1, 2, 3])) as _)])?,
+    )?;
+    let write_edges = |boundary| -> Result<()> {
+        write_parquet(
+            "edges",
+            &RecordBatch::try_from_iter([
+                ("id", Arc::new(Int64Array::from(vec![10, 20])) as _),
+                ("src", Arc::new(Int64Array::from(vec![1, 1])) as _),
+                ("dst", Arc::new(Int64Array::from(vec![2, 3])) as _),
+                (
+                    "since",
+                    Arc::new(TimestampMillisecondArray::from(vec![0, boundary])) as _,
+                ),
+                (
+                    "until",
+                    Arc::new(TimestampMillisecondArray::from(vec![Some(boundary), None])) as _,
+                ),
+            ])?,
+        )
+    };
+    write_edges(chrono::Utc::now().timestamp_millis() + 60_000)?;
+    fs::write(
+        root.path().join("payments.yaml"),
+        r#"
+graph: temporal
+sources:
+  store: {type: parquet, tables: {nodes: [nodes.parquet], edges: [edges.parquet]}}
+nodes:
+  Account: {source: store.nodes, key: [id]}
+edges:
+  Payment:
+    source: store.edges
+    key: [id]
+    from: {node: Account, columns: [src]}
+    to: {node: Account, columns: [dst]}
+    scd2: {valid_from: since, valid_to: until}
+"#,
+    )?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let model = server.model("payments").await?;
+    let boundary = chrono::Utc::now().timestamp_millis() + 4000;
+    write_edges(boundary)?;
+    let explore = |cursor: Value| {
+        server
+            .request(Method::POST, "models/payments/explore")
+            .json(&json!({
+                "model_revision": model["active_revision"],
+                "neighbors": true,
+                "element": {"kind":"node", "label":"Account", "key":["1"]},
+                "graph_options": {},
+                "cursor": cursor,
+            }))
+    };
+    let initial: Value = explore(Value::Null)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let edge = |result: &Value| -> Value {
+        result["graph"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["kind"] == "edge")
+            .unwrap()["key"]
+            .clone()
+    };
+    assert_eq!(edge(&initial), json!(["10"]));
+    let wait = (boundary - chrono::Utc::now().timestamp_millis()).max(0) as u64;
+    tokio::time::sleep(Duration::from_millis(wait + 20)).await;
+    let fresh: Value = explore(Value::Null)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(edge(&fresh), json!(["20"]));
+    let cursor = initial["page_cursor"].clone();
+    assert!(cursor.is_string(), "{initial}");
+    let replayed: Value = explore(cursor)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(edge(&replayed), json!(["10"]));
     Ok(())
 }
 

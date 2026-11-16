@@ -199,6 +199,7 @@ struct MatchPlan<'a> {
     expression_joins: RefCell<Vec<clauses::ExpressionJoin>>,
     call_imports: std::rc::Rc<BTreeMap<usize, Vec<String>>>,
     lambda_inputs: RefCell<Vec<(String, String)>>,
+    order_inputs: BTreeMap<(usize, usize), String>,
     labels: BTreeSet<String>,
     bindings: BTreeMap<String, Binding>,
     relations: Vec<(String, usize)>,
@@ -757,6 +758,12 @@ impl<'a> MatchPlan<'a> {
             expression_step(),
             "Cypher expression planning exceeds its work limit"
         );
+        if let Some(value) = self
+            .order_inputs
+            .get(&(expression.span.start, expression.span.end))
+        {
+            return Ok(value.clone());
+        }
         bounded_expression(self.render_expression(expression, aliases)?)
     }
 
@@ -1566,29 +1573,58 @@ impl<'a> MatchPlan<'a> {
                 ..Default::default()
             };
             scope.bind("d", &mut projected);
+            let projected_names = body
+                .items
+                .iter()
+                .map(|item| {
+                    let expression = expression_name(&item.expr);
+                    let name = item
+                        .alias
+                        .as_ref()
+                        .map_or(expression.clone(), |alias| alias.0.clone());
+                    (expression, name)
+                })
+                .collect::<BTreeMap<_, _>>();
             for (index, item) in body.order_by.iter().enumerate() {
                 let column = order_column(index, &mut output_names);
                 let mut aggregate = HasAggregate(false);
                 aggregate.visit_expr(&item.expr);
                 let spelling = expression_name(&item.expr);
-                let projected_expression = if !aggregate.0 {
+                let mut projected_expression = if !aggregate.0 {
                     projected.expr(&item.expr).ok()
                 } else {
                     None
                 };
-                let projected_expression = projected_expression.or_else(|| {
-                    body.items
-                        .iter()
-                        .find(|item| expression_name(&item.expr) == spelling)
-                        .map(|item| {
-                            qualified(
-                                "d",
-                                item.alias
-                                    .as_ref()
-                                    .map_or(spelling.as_str(), |name| name.0.as_str()),
-                            )
-                        })
+                projected_expression = projected_expression.or_else(|| {
+                    projected_names
+                        .get(&spelling)
+                        .map(|name| qualified("d", name))
                 });
+                if projected_expression.is_none() && aggregate.0 && aggregated && !distinct {
+                    let mut inputs = AggregateOrderInputs {
+                        projected: &projected_names,
+                        items: Vec::new(),
+                    };
+                    inputs.visit_expr(&item.expr);
+                    for (part, output) in inputs.items {
+                        let name = match output {
+                            Some(name) => name,
+                            None => {
+                                let name = order_column(index, &mut output_names);
+                                let expression = self.expr_with_aliases(&part, &aliases)?;
+                                projection.push(format!("{expression} AS {}", ident(&name)));
+                                name
+                            }
+                        };
+                        projected
+                            .order_inputs
+                            .insert((part.span.start, part.span.end), qualified("d", &name));
+                    }
+                    projected_expression = Some(projected.expr(&item.expr).context(
+                        "ORDER BY after aggregation requires grouped or aggregate values",
+                    )?);
+                    projected.order_inputs.clear();
+                }
                 if let Some(expression) = projected_expression {
                     hidden.push(format!("{expression} AS {}", ident(&column)));
                 } else {
@@ -1813,6 +1849,12 @@ pub(crate) fn literal(expr: &Expr) -> Result<String> {
 
 struct HasAggregate(bool);
 
+fn aggregate_call(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::CountStar)
+        || matches!(&expr.kind, ExprKind::FunctionCall { name, .. }
+            if matches!(name.0.to_ascii_lowercase().as_str(), "count" | "sum" | "avg" | "min" | "max" | "collect" | collect::COUNT_SIZE))
+}
+
 impl Visitor for HasAggregate {
     fn visit_expr(&mut self, expr: &Expr) {
         if matches!(
@@ -1821,12 +1863,28 @@ impl Visitor for HasAggregate {
         ) {
             return;
         }
-        if matches!(&expr.kind, ExprKind::CountStar)
-            || matches!(&expr.kind, ExprKind::FunctionCall { name, .. }
-            if matches!(name.0.to_ascii_lowercase().as_str(), "count" | "sum" | "avg" | "min" | "max" | "collect" | collect::COUNT_SIZE))
-        {
+        if aggregate_call(expr) {
             self.0 = true;
         } else {
+            walk_expr(self, expr);
+        }
+    }
+}
+
+struct AggregateOrderInputs<'a> {
+    projected: &'a BTreeMap<String, String>,
+    items: Vec<(Expr, Option<String>)>,
+}
+
+impl Visitor for AggregateOrderInputs<'_> {
+    fn visit_expr(&mut self, expr: &Expr) {
+        let output = self.projected.get(&expression_name(expr));
+        if output.is_some() || aggregate_call(expr) {
+            self.items.push((expr.clone(), output.cloned()));
+        } else if !matches!(
+            expr.kind,
+            ExprKind::Exists(_) | ExprKind::PatternComprehension { .. }
+        ) {
             walk_expr(self, expr);
         }
     }

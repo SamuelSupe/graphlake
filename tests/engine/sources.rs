@@ -808,13 +808,18 @@ async fn postgres_pushdown_preserves_null_keys_and_filtered_order() -> Result<()
     client
         .batch_execute(&format!(
             "CREATE SCHEMA {schema};
-         CREATE TABLE {schema}.accounts (id BIGINT UNIQUE, amount INTEGER);
-         INSERT INTO {schema}.accounts VALUES (NULL,999),(NULL,888),(1,8),(2,NULL),(3,-1);"
+         CREATE TABLE {schema}.accounts (id BIGINT UNIQUE, amount INTEGER, code TEXT, uid UUID UNIQUE);
+         CREATE INDEX ON {schema}.accounts(code);
+         INSERT INTO {schema}.accounts VALUES
+            (NULL,999,NULL,NULL),(NULL,888,NULL,NULL),
+            (1,8,'alpha','aaaaaaaa-0000-0000-0000-000000000001'),
+            (2,NULL,'ALPHA','aaaaaaaa-0000-0000-0000-000000000002'),
+            (3,-1,'beta','aaaaaaaa-0000-0000-0000-000000000003');"
         ))
         .await?;
     let checked = async {
         let catalog: Catalog = serde_saphyr::from_str(&format!(
-            "graph: pg\nsources:\n  db: {{type: postgres, dsn_env: GRAPHLAKE_TEST_POSTGRES}}\nnodes:\n  Account: {{source: db.{schema}.accounts, key: [id], properties: [amount]}}"
+            "graph: pg\nsources:\n  db: {{type: postgres, dsn_env: GRAPHLAKE_TEST_POSTGRES}}\nnodes:\n  Account: {{source: db.{schema}.accounts, key: [id], properties: [amount,code,uid]}}"
         ))?;
         let engine = Engine::new(catalog)?;
         for (sql, control, expected) in [
@@ -834,6 +839,19 @@ async fn postgres_pushdown_preserves_null_keys_and_filtered_order() -> Result<()
             assert_eq!(result, vec![expected]);
             assert_eq!(result, rows(&mut control).await?);
             assert_eq!(fast.metrics().reads.postgres_rows, 1);
+        }
+        for (query, expected) in [
+            (r#"SELECT id FROM "Account" WHERE code IN ('alpha','beta') ORDER BY id"#, vec![1,3]),
+            (r#"SELECT id FROM "Account" WHERE uid IN
+                ('aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000003')
+                ORDER BY id"#, vec![1,3]),
+            (r#"SELECT id FROM "Account" WHERE uid IN
+                ('AAAAAAAA-0000-0000-0000-000000000002','aaaaaaaa-0000-0000-0000-000000000003')
+                ORDER BY id"#, vec![3]),
+        ] {
+            let expected = expected.into_iter().map(|id| serde_json::json!({"id":id})).collect::<Vec<_>>();
+            let mut result = engine.query(Language::Sql, query, Default::default()).await?;
+            assert_eq!(rows(&mut result).await?, expected, "{query}");
         }
         Ok::<_, anyhow::Error>(())
     }.await;

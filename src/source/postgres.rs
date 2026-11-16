@@ -969,7 +969,42 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
         Expr::InList(list) if !list.negated && !list.list.is_empty() => {
             let field = operand(&list.expr)?;
             let values = list.list.iter().map(operand).collect::<Option<Vec<_>>>()?;
-            Some(format!("({field} IN ({}))", values.join(", ")))
+            let exact = format!("({field} IN ({}))", values.join(", "));
+            if let Some(column) = column(&list.expr)
+                && let Some(strings) = list
+                    .list
+                    .iter()
+                    .map(|item| match item {
+                        Expr::Literal(
+                            ScalarValue::Utf8(Some(value))
+                            | ScalarValue::Utf8View(Some(value))
+                            | ScalarValue::LargeUtf8(Some(value)),
+                            _,
+                        ) => Some(value),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+            {
+                let name = ident(column.name());
+                match types[schema.index_of(column.name()).ok()?] {
+                    Type::TEXT | Type::VARCHAR => {
+                        return Some(format!("({name} IN ({}) AND {exact})", values.join(", ")));
+                    }
+                    Type::UUID
+                        if strings.iter().all(|value| {
+                            uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == **value)
+                        }) =>
+                    {
+                        let values = values
+                            .iter()
+                            .map(|value| format!("{value}::uuid"))
+                            .collect::<Vec<_>>();
+                        return Some(format!("({name} IN ({}))", values.join(", ")));
+                    }
+                    _ => {}
+                }
+            }
+            Some(exact)
         }
         Expr::BinaryExpr(binary) => {
             let op = binary.op;

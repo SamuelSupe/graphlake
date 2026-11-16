@@ -125,7 +125,9 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
         Some(("hasLabel", [label])) => {
             Some(text(label)?).filter(|name| names.iter().any(|known| *known == name))
         }
-        Some(("has", [label, _, _])) => Some(text(label)?),
+        Some(("has", [label, _, _])) => {
+            Some(text(label)?).filter(|name| names.iter().any(|known| *known == name))
+        }
         _ => None,
     };
     let selected = selected.or_else(|| (names.len() == 1).then(|| names[0].clone()));
@@ -314,6 +316,9 @@ impl Traversers<'_> {
         ensure!(depth <= 16, "Gremlin nesting exceeds 16");
         let mut steps = steps.iter().peekable();
         while let Some(step) = steps.next() {
+            let early_limit = self.order.is_empty()
+                && self.group.is_none()
+                && steps.peek().is_some_and(|next| next.name == "limit");
             if !self.variants.is_empty()
                 && matches!(
                     step.name,
@@ -340,7 +345,7 @@ impl Traversers<'_> {
                         | "as"
                 )
             {
-                self.dispatch(step, depth)?;
+                self.dispatch(step, depth, early_limit)?;
                 ensure!(self.sql.len() <= 256 * 1024, "Gremlin plan exceeds 256 KiB");
                 continue;
             }
@@ -387,7 +392,7 @@ impl Traversers<'_> {
                         self.hop(step.name, edge)?;
                     } else {
                         let table = self.fresh("edge_input");
-                        let cte = self.shared_input(&table, edges.len());
+                        let cte = self.shared_input(&table, !early_limit);
                         let mut branches = Vec::with_capacity(edges.len());
                         for edge in edges {
                             let mut branch = self.clone();
@@ -402,7 +407,7 @@ impl Traversers<'_> {
                 ("outV" | "inV", []) => self.endpoint(step.name == "outV", false)?,
                 ("bothV" | "otherV", []) => {
                     let table = self.fresh("endpoints");
-                    let cte = self.shared_input(&table, 2);
+                    let cte = self.shared_input(&table, !early_limit);
                     let mut source = self.clone();
                     source.sql = format!("SELECT * FROM {}", ident(&table));
                     source.endpoint(true, step.name == "otherV")?;

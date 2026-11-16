@@ -111,17 +111,32 @@ impl Metadata {
         // A lost lease-grant reply can leave an unused lease until its TTL.
         // It carries no lock or job, so trying another member is safe.
         let retry = read_only || path == "/v3/lease/grant";
+        let timeout = if retry && self.has_alternates() {
+            210
+        } else {
+            2000
+        };
+        self.request(path, body, retry, Duration::from_millis(timeout))
+            .await
+    }
+
+    pub(super) async fn retention_range(&self, body: Value) -> Result<Value> {
+        self.request("/v3/kv/range", body, true, Duration::from_secs(2))
+            .await
+    }
+
+    async fn request(
+        &self,
+        path: &str,
+        body: Value,
+        retry: bool,
+        timeout: Duration,
+    ) -> Result<Value> {
         self.try_endpoints(retry, |endpoint| {
             let request = self
                 .client
                 .post(endpoint.join(path).expect("validated etcd endpoint"))
-                .timeout(Duration::from_millis(
-                    if retry && self.endpoints.len() > 1 {
-                        210
-                    } else {
-                        2000
-                    },
-                ))
+                .timeout(timeout)
                 .json(&body);
             async move { Ok(request.send().await?.error_for_status()?.json().await?) }
         })

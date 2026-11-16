@@ -427,6 +427,8 @@ nodes:
         .await?;
     assert!(!rows(&mut analyze).await?.is_empty());
     assert_eq!(analyze.metrics().reads.warehouse_rows, 8192);
+    // One statement submission and 64 pages, with no schema-only statement.
+    assert_eq!(analyze.metrics().reads.requests, 65);
     for (language, query) in [
         (Language::Sql, r#"SELECT id FROM "Account" WHERE id = 42"#),
         (

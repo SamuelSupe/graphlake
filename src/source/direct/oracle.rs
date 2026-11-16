@@ -205,51 +205,84 @@ fn arrow_schema(columns: &[ColumnInfo]) -> Result<datafusion::arrow::datatypes::
         columns
             .iter()
             .map(|column| {
-                let kind = match column.oracle_type() {
-                    OracleType::Number(p, 0) if *p > 0 && *p <= 18 => DataType::Int64,
-                    OracleType::Number(p, s) if *p > 0 && *s >= 0 && (*s as u8) <= *p => {
-                        types::numeric(*p, *s)?
-                    }
-                    OracleType::Number(p, s) if *p > 0 && *s > 0 && *s <= 38 => {
-                        types::numeric((*p).max(*s as u8), *s)?
-                    }
-                    OracleType::Number(p, s)
-                        if *p > 0 && *s < 0 && i16::from(*p) - i16::from(*s) <= 38 =>
-                    {
-                        let precision = (i16::from(*p) - i16::from(*s)) as u8;
-                        if precision <= 18 {
-                            DataType::Int64
-                        } else {
-                            types::numeric(precision, 0)?
-                        }
-                    }
-                    // Out-of-range fixed-point numbers still have an exact
-                    // text representation; Oracle's unconstrained types do not
-                    // imply a single fixed scale for numeric comparison.
-                    OracleType::Number(p, _) if *p > 0 => DataType::Utf8,
-                    OracleType::Number(_, _) | OracleType::Float(_) => DataType::Float64,
-                    OracleType::BinaryFloat => DataType::Float32,
-                    OracleType::BinaryDouble => DataType::Float64,
-                    OracleType::Date => DataType::Timestamp(TimeUnit::Microsecond, None),
-                    OracleType::Timestamp(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
-                    OracleType::TimestampTZ(_) | OracleType::TimestampLTZ(_) => {
-                        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-                    }
-                    OracleType::Raw(_) | OracleType::BLOB => DataType::Binary,
-                    OracleType::Varchar2(_)
-                    | OracleType::NVarchar2(_)
-                    | OracleType::Char(_)
-                    | OracleType::NChar(_)
-                    | OracleType::Rowid
-                    | OracleType::CLOB
-                    | OracleType::NCLOB
-                    | OracleType::Long => DataType::Utf8,
-                    other => {
-                        bail!("unsupported Oracle type {other}; expose it as a scalar view column")
-                    }
-                };
+                let kind = arrow_type(column.oracle_type())?;
                 Ok(Field::new(column.name(), kind, column.nullable()))
             })
             .collect::<Result<Vec<_>>>()?,
     )))
+}
+
+fn arrow_type(oracle_type: &OracleType) -> Result<DataType> {
+    Ok(match oracle_type {
+        OracleType::Number(p, 0) if *p > 0 && *p <= 18 => DataType::Int64,
+        OracleType::Number(p, s) if *p > 0 && *s >= 0 && (*s as u8) <= *p => {
+            types::numeric(*p, *s)?
+        }
+        OracleType::Number(p, s) if *p > 0 && *s > 0 && *s <= 38 => {
+            types::numeric((*p).max(*s as u8), *s)?
+        }
+        OracleType::Number(p, s) if *p > 0 && *s < 0 && i16::from(*p) - i16::from(*s) <= 38 => {
+            let precision = (i16::from(*p) - i16::from(*s)) as u8;
+            if precision <= 18 {
+                DataType::Int64
+            } else {
+                types::numeric(precision, 0)?
+            }
+        }
+        // Oracle FLOAT is a NUMBER subtype. Text preserves digits
+        // when the declared type cannot be mapped to fixed point.
+        OracleType::Number(_, _) | OracleType::Float(_) => DataType::Utf8,
+        OracleType::BinaryFloat => DataType::Float32,
+        OracleType::BinaryDouble => DataType::Float64,
+        OracleType::Date => DataType::Timestamp(TimeUnit::Microsecond, None),
+        OracleType::Timestamp(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
+        OracleType::TimestampTZ(_) | OracleType::TimestampLTZ(_) => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        }
+        OracleType::Raw(_) | OracleType::BLOB => DataType::Binary,
+        OracleType::Varchar2(_)
+        | OracleType::NVarchar2(_)
+        | OracleType::Char(_)
+        | OracleType::NChar(_)
+        | OracleType::Rowid
+        | OracleType::CLOB
+        | OracleType::NCLOB
+        | OracleType::Long => DataType::Utf8,
+        other => {
+            bail!("unsupported Oracle type {other}; expose it as a scalar view column")
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unconstrained_numbers_preserve_business_keys_as_text() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ID", arrow_type(&OracleType::Number(0, -127))?, false),
+            Field::new("AMOUNT", arrow_type(&OracleType::Float(126))?, false),
+        ]));
+        let rows = [
+            vec![
+                Some("9007199254740992".into()),
+                Some("0.10000000000000000001".into()),
+            ],
+            vec![
+                Some("9007199254740993".into()),
+                Some("1.00000000000000000002".into()),
+            ],
+        ];
+        let batch = types::batch(schema, &rows, Encoding::Rfc3339)?;
+        for (index, field) in batch.columns().iter().enumerate() {
+            let values = field
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .unwrap();
+            assert_eq!(values.value(0), rows[0][index].as_deref().unwrap());
+            assert_eq!(values.value(1), rows[1][index].as_deref().unwrap());
+        }
+        Ok(())
+    }
 }

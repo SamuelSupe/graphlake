@@ -5,14 +5,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectMeta, path::Path as Key};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{
-    Metadata, Objects,
-    control::Receipt,
-    store::{Job, JobState},
-};
+use super::{Metadata, Objects, control::Leadership};
 
 const GRACE: TimeDelta = TimeDelta::hours(24);
 
@@ -20,7 +17,9 @@ pub(super) async fn sweep(
     metadata: &Metadata,
     objects: &Objects,
     now: DateTime<Utc>,
+    leader: Option<&Leadership>,
 ) -> Result<()> {
+    confirm(leader).await?;
     let csr = objects.prefix.clone().join("csr");
     let catalog = objects.prefix.clone().join("control").join("catalog");
     let retired = objects.prefix.clone().join("retired");
@@ -90,6 +89,7 @@ pub(super) async fn sweep(
     stream::iter(actions)
         .map(Ok)
         .try_for_each_concurrent(8, |(marker, files)| async move {
+            confirm(leader).await?;
             match files {
                 None => objects.put_immutable(&marker, Vec::new()).await,
                 Some(mut files) => {
@@ -105,7 +105,17 @@ pub(super) async fn sweep(
                     }
                     let deletions = stream::iter(files.into_iter().map(|file| Ok(file.location)));
                     let mut deleted = objects.store.delete_stream(deletions.boxed());
-                    while deleted.try_next().await?.is_some() {}
+                    while let Some(result) = deleted.next().await {
+                        match result {
+                            Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        if let Some(leader) = leader {
+                            leader
+                                .admission()
+                                .map_err(|error| anyhow::anyhow!(error.message))?;
+                        }
+                    }
                     objects.delete_local(&marker).await
                 }
             }
@@ -117,79 +127,136 @@ async fn inventory(objects: &Objects, prefix: &Key) -> Result<Vec<ObjectMeta>> {
     Ok(objects.store.list(Some(prefix)).try_collect().await?)
 }
 
+async fn confirm(leader: Option<&Leadership>) -> Result<()> {
+    if let Some(leader) = leader {
+        leader
+            .confirm()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct JobRoot {
+    model: String,
+    revision: String,
+    csr_generation: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct ReceiptRoot {
+    generation: String,
+}
+
+fn entries(response: &Value) -> Result<&[Value]> {
+    match response.get("kvs") {
+        Some(values) => Ok(values.as_array().context("invalid retention entries")?),
+        None => Ok(&[]),
+    }
+}
+
+fn decode(entry: &Value, field: &str) -> Result<Vec<u8>> {
+    Ok(STANDARD.decode(entry[field].as_str().context("invalid retention entry")?)?)
+}
+
+async fn visit_range(
+    metadata: &Metadata,
+    prefix: &str,
+    revision: &str,
+    mut visit: impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
+    let mut start = prefix.as_bytes().to_vec();
+    let mut end = start.clone();
+    *end.last_mut().expect("nonempty prefix") += 1;
+    let end = STANDARD.encode(end);
+    loop {
+        let response = metadata
+            .retention_range(json!({
+                "key":STANDARD.encode(&start), "range_end":end, "revision":revision,
+                "limit":"256", "sort_order":"ASCEND", "sort_target":"KEY",
+            }))
+            .await?;
+        ensure!(
+            response["header"]["revision"].as_str().is_some(),
+            "missing retention page revision"
+        );
+        let page = entries(&response)?;
+        for entry in page {
+            visit(entry)?;
+        }
+        if response["more"] != true {
+            return Ok(());
+        }
+        let mut next = decode(
+            page.last()
+                .context("empty retention page with continuation")?,
+            "key",
+        )?;
+        next.push(0);
+        ensure!(next > start, "retention range did not advance");
+        start = next;
+    }
+}
+
 async fn live_generations(metadata: &Metadata, objects: &Objects) -> Result<HashSet<Key>> {
     let key = |suffix: &str| format!("{}/{suffix}", metadata.prefix);
-    let range = |prefix: &str| {
-        let mut end = key(prefix).into_bytes();
-        *end.last_mut().expect("nonempty prefix") += 1;
-        json!({"request_range":{"key":STANDARD.encode(key(prefix)), "range_end":STANDARD.encode(end)}})
-    };
-    // A single linearizable revision covers jobs, current pointers and receipts.
-    // UUIDs are published once. The extra age and retirement windows cover
-    // unpublished writes and readers admitted before a pointer is replaced.
-    let result = metadata
-        .call(
-            "/v3/kv/txn",
-            json!({"success":[
-                range("csr/"), range("jobs/"),
-                {"request_range":{"key":STANDARD.encode(key("coordinator/catalog"))}},
-                range("coordinator/receipts/"),
-            ]}),
-        )
+    // Every page uses the revision of the initial linearizable read. A failed
+    // or compacted page aborts collection before any objects can be deleted.
+    let catalog = metadata
+        .retention_range(json!({
+            "key":STANDARD.encode(key("coordinator/catalog"))
+        }))
         .await?;
-    let responses = result["responses"]
-        .as_array()
-        .context("missing retention roots")?;
-    ensure!(responses.len() == 4, "incomplete retention roots");
-    let entries = |i: usize| -> Result<&[Value]> {
-        let response = responses[i]["response_range"]
-            .as_object()
-            .context("missing retention range")?;
-        ensure!(
-            response.get("more") != Some(&Value::Bool(true)),
-            "incomplete retention range"
-        );
-        match response.get("kvs") {
-            Some(values) => Ok(values.as_array().context("invalid retention entries")?),
-            None => Ok(&[]),
-        }
-    };
-    let decode = |entry: &Value, field| -> Result<Vec<u8>> {
-        Ok(STANDARD.decode(entry[field].as_str().context("invalid retention entry")?)?)
-    };
-    let csr_prefix = key("csr/");
+    let revision = catalog["header"]["revision"]
+        .as_str()
+        .context("missing retention revision")?;
+    ensure!(revision.parse::<i64>()? > 0, "invalid retention revision");
     let mut live = HashSet::new();
-    for entry in entries(0)? {
-        let key = String::from_utf8(decode(entry, "key")?)?;
-        let (model, revision) = key
-            .strip_prefix(&csr_prefix)
-            .and_then(|suffix| suffix.split_once('/'))
-            .context("invalid CSR pointer key")?;
-        live.insert(objects.graph(model, revision, Uuid::from_slice(&decode(entry, "value")?)?));
-    }
-    for entry in entries(1)? {
-        let job: Job = serde_json::from_slice(&decode(entry, "value")?)?;
-        if let Some(generation) = job.csr_generation
-            && matches!(job.state, JobState::Running)
-        {
-            live.insert(objects.graph(&job.model, &job.revision, generation));
-        }
-    }
-    for entry in entries(2)? {
+    for entry in entries(&catalog)? {
         let generation: String = serde_json::from_slice(&decode(entry, "value")?)?;
         live.insert(objects.control_catalog(&generation));
     }
-    for entry in entries(3)? {
-        let receipt: Receipt = serde_json::from_slice(&decode(entry, "value")?)?;
+    let prefix = key("csr/");
+    visit_range(metadata, &prefix, revision, |entry| {
+        let key = String::from_utf8(decode(entry, "key")?)?;
+        let (model, revision) = key
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.split_once('/'))
+            .context("invalid CSR pointer key")?;
+        live.insert(objects.graph(model, revision, Uuid::from_slice(&decode(entry, "value")?)?));
+        Ok(())
+    })
+    .await?;
+    visit_range(metadata, &key("jobs/"), revision, |entry| {
+        // Leases remove finished jobs. Reading only their object references
+        // also protects jobs written by a newer Coordinator during an upgrade.
+        let job: JobRoot = serde_json::from_slice(&decode(entry, "value")?)?;
+        if let Some(generation) = job.csr_generation {
+            live.insert(objects.graph(&job.model, &job.revision, generation));
+        }
+        Ok(())
+    })
+    .await?;
+    visit_range(metadata, &key("coordinator/receipts/"), revision, |entry| {
+        let receipt: ReceiptRoot = serde_json::from_slice(&decode(entry, "value")?)?;
         live.insert(objects.control_catalog(&receipt.generation));
-    }
+        Ok(())
+    })
+    .await?;
     Ok(live)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::{access::Principal, cluster::control::Control};
+    use crate::admin::{
+        access::Principal,
+        cluster::{
+            control::{Control, Receipt},
+            store::{Job, JobState},
+        },
+    };
 
     #[tokio::test]
     #[ignore = "requires GRAPHLAKE_TEST_ETCD"]
@@ -211,16 +278,17 @@ mod tests {
 
         let old = Uuid::new_v4();
         let current = Uuid::new_v4();
+        let future_generation = Uuid::new_v4();
         let job_id = Uuid::new_v4();
         let csr = |generation| objects.graph("model", "revision", generation);
         let old_files = [
             csr(old).join("manifest.json"),
             csr(old).join("0").join("graph"),
         ];
-        for key in old_files
-            .iter()
-            .chain(&[csr(current).join("manifest.json")])
-        {
+        for key in old_files.iter().chain(&[
+            csr(current).join("manifest.json"),
+            csr(future_generation).join("manifest.json"),
+        ]) {
             objects.put_bytes(key, vec![1]).await?;
         }
         assert!(
@@ -286,17 +354,41 @@ mod tests {
             .await
             .map_err(|err| anyhow::anyhow!(err.message))?
             .context("commit catalog")?;
+        for start in [0, 100, 200] {
+            let writes = (start..start + 100).map(|id| json!({
+                "request_put":{
+                    "key": STANDARD.encode(format!("{}/jobs/page-{id:04}", metadata.prefix)),
+                    "value": STANDARD.encode(serde_json::to_vec(&json!({"model":"model","revision":"revision"})).unwrap()),
+                }
+            })).collect::<Vec<_>>();
+            metadata
+                .call("/v3/kv/txn", json!({"success":writes}))
+                .await?;
+        }
+        let future_job = format!("{}/jobs/zz-upgraded", metadata.prefix);
+        metadata
+            .call(
+                "/v3/kv/put",
+                json!({
+                    "key": STANDARD.encode(&future_job),
+                    "value": STANDARD.encode(serde_json::to_vec(&json!({
+                        "model":"model","revision":"revision","csr_generation":future_generation,
+                        "state":"new_state_from_a_later_version"
+                    }))?)
+                }),
+            )
+            .await?;
 
         let now = Utc::now();
         let retired = objects.prefix.clone().join("retired");
-        sweep(&metadata, &objects, now).await?;
+        sweep(&metadata, &objects, now, Some(&leader)).await?;
         assert!(inventory(&objects, &retired).await?.is_empty());
         let later = now + GRACE + TimeDelta::seconds(1);
-        sweep(&metadata, &objects, later).await?;
+        sweep(&metadata, &objects, later, Some(&leader)).await?;
         assert_eq!(inventory(&objects, &retired).await?.len(), 1);
-        sweep(&metadata, &objects, now).await?;
+        sweep(&metadata, &objects, now, Some(&leader)).await?;
         objects.object_meta(&orphan).await?;
-        sweep(&metadata, &objects, later).await?;
+        sweep(&metadata, &objects, later, Some(&leader)).await?;
         assert!(objects.object_meta(&orphan).await.is_err());
         for key in old_files
             .iter()
@@ -304,6 +396,9 @@ mod tests {
         {
             objects.object_meta(key).await?;
         }
+        objects
+            .object_meta(&csr(future_generation).join("manifest.json"))
+            .await?;
 
         // Removing the leased entries simulates expiry without sleeping for their TTL.
         for suffix in [
@@ -319,9 +414,9 @@ mod tests {
                 )
                 .await?;
         }
-        sweep(&metadata, &objects, later).await?;
+        sweep(&metadata, &objects, later, Some(&leader)).await?;
         assert_eq!(inventory(&objects, &retired).await?.len(), 2);
-        sweep(&metadata, &objects, later).await?;
+        sweep(&metadata, &objects, later, Some(&leader)).await?;
         for key in old_files.iter().chain([&old_manifest]) {
             assert!(objects.object_meta(key).await.is_err(), "{key}");
         }

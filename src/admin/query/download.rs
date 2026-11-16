@@ -275,7 +275,13 @@ pub(in crate::admin) async fn export(
                     .sum::<u64>()
                 > budget
         {
-            downloads.pop_front();
+            let Some(index) = downloads
+                .iter()
+                .position(|download| download.owner == principal)
+            else {
+                return Err(Error::busy());
+            };
+            downloads.remove(index);
         }
         downloads.push_back(Download {
             ticket,

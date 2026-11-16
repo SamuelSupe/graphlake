@@ -2,14 +2,88 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::Result;
 
-use crate::{
-    Source,
-    source::{iceberg, parquet, postgres::Snapshot},
-};
+#[cfg(feature = "admin")]
+use crate::source::{iceberg, postgres::Snapshot};
+use crate::{Source, SourceVersion, source::parquet};
+
+type Stores = BTreeMap<String, Arc<dyn object_store::ObjectStore>>;
 
 use super::{Engine, QueryScope};
 
 impl Engine {
+    pub(crate) async fn pinned_versions_match(
+        &self,
+        scope: &QueryScope,
+        expected: &[SourceVersion],
+    ) -> Result<bool> {
+        if expected.is_empty() || expected.iter().any(|v| v.consistency != "pinned object") {
+            return Ok(false);
+        }
+        let mut stores = Stores::new();
+        for source in expected {
+            if self
+                .pinned_version(scope, &source.source, &mut stores)
+                .await?
+                .as_ref()
+                != Some(&source.version)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn pinned_version(
+        &self,
+        scope: &QueryScope,
+        name: &str,
+        stores: &mut Stores,
+    ) -> Result<Option<String>> {
+        if let Some(id) = crate::source::parquet_snapshot::logical_id(name) {
+            return Ok(self
+                .managed_parquet
+                .get(&id)
+                .map(|current| current.generation.to_string()));
+        }
+        let configured = self.catalog.sources.values().find_map(|source| {
+            let Source::ObjectStorage {
+                storage, tables, ..
+            } = source
+            else {
+                return None;
+            };
+            let prefix = crate::source::storage::version_prefix(storage);
+            let path = name.strip_prefix(&prefix)?;
+            tables
+                .values()
+                .any(|table| table.files.iter().any(|file| file == path))
+                .then_some((prefix, path, storage))
+        });
+        let (location, store) = match configured {
+            Some((prefix, path, storage)) => {
+                let store = match stores.entry(prefix) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(crate::source::storage::open(storage)?)
+                    }
+                };
+                (path, Some(&*store))
+            }
+            None => (name, None),
+        };
+        Ok(Some(
+            parquet::object_version(
+                location,
+                store,
+                Arc::clone(&scope.runtime.memory_pool),
+                Arc::clone(&scope.reads),
+            )
+            .await?
+            .version,
+        ))
+    }
+
+    #[cfg(feature = "admin")]
     pub(crate) async fn exploration_versions_match(
         &self,
         scope: &QueryScope,
@@ -17,6 +91,7 @@ impl Engine {
         validated: &mut BTreeMap<String, String>,
     ) -> Result<bool> {
         let mut postgres = BTreeMap::new();
+        let mut stores = BTreeMap::new();
         for source in expected {
             let name = &source.source;
             let current = match source.consistency {
@@ -54,24 +129,10 @@ impl Engine {
                     }
                     version
                 }
-                "pinned object" => {
-                    if let Some(id) = crate::source::parquet_snapshot::logical_id(name) {
-                        let Some(current) = self.managed_parquet.get(&id) else {
-                            return Ok(false);
-                        };
-                        if current.generation.to_string() != source.version {
-                            return Ok(false);
-                        }
-                        continue;
-                    }
-                    parquet::object_version(
-                        name,
-                        Arc::clone(&scope.runtime.memory_pool),
-                        Arc::clone(&scope.reads),
-                    )
-                    .await?
-                    .version
-                }
+                "pinned object" => match self.pinned_version(scope, name, &mut stores).await? {
+                    Some(version) => version,
+                    None => return Ok(false),
+                },
                 "Delta version" => {
                     let (_, table, Source::Delta { tables }) = self.catalog.source(name)? else {
                         return Ok(false);

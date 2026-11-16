@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail, ensure};
 use opencypher::{
-    Direction, Expr, ExprKind, LabelExpr, NodePattern, Properties, Visitor, walk_expr,
+    BinaryOp, CallKind, Clause, ComparisonOp, Direction, Expr, ExprKind, LabelExpr, NodePattern,
+    Properties, Query, Variable, Visitor, walk_expr,
 };
 
 use super::{
     MatchPlan, ShortestRanking, clauses,
     entities::{IdentityList, PathTypes},
-    paths, property_terms, start_terms, string,
+    literal, paths, property_terms, property_terms_with, start_terms, string,
 };
 use crate::{
     Catalog,
@@ -20,6 +21,171 @@ use crate::{
 pub(super) enum MatchTypes {
     Explicit,
     Inferred,
+}
+
+// Correlated inline values belong in the same join predicate as WHERE.
+// The independent pattern relation cannot refer to values from its left input.
+pub(super) fn normalize_patterns(query: &mut Query) {
+    fn defer(
+        variable: Option<&Variable>,
+        props: &mut Option<Properties>,
+        predicate: &mut Option<Expr>,
+    ) {
+        let (Some(variable), Some(Properties::Map(fields))) = (variable, props.as_mut()) else {
+            return;
+        };
+        fields.retain(|(key, value)| {
+            if literal(value).is_ok() {
+                return true;
+            }
+            let span = value.span;
+            let field = Expr::new(
+                ExprKind::Property {
+                    base: Box::new(Expr::new(ExprKind::Variable(variable.clone()), span)),
+                    key: key.clone(),
+                },
+                span,
+            );
+            let comparison = Expr::new(
+                ExprKind::Comparison {
+                    first: Box::new(field),
+                    rest: vec![(ComparisonOp::Eq, value.clone())],
+                },
+                span,
+            );
+            and_where(predicate, comparison);
+            false
+        });
+        if fields.is_empty() {
+            *props = None;
+        }
+    }
+
+    let branches = std::iter::once(&mut query.initial)
+        .chain(query.unions.iter_mut().map(|union| &mut union.query));
+    for branch in branches {
+        for index in 1..branch.clauses.len() {
+            let (before, after) = branch.clauses.split_at_mut(index);
+            let (Some(Clause::Match(first)), Clause::Match(next)) = (before.last(), &mut after[0])
+            else {
+                continue;
+            };
+            let [seed] = first.patterns.as_slice() else {
+                continue;
+            };
+            let Some(variable) = &seed.element.start.variable else {
+                continue;
+            };
+            if first.optional
+                || next.optional
+                || !seed.element.chain.is_empty()
+                || !next.patterns.iter().any(|part| {
+                    part.element.start.variable.as_ref() == Some(variable)
+                        && part
+                            .element
+                            .chain
+                            .first()
+                            .is_some_and(|(edge, _)| edge.range.is_some())
+                })
+            {
+                continue;
+            }
+            if let Some(filter) = first
+                .where_clause
+                .as_ref()
+                .and_then(|expr| anchor_filter(expr, variable))
+            {
+                and_where(&mut next.where_clause, filter);
+            }
+        }
+        for clause in &mut branch.clauses {
+            match clause {
+                Clause::Match(pattern) => {
+                    for part in &mut pattern.patterns {
+                        let start = &mut part.element.start;
+                        defer(
+                            start.variable.as_ref(),
+                            &mut start.properties,
+                            &mut pattern.where_clause,
+                        );
+                        for (edge, node) in &mut part.element.chain {
+                            if edge.range.is_none() {
+                                defer(
+                                    edge.variable.as_ref(),
+                                    &mut edge.properties,
+                                    &mut pattern.where_clause,
+                                );
+                            }
+                            defer(
+                                node.variable.as_ref(),
+                                &mut node.properties,
+                                &mut pattern.where_clause,
+                            );
+                        }
+                    }
+                }
+                Clause::Call(call) => {
+                    if let CallKind::Subquery(query) = &mut call.kind {
+                        normalize_patterns(query);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn and_where(predicate: &mut Option<Expr>, filter: Expr) {
+    let span = filter.span;
+    *predicate = Some(match predicate.take() {
+        Some(previous) => Expr::new(
+            ExprKind::Binary {
+                op: BinaryOp::And,
+                lhs: Box::new(previous),
+                rhs: Box::new(filter),
+            },
+            span,
+        ),
+        None => filter,
+    });
+}
+
+// The previous mandatory node match already enforced these constraints on
+// the same business identity. Copy only local constants into the expansion.
+fn anchor_filter(expr: &Expr, variable: &Variable) -> Option<Expr> {
+    let property = |expr: &Expr| {
+        matches!(&expr.kind, ExprKind::Property { base, .. }
+        if matches!(&base.kind, ExprKind::Variable(name) if name == variable))
+    };
+    match &expr.kind {
+        ExprKind::Binary {
+            op: BinaryOp::And,
+            lhs,
+            rhs,
+        } => {
+            let mut filter = anchor_filter(lhs, variable);
+            if let Some(right) = anchor_filter(rhs, variable) {
+                and_where(&mut filter, right);
+            }
+            filter
+        }
+        ExprKind::Binary {
+            op: BinaryOp::In,
+            lhs,
+            rhs,
+        } if property(lhs)
+            && matches!(&rhs.kind, ExprKind::List(items) if items.iter().all(|item| literal(item).is_ok())) =>
+        {
+            Some(expr.clone())
+        }
+        ExprKind::Comparison { first, rest }
+            if property(first)
+                && matches!(rest.as_slice(), [(ComparisonOp::Eq, rhs)] if literal(rhs).is_ok()) =>
+        {
+            Some(expr.clone())
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn bind_pattern(
@@ -161,11 +327,16 @@ pub(super) fn bind_pattern(
                 };
                 let node_mapping = &catalog.nodes[&left_type];
                 let allowed = columns([&node_mapping.key, &node_mapping.properties]);
-                let mut starts = property_terms("src", &allowed, left_node.properties.as_ref())?;
+                let mut starts =
+                    property_terms_with("src", &allowed, left_node.properties.as_ref(), |value| {
+                        Ok(literal(value).ok())
+                    })?;
                 let mut bound_keys = match &left_node.properties {
-                    Some(Properties::Map(properties)) => {
-                        properties.iter().map(|(key, _)| key.0.clone()).collect()
-                    }
+                    Some(Properties::Map(properties)) => properties
+                        .iter()
+                        .filter(|(_, value)| literal(value).is_ok())
+                        .map(|(key, _)| key.0.clone())
+                        .collect(),
                     _ => BTreeSet::new(),
                 };
                 if let Some(variable) = &left_node.variable
@@ -184,7 +355,10 @@ pub(super) fn bind_pattern(
                 let finishes = {
                     let mapped = &catalog.nodes[&right_type];
                     let fields = columns([&mapped.key, &mapped.properties]);
-                    let mut terms = property_terms("src", &fields, node.properties.as_ref())?;
+                    let mut terms =
+                        property_terms_with("src", &fields, node.properties.as_ref(), |value| {
+                            Ok(literal(value).ok())
+                        })?;
                     if let (Some(variable), Some(predicate)) =
                         (&node.variable, &pattern.where_clause)
                     {
@@ -333,11 +507,13 @@ pub(super) fn bind_pattern(
                 {
                     builder.predicates.push("FALSE".into());
                 } else {
-                    builder.predicates.extend(property_terms(
+                    let terms = property_terms_with(
                         &alias,
                         &properties,
                         relationship.properties.as_ref(),
-                    )?);
+                        |value| builder.expr(value).map(Some),
+                    )?;
+                    builder.predicates.extend(terms);
                 }
                 let keys = |from: &crate::Endpoint, to: &crate::Endpoint| {
                     format!(

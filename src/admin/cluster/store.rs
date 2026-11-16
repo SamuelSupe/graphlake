@@ -84,6 +84,7 @@ pub(in crate::admin) struct Metadata {
     client: reqwest::Client,
     endpoints: Arc<[url::Url]>,
     preferred: Arc<AtomicUsize>,
+    query_lease: Arc<tokio::sync::Mutex<Option<(tokio::time::Instant, u64, String)>>>,
     pub(in crate::admin) prefix: String,
 }
 
@@ -93,6 +94,7 @@ impl Metadata {
             client,
             endpoints: endpoints.into(),
             preferred: Arc::default(),
+            query_lease: Arc::default(),
             prefix: format!("/graphlake/v1/{name}"),
         }
     }
@@ -244,23 +246,35 @@ impl Metadata {
         ttl: u64,
         leader: Option<&super::control::Leadership>,
     ) -> Result<bool> {
-        let lease = self
-            .call("/v3/lease/grant", json!({"TTL":ttl.to_string()}))
-            .await?;
-        let lease = lease["ID"].as_str().context("missing etcd lease")?;
-        let created = self
-            .write(
-                id,
-                job,
-                json!({"target":"CREATE","create_revision":"0"}),
-                json!({"lease":lease}),
-                leader,
-            )
-            .await?;
-        if !created {
-            let _ = self.call("/v3/lease/revoke", json!({"ID":lease})).await;
-        }
-        Ok(created)
+        const WINDOW: u64 = 5;
+        let lease = {
+            let mut slot = self.query_lease.lock().await;
+            if let Some((expires, duration, lease)) = slot.as_ref()
+                && *duration == ttl
+                && tokio::time::Instant::now() < *expires
+            {
+                lease.clone()
+            } else {
+                let started = tokio::time::Instant::now();
+                let response = self
+                    .call("/v3/lease/grant", json!({"TTL":(ttl + WINDOW).to_string()}))
+                    .await?;
+                let lease = response["ID"]
+                    .as_str()
+                    .context("missing etcd lease")?
+                    .to_owned();
+                *slot = Some((started + Duration::from_secs(WINDOW), ttl, lease.clone()));
+                lease
+            }
+        };
+        self.write(
+            id,
+            job,
+            json!({"target":"CREATE","create_revision":"0"}),
+            json!({"lease":lease}),
+            leader,
+        )
+        .await
     }
 
     pub(in crate::admin::cluster) async fn replace(
@@ -354,10 +368,10 @@ impl Metadata {
 
 #[derive(Clone)]
 pub(in crate::admin) struct Objects {
-    store: Arc<dyn ObjectStore>,
+    pub(super) store: Arc<dyn ObjectStore>,
     remote: bool,
     bucket: Option<String>,
-    prefix: Key,
+    pub(super) prefix: Key,
 }
 
 impl Objects {

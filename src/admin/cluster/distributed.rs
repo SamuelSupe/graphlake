@@ -9,7 +9,11 @@ use std::{
 };
 
 use anyhow::{Result, ensure};
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use datafusion::{
     execution::{SessionState, TaskContext},
     physical_plan::{ExecutionPlan, ExecutionPlanProperties},
@@ -18,8 +22,9 @@ use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{JobState, Shared, now_ms, worker::Worker};
+use super::{JobState, Shared, WORK_BUDGET_HEADER, work_deadline, worker::Worker};
 use crate::{QueryOptions, engine::QueryScope, source::parquet::ScanObject};
+use tokio::time::Instant;
 
 const MAX_PLAN: u64 = 768 * 1024;
 const MAX_STAGES: usize = 48;
@@ -31,7 +36,7 @@ pub(crate) struct Distributed {
     id: Uuid,
     attempt: Uuid,
     leader: Uuid,
-    deadline_ms: u64,
+    deadline: Instant,
     pub(crate) partitions: usize,
     min_rows: usize,
     stats: Arc<Mutex<Stats>>,
@@ -89,7 +94,7 @@ impl Distributed {
         id: Uuid,
         attempt: Uuid,
         leader: Uuid,
-        deadline_ms: u64,
+        deadline: Instant,
         partitions: usize,
         min_rows: usize,
     ) -> Self {
@@ -99,7 +104,7 @@ impl Distributed {
             id,
             attempt,
             leader,
-            deadline_ms,
+            deadline,
             partitions,
             min_rows,
             stats: Default::default(),
@@ -264,7 +269,8 @@ impl Distributed {
                     task: attempt,
                     plan: &task,
                 };
-                let remaining = self.deadline_ms.saturating_sub(now_ms());
+                let remaining = self.deadline.saturating_duration_since(Instant::now());
+                let remaining = remaining.as_millis() as u64;
                 ensure!(remaining > 0, "query deadline exceeded");
                 let request = self
                     .shared
@@ -273,6 +279,7 @@ impl Distributed {
                     .headers(crate::admin::telemetry::trace_headers())
                     .bearer_auth(&self.shared.token)
                     .timeout(Duration::from_millis(remaining))
+                    .header(WORK_BUDGET_HEADER, remaining.to_string())
                     .json(&request)
                     .send();
                 let disconnected = async {
@@ -398,8 +405,10 @@ fn input_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
 
 pub(super) async fn run_task(
     State(worker): State<Arc<Worker>>,
+    headers: HeaderMap,
     Json(request): Json<StageRequest<Task>>,
 ) -> super::super::ApiResult<Json<Output>> {
+    let started = Instant::now();
     let job = worker
         .shared
         .metadata
@@ -424,24 +433,25 @@ pub(super) async fn run_task(
         .clone()
         .try_acquire_owned()
         .map_err(|_| super::super::Error::busy())?;
+    let deadline = work_deadline(&headers, started, job.deadline_ms)?;
     let cluster = Distributed::new(
         worker.shared.clone(),
         Vec::new(),
         request.id,
         request.attempt,
         leader,
-        job.deadline_ms,
+        deadline,
         1,
         0,
     );
     let task = request.plan;
-    let remaining = job.deadline_ms.saturating_sub(now_ms());
-    if remaining == 0 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
         return Err(super::timeout());
     }
     let cancellation = worker.shutdown.child_token();
     let options = QueryOptions {
-        timeout: Duration::from_millis(remaining),
+        timeout: remaining,
         cancellation: cancellation.clone(),
         memory_bytes: task.memory_bytes.min(worker.memory_bytes),
         spill_bytes: task.spill_bytes,

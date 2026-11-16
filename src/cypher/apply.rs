@@ -1,6 +1,7 @@
 mod batch;
-pub(crate) use batch::Batch;
+pub(crate) use batch::{Batch, SINGLE_KEY_PAGE};
 mod lookup;
+mod replay;
 pub(crate) use lookup::Lookup;
 pub(super) use lookup::scalar_projection;
 
@@ -125,7 +126,16 @@ impl Apply {
         let outer = graph_frame(context, &self.outer).await?;
         let outer_schema = Arc::clone(outer.schema().inner());
         let seed = TableReference::bare(self.seed.as_str());
-        replace(context, seed.clone(), Arc::clone(&outer_schema), Vec::new())?;
+        let replay = !explain_only
+            && self.limit != Some(0)
+            && matches!(self.mode, Mode::Row { .. })
+            && self.nested.is_empty()
+            && self.lookups.is_empty();
+        if replay {
+            replay::register_seed(context, seed.clone(), Arc::clone(&outer_schema))?;
+        } else {
+            replace(context, seed.clone(), Arc::clone(&outer_schema), Vec::new())?;
+        }
         let _nested_schema = self
             .prepare_inner(catalog, context, scope, true, false)
             .await?;
@@ -201,6 +211,7 @@ impl Apply {
             let mut cached_bytes = 0usize;
             let mut remaining = self.limit;
             let mut sequence = 0u64;
+            let mut replay_plan = None;
             let mut outer = outer.execute_stream().await?;
             'outer: while let Some(batch) = outer.try_next().await? {
                 let keys = converter.convert_columns(
@@ -221,25 +232,32 @@ impl Apply {
                         Arc::clone(table)
                     } else {
                         oversized = None;
-                        replace(
-                            context,
-                            seed.clone(),
-                            Arc::clone(&outer_schema),
-                            vec![batch.slice(index, 1)],
-                        )?;
-                        let _nested_budget = self
-                            .prepare_inner(
-                                catalog,
+                        let input = batch.slice(index, 1);
+                        let _nested_budget;
+                        let mut inner = if replay {
+                            if replay_plan.is_none() {
+                                replay_plan = Some(replay::Plan::new(context, &inner).await?);
+                            }
+                            replay_plan.as_ref().unwrap().execute(input)?
+                        } else {
+                            replace(
                                 context,
-                                scope,
-                                false,
-                                remaining.is_some_and(|n| n <= 64),
-                            )
-                            .await?;
-                        let mut inner = graph_frame(context, &self.inner)
-                            .await?
-                            .execute_stream()
-                            .await?;
+                                seed.clone(),
+                                Arc::clone(&outer_schema),
+                                vec![input],
+                            )?;
+                            _nested_budget = self
+                                .prepare_inner(
+                                    catalog,
+                                    context,
+                                    scope,
+                                    false,
+                                    remaining.is_some_and(|n| n <= 64),
+                                )
+                                .await?;
+                            let frame = graph_frame(context, &self.inner).await?;
+                            frame.execute_stream().await?
+                        };
                         let mut saved = buffer();
                         let key_bytes = key.as_ref().len().saturating_add(64);
                         let mut bytes = key_bytes;
@@ -337,15 +355,24 @@ impl Apply {
         sql: &str,
         explain_only: bool,
     ) -> Result<MemoryReservation> {
-        use datafusion::physical_plan::execute_stream;
         let frame = graph_frame(context, sql).await?;
-        let schema = Arc::clone(frame.schema().inner());
+        Self::materialize_frame(context, scope, name, frame, explain_only).await
+    }
+
+    pub(crate) async fn materialize_frame(
+        context: &SessionContext,
+        scope: &QueryScope,
+        name: &str,
+        frame: datafusion::dataframe::DataFrame,
+        explain_only: bool,
+    ) -> Result<MemoryReservation> {
+        use datafusion::physical_plan::execute_stream;
         let mut buffer = Buffer::new(
             &scope.runtime.memory_pool,
             Some(&scope.runtime.disk_manager),
         );
         let (table, budget) = if explain_only {
-            buffer.finish_schema(schema)?
+            buffer.finish_schema(Arc::clone(frame.schema().inner()))?
         } else {
             let task = Arc::new(frame.task_ctx());
             let physical = frame.create_physical_plan().await?;
@@ -355,7 +382,7 @@ impl Apply {
                 buffer.push(batch)?;
             }
             scope.record_spill(physical.as_ref());
-            buffer.finish(schema, &scope.reads)?
+            buffer.finish(stream.schema(), &scope.reads)?
         };
         context.register_table(TableReference::bare(name), table)?;
         Ok(budget)

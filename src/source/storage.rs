@@ -64,6 +64,16 @@ pub(crate) fn validate(config: &StorageConfig) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn version_prefix(config: &StorageConfig) -> String {
+    format!(
+        "{}:{}:{}:{}/",
+        config.provider,
+        config.endpoint.as_deref().unwrap_or("default"),
+        config.account.as_deref().unwrap_or("default"),
+        config.bucket,
+    )
+}
+
 pub(crate) fn object_path(value: &str) -> Result<Path> {
     ensure!(
         !value.trim().is_empty()

@@ -92,7 +92,11 @@ impl Driver {
                     .table(table, columns, filters, batch_size, explain)
                     .await
             }
-            Self::Mongodb(driver) => driver.table(table, columns, batch_size, explain).await,
+            Self::Mongodb(driver) => {
+                driver
+                    .table(table, columns, filters, batch_size, explain)
+                    .await
+            }
         }
     }
 

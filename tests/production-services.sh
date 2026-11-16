@@ -62,6 +62,8 @@ run_fixture engine direct_sources::mysql_single_scan_is_lazy_and_releases_the_re
 run_fixture lib source::warehouse::clickhouse::tests::single_scan_yields_before_eof_and_preserves_arrow
 run_fixture lib source::warehouse::clickhouse::tests::preview_schema_excludes_ephemeral_columns
 run_fixture lib admin::cluster::control::tests::stale_leadership_cannot_replace_committed_state
+GRAPHLAKE_TEST_RETENTION_STORAGE="s3://$GRAPHLAKE_TEST_BUCKET" \
+  run_fixture lib admin::cluster::retention::tests::sweep_keeps_current_state_jobs_and_leased_receipts
 run_fixture admin local_tables::local_tables_postgres_upsert_and_cancel
 run_fixture admin local_tables::mysql_local_table_reads_only_timestamp_boundary_and_changes
 run_fixture admin admin_persists_validates_and_queries_a_real_cross_source_model

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use datafusion::{
     arrow::{
         array::{RecordBatch, UInt32Array},
-        compute::take,
+        compute::{take, take_record_batch},
         datatypes::SchemaRef,
         row::{RowConverter, SortField},
     },
@@ -16,18 +16,22 @@ use datafusion::{
     dataframe::DataFrame,
     execution::memory_pool::MemoryReservation,
     physical_plan::execute_stream,
-    prelude::{SessionContext, col},
+    prelude::{SessionContext, col, lit},
 };
 use futures::TryStreamExt;
 
 use super::{Apply, Buffer, Catalog, QueryScope, replace};
 use crate::engine::graph_frame;
 
+pub(crate) const SINGLE_KEY_PAGE: usize = 64;
+
 pub(crate) struct Batch {
     pub(crate) order: Vec<String>,
     pub(crate) keys: String,
     pub(crate) groups: String,
-    pub(crate) group_rank: Option<String>,
+    pub(crate) group_key: String,
+    pub(crate) group_rank: Option<(String, u64)>,
+    pub(crate) single_key_only: bool,
     pub(crate) push_group_limit: bool,
     pub(crate) table: String,
 }
@@ -59,6 +63,7 @@ impl Apply {
         let cache_limit = (scope.options.memory_bytes / 8).min(8 * 1024 * 1024);
         let mut memo = VecDeque::<CachedBatch>::new();
         let mut cached_bytes = 0usize;
+        let mut empty_batches = 0;
         let mut outer = outer.execute_stream().await?;
         while let Some(batch) = outer.try_next().await? {
             let mut offset = 0;
@@ -85,6 +90,7 @@ impl Apply {
                 let keys = keys.iter().flat_map(|rows| rows.iter()).collect::<Vec<_>>();
                 let cached = |key: &[u8]| memo.iter().any(|cached| cached.keys.contains(key));
                 if self.limit.is_some()
+                    && (plan.single_key_only || remaining <= SINGLE_KEY_PAGE && empty_batches < 3)
                     && let Some(first_miss) = keys.iter().position(|key| !cached(key.as_ref()))
                 {
                     // A fresh group can satisfy the whole remaining limit.
@@ -113,6 +119,7 @@ impl Apply {
                 let fresh = if indexes.is_empty() {
                     None
                 } else {
+                    let single_key = indexes.len() == 1;
                     let indexes = UInt32Array::from(indexes);
                     let fields = input
                         .columns()
@@ -128,17 +135,24 @@ impl Apply {
                             context,
                             scope,
                             false,
-                            plan.push_group_limit && prefix.is_some_and(|n| n <= 64),
+                            plan.push_group_limit
+                                && single_key
+                                && prefix.is_some_and(|n| n <= SINGLE_KEY_PAGE),
                         )
                         .await?;
                     let mut frame = graph_frame(context, &plan.groups).await?;
+                    let stream_prefix = prefix.filter(|_| single_key);
                     if let Some(left) = prefix {
-                        if let Some(rank) = &plan.group_rank {
-                            // A bounded sort cannot spill. Read the ordered prefix
-                            // from a spillable sort instead.
-                            frame =
-                                frame.sort(vec![col(Column::from_name(rank)).sort(true, false)])?;
-                        } else if plan.push_group_limit {
+                        if let Some((rank, skip)) = &plan.group_rank {
+                            let rank = col(Column::from_name(rank));
+                            frame = if single_key {
+                                // A bounded sort cannot spill. Read the ordered
+                                // prefix from a spillable sort instead.
+                                frame.sort(vec![rank.sort(true, false)])?
+                            } else {
+                                frame.filter(rank.lt_eq(lit(skip.saturating_add(left as u64))))?
+                            };
+                        } else if single_key && plan.push_group_limit {
                             frame = frame.limit(0, Some(left))?;
                         }
                     }
@@ -153,14 +167,47 @@ impl Apply {
                         .iter()
                         .map(|key| key.len().saturating_add(64))
                         .sum::<usize>();
-                    let mut left = prefix.unwrap_or(usize::MAX);
+                    let mut left = stream_prefix.unwrap_or(usize::MAX);
+                    let group_prefix = prefix.filter(|_| !single_key && plan.group_rank.is_none());
+                    let group_converter = if group_prefix.is_some() {
+                        let field = stream.schema().field_with_name(&plan.group_key)?.clone();
+                        Some(RowConverter::new(vec![SortField::new(
+                            field.data_type().clone(),
+                        )])?)
+                    } else {
+                        None
+                    };
+                    let mut group_counts = HashMap::<Vec<u8>, usize>::new();
+                    let mut full_groups = 0;
                     while let Some(result) = stream.try_next().await? {
                         scope.check()?;
-                        let result = result.slice(0, result.num_rows().min(left));
-                        left -= result.num_rows();
+                        let result = if let (Some(cap), Some(converter)) =
+                            (group_prefix, &group_converter)
+                        {
+                            let key = result
+                                .column_by_name(&plan.group_key)
+                                .context("missing CALL group key")?;
+                            let encoded = converter.convert_columns(std::slice::from_ref(key))?;
+                            let mut keep = Vec::new();
+                            for (index, key) in encoded.iter().enumerate() {
+                                let count = group_counts.entry(key.as_ref().to_vec()).or_default();
+                                if *count < cap {
+                                    keep.push(index as u32);
+                                    *count += 1;
+                                    if *count == cap {
+                                        full_groups += 1;
+                                    }
+                                }
+                            }
+                            take_record_batch(&result, &UInt32Array::from(keep))?
+                        } else {
+                            let result = result.slice(0, result.num_rows().min(left));
+                            left -= result.num_rows();
+                            result
+                        };
                         bytes = bytes.saturating_add(result.get_array_memory_size());
                         buffer.push(result)?;
-                        if left == 0 {
+                        if left == 0 || full_groups == missing.len() {
                             break;
                         }
                     }
@@ -186,10 +233,9 @@ impl Apply {
                 replace(context, seed.clone(), batch.schema(), vec![input])?;
                 // DataFusion's TopK sort cannot spill wide rows. Keep the
                 // chunk's sort spillable and cap the stream after sorting.
-                let mut inner = graph_frame(context, &self.inner)
-                    .await?
-                    .execute_stream()
-                    .await?;
+                let frame = graph_frame(context, &self.inner).await?;
+                let mut inner = frame.execute_stream().await?;
+                let before = remaining;
                 while let Some(result) = inner.try_next().await? {
                     scope.check()?;
                     let rows = remaining.min(result.num_rows());
@@ -200,6 +246,11 @@ impl Apply {
                     }
                 }
                 drop(inner);
+                empty_batches = if remaining == before {
+                    (empty_batches + 1).min(3)
+                } else {
+                    0
+                };
                 context.deregister_table(groups.clone())?;
                 if let Some(fresh) = fresh
                     && fresh.bytes <= cache_limit

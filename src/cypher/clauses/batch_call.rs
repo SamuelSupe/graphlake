@@ -212,6 +212,9 @@ fn single(
     let seed_stage = right.sql.clone();
     let lookup_start = state.call_lookups.len();
     let nested_start = state.calls.len();
+    let single_key_only = outer_limit.is_some_and(|limit| limit <= crate::cypher::apply::SINGLE_KEY_PAGE)
+        && body.iter().any(|clause| matches!(clause, Clause::With(with)
+            if with.body.order_by.is_empty() && (with.body.skip.is_some() || with.body.limit.is_some())));
     for (index, clause) in body.iter().enumerate() {
         right = match clause {
             Clause::Match(pattern) => join_match(
@@ -237,7 +240,7 @@ fn single(
                 imports.explicit,
                 &key,
                 &seed_stage,
-                outer_limit.is_some(),
+                single_key_only,
                 extensions,
                 state,
             )?,
@@ -457,7 +460,9 @@ fn single(
                 order: order.iter().map(|key| key.column.clone()).collect(),
                 keys: format!("SELECT {} FROM {input} AS s", key_expr("s")),
                 groups: right,
-                group_rank: window.then_some(rank),
+                group_key: key,
+                group_rank: window.then_some((rank, skip as u64)),
+                single_key_only,
                 push_group_limit: !aggregated
                     && body.iter().all(|clause| match clause {
                         Clause::With(with) => {

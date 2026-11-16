@@ -107,7 +107,8 @@ struct Traversers<'a> {
     control_columns: Vec<String>,
     group: Option<control::Group>,
     ctes: Vec<String>,
-    repeats: Rc<RefCell<Vec<repeat::Repeat>>>,
+    stages: Rc<RefCell<Vec<repeat::Stage>>>,
+    recursive: bool,
 }
 
 pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
@@ -121,7 +122,10 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
         _ => bail!("Gremlin must start with g.V() or g.E()"),
     };
     let selected = match rest.first().map(|step| (step.name, step.args.as_slice())) {
-        Some(("hasLabel", [label])) | Some(("has", [label, _, _])) => Some(text(label)?),
+        Some(("hasLabel", [label])) => {
+            Some(text(label)?).filter(|name| names.iter().any(|known| *known == name))
+        }
+        Some(("has", [label, _, _])) => Some(text(label)?),
         _ => None,
     };
     let selected = selected.or_else(|| (names.len() == 1).then(|| names[0].clone()));
@@ -220,7 +224,8 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
                 control_columns: Vec::new(),
                 group: None,
                 ctes: Vec::new(),
-                repeats: Rc::default(),
+                stages: Rc::default(),
+                recursive: false,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -249,7 +254,7 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
     };
     #[cfg(feature = "admin")]
     let graph_output = state.graph_output();
-    let repeats = state.repeats.take();
+    let stages = state.stages.take();
     Ok(Plan {
         sql: format!(
             "SELECT {output} FROM ({}) AS v{}",
@@ -257,7 +262,7 @@ pub(crate) fn plan(catalog: &Catalog, query: &str) -> Result<Plan> {
             state.order_clause()
         ),
         labels: state.labels,
-        repeats,
+        gremlin_stages: stages,
         #[cfg(feature = "admin")]
         graph_output,
         ..Default::default()
@@ -381,30 +386,31 @@ impl Traversers<'_> {
                     } else if let [edge] = edges.as_slice() {
                         self.hop(step.name, edge)?;
                     } else {
-                        let branches = edges
-                            .iter()
-                            .map(|name| {
-                                format!(
-                                    "__.{}({})",
-                                    step.name,
-                                    serde_json::to_string(name).expect("serialize edge label")
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        self.branch(
-                            "union",
-                            &branches.iter().map(String::as_str).collect::<Vec<_>>(),
-                            depth,
-                        )?;
+                        let table = self.fresh("edge_input");
+                        let cte = self.shared_input(&table, edges.len());
+                        let mut branches = Vec::with_capacity(edges.len());
+                        for edge in edges {
+                            let mut branch = self.clone();
+                            branch.sql = format!("SELECT * FROM {}", ident(&table));
+                            branch.hop(step.name, &edge)?;
+                            branches.push(branch);
+                        }
+                        let combined = self.combine(&branches);
+                        self.sql = variants::with_input(cte, combined);
                     }
                 }
                 ("outV" | "inV", []) => self.endpoint(step.name == "outV", false)?,
                 ("bothV" | "otherV", []) => {
+                    let table = self.fresh("endpoints");
+                    let cte = self.shared_input(&table, 2);
                     let mut source = self.clone();
+                    source.sql = format!("SELECT * FROM {}", ident(&table));
                     source.endpoint(true, step.name == "otherV")?;
                     let mut target = self.clone();
+                    target.sql = format!("SELECT * FROM {}", ident(&table));
                     target.endpoint(false, step.name == "otherV")?;
-                    self.sql = self.combine(&[source, target]);
+                    let combined = self.combine(&[source, target]);
+                    self.sql = variants::with_input(cte, combined);
                 }
                 ("values", [field]) => {
                     let field = text(field)?;

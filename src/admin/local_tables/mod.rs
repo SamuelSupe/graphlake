@@ -13,6 +13,7 @@ use axum::{
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
+    io::Write as _,
     path::{Path as FilePath, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::Duration,
@@ -214,6 +215,8 @@ fn apply_schedule(table: &mut Table, request: &Schedule) -> ApiResult<()> {
     if table.revision != request.revision {
         return Err(conflict("配置已变化，请重新读取后保存"));
     }
+    let reset_reconcile = table.schedule_paused
+        || table.config.reconcile_interval_seconds != request.reconcile_interval_seconds;
     table.config.mode = request.mode;
     table.config.interval_seconds = request.interval_seconds;
     table.config.timeout_seconds = request.timeout_seconds;
@@ -222,7 +225,9 @@ fn apply_schedule(table: &mut Table, request: &Schedule) -> ApiResult<()> {
     table.revision = Uuid::new_v4();
     table.schedule_paused = false;
     table.next_run_at_ms = request.interval_seconds.map(|s| now() + s * 1000);
-    table.next_reconcile_at_ms = request.reconcile_interval_seconds.map(|s| now() + s * 1000);
+    if reset_reconcile {
+        table.next_reconcile_at_ms = request.reconcile_interval_seconds.map(|s| now() + s * 1000);
+    }
     Ok(())
 }
 
@@ -320,6 +325,7 @@ fn prepare_run(
 
 fn start(app: &Arc<App>, key: String, mode: Option<Mode>, scheduled: bool) -> ApiResult<Run> {
     let mut store = app.local_tables.store.lock().unwrap();
+    store.flush()?;
     let mut table = store.tables.get(&key).ok_or_else(Error::not_found)?.clone();
     if table.managed {
         return Err(managed::unavailable());
@@ -349,14 +355,13 @@ fn start(app: &Arc<App>, key: String, mode: Option<Mode>, scheduled: bool) -> Ap
         let mut store = app.local_tables.store.lock().unwrap();
         if let Some(mut current) = store.tables.get(&key).cloned() {
             record_result(&mut current, result, cancel.is_cancelled());
-            if let Err(error) = store.put(key.clone(), current) {
-                eprintln!(
+            if let Err(error) = store.finish(key.clone(), current) {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
                     "GraphLake local-table status persistence failed: {}",
                     error.message
                 );
-                // Fail closed: a successful data commit is safe to replay, but
-                // never launch another task with an unrecorded outcome.
-                app.shutdown.cancel();
+                // The watcher retries persistence before scheduling another run.
             }
         }
         app.local_tables.running.lock().unwrap().remove(&key);
@@ -430,6 +435,9 @@ pub(super) async fn watch(app: Weak<App>) {
         if let Some(backend) = managed::backend(&app) {
             backend.tick(&app).await;
         }
+        if app.local_tables.store.lock().unwrap().flush().is_err() {
+            continue;
+        }
         let due: Vec<_> = app
             .local_tables
             .store
@@ -450,7 +458,16 @@ pub(super) async fn watch(app: Weak<App>) {
         let mut due = due;
         due.sort_unstable();
         for (_, key) in due {
-            let _ = start(&app, key, None, true);
+            if let Err(error) = start(&app, key, None, true)
+                && error.status.is_server_error()
+                && error.status != StatusCode::SERVICE_UNAVAILABLE
+            {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "GraphLake scheduled local-table load did not start: {}",
+                    error.code
+                );
+            }
         }
     }
 }

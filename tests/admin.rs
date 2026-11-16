@@ -69,6 +69,9 @@ impl Server {
             let _ = child.wait();
             anyhow::bail!("admin server failed to start: {message}");
         };
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        });
         Ok(Self {
             child,
             base: base.into(),
@@ -1240,6 +1243,131 @@ fn payments_file(path: &Path, narrow_endpoint: bool, ids: &[i64]) -> Result<()> 
     let mut writer = ArrowWriter::try_new(fs::File::create(path)?, batch.schema(), None)?;
     writer.write(&batch)?;
     writer.close()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn object_storage_exploration_replays_pages_and_detects_object_replacement() -> Result<()> {
+    use axum::{Router, body::Bytes, http::HeaderMap};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let file = root.path().join("payments.parquet");
+    payments_file(&file, false, &(1000..=1120).collect::<Vec<_>>())?;
+    let contents = Bytes::from(fs::read(&file)?);
+    let tag = Arc::new(AtomicUsize::new(1));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let router = Router::new().fallback({
+        let tag = Arc::clone(&tag);
+        move |method: Method, headers: HeaderMap| {
+            let tag = tag.load(Ordering::Relaxed);
+            let contents = contents.clone();
+            async move {
+                let total = contents.len();
+                let mut response = axum::http::Response::builder()
+                    .header("last-modified", "Mon, 01 Jun 2026 00:00:00 GMT")
+                    .header("etag", format!("\"{tag}\""));
+                let body = if method == Method::HEAD {
+                    response = response.header("content-length", total);
+                    Bytes::new()
+                } else if let Some(range) = headers.get("range") {
+                    let (start, end) = range
+                        .to_str()
+                        .unwrap()
+                        .strip_prefix("bytes=")
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let start: usize = start.parse().unwrap();
+                    let end: usize = end.parse().unwrap();
+                    response = response
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header("content-range", format!("bytes {start}-{end}/{total}"))
+                        .header("content-length", end + 1 - start);
+                    contents.slice(start..=end)
+                } else {
+                    response = response.header("content-length", total);
+                    contents
+                };
+                response.body(axum::body::Body::from(body)).unwrap()
+            }
+        }
+    });
+    let fixture = tokio::spawn(async move { axum::serve(listener, router).await });
+    fs::write(
+        root.path().join("accounts.jsonl"),
+        "{\"tenant_id\":1,\"account_id\":9007199254740993}\n",
+    )?;
+    fs::write(
+        root.path().join("merchants.jsonl"),
+        "{\"tenant_id\":1,\"merchant_id\":7}\n",
+    )?;
+    let model = format!(
+        r#"graph: payments
+sources:
+  nodes:
+    type: jsonl
+    tables:
+      accounts:
+        files: [accounts.jsonl]
+        columns: [{{name: tenant_id, data_type: Int64}}, {{name: account_id, data_type: Int64}}]
+      merchants:
+        files: [merchants.jsonl]
+        columns: [{{name: tenant_id, data_type: Int64}}, {{name: merchant_id, data_type: Int64}}]
+  store:
+    type: object_storage
+    storage:
+      provider: minio
+      endpoint: 'http://{address}'
+      bucket: 'fixture'
+      access_key_env: GRAPHLAKE_CLUSTER_TEST_TOKEN
+      secret_key_env: GRAPHLAKE_CLUSTER_TEST_TOKEN
+    format: parquet
+    tables:
+      payments: {{files: [payments.parquet]}}
+nodes:
+  Account: {{source: nodes.accounts, key: [tenant_id, account_id]}}
+  Merchant: {{source: nodes.merchants, key: [tenant_id, merchant_id]}}
+edges:
+  Payment:
+    source: store.payments
+    key: [tenant_id, payment_id]
+    from: {{node: Account, columns: [tenant_id, from_account_id]}}
+    to: {{node: Merchant, columns: [tenant_id, to_merchant_id]}}
+"#
+    );
+    fs::write(root.path().join("payments.yaml"), model)?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let revision = server.model("payments").await?["active_revision"].clone();
+    let page =
+        |cursor: Value| {
+            server.request(Method::POST, "models/payments/explore").json(&json!({
+            "model_revision": revision, "neighbors": true,
+            "element": {"kind": "node", "label": "Account", "key": ["1", "9007199254740993"]},
+            "graph_options": {}, "filter": {}, "cursor": cursor
+        })).send()
+        };
+    let first: Value = page(Value::Null).await?.error_for_status()?.json().await?;
+    let cursor = first["next_cursor"].clone();
+    assert!(cursor.is_string(), "{first}");
+    let second: Value = page(cursor.clone())
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(second["page_number"], 2);
+    tag.store(2, Ordering::Relaxed);
+    let stale = page(cursor).await?;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        stale.json::<Value>().await?["code"],
+        "graph_sources_changed"
+    );
+    fixture.abort();
     Ok(())
 }
 

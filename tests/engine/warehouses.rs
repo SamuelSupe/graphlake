@@ -220,6 +220,12 @@ nodes:
     assert_eq!(records[0]["recorded"], "2026-01-01T19:04:05.123456789Z");
     assert_eq!(records[0]["recorded"], records[1]["recorded"]);
     assert_ne!(records[0]["payload"], records[1]["payload"]);
+    let mut folded = engine(&catalog("dst_fold"))?
+        .query(Language::Sql, sql, Default::default())
+        .await?;
+    let folded = rows(&mut folded).await?;
+    assert_eq!(folded[0]["recorded"], "2026-11-01T05:30:00.123456789Z");
+    assert_eq!(folded[1]["recorded"], "2026-11-01T06:30:00.123456789Z");
     let Err(error) = engine(&catalog("foreign"))?
         .query(Language::Sql, sql, Default::default())
         .await

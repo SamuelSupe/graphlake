@@ -88,6 +88,7 @@ pub(super) async fn observe(app: &App, catalog: &Catalog) -> Vec<Observation> {
                 } else if let Some(path) = source::parquet_snapshot::managed_location(location) {
                     let version = source::parquet::object_version(
                         location,
+                        None,
                         Arc::new(UnboundedMemoryPool::default()),
                         Arc::default(),
                     )

@@ -97,8 +97,58 @@ pub(super) struct Policy {
     path: PathBuf,
     managed: bool,
     accounts: Mutex<Accounts>,
-    audit: Option<Mutex<File>>,
+    audit: Option<Mutex<AuditFile>>,
     audit_failures: AtomicU64,
+}
+
+const AUDIT_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+
+struct AuditFile {
+    path: PathBuf,
+    file: File,
+    bytes: u64,
+}
+
+impl AuditFile {
+    fn open(audit_path: PathBuf) -> Result<Self> {
+        if let Ok(meta) = fs::symlink_metadata(&audit_path) {
+            ensure!(meta.is_file(), "audit log must be a regular file");
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let audit = options
+            .open(&audit_path)
+            .context("opening operation audit log")?;
+        let meta = audit.metadata()?;
+        ensure!(meta.is_file(), "audit log must be a regular file");
+        auth::private_permissions(&meta, true)?;
+        Ok(Self {
+            path: audit_path,
+            file: audit,
+            bytes: meta.len(),
+        })
+    }
+
+    fn append(&mut self, entry: &[u8]) -> Result<()> {
+        if self.bytes.saturating_add(entry.len() as u64) > AUDIT_ROTATE_BYTES {
+            match fs::rename(&self.path, self.path.with_extension("jsonl.previous")) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            *self = Self::open(self.path.clone())?;
+        }
+        self.file.write_all(entry)?;
+        self.bytes += entry.len() as u64;
+        Ok(())
+    }
 }
 
 impl Policy {
@@ -141,25 +191,7 @@ impl Policy {
             None
         } else {
             let audit_path = dir.join("audit.jsonl");
-            if let Ok(meta) = fs::symlink_metadata(&audit_path) {
-                ensure!(meta.is_file(), "audit log must be a regular file");
-            }
-            let mut options = OpenOptions::new();
-            options.create(true).append(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            }
-            let audit = options
-                .open(audit_path)
-                .context("opening operation audit log")?;
-            let meta = audit.metadata()?;
-            ensure!(meta.is_file(), "audit log must be a regular file");
-            auth::private_permissions(&meta, true)?;
-            Some(Mutex::new(audit))
+            Some(Mutex::new(AuditFile::open(audit_path)?))
         };
         Ok(Self {
             path,
@@ -349,7 +381,7 @@ impl Policy {
         if let Some(audit) = &self.audit {
             let mut entry = serde_json::to_vec(&entry).expect("serializable audit event");
             entry.push(b'\n');
-            if let Err(error) = audit.lock().unwrap().write_all(&entry) {
+            if let Err(error) = audit.lock().unwrap().append(&entry) {
                 self.audit_failures.fetch_add(1, Ordering::Relaxed);
                 eprintln!("GraphLake audit write failed: {error}");
             }

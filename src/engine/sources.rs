@@ -226,15 +226,23 @@ pub(super) async fn prepare<'a, 'q>(
                         reservations.push(budget);
                         (table, objects)
                     };
-                for mut object in objects {
-                    object.source = format!(
-                        "{}:{}:{}:{}/{}",
-                        storage.provider,
-                        storage.endpoint.as_deref().unwrap_or("default"),
-                        storage.account.as_deref().unwrap_or("default"),
-                        storage.bucket,
-                        object.source
+                let prefix = source::storage::version_prefix(storage);
+                let objects = objects
+                    .into_iter()
+                    .map(|mut object| {
+                        object.source.insert_str(0, &prefix);
+                        object
+                    })
+                    .collect::<Vec<_>>();
+                if matches!(format, crate::ObjectFormat::Parquet) {
+                    parquet_versions = Some(
+                        objects
+                            .iter()
+                            .map(|object| (object.source.clone(), object.version.clone()))
+                            .collect(),
                     );
+                }
+                for object in objects {
                     if let Some(previous) = versions.get(&object.source) {
                         ensure!(
                             previous.version == object.version,

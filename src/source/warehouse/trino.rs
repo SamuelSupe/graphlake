@@ -150,41 +150,52 @@ impl Trino {
             .map(|column| ident(column))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut sql = format!("SELECT {selected} FROM {relation}");
-        let expected = if !crate::engine::read_filters::needs_sql_types(filters) && !explain_only {
-            None
-        } else {
-            let mut metadata_id = None;
-            let (schema, buffer) = {
-                let mut pages = self.pages(format!("{sql} WHERE FALSE"), &mut metadata_id);
-                collect_pages(
-                    &self.http,
-                    &mut pages,
-                    columns,
-                    batch_size,
-                    false,
-                    Encoding::Trino,
-                    None,
-                )
-                .await?
-            };
-            if explain_only {
-                let (table, budget) = buffer.finish_schema(schema)?;
-                return Ok((
-                    table,
-                    budget,
-                    metadata_id.context("Trino response has no query ID")?,
-                ));
-            }
-            ensure!(
-                buffer.memory().is_empty(),
-                "Trino schema query returned rows"
+        let mut metadata_id = None;
+        let (expected, buffer) = {
+            let mut pages = self.pages(
+                format!("SELECT {selected} FROM {relation} WHERE FALSE"),
+                &mut metadata_id,
             );
-            sql.push_str(&crate::engine::read_filters::where_clause(
-                filters, &schema, ident,
-            ));
-            Some(schema)
+            collect_pages(
+                &self.http,
+                &mut pages,
+                columns,
+                batch_size,
+                false,
+                Encoding::Trino,
+                None,
+            )
+            .await?
         };
+        if explain_only {
+            let (table, budget) = buffer.finish_schema(expected)?;
+            return Ok((
+                table,
+                budget,
+                metadata_id.context("Trino response has no query ID")?,
+            ));
+        }
+        ensure!(
+            buffer.memory().is_empty(),
+            "Trino schema query returned rows"
+        );
+        // A zone name plus a wall time is ambiguous at a DST fold. Convert
+        // before the Trino protocol formats the timestamp as text.
+        let projection = expected
+            .fields()
+            .iter()
+            .map(|field| {
+                let column = ident(field.name());
+                if matches!(field.data_type(), DataType::Timestamp(_, Some(_))) {
+                    format!("at_timezone({column}, 'UTC') AS {column}")
+                } else {
+                    column
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let where_clause = crate::engine::read_filters::where_clause(filters, &expected, ident);
+        let sql = format!("SELECT {projection} FROM {relation}{where_clause}");
         let mut id = None;
         let (schema, buffer) = {
             let mut pages = self.pages(sql, &mut id);
@@ -200,7 +211,7 @@ impl Trino {
             .await?
         };
         ensure!(
-            expected.is_none_or(|expected| expected.fields() == schema.fields()),
+            expected.fields() == schema.fields(),
             "Trino result schema changed after describing the table"
         );
         let (table, budget) = buffer.finish(schema, &self.http.stats)?;

@@ -35,6 +35,13 @@ fn literal(value: &str) -> String {
     format!("N'{}'", value.replace('\'', "''"))
 }
 
+fn native_scalar(kind: &DataType) -> bool {
+    matches!(
+        kind,
+        DataType::Boolean | DataType::UInt8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
 impl Driver {
     pub(super) async fn open(
         source: &Source,
@@ -70,12 +77,15 @@ impl Driver {
         if let Some(path) = ca_file {
             config.trust_cert_ca(path);
         }
-        let tcp = TcpStream::connect(config.get_addr()).await?;
-        tcp.set_nodelay(true)?;
-        stats.request();
-        let mut client = Client::connect(config, tcp.compat_write())
-            .await
-            .context("connecting to SQL Server")?;
+        let mut client = tokio::time::timeout(timeout, async {
+            let tcp = TcpStream::connect(config.get_addr()).await?;
+            tcp.set_nodelay(true)?;
+            stats.request();
+            Ok::<_, anyhow::Error>(Client::connect(config, tcp.compat_write()).await?)
+        })
+        .await
+        .context("SQL Server connection timed out")?
+        .context("connecting to SQL Server")?;
         client
             .simple_query(format!(
                 "SET LOCK_TIMEOUT {}",
@@ -137,6 +147,11 @@ impl Driver {
             let kind = row.try_get::<&str, _>(1)?.context("missing column type")?;
             let precision = row.try_get::<i32, _>(2)?.unwrap_or(0);
             let scale = row.try_get::<i32, _>(3)?.unwrap_or(0);
+            let temporal_unit = if row.try_get::<i32, _>(5)?.unwrap_or(7) > 6 {
+                TimeUnit::Nanosecond
+            } else {
+                TimeUnit::Microsecond
+            };
             let ty = match kind {
                 "bit" => DataType::Boolean,
                 "tinyint" => DataType::UInt8,
@@ -150,10 +165,9 @@ impl Driver {
                 "smallmoney" => DataType::Decimal128(10, 4),
                 "date" => DataType::Date32,
                 "time" => DataType::Time64(TimeUnit::Nanosecond),
-                "datetime" | "smalldatetime" | "datetime2" => {
-                    DataType::Timestamp(TimeUnit::Microsecond, None)
-                }
-                "datetimeoffset" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "datetime" | "smalldatetime" => DataType::Timestamp(TimeUnit::Microsecond, None),
+                "datetime2" => DataType::Timestamp(temporal_unit, None),
+                "datetimeoffset" => DataType::Timestamp(temporal_unit, Some("UTC".into())),
                 "binary" | "varbinary" | "image" | "timestamp" | "rowversion" => DataType::Binary,
                 "char" | "varchar" | "nchar" | "nvarchar" | "text" | "ntext"
                 | "uniqueidentifier" | "xml" => DataType::Utf8,
@@ -191,16 +205,16 @@ impl Driver {
             .fields()
             .iter()
             .map(|field| {
+                let name = ident(field.name());
+                if native_scalar(field.data_type()) {
+                    return name;
+                }
                 let style = match field.data_type() {
                     DataType::Binary | DataType::Decimal128(_, _) => 2,
                     DataType::Float32 | DataType::Float64 => 3,
                     _ => 127,
                 };
-                format!(
-                    "CONVERT(nvarchar(max), {}, {style}) AS {}",
-                    ident(field.name()),
-                    ident(field.name())
-                )
+                format!("CONVERT(nvarchar(max), {name}, {style}) AS {name}")
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -221,8 +235,20 @@ impl Driver {
             let row = stream.try_next().await?;
             let done = row.is_none();
             if let Some(row) = row {
-                let values = (0..schema.fields().len())
-                    .map(|i| -> Result<_> { Ok(row.try_get::<&str, _>(i)?.map(str::to_owned)) })
+                let values = schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| -> Result<_> {
+                        Ok(match field.data_type() {
+                            DataType::Boolean => row.try_get::<bool, _>(i)?.map(|v| v.to_string()),
+                            DataType::UInt8 => row.try_get::<u8, _>(i)?.map(|v| v.to_string()),
+                            DataType::Int16 => row.try_get::<i16, _>(i)?.map(|v| v.to_string()),
+                            DataType::Int32 => row.try_get::<i32, _>(i)?.map(|v| v.to_string()),
+                            DataType::Int64 => row.try_get::<i64, _>(i)?.map(|v| v.to_string()),
+                            _ => row.try_get::<&str, _>(i)?.map(str::to_owned),
+                        })
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 raw.try_grow(
                     values

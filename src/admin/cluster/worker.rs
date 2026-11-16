@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -26,6 +26,7 @@ pub(super) struct Worker {
     pub(super) distributed_min_rows: usize,
     pub(super) memory_bytes: usize,
     source_dir: PathBuf,
+    models: Mutex<VecDeque<(String, String, Engine)>>,
     token_hash: [u8; 32],
     slots: Arc<Semaphore>,
     probes: Semaphore,
@@ -42,8 +43,14 @@ pub(super) fn router(
     slots: usize,
 ) -> (Router, CancellationToken) {
     let shutdown = CancellationToken::new();
-    let remote = usize::from(config.distributed_partitions > 0);
-    let slots = slots.min(config.process_memory_mib / config.memory_mib - remote);
+    let capacity = config.process_memory_mib / config.memory_mib;
+    let reserve = usize::from(config.distributed_partitions > 0);
+    let slots = slots.min(capacity - reserve);
+    let remote = if reserve > 0 {
+        (capacity - slots).clamp(1, 4)
+    } else {
+        0
+    };
     let worker = Arc::new(Worker {
         id: Uuid::new_v4(),
         token_hash: Sha256::digest(shared.token.as_bytes()).into(),
@@ -53,6 +60,7 @@ pub(super) fn router(
         distributed_min_rows: config.distributed_min_rows,
         memory_bytes: config.memory_mib * 1024 * 1024,
         source_dir,
+        models: Default::default(),
         slots: Arc::new(Semaphore::new(slots)),
         probes: Semaphore::new(2),
         stage_slots: Arc::new(Semaphore::new(remote)),
@@ -130,9 +138,8 @@ async fn readiness(
     options.memory_bytes = worker.memory_bytes;
     let probe = tokio::time::timeout(Duration::from_secs(5), async {
         worker.shared.metadata.ping().await.map_err(storage)?;
-        let catalog = worker.catalog(&model, &revision).await?;
-        let ids = crate::admin::local_tables::managed::referenced(&catalog);
-        let mut engine = Engine::new(catalog).map_err(query::query_error)?;
+        let mut engine = worker.engine(&model, &revision).await?;
+        let ids = crate::admin::local_tables::managed::referenced(&engine.catalog);
         let managed = crate::admin::local_tables::managed::Managed::reader(
             worker.shared.metadata.clone(),
             worker.shared.objects.clone(),
@@ -161,18 +168,19 @@ async fn authenticate(State(worker): State<Arc<Worker>>, request: Request, next:
         _ => None,
     };
     let started = std::time::Instant::now();
-    let span =
-        operation.and_then(|op| telemetry::start_span(op, "worker", Some(request.headers())));
     let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
     let bearer = values
         .next()
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|value| value.len() <= 256);
-    let response = if values.next().is_some()
-        || !bearer.is_some_and(|token| {
+    let authorized = values.next().is_none()
+        && bearer.is_some_and(|token| {
             bool::from(worker.token_hash.ct_eq(&Sha256::digest(token.as_bytes())))
-        }) {
+        });
+    let span = operation
+        .and_then(|op| telemetry::start_span(op, "worker", authorized.then(|| request.headers())));
+    let response = if !authorized {
         StatusCode::UNAUTHORIZED.into_response()
     } else if let Some(span) = &span {
         next.run(request).with_context(span.clone()).await
@@ -195,8 +203,10 @@ async fn authenticate(State(worker): State<Arc<Worker>>, request: Request, next:
 
 async fn accept(
     State(worker): State<Arc<Worker>>,
+    headers: HeaderMap,
     Json(dispatch): Json<Dispatch>,
 ) -> ApiResult<StatusCode> {
+    let started = Instant::now();
     if worker.shutdown.is_cancelled() {
         return Err(unavailable());
     }
@@ -225,7 +235,8 @@ async fn accept(
     {
         return Err(Error::not_found());
     }
-    if now_ms() >= job.deadline_ms {
+    let deadline = work_deadline(&headers, started, job.deadline_ms)?;
+    if Instant::now() >= deadline {
         return Err(timeout());
     }
     job.worker = Some(worker.id);
@@ -241,18 +252,30 @@ async fn accept(
     tokio::spawn(async move {
         if let Some(span) = span {
             worker
-                .run(dispatch, job, slot, Some(&span))
+                .run(dispatch, job, slot, deadline, Some(&span))
                 .with_context(span.clone())
                 .await;
         } else {
-            worker.run(dispatch, job, slot, None).await;
+            worker.run(dispatch, job, slot, deadline, None).await;
         }
     });
     Ok(StatusCode::ACCEPTED)
 }
 
 impl Worker {
-    async fn catalog(&self, model: &str, revision: &str) -> ApiResult<crate::Catalog> {
+    async fn engine(&self, model: &str, revision: &str) -> ApiResult<Engine> {
+        {
+            let mut models = self.models.lock().unwrap();
+            if let Some(index) = models
+                .iter()
+                .position(|(id, active, _)| id == model && active == revision)
+            {
+                let entry = models.remove(index).expect("cached model");
+                let engine = entry.2.clone();
+                models.push_front(entry);
+                return Ok(engine);
+            }
+        }
         let yaml = self
             .shared
             .objects
@@ -262,7 +285,21 @@ impl Worker {
         if models::revision(&yaml) != revision {
             return Err(Error::storage());
         }
-        models::parse(&yaml, &self.source_dir.join(format!("{model}.yaml")))
+        let mut catalog = models::parse(&yaml, &self.source_dir.join(format!("{model}.yaml")))?;
+        catalog.export_locations.clear();
+        let engine = Engine::new(catalog).map_err(query::query_error)?;
+        let mut models = self.models.lock().unwrap();
+        if let Some((_, _, cached)) = models
+            .iter()
+            .find(|(id, active, _)| id == model && active == revision)
+        {
+            return Ok(cached.clone());
+        }
+        if models.len() >= 4 {
+            models.pop_back();
+        }
+        models.push_front((model.into(), revision.into(), engine.clone()));
+        Ok(engine)
     }
 
     async fn run(
@@ -270,13 +307,12 @@ impl Worker {
         dispatch: Dispatch,
         job: Job,
         slot: tokio::sync::OwnedSemaphorePermit,
+        deadline: Instant,
         span: Option<&opentelemetry::Context>,
     ) {
         let started = std::time::Instant::now();
         let token = self.shutdown.child_token();
         let id = dispatch.id;
-        let deadline =
-            Instant::now() + Duration::from_millis(job.deadline_ms.saturating_sub(now_ms()));
         let result = {
             let worker = self.clone();
             let lease_job = job.clone();
@@ -414,9 +450,7 @@ impl Worker {
         cancellation: CancellationToken,
         deadline: Instant,
     ) -> ApiResult<JobState> {
-        let mut catalog = self.catalog(&job.model, &job.revision).await?;
-        catalog.export_locations.clear();
-        let mut engine = Engine::new(catalog).map_err(query::query_error)?;
+        let mut engine = self.engine(&job.model, &job.revision).await?;
         let request = &dispatch.request;
         if let Some(pin) = dispatch.managed.first() {
             let managed = crate::admin::local_tables::managed::Managed::reader(
@@ -458,7 +492,7 @@ impl Worker {
                 id,
                 job.attempt,
                 self.id,
-                job.deadline_ms,
+                deadline,
                 self.partitions,
                 self.distributed_min_rows,
             )
@@ -634,6 +668,7 @@ mod tests {
             memory_bytes: 256 * 1024 * 1024,
             distributed_min_rows: 0,
             source_dir: dir.path().to_owned(),
+            models: Default::default(),
             token_hash: [0; 32],
             slots: Arc::new(Semaphore::new(1)),
             probes: Semaphore::new(0),

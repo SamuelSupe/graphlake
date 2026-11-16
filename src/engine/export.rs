@@ -204,7 +204,7 @@ impl Destination {
                 columns.iter().collect::<BTreeSet<_>>().len() == columns.len(),
                 "CSV export requires unique column names"
             );
-            csv_row(&mut writer, columns.iter().copied())?;
+            csv_row(&mut writer, columns.iter().copied().map(Some))?;
             while let Some(batch) = batches.try_next().await? {
                 scope.check()?;
                 budget.try_grow(batch.get_array_memory_size().saturating_mul(4))?;
@@ -221,14 +221,14 @@ impl Destination {
                     let cells = columns
                         .iter()
                         .map(|column| match row.get(*column).map(|value| value.get()) {
-                            None | Some("null") => Ok(String::new()),
+                            None | Some("null") => Ok(None),
                             Some(value) if value.starts_with('"') => {
-                                serde_json::from_str::<String>(value)
+                                serde_json::from_str::<String>(value).map(Some)
                             }
-                            Some(value) => Ok(value.to_owned()),
+                            Some(value) => Ok(Some(value.to_owned())),
                         })
                         .collect::<std::result::Result<Vec<_>, _>>()?;
-                    csv_row(&mut writer, cells.iter().map(String::as_str))?;
+                    csv_row(&mut writer, cells.iter().map(Option::as_deref))?;
                 }
                 count += batch.num_rows() as u64;
                 budget.free();
@@ -241,14 +241,15 @@ impl Destination {
 
 fn csv_row(
     writer: &mut impl Write,
-    cells: impl Iterator<Item = impl AsRef<str>>,
+    cells: impl Iterator<Item = Option<impl AsRef<str>>>,
 ) -> std::io::Result<()> {
     for (index, cell) in cells.enumerate() {
         if index > 0 {
             writer.write_all(b",")?;
         }
+        let Some(cell) = cell else { continue };
         let cell = cell.as_ref();
-        if cell.contains([',', '"', '\r', '\n']) {
+        if cell.is_empty() || cell.contains([',', '"', '\r', '\n']) {
             write!(writer, "\"{}\"", cell.replace('"', "\"\""))?;
         } else {
             writer.write_all(cell.as_bytes())?;

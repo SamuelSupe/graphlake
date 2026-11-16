@@ -425,7 +425,8 @@ async fn start(
         .clone()
         .try_lock_owned()
         .map_err(|_| Error::busy())?;
-    let leader = stage.leader.confirm().await?;
+    stage.leader.confirm().await?;
+    let lost = stage.leader.loss_token();
     let (previous, revision) = stage
         .leader
         .get::<Option<Job>>(JOB_KEY)
@@ -457,7 +458,7 @@ async fn start(
         let _slot = slot;
         let result = tokio::select! {
             biased;
-            _ = leader.cancelled() => Err(anyhow::anyhow!("Coordinator 主权暂不可用，请重试")),
+            _ = lost.cancelled() => Err(anyhow::anyhow!("Coordinator 已失去主权，请重试")),
             _ = stage.shutdown.cancelled() => return,
             result = tokio::time::timeout(RESTORE_TIMEOUT, stage.run(&mut job, &mut revision, reviewed.as_deref())) =>
                 result.unwrap_or_else(|_| Err(anyhow::anyhow!("恢复作业超时"))),
@@ -489,10 +490,20 @@ impl Stage {
 
     async fn advance(&self, job: &mut Job, revision: &mut i64, phase: Phase) -> Result<()> {
         job.phase = phase;
-        *revision = self
-            .write(*revision, job)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.message))?;
+        loop {
+            match self.write(*revision, job).await {
+                Ok(next) => {
+                    *revision = next;
+                    break;
+                }
+                // No write was sent. Wait for the current leader's heartbeat to
+                // recover; the enclosing job observes definitive lease loss.
+                Err(e) if e.code == super::super::cluster::control::UNCERTAIN => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(anyhow::anyhow!(e.message)),
+            }
+        }
         Ok(())
     }
 

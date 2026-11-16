@@ -222,6 +222,7 @@ impl Driver {
         &self,
         table: &str,
         columns: &[String],
+        filters: &[crate::Predicate],
         batch_size: usize,
         explain: bool,
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation)> {
@@ -239,8 +240,17 @@ impl Driver {
         }
         let projection = projection(schema.fields().iter().map(|field| field.name().as_str()));
         self.stats.request();
+        let terms = filters
+            .iter()
+            .filter_map(|filter| mongo_predicate(&schema, filter))
+            .collect::<Vec<_>>();
+        let filter = if terms.is_empty() {
+            doc! {}
+        } else {
+            doc! { "$and": terms }
+        };
         let mut cursor = collection
-            .find(doc! {})
+            .find(filter)
             .projection(projection)
             .batch_size(batch_size.min(1024) as u32)
             .max_time(self.timeout)
@@ -279,4 +289,26 @@ impl Driver {
             }
         }
     }
+}
+
+fn mongo_predicate(schema: &Schema, filter: &crate::Predicate) -> Option<Document> {
+    use crate::Comparison;
+    if filter.column.contains('.') || filter.column.starts_with('$') {
+        return None;
+    }
+    let kind = schema.field_with_name(&filter.column).ok()?.data_type();
+    let value = match kind {
+        DataType::Int64 => Bson::Int64(filter.value.as_i64()?),
+        DataType::Boolean if filter.op == Comparison::Eq => Bson::Boolean(filter.value.as_bool()?),
+        _ => return None,
+    };
+    let op = match filter.op {
+        Comparison::Eq => "$eq",
+        Comparison::Lt => "$lt",
+        Comparison::Le => "$lte",
+        Comparison::Gt => "$gt",
+        Comparison::Ge => "$gte",
+        _ => return None,
+    };
+    Some(doc! { &filter.column: { op: value } })
 }

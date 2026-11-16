@@ -239,6 +239,8 @@ pub(in crate::admin) fn interrupted() -> Error {
     )
 }
 
+pub(in crate::admin) const MUTATION_UNKNOWN: &str = "control_mutation_unknown";
+
 pub(in crate::admin) fn unavailable() -> Error {
     Error::new(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -695,6 +697,10 @@ impl Leadership {
         }
     }
 
+    pub(in crate::admin) fn loss_token(&self) -> CancellationToken {
+        self.stop.clone()
+    }
+
     pub fn retire(&self) {
         self.stop.cancel();
     }
@@ -762,11 +768,20 @@ impl Leadership {
             puts.push(json!({"request_put":{"key":key,"value":encoded(value)?,"lease":lease}}));
         }
         self.admission()?;
-        let written = self
-            .control
-            .txn(compares, puts)
-            .await
-            .map_err(|_| unavailable())?;
+        let written = self.control.txn(compares, puts).await.map_err(|error| {
+            if error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|e| e.is_connect())
+            {
+                unavailable()
+            } else {
+                Error::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    MUTATION_UNKNOWN,
+                    "集群写入结果未知，请使用同一请求标识查询或重试",
+                )
+            }
+        })?;
         if written.is_none() {
             self.confirm().await?;
         }
@@ -1081,6 +1096,26 @@ mod tests {
             elected: false,
             stop: stop.clone(),
         };
+
+        let error = leader
+            .commit("catalog", 0, &"new", Some((Uuid::new_v4(), &"receipt")))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            unavailable().code,
+            "an unsent write is retryable"
+        );
+        gateway.store(1, Ordering::Relaxed);
+        let error = leader
+            .commit("catalog", 0, &"new", None::<(Uuid, &())>)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code, MUTATION_UNKNOWN,
+            "an absent acknowledgment is ambiguous"
+        );
+        gateway.store(0, Ordering::Relaxed);
 
         let epoch = leader
             .confirm()

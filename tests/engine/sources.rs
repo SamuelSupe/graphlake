@@ -205,7 +205,9 @@ async fn check_frontier(
     assert_eq!(auto.metrics().reads.frontier_scan_fallbacks, 1);
 
     let refresh = engine.refresh("Transfer", opts.clone()).await?;
-    let mut cached = engine.traverse(request, opts).await?;
+    let mut cached = engine
+        .traverse_with_strategy(request, opts, TraversalStrategy::Cached)
+        .await?;
     let mut result = rows(&mut cached).await?;
     result.sort_by_key(ToString::to_string);
     assert_eq!(result, expected);

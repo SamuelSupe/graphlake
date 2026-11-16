@@ -51,6 +51,16 @@ impl Walk {
         })
     }
 
+    pub(super) fn restart(&mut self, graph: &Topology, start: usize, target: Target) {
+        match &mut self.0 {
+            WalkState::BreadthFirst(bfs) => bfs.restart(start, target),
+            WalkState::Trails(trails) => {
+                trails.stack.push(Trails::frame(graph, start));
+                debug_assert!(trails.path.is_empty() && trails.used.is_empty());
+            }
+        }
+    }
+
     pub(super) fn step(&mut self, graph: &Topology, max_hops: usize) -> Step {
         match &mut self.0 {
             WalkState::BreadthFirst(bfs) => bfs.step(graph, max_hops),
@@ -70,6 +80,7 @@ struct BreadthFirst {
     target: Target,
     queue: VecDeque<(usize, usize)>,
     predecessor: Vec<Option<Neighbor>>,
+    touched: Vec<usize>,
     expansion: Option<(usize, usize, std::ops::Range<usize>)>,
     shortest: Option<(Shortest, usize)>,
     ties: Option<Ties>,
@@ -100,6 +111,7 @@ impl BreadthFirst {
             target,
             queue,
             predecessor,
+            touched: vec![start],
             expansion: None,
             shortest,
             ties: matches!(shortest, Some((Shortest::All, _))).then(|| {
@@ -113,6 +125,33 @@ impl BreadthFirst {
             }),
             emit: None,
             track_vertices,
+        }
+    }
+
+    fn restart(&mut self, start: usize, target: Target) {
+        for vertex in self.touched.drain(..) {
+            self.predecessor[vertex] = None;
+            if let Some(ties) = &mut self.ties {
+                ties.depths[vertex] = usize::MAX;
+                // Do not retain a different start's predecessor allocations.
+                ties.parents[vertex] = Vec::new();
+            }
+        }
+        self.start = start;
+        self.target = target;
+        self.expansion = None;
+        self.emit = None;
+        self.queue.clear();
+        if !matches!(target, Target::Vertex(None)) {
+            self.queue.push_back((start, 0));
+        }
+        self.predecessor[start] = Some(Neighbor {
+            vertex: start,
+            edge: 0,
+        });
+        self.touched.push(start);
+        if let Some(ties) = &mut self.ties {
+            ties.depths[start] = 0;
         }
     }
 
@@ -136,6 +175,7 @@ impl BreadthFirst {
                 };
                 if self.predecessor[edge.vertex].is_none() {
                     self.predecessor[edge.vertex] = Some(parent);
+                    self.touched.push(edge.vertex);
                     if let Some(ties) = &mut self.ties {
                         ties.depths[edge.vertex] = *depth + 1;
                     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs::{File, OpenOptions, TryLockError},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     mem::size_of,
@@ -28,14 +28,14 @@ const MAGIC: &[u8; 8] = b"GLCSR001";
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const IPC_ROWS: usize = 8192;
 #[cfg(unix)]
-const MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct Cache {
     dir: PathBuf,
     binding: String,
     #[cfg(unix)]
-    recent: Arc<std::sync::Mutex<Option<Recent>>>,
+    recent: Arc<std::sync::Mutex<VecDeque<Recent>>>,
 }
 
 #[derive(Debug)]
@@ -237,9 +237,13 @@ impl Cache {
             #[cfg(unix)]
             let (id, file_check) = {
                 let id = file_id(&file)?;
-                if let Some(entry) = recent.lock().unwrap().as_ref().filter(|entry| {
+                let mut recent = recent.lock().unwrap();
+                if let Some(index) = recent.iter().position(|entry| {
                     entry.id == id && entry.path == path && entry.direction == direction
                 }) {
+                    let entry = recent.remove(index).expect("cache entry");
+                    recent.push_front(entry);
+                    let entry = &recent[0];
                     scope.check()?;
                     let budget = MemoryConsumer::new("GraphLake persisted CSR")
                         .register(&scope.runtime.memory_pool);
@@ -259,7 +263,15 @@ impl Cache {
             {
                 let reserved = loaded._budget.size();
                 if reserved <= MAX_RETAINED_BYTES && file_id(&file_check)? == id {
-                    *recent.lock().unwrap() = Some(Recent {
+                    let mut recent = recent.lock().unwrap();
+                    recent.retain(|entry| entry.path != path || entry.direction != direction);
+                    while recent.len() >= 4
+                        || recent.iter().map(|entry| entry.reserved).sum::<usize>() + reserved
+                            > MAX_RETAINED_BYTES
+                    {
+                        recent.pop_back();
+                    }
+                    recent.push_front(Recent {
                         path,
                         direction,
                         id,

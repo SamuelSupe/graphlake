@@ -29,6 +29,47 @@ pub(super) struct OutputLimit {
     pub(super) distinct: Option<String>,
 }
 
+pub(crate) enum Stage {
+    Repeat(Box<Repeat>),
+    Shared { table: String, sql: String },
+}
+
+impl Stage {
+    pub(crate) fn table(&self) -> &str {
+        match self {
+            Self::Repeat(repeat) => &repeat.table,
+            Self::Shared { table, .. } => table,
+        }
+    }
+
+    pub(crate) async fn register(
+        &self,
+        catalog: &Catalog,
+        context: &SessionContext,
+        scope: &QueryScope,
+        explain_only: bool,
+    ) -> Result<MemoryReservation> {
+        match self {
+            Self::Repeat(repeat) => repeat.register(catalog, context, scope, explain_only).await,
+            Self::Shared { table, sql } => {
+                ensure!(
+                    !catalog.nodes.contains_key(table) && !catalog.edges.contains_key(table),
+                    "graph label collides with internal Gremlin relation name"
+                );
+                let frame = gremlin_frame(context, sql).await?;
+                crate::cypher::apply::Apply::materialize_frame(
+                    context,
+                    scope,
+                    table,
+                    frame,
+                    explain_only,
+                )
+                .await
+            }
+        }
+    }
+}
+
 pub(crate) struct Repeat {
     pub(super) table: String,
     pub(super) seed: String,
@@ -42,8 +83,8 @@ pub(crate) struct Repeat {
     pub(super) post_eligible: Option<String>,
     pub(super) emit_before: bool,
     pub(super) limit: Option<OutputLimit>,
-    pub(super) nested: Vec<Repeat>,
-    pub(super) checked_nested: Vec<Repeat>,
+    pub(super) nested: Vec<Stage>,
+    pub(super) checked_nested: Vec<Stage>,
 }
 
 impl Repeat {
@@ -134,7 +175,7 @@ impl Repeat {
             }
             drop(body);
             for nested in &self.nested {
-                context.deregister_table(TableReference::bare(nested.table.as_str()))?;
+                context.deregister_table(TableReference::bare(nested.table()))?;
             }
             drop(nested_budget);
             context.deregister_table(seed.clone())?;
@@ -236,7 +277,7 @@ impl Repeat {
         }
         drop(checked);
         for nested in &self.checked_nested {
-            context.deregister_table(TableReference::bare(nested.table.as_str()))?;
+            context.deregister_table(TableReference::bare(nested.table()))?;
         }
         if saturated
             && active

@@ -53,6 +53,46 @@ async fn wildcard_match_joins_many_labels_without_enumerating_combinations() -> 
 }
 
 #[tokio::test]
+async fn gremlin_reuses_multilabel_inputs_across_hops_and_repeat_rounds() -> Result<()> {
+    let (dir, _, _) = fixture()?;
+    let mut catalog = Catalog::load(dir.path().join("graph.yaml"))?;
+    let vertex = catalog.nodes["Account"].clone();
+    let mut edge = catalog.edges["Invalid"].clone();
+    edge.properties.clear();
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1, 2])) as _),
+        ("src", Arc::new(Int64Array::from(vec![1, 1])) as _),
+        ("dst", Arc::new(Int64Array::from(vec![1, 1])) as _),
+    ])?;
+    std::fs::write(dir.path().join("invalid.parquet"), parquet(&batch)?)?;
+    catalog.nodes.clear();
+    catalog.edges.clear();
+    for index in 0..4 {
+        let label = format!("V{index}");
+        catalog.nodes.insert(label.clone(), vertex.clone());
+        edge.from.node = label;
+        edge.to.node = format!("V{}", (index + 1) % 4);
+        catalog.edges.insert(format!("E{index}"), edge.clone());
+    }
+    let engine = Engine::new(catalog)?;
+    let chain = ".out()".repeat(9);
+    for query in [
+        format!("g.V(1){chain}.label().order()"),
+        "g.V(1).repeat(__.out().out().out()).times(3).label().order()".into(),
+    ] {
+        let mut result = engine
+            .query(Language::Gremlin, &query, Default::default())
+            .await
+            .with_context(|| query.clone())?;
+        let expected = (0..4)
+            .flat_map(|label| std::iter::repeat_n(json!({"value":format!("V{label}")}), 512))
+            .collect::<Vec<_>>();
+        assert_eq!(rows(&mut result).await?, expected, "{query}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn gremlin_barriers_are_scoped_to_branches_and_loop_rounds() -> Result<()> {
     let (_dir, engine, _) = fixture()?;
     let options = QueryOptions {

@@ -528,6 +528,7 @@ async fn operational_settings_are_admin_only_versioned_and_applied_on_restart() 
     assert_eq!(saved["active"]["enabled"], false);
     assert_eq!(saved["restart_required"], true);
     let yaml: Value = serde_saphyr::from_str(saved["rules_yaml"].as_str().unwrap())?;
+    let original_yaml: Value = serde_saphyr::from_str(state["rules_yaml"].as_str().unwrap())?;
     assert!(
         yaml["groups"][0]["rules"]
             .as_array()
@@ -540,6 +541,16 @@ async fn operational_settings_are_admin_only_versioned_and_applied_on_restart() 
                         .is_some_and(|expr| expr.contains("[240s]") && expr.ends_with("> 0.25"))
             })
     );
+    let deployment_rule = |doc: &Value| {
+        doc["groups"][0]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["alert"] == "GraphLakeFreshnessBudgetExceeded")
+            .cloned()
+            .context("missing deployment freshness rule")
+    };
+    assert_eq!(deployment_rule(&yaml)?, deployment_rule(&original_yaml)?);
     assert_eq!(
         request.send().await?.status(),
         StatusCode::PRECONDITION_FAILED

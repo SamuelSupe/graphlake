@@ -369,7 +369,7 @@ impl QueryResult {
 pub(crate) struct QueryScope {
     pub(crate) options: QueryOptions,
     start: Instant,
-    pub(super) wall_time: chrono::DateTime<chrono::Utc>,
+    pub(crate) wall_time: chrono::DateTime<chrono::Utc>,
     pub(super) deadline: Instant,
     lease: Mutex<Option<Lease>>,
     pub(crate) runtime: Arc<RuntimeEnv>,

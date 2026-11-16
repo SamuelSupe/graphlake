@@ -187,6 +187,8 @@ pub(super) struct Cursor {
     pub session: Uuid,
     pub page: usize,
     pub versions: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_at: Option<chrono::DateTime<chrono::Utc>>,
     pub anchor: Option<Anchor>,
     pub history: Vec<Option<Anchor>>,
 }
@@ -229,6 +231,7 @@ pub(super) struct Pages {
     pub signature: String,
     pub sources: Vec<SourceVersion>,
     pub versions: [u8; 32],
+    temporal_at: Option<chrono::DateTime<chrono::Utc>>,
     pub postgres: Mutex<BTreeMap<String, String>>,
     selected: Option<Element>,
     storage: Mutex<Storage>,
@@ -255,6 +258,7 @@ struct Page {
 impl Pages {
     pub fn new(
         signature: String,
+        temporal_at: Option<chrono::DateTime<chrono::Utc>>,
         sources: Vec<SourceVersion>,
         postgres: BTreeMap<String, String>,
         selected: Option<Element>,
@@ -264,6 +268,7 @@ impl Pages {
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             signature,
+            temporal_at,
             versions: super::versions_digest(&sources),
             sources,
             postgres: Mutex::new(postgres),
@@ -404,6 +409,7 @@ impl Pages {
                 session: id,
                 page,
                 versions: self.versions,
+                temporal_at: self.temporal_at,
                 anchor: self.anchor(page),
                 history,
             },

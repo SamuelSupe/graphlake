@@ -98,6 +98,7 @@ pub(super) struct Policy {
     managed: bool,
     accounts: Mutex<Accounts>,
     audit: Option<Mutex<AuditFile>>,
+    anonymous_audit: Option<Mutex<AuditFile>>,
     audit_failures: AtomicU64,
 }
 
@@ -193,11 +194,19 @@ impl Policy {
             let audit_path = dir.join("audit.jsonl");
             Some(Mutex::new(AuditFile::open(audit_path)?))
         };
+        let anonymous_audit = if managed {
+            None
+        } else {
+            Some(Mutex::new(AuditFile::open(
+                dir.join("audit-anonymous.jsonl"),
+            )?))
+        };
         Ok(Self {
             path,
             managed,
             accounts: Mutex::new(accounts),
             audit,
+            anonymous_audit,
             audit_failures: AtomicU64::new(0),
         })
     }
@@ -360,7 +369,7 @@ impl Policy {
         if let Some(target) = target {
             entry["target"] = json!(target);
         }
-        self.write_audit(entry);
+        self.write_audit(entry, principal.is_none());
     }
 
     pub(super) fn record_role_change(
@@ -373,12 +382,17 @@ impl Policy {
             "at_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
             "subject": "admin", "protocol": "http", "action": "role_changed", "target": name,
             "outcome": "ok", "before": before, "after": after,
-        }));
+        }), false);
     }
 
-    fn write_audit(&self, entry: serde_json::Value) {
+    fn write_audit(&self, entry: serde_json::Value, anonymous: bool) {
         super::telemetry::audit(&entry);
-        if let Some(audit) = &self.audit {
+        let audit = if anonymous {
+            &self.anonymous_audit
+        } else {
+            &self.audit
+        };
+        if let Some(audit) = audit {
             let mut entry = serde_json::to_vec(&entry).expect("serializable audit event");
             entry.push(b'\n');
             if let Err(error) = audit.lock().unwrap().append(&entry) {

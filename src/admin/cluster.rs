@@ -278,7 +278,11 @@ impl Coordinator {
         )
     }
 
-    pub fn start_cleanup(&self, shutdown: crate::CancellationToken) {
+    pub fn start_cleanup(
+        &self,
+        shutdown: crate::CancellationToken,
+        leader: Option<Arc<control::Leadership>>,
+    ) {
         let shared = self.shared.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
@@ -294,7 +298,7 @@ impl Coordinator {
                                 tokio::join!(
                                     tokio::time::timeout(timeout, shared.objects.expire_results()),
                                     tokio::time::timeout(timeout, retention::sweep(
-                                        &shared.metadata, &shared.objects, chrono::Utc::now()
+                                        &shared.metadata, &shared.objects, chrono::Utc::now(), leader.as_deref()
                                     ))
                                 )
                             } => sweeps,

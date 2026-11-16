@@ -338,10 +338,10 @@ impl<'a> Traversers<'a> {
         )
     }
 
-    pub(super) fn shared_input(&self, table: &str, readers: usize) -> Option<String> {
+    pub(super) fn shared_input(&self, table: &str, share: bool) -> Option<String> {
         // A lexical CTE or a recursive SQL frontier is only visible inside its
         // enclosing statement. Ordinary repeat frontiers are registered tables.
-        if readers > 1 && self.ctes.is_empty() && !self.recursive {
+        if share && self.ctes.is_empty() && !self.recursive {
             self.stages.borrow_mut().push(super::repeat::Stage::Shared {
                 table: table.into(),
                 sql: self.sql.clone(),
@@ -359,7 +359,7 @@ impl<'a> Traversers<'a> {
             .with_context(|| format!("unknown step label {name}"))?
             .clone();
         let table = self.fresh("select");
-        let cte = self.shared_input(&table, entities.len());
+        let cte = self.shared_input(&table, entities.len() > 1);
         let states = entities
             .into_iter()
             .map(|entity| {
@@ -380,7 +380,12 @@ impl<'a> Traversers<'a> {
         Ok(())
     }
 
-    pub(super) fn dispatch(&mut self, step: &Step<'_>, depth: usize) -> Result<()> {
+    pub(super) fn dispatch(
+        &mut self,
+        step: &Step<'_>,
+        depth: usize,
+        early_limit: bool,
+    ) -> Result<()> {
         let table = self.fresh("variant");
         let mut states = Vec::new();
         for state in self.lanes(&table) {
@@ -392,7 +397,7 @@ impl<'a> Traversers<'a> {
             self.restrict("FALSE");
             return Ok(());
         }
-        let cte = self.shared_input(&table, states.len());
+        let cte = self.shared_input(&table, !early_limit && states.len() > 1);
         for state in &mut states {
             if let Some(cte) = &cte {
                 state.ctes.push(cte.clone());
@@ -595,7 +600,7 @@ impl<'a> Traversers<'a> {
             ));
         }
         ensure!(!reads.is_empty(), "unknown property {property} for order()");
-        let cte = self.shared_input(&seed, reads.len());
+        let cte = self.shared_input(&seed, reads.len() > 1);
         self.sql = with_input(cte, crate::catalog::union_all(&reads));
         Ok(())
     }

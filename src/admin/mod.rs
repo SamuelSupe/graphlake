@@ -374,7 +374,10 @@ pub async fn serve_clustered_with_status(
         None => None,
     };
     if let Some(cluster) = &cluster {
-        cluster.start_cleanup(shutdown.clone());
+        cluster.start_cleanup(
+            shutdown.clone(),
+            ha.as_ref().map(|ha| Arc::clone(&ha.leader)),
+        );
     }
     let explorations = cluster
         .as_ref()

@@ -2194,6 +2194,7 @@ async fn cypher_correlated_call_spills_wide_results_and_honors_outer_limit() -> 
 async fn gremlin_typed_comparison_order_and_traversal_steps() -> Result<()> {
     let (_dir, engine, _) = fixture()?;
     for (query, expected) in [
+        ("g.V().has('MissingLabel','id',1).id()", vec![]),
         (
             "g.V('Account[2]').outE('Owns').as('r').select('r').otherV().id()",
             vec![json!("Device[1]")],

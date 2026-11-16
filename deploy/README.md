@@ -106,7 +106,7 @@ Bolt 5.1–5.4 支持直连、自动提交、显式只读事务和托管只读�
 
 Bolt 按 `PULL` 传输结果，Gremlin 以状态 206 传输中间批次，每批最多 128 条、约 2 MiB。单条记录保留编码预算。两种驱动返回原生节点、边和路径，定点小数及超出有符号 64 位的整数使用字符串。Gremlin 路径的步骤标签和标量保真以当前遍历引擎的路径表示为限。任意 Groovy、字节码策略、动态脚本绑定和 Bolt 集群路由仍超出当前范围。Bolt 和 Gremlin 在完成时返回 `model_revision`。
 
-单机操作审计追加到 `.graphlake-auth/audit.jsonl`，每个文件达到约 32 MiB 后轮转，保留一个 `audit.jsonl.previous`；需长期留存时将两者采集到外部系统。HA 操作审计输出到服务日志。每行记录时间、主体、协议、操作、模型和状态，省略令牌、查询文本、参数与结果内容。部署时可由宿主机收集日志，备份包含该目录。
+单机操作审计追加到 `.graphlake-auth/audit.jsonl`，未认证事件追加到 `.graphlake-auth/audit-anonymous.jsonl`。两个日志分别在约 32 MiB 轮转并各保留一个 `.previous`，长期留存可采集这两组文件。HA 操作审计输出到服务日志。每行记录时间、主体、协议、操作、模型和状态，省略令牌、查询文本、参数与结果内容。部署时可由宿主机收集日志，备份包含该目录。
 
 协议参考见 [Neo4j Bolt](https://neo4j.com/docs/bolt/current/) 和 [Apache TinkerPop](https://tinkerpop.apache.org/docs/3.7.4/reference/)。
 
@@ -185,7 +185,7 @@ curl -fsS http://127.0.0.1:7337/readyz
 
 ## 告警与审计收集
 
-按[生产监控与恢复检查](monitoring.md)配置独立探针和通知。异地恢复使用[恢复清单和 HTTPS 切流验收](cluster.md#绑定恢复点并开放入口)。规则覆盖候选进程、主节点、Worker、客户端入口、模型来源、业务查询恢复、遥测和备份。HA 审计可从每台 Coordinator 的 journal 收集。单机完整审计写入 `.graphlake-auth/audit.jsonl`。角色变更事件 `role_changed` 在本地记录权限和成员的变更前后值。
+按[生产监控与恢复检查](monitoring.md)配置独立探针和通知。异地恢复使用[恢复清单和 HTTPS 切流验收](cluster.md#绑定恢复点并开放入口)。规则覆盖候选进程、主节点、Worker、客户端入口、模型来源、业务查询恢复、遥测和备份。HA 审计可从每台 Coordinator 的 journal 收集。单机审计写入 `.graphlake-auth/audit.jsonl` 和 `.graphlake-auth/audit-anonymous.jsonl`。角色变更事件 `role_changed` 在本地记录权限和成员的变更前后值。
 
 `/metrics` 保留旧指标，另提供 `graphlake_request_duration_seconds` 直方图，按协议、操作和结果分类。用 `outcome="busy"` 统计限流，用 `outcome="timeout"` 统计超时。查询排队用 `protocol="internal",operation="query_slot"`。查询输出行数、源读取次数、对象读取字节及溢写字节是按进程累计的执行量。执行失败、预览截断或跨 Worker 查询时，这些值反映实际观测的数据量。在集群中，从 Worker 的回环 `/metrics` 抓取时需发送集群 Bearer 令牌，或由现有受信任代理在抓取时注入。
 

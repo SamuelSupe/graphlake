@@ -314,6 +314,32 @@ pub(in crate::admin) async fn explore(
                 .ok_or_else(invalid_cursor)
         })
         .transpose()?;
+    let time_dependent = |label: &str| {
+        catalog
+            .mapping(label)
+            .scd2
+            .is_some_and(|scd2| scd2.current_flag.is_none())
+    };
+    let temporal_current = snapshot.is_none()
+        && options
+            .graph
+            .snapshot_time
+            .as_deref()
+            .is_none_or(|time| time.eq_ignore_ascii_case("current"))
+        && (time_dependent(&target.label)
+            || edges.iter().any(|(label, edge)| {
+                time_dependent(label)
+                    || time_dependent(&edge.from.node)
+                    || time_dependent(&edge.to.node)
+            }));
+    let temporal_at = if temporal_current {
+        Some(match &resume {
+            Some(cursor) => cursor.temporal_at.ok_or_else(source_changed)?,
+            None => chrono::Utc::now(),
+        })
+    } else {
+        None
+    };
     if let Some(cursor) = &resume {
         if let Some(search) = &request.search {
             let index = app
@@ -363,7 +389,7 @@ pub(in crate::admin) async fn explore(
             )
             .await;
         }
-    } else if request.neighbors {
+    } else if request.neighbors && !temporal_current {
         let existing = app.explorations.lock().unwrap().find(&signature);
         if let Some((session, saved)) =
             existing.filter(|(_, saved)| snapshot.is_some() || can_replay(&saved.sources))
@@ -424,6 +450,7 @@ pub(in crate::admin) async fn explore(
             resume,
             options,
             snapshot.as_ref(),
+            temporal_at,
             |pages: Arc<pages::Pages>| {
                 published = Some(pages::Production(Arc::clone(&pages)));
                 let _ = send.send(pages);
@@ -602,6 +629,7 @@ async fn read(
     resume: Option<pages::Cursor>,
     options: crate::QueryOptions,
     snapshot: Option<&super::super::cluster::csr::ExplorationSnapshot>,
+    temporal_at: Option<chrono::DateTime<chrono::Utc>>,
     publish: impl FnOnce(Arc<pages::Pages>),
 ) -> ApiResult<()> {
     let catalog = &engine.catalog;
@@ -616,7 +644,12 @@ async fn read(
         .chain(edges.iter().cloned())
         .collect::<BTreeSet<_>>();
     let spill_bytes = options.spill_bytes;
-    let scope = engine.scope(options).await.map_err(query_error)?;
+    let mut scope = engine.scope(options).await.map_err(query_error)?;
+    if let Some(time) = temporal_at {
+        Arc::get_mut(&mut scope)
+            .expect("new exploration scope")
+            .wall_time = time;
+    }
     scope
         .run(async {
             let context = scope.exploration_session();
@@ -708,6 +741,7 @@ async fn read(
                 .map_or(0, |cursor| cursor.page);
             let pages = pages::Pages::new(
                 signature,
+                temporal_at,
                 prepared.versions,
                 postgres,
                 selected,

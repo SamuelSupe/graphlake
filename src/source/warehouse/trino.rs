@@ -2,14 +2,14 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::{
-    arrow::datatypes::{DataType, Field, TimeUnit},
+    arrow::datatypes::{DataType, Field, Schema, TimeUnit},
     catalog::TableProvider,
     execution::{
         disk_manager::DiskManager,
         memory_pool::{MemoryPool, MemoryReservation},
     },
 };
-use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use reqwest::{RequestBuilder, header::CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::Value;
@@ -151,12 +151,44 @@ impl Trino {
             .collect::<Vec<_>>()
             .join(", ");
         let mut metadata_id = None;
-        let (expected, buffer) = {
+        let expected = if !explain_only && !crate::engine::read_filters::needs_sql_types(filters) {
+            let mut id = None;
+            let mut pages = self.pages(format!("SELECT {selected} FROM {relation}"), &mut id);
+            let first = pages
+                .try_next()
+                .await?
+                .context("warehouse result has no schema")?;
+            let fields = first
+                .fields
+                .as_ref()
+                .context("warehouse result has no schema")?;
+            if !fields
+                .iter()
+                .any(|field| matches!(field.data_type(), DataType::Timestamp(_, Some(_))))
+            {
+                let mut pages = futures::stream::iter([Ok(first)]).chain(pages).boxed();
+                let (schema, buffer) = collect_pages(
+                    &self.http,
+                    &mut pages,
+                    columns,
+                    batch_size,
+                    true,
+                    Encoding::Trino,
+                    Some(disk),
+                )
+                .await?;
+                drop(pages);
+                let (table, budget) = buffer.finish(schema, &self.http.stats)?;
+                return Ok((table, budget, id.context("Trino response has no query ID")?));
+            }
+            // Dropping the unnormalized read cancels its remaining pages.
+            Arc::new(Schema::new(fields.clone()))
+        } else {
             let mut pages = self.pages(
                 format!("SELECT {selected} FROM {relation} WHERE FALSE"),
                 &mut metadata_id,
             );
-            collect_pages(
+            let (expected, buffer) = collect_pages(
                 &self.http,
                 &mut pages,
                 columns,
@@ -165,20 +197,22 @@ impl Trino {
                 Encoding::Trino,
                 None,
             )
-            .await?
+            .await?;
+            if explain_only {
+                let (table, budget) = buffer.finish_schema(expected)?;
+                drop(pages);
+                return Ok((
+                    table,
+                    budget,
+                    metadata_id.context("Trino response has no query ID")?,
+                ));
+            }
+            ensure!(
+                buffer.memory().is_empty(),
+                "Trino schema query returned rows"
+            );
+            expected
         };
-        if explain_only {
-            let (table, budget) = buffer.finish_schema(expected)?;
-            return Ok((
-                table,
-                budget,
-                metadata_id.context("Trino response has no query ID")?,
-            ));
-        }
-        ensure!(
-            buffer.memory().is_empty(),
-            "Trino schema query returned rows"
-        );
         // A zone name plus a wall time is ambiguous at a DST fold. Convert
         // before the Trino protocol formats the timestamp as text.
         let projection = expected

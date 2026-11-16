@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::Result;
+use futures::{StreamExt, TryStreamExt};
 
 #[cfg(feature = "admin")]
 use crate::source::{iceberg, postgres::Snapshot};
@@ -20,31 +21,29 @@ impl Engine {
             return Ok(false);
         }
         let mut stores = Stores::new();
-        for source in expected {
-            if self
-                .pinned_version(scope, &source.source, &mut stores)
-                .await?
-                .as_ref()
-                != Some(&source.version)
-            {
+        let reads = expected.iter().map(|source| {
+            let read = self.pinned_version(scope, &source.source, &mut stores);
+            async move { Ok::<_, anyhow::Error>(read?.await?.as_ref() == Some(&source.version)) }
+        });
+        let mut checks = futures::stream::iter(reads).buffer_unordered(8);
+        while let Some(matches) = checks.try_next().await? {
+            if !matches {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    async fn pinned_version(
+    fn pinned_version(
         &self,
         scope: &QueryScope,
         name: &str,
         stores: &mut Stores,
-    ) -> Result<Option<String>> {
-        if let Some(id) = crate::source::parquet_snapshot::logical_id(name) {
-            return Ok(self
-                .managed_parquet
-                .get(&id)
-                .map(|current| current.generation.to_string()));
-        }
+    ) -> Result<impl std::future::Future<Output = Result<Option<String>>> + use<>> {
+        let logical = crate::source::parquet_snapshot::logical_id(name);
+        let managed = logical
+            .and_then(|id| self.managed_parquet.get(&id))
+            .map(|current| current.generation.to_string());
         let configured = self.catalog.sources.values().find_map(|source| {
             let Source::ObjectStorage {
                 storage, tables, ..
@@ -67,20 +66,23 @@ impl Engine {
                         entry.insert(crate::source::storage::open(storage)?)
                     }
                 };
-                (path, Some(&*store))
+                (path, Some(Arc::clone(store)))
             }
             None => (name, None),
         };
-        Ok(Some(
-            parquet::object_version(
-                location,
-                store,
-                Arc::clone(&scope.runtime.memory_pool),
-                Arc::clone(&scope.reads),
-            )
-            .await?
-            .version,
-        ))
+        let location = location.to_owned();
+        let pool = Arc::clone(&scope.runtime.memory_pool);
+        let stats = Arc::clone(&scope.reads);
+        Ok(async move {
+            if logical.is_some() {
+                return Ok(managed);
+            }
+            Ok(Some(
+                parquet::object_version(&location, store.as_ref(), pool, stats)
+                    .await?
+                    .version,
+            ))
+        })
     }
 
     #[cfg(feature = "admin")]
@@ -129,7 +131,7 @@ impl Engine {
                     }
                     version
                 }
-                "pinned object" => match self.pinned_version(scope, name, &mut stores).await? {
+                "pinned object" => match self.pinned_version(scope, name, &mut stores)?.await? {
                     Some(version) => version,
                     None => return Ok(false),
                 },

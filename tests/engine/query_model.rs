@@ -34,6 +34,18 @@ async fn cypher_aggregated_order_only_uses_projected_values() -> Result<()> {
         rows(&mut result).await?,
         [json!({"tenant": 1, "n": 3}), json!({"tenant": 2, "n": 1})]
     );
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "MATCH (a:Account) RETURN a.tenant AS tenant, count(*) AS n
+             ORDER BY a.tenant + count(a.id) ASC, n DESC",
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut result).await?,
+        [json!({"tenant": 2, "n": 1}), json!({"tenant": 1, "n": 3})]
+    );
     Ok(())
 }
 
@@ -292,6 +304,36 @@ async fn cypher_correlated_call_large_page_preserves_key_and_subquery_order() ->
         .take(130)
         .collect::<Vec<_>>();
     assert_eq!(rows(&mut result).await?, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cypher_row_call_replays_ordered_parquet_reads_for_each_key() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "UNWIND [1,3,2,1] AS k
+             CALL (k) {
+                 MATCH (a:Account) WHERE a.id >= k
+                 RETURN DISTINCT a.id AS id ORDER BY id LIMIT 1
+             } RETURN k,id",
+            QueryOptions {
+                batch_size: 1,
+                partitions: 4,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut result).await?,
+        [
+            json!({"k":1,"id":1}),
+            json!({"k":3,"id":3}),
+            json!({"k":2,"id":2}),
+            json!({"k":1,"id":1})
+        ]
+    );
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, ops::ControlFlow};
 
 use datafusion::{
-    arrow::datatypes::Schema,
+    arrow::datatypes::{DataType, Schema},
     sql::sqlparser::ast::{
         BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SetExpr,
         Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
@@ -333,7 +333,7 @@ pub(crate) fn sql_term(
         Comparison::Gt => ">",
         Comparison::Ge => ">=",
     };
-    if !kind.is_integer() {
+    if !kind.is_integer() && !matches!(kind, DataType::Decimal128(_, 0)) {
         return None;
     }
     let value = predicate.value.as_i64()?.to_string();

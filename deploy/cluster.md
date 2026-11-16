@@ -88,11 +88,11 @@ Shuffle 使用压缩 Arrow IPC，先写 Worker 本机临时文件，再发布到
 - 请求固定清单中的 `graph_options` 和来源版本，省略外层 `query`、`language`、`parameters_json` 和 `graph_options`。刷新期间已经接单的查询继续读取旧代次，新查询读取最新代次。使用过期代次开始新查询返回 `409 csr_generation_conflict`。
 - PageRank 和 WCC 在各 Worker 上加载一个分区的顶点状态，并把下一轮状态和按目标分片分组的消息提交到共享存储。接单 Worker 归并每轮的标量收敛信息，并分批收集最终 Arrow 结果。分区重试使用前一轮的已提交状态。每个分片的状态仍受执行该分片的 Worker 内存预算约束。
 - 每个 Worker 可为最近两个已发布代次保留校验过的邻接块，上限为 Worker 单查询预算的八分之一且最多 8 MiB。变长路径可复用同一起点遍历中的小型邻接列表。
-- 响应的 `csr_stats` 提供远端分区数、Worker、重试、对象读取、分区控制消息字节、状态交换文件字节和内存预留峰值。已发布 CSR 对象保存在独立的 `csr/` 前缀，Coordinator 每五分钟检查无人引用的代次。各模型版本的当前指针及运行中任务引用的代次受保护。所有对象写入满 24 小时后，首次确认无人引用时写入回收标记，再过 24 小时并复查引用后删除整代对象。
+- 响应的 `csr_stats` 提供远端分区数、Worker、重试、对象读取、分区控制消息字节、状态交换文件字节和内存预留峰值。已发布 CSR 对象保存在独立的 `csr/` 前缀，Coordinator 每五分钟检查无人引用的代次。各模型版本的当前指针及尚有租约任务引用的代次受保护。同轮引用检查固定在一个 etcd 修订并分页读取。启用 HA 时由当前 Coordinator 主节点回收。所有对象写入满 24 小时后，首次确认无人引用时写入回收标记，再过 24 小时并复查引用后删除整代对象。
 
 普通 Cypher 查询可在请求体中提交顶层 `csr_generation`，同时保留原 `language: "cypher"`、`query`、参数和结果选项。变长关系、`shortestPath()` 和 `allShortestPaths()` 使用该代次的正反邻接。刷新会生成第 5 版快照，按实体 ID 组织类型化属性块。列表表达式、`UNWIND` 和图预览按命中的节点或边 ID 批量读取。Worker 对当前邻接候选执行关系模式内联属性过滤，`csr_stats.filtered_arcs` 记录被过滤的邻接项。请求省略 `csr_generation` 时读取实时来源。第 3 版快照支持原有执行路径，刷新后启用索引和 Worker 过滤。第 2 版快照需要刷新才能用于普通 Cypher 和分布式 WCC。
 
-查询结果的属性查看、邻居展开和搜索可向 `POST /api/v1/models/{id}/explore` 提交结果中的 `model_revision`、`csr_generation` 和图范围，使用原代次的实体标识和数据。发布新代次或新模型版本后，只要原代次对象和模型归档仍在，已有结果可继续探索。快照被清理后返回 `409 csr_snapshot_expired`，可用当前已发布代次重新运行查询。
+查询结果的属性查看、邻居展开和搜索可向 `POST /api/v1/models/{id}/explore` 提交结果中的 `model_revision`、`csr_generation` 和图范围，使用原代次的实体标识和数据。发布新代次或新模型版本后，只要原代次对象和模型归档仍在，已有结果可继续探索。快照被清理后返回 `409 csr_snapshot_expired`，可用当前已发布代次重新运行查询。直接从来源探索带时间区间的 SCD2 映射时，每次新探索使用当前时间，该探索签发的游标保留开始时的时间。
 
 第 4 版及更新的快照支持整数和 Decimal 关系属性的块级范围与独立列页，以及浮点和字符串关系属性的独立列页。Worker 可用整数和 Decimal 的范围排除无匹配的块，再通过范围读取取回剩余块的谓词列。浮点和字符串在列页上执行原 Cypher 比较规则。包含未索引列的过滤继续读取类型化属性块。`csr_stats.skipped_property_blocks` 和 `csr_stats.filter_column_pages` 分别记录跳过的属性块和读取的列页。
 

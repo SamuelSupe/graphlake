@@ -115,7 +115,7 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 | `tidb` / `oceanbase` | 同样使用 MySQL 连接字段；OceanBase 仅支持 MySQL 模式租户。按语句读取，不声明跨表一致快照。 |
 | `mariadb` | 使用 MySQL 连接字段；InnoDB 只读重复读事务，使用 MariaDB 的 `max_statement_time`。 |
 | `sqlserver_native` | `host`、`port`、`database`、`user`、`password_env`，TLS 默认开启，可配置 `ca_file`。通过 TDS 直接执行生成的 SELECT；按语句读取，不声明跨表同一快照。读取账号应只授予 SELECT 和所需元数据权限。 |
-| `oracle_native` | `connect_string`、`user`、`password_env`。使用 Easy Connect 或 TNS 名称；GraphLake 进程所在机器需安装 Oracle Instant Client，库搜索路径需能找到客户端库。使用只读事务，`NUMBER(p,s)` 在可表达时使用整数或 Decimal128；无固定精度的 `NUMBER` 和 Oracle `FLOAT` 映射为 Float64，超出 Arrow 定点类型范围的固定精度数值保留为文本。需要精确金额、比较或业务键的列应在源视图中显式转为合适的 `NUMBER(p,s)`；无法选定固定精度和标度时，可显式以文本保留原值。Oracle DATE 保留时分秒。 |
+| `oracle_native` | `connect_string`、`user`、`password_env`。使用 Easy Connect 或 TNS 名称；GraphLake 进程所在机器需安装 Oracle Instant Client，库搜索路径需能找到客户端库。使用只读事务，`NUMBER(p,s)` 在可表达时使用整数或 Decimal128；无固定精度的 `NUMBER`、Oracle `FLOAT` 和超出 Arrow 定点类型范围的数值以文本保留原始精度。需要数值排序或计算时，可在源视图中声明合适的 `NUMBER(p,s)`。Oracle DATE 保留时分秒。 |
 | `mongodb_native` | `dsn_env` 保存 `mongodb://` 或 `mongodb+srv://` 连接串。引用使用 `source.database.collection`。默认采样 1000 条推断结构，`schema_sample_size` 可设为 1–10000；空集合或采样内全为空的字段无法推断。嵌套对象展开为点分字段，数组保留为 Extended JSON 文本，ObjectId 为十六进制文本，Decimal128 保留为十进制文本。采样和后续读取发现类型不一致时失败，不做静默转换。普通游标不保证一致快照，`require_consistent_snapshot` 拒绝此来源。 |
 | `duckdb` | `path` 指向服务端数据库文件，引用使用 `source.schema.table`（常见模式为 `main`）。只读打开并使用事务；禁止外部访问与自动扩展访问，关闭 DuckDB 临时落盘，查询结果通过 GraphLake 的磁盘配额溢写。DuckDB 执行引擎预留查询内存预算的一半；读取期间文件不能由其他进程写入。 |
 | `databricks` | 工作区 `uri`、`token_env`、SQL Warehouse ID `warehouse`、`catalog`；引用使用 `source.schema.table`。通过 Statement Execution API 读取 JSON_ARRAY 分页，校验行数、游标和截断标记，超时取消语句。使用 INLINE 结果，受 Databricks 的 INLINE 大小限制；超过限制需缩小远端视图，不会返回部分结果。复杂类型应在远端视图转为标量。 |
@@ -153,7 +153,7 @@ DuckDB 可利用行组的列最小值和最大值裁剪有序 `LIMIT` 的扫描�
 Parquet 表显式列出文件，YAML 中的相对路径以配置文件目录为准。同一表各文件的映射列须具有相同的 Arrow 类型。HTTP 服务须支持 HEAD、Range 和强 ETag。S3 使用 `AWS_REGION` 等标准 AWS 配置，也可通过 `AWS_ENDPOINT` 指定兼容服务。
 
 
-Snowflake、Spanner、SAP HANA 和 Oracle 直连使用 Arrow 微秒时间戳。SQL Server 的 `datetime2` 和 `datetimeoffset` 在声明 7 位小数时使用纳秒保留 100 ns 精度，其余时间戳使用微秒；`datetimeoffset` 以 UTC 表示。Trino 按声明精度选择微秒或纳秒，并在服务端将带时区值转为 UTC。ClickHouse 的 `DateTime` 以时间戳读取。当值超出对应 Arrow 类型的范围或精度时，查询返回对应列的错误，例如 9999-12-31 超过纳秒时间戳的范围；可在源视图中选择微秒精度或显式读取文本。
+Snowflake、Spanner、SAP HANA 和 Oracle 直连使用 Arrow 微秒时间戳。SQL Server 时间戳使用微秒，覆盖 `datetime2` 和 `datetimeoffset` 的完整日期范围。第七位小数非零时返回精度错误，可在源视图中以文本读取原值。`datetimeoffset` 以 UTC 表示，独立的 `time` 列使用纳秒。Trino 按声明精度选择微秒或纳秒，并在服务端将带时区值转为 UTC。ClickHouse 的 `DateTime` 以时间戳读取。当值超出对应 Arrow 类型的范围或精度时，查询返回对应列的错误，例如 9999-12-31 超过纳秒时间戳的范围；可在源视图中选择微秒精度或显式读取文本。
 
 PostgreSQL 无穷日期、无穷时间戳和定点 `NaN` 在读取时报告具体值和类型。需要这些值或无精度约束的 `NUMERIC` 时，可在源端创建只读视图，将相应列转成 `text`，例如 `valid_until::text AS valid_until`。有限日期与定点数继续使用 Arrow 类型。
 
@@ -262,7 +262,7 @@ Snowflake 表引用形如 `snow.FINANCE.PUBLIC.TRANSFERS`，按映射中的精�
 
 ClickHouse 通过 HTTP 读取 ArrowStream，将 Date 和 Nullable(Date) 映射为 Arrow Date32，表引用使用 `source.database.table`。配置 `user` 和可选的 `password_env`。投影下推到 ClickHouse，默认以 Arrow Utf8 读取字符串并展开 LowCardinality 字符串。若只读账号禁止更改查询设置，引擎沿用服务器配置的 Arrow 格式和远端执行限制。查询结果按语句记录 ClickHouse 查询 ID。锁定只读配置需在服务端设置远端执行时限和断连取消，GraphLake 仍按请求超时停止等待。
 
-Trino 通过协调器的 HTTP 查询协议读取 `source.catalog.schema.table`。配置 `user`，并按协调器认证方式配置 `token_env` 或 `password_env`。引擎读取分页结果，保留十进制精度，并启用 Trino 参数化时间类型以保留不超过纳秒的时间精度。带时区时间戳归一为 UTC。数组、Map、Row 等结构化 Trino 列需要先在远端视图中展开或转换。结果按表记录 Trino 查询 ID。
+Trino 通过协调器的 HTTP 查询协议读取 `source.catalog.schema.table`。配置 `user`，并按协调器认证方式配置 `token_env` 或 `password_env`。引擎读取分页结果，保留十进制精度，并启用 Trino 参数化时间类型以保留不超过纳秒的时间精度。带时区时间戳在 Trino 端归一为 UTC，未选取带时区列且无需类型下推时，直接复用首个结果页。数组、Map、Row 等结构化 Trino 列需要先在远端视图中展开或转换。结果按表记录 Trino 查询 ID。
 
 ```yaml
 sources:
@@ -450,7 +450,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml query --language 
   "g.V([1,10]).hasLabel('Account').repeat(__.out('Transfer')).times(2).dedup().values('account_id').order()"
 ```
 
-支持 `V/E`、`has/hasLabel/hasId`、`in/out/both` 及边遍历、`inV/outV/bothV/otherV`、`values/label/id/is`、`dedup/count/order/limit/range`、有界 `repeat(...).times(n)`、`simplePath/path` 和 `as/select`。`g.V()` 从全部节点标签开始，`g.E()` 从全部关系类型开始。可通过 `hasLabel('Account','Device')` 筛选多个标签，或用 `g.V('Account[1,10]')` 指定包含标签的身份。`hasId('Account[1,10]', 'Device[2]')` 接受多个完整身份，也可按原始业务键筛选。`range(low, high)` 从零计数，包含起点并排除终点，`high = -1` 表示取到末尾。遍历支持带类型的属性列和复合业务键。方向步骤省略关系标签时会遍历所有匹配方向的边类型。`bothV()` 返回边的两个端点，`otherV()` 根据遍历路径里进入边的顶点返回另一端。`path()` 返回带标签的业务键和标量序列。支持范围为嵌入式只读 Gremlin 文本。
+支持 `V/E`、`has/hasLabel/hasId`、`in/out/both` 及边遍历、`inV/outV/bothV/otherV`、`values/label/id/is`、`dedup/count/order/limit/range`、有界 `repeat(...).times(n)`、`simplePath/path` 和 `as/select`。`g.V()` 从全部节点标签开始，`g.E()` 从全部关系类型开始。可通过 `hasLabel('Account','Device')` 筛选多个标签，或用 `g.V('Account[1,10]')` 指定包含标签的身份。`hasId('Account[1,10]', 'Device[2]')` 接受多个完整身份，也可按原始业务键筛选。`range(low, high)` 从零计数，包含起点并排除终点，`high = -1` 表示取到末尾。遍历支持带类型的属性列和复合业务键。方向步骤省略关系标签时会遍历所有匹配方向的边类型。`bothV()` 返回边的两个端点，`otherV()` 根据遍历路径里进入边的顶点返回另一端。此步骤用业务键的文本表示定位前一顶点。节点键与边端点列应映射为相同类型，避免类型不同导致相同数值的文本表示不一致。`path()` 返回带标签的业务键和标量序列。支持范围为嵌入式只读 Gremlin 文本。
 
 `project('a','b')` 对每条遍历记录生成一个结构体，`select('a','b')` 同时读取多个步骤标签。`by()` 保留当前值，`by('field')` 读取属性，`by(out('Transfer').count())` 对每条记录执行子遍历。投影缺失的字段为 `null`。可继续用 `select('b')` 取出结果中的一个值。异构值通过带类型的 Arrow 结构体保存。
 

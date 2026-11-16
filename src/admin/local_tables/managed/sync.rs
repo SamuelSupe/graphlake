@@ -1,6 +1,6 @@
 use std::{io::Write as _, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use uuid::Uuid;
 
 use super::metadata::{Historical, Pending};
@@ -53,8 +53,12 @@ fn view(record: &Record) -> View {
     }
 }
 
-fn recover(record: &mut Record, owner: &str) -> bool {
-    if !record.pending.as_ref().is_some_and(|p| p.owner != owner) {
+fn recover(record: &mut Record, owner: &str, running: bool) -> bool {
+    let Some(pending) = &record.pending else {
+        return false;
+    };
+    let same_owner = pending.owner == owner;
+    if same_owner && running {
         return false;
     }
     record.pending = None;
@@ -66,7 +70,11 @@ fn recover(record: &mut Record, owner: &str) -> bool {
     {
         run.status = "interrupted".into();
         run.finished_at_ms = Some(now());
-        run.error = Some("Coordinator 切换中断了任务，可基于已提交水位重试".into());
+        run.error = Some(if same_owner {
+            "同步结果未确认，可基于已提交水位重试".into()
+        } else {
+            "Coordinator 切换中断了任务，可基于已提交水位重试".into()
+        });
     }
     if !record.table.schedule_paused {
         record.table.next_run_at_ms = record
@@ -164,12 +172,13 @@ impl Managed {
                 .await
                 .map_err(error)?
                 .ok_or_else(Error::not_found)?;
-            recover(&mut record, &owner);
+            let key = format!("{}/{}", record.table.model, record.table.config.name);
+            let running = app.local_tables.running.lock().unwrap().contains_key(&key);
+            recover(&mut record, &owner, running);
             if record.pending.is_some() {
                 return Err(conflict("此表正在加载，请等待完成或取消任务"));
             }
-            let key = format!("{}/{}", record.table.model, record.table.config.name);
-            if app.local_tables.running.lock().unwrap().contains_key(&key) {
+            if running {
                 return Err(Error::busy());
             }
             let run = prepare_run(&mut record.table, mode, scheduled, record.head.is_some())?;
@@ -191,7 +200,6 @@ impl Managed {
                 .unwrap()
                 .insert(key.clone(), cancel.clone());
             tokio::spawn(async move {
-                let _permit = permit;
                 let result = tokio::select! {
                     biased;
                     _ = lease.cancelled() => Err(anyhow::anyhow!("managed sync interrupted by leadership change")),
@@ -201,15 +209,20 @@ impl Managed {
                         result.unwrap_or_else(|_| Err(anyhow::anyhow!("deadline exceeded")))
                     }
                 };
+                drop(permit);
                 let cached = result
                     .as_ref()
                     .ok()
                     .and_then(|(_, head)| head.as_ref().or(record.head.as_ref()))
                     .map(|head| head.generation);
                 let mut logged = false;
+                let confirmation_deadline = tokio::time::sleep(Duration::from_secs(30));
+                tokio::pin!(confirmation_deadline);
                 loop {
                     let finished = tokio::select! {
+                        biased;
                         _ = app.shutdown.cancelled() => break,
+                        _ = &mut confirmation_deadline => break,
                         finished = managed.finish(&app, id, task.id, &owner, &result, cancel.is_cancelled()) => finished,
                     };
                     match finished {
@@ -314,10 +327,9 @@ impl Managed {
         }
         leader.confirm().await.map_err(api_error)?;
         for _ in 0..8 {
-            let (mut record, rev) = self
-                .record(id)
-                .await?
-                .context("managed table disappeared")?;
+            let Some((mut record, rev)) = self.record(id).await? else {
+                return Ok(false);
+            };
             if !record
                 .pending
                 .as_ref()
@@ -361,21 +373,67 @@ impl Managed {
             return;
         };
         for (mut record, rev) in records {
-            if recover(&mut record, &owner) {
-                let _ = self.save(&record, rev, leader).await;
+            if record.pending.is_some() {
+                // start() holds the same lock across publishing pending and
+                // registering the task locally.
+                let _serial = app.local_tables.create_work.lock().await;
+                let key = format!("{}/{}", record.table.model, record.table.config.name);
+                let running = app.local_tables.running.lock().unwrap().contains_key(&key);
+                if recover(&mut record, &owner, running) {
+                    let _ = self.save(&record, rev, leader).await;
+                }
                 continue;
             }
-            if record.pending.is_none()
-                && [
-                    record.table.next_run_at_ms,
-                    record.table.next_reconcile_at_ms,
-                ]
-                .into_iter()
-                .flatten()
-                .any(|due| due <= now())
+            if [
+                record.table.next_run_at_ms,
+                record.table.next_reconcile_at_ms,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|due| due <= now())
             {
                 let _ = self.start(app, record.table.data_id, None, true).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn orphaned_confirmation_can_recover_without_changing_the_committed_head() -> Result<()> {
+        let id = Uuid::new_v4();
+        let mut table: Table = serde_json::from_value(json!({
+            "model":"model", "data_id":id, "revision":Uuid::new_v4(), "managed":true,
+            "source":{"type":"sqlite","path":"unused"},
+            "config":{"name":"local", "source_table":"main.events", "columns":["id"], "mode":"full"},
+            "history":[]
+        }))?;
+        let run = prepare_run(&mut table, None, false, true).map_err(api_error)?;
+        let head = Head {
+            generation: Uuid::new_v4(),
+            upload: Uuid::new_v4(),
+            sha256: "digest".into(),
+            watermark: Some(json!(42)),
+        };
+        let mut record = Record {
+            table,
+            head: Some(head.clone()),
+            retired: Vec::new(),
+            pending: Some(Pending {
+                run: run.id,
+                owner: "leader".into(),
+            }),
+        };
+        assert!(!recover(&mut record, "leader", true));
+        assert_eq!(record.table.history[0].status, "running");
+        assert!(recover(&mut record, "leader", false));
+        assert_eq!(record.table.history[0].status, "interrupted");
+        assert!(record.pending.is_none());
+        assert_eq!(record.head, Some(head));
+        Ok(())
     }
 }

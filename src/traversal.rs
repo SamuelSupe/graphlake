@@ -157,8 +157,30 @@ impl Engine {
             TraversalStrategy::Auto | TraversalStrategy::Cached
         ) && let Some(cache) = &self.cache
         {
-            match cache.load(edge, direction, Arc::clone(scope)).await {
-                Ok(Some(generation)) => {
+            let mapping = &self.catalog.edges[edge];
+            let time_sensitive = scope
+                .options
+                .graph
+                .snapshot_time
+                .as_deref()
+                .is_none_or(|time| time.eq_ignore_ascii_case("current"))
+                && (mapping.scd2.is_some()
+                    || self.catalog.nodes[&mapping.from.node].scd2.is_some()
+                    || self.catalog.nodes[&mapping.to.node].scd2.is_some());
+            let loaded = if strategy == TraversalStrategy::Auto && time_sensitive {
+                Ok(None)
+            } else {
+                cache.load(edge, direction, Arc::clone(scope)).await
+            };
+            match loaded {
+                Ok(Some(generation))
+                    if strategy == TraversalStrategy::Cached
+                        || (!time_sensitive
+                            && self
+                                .pinned_versions_match(scope, &generation.versions)
+                                .await
+                                .unwrap_or(false)) =>
+                {
                     *scope.csr_generation.lock().expect("CSR metrics") =
                         Some(generation.generation.clone());
                     let prepared = Prepared {
@@ -665,8 +687,15 @@ fn walk_batches<'a>(
         let mut hits = Vec::new();
         let mut work = 0;
         let mut path_bytes = 0;
+        let mut state: Option<Walk> = None;
         for start in starts {
-            let mut walk = Walk::new(topology, start, target, kind.clone(), output.shortest, output.track_vertices);
+            let walk = match &mut state {
+                Some(walk) => {
+                    walk.restart(topology, start, target);
+                    walk
+                }
+                slot => slot.insert(Walk::new(topology, start, target, kind.clone(), output.shortest, output.track_vertices)),
+            };
             loop {
                 match walk.step(topology, max_hops) {
                     Step::Done => break,

@@ -338,6 +338,20 @@ impl<'a> Traversers<'a> {
         )
     }
 
+    pub(super) fn shared_input(&self, table: &str, readers: usize) -> Option<String> {
+        // A lexical CTE or a recursive SQL frontier is only visible inside its
+        // enclosing statement. Ordinary repeat frontiers are registered tables.
+        if readers > 1 && self.ctes.is_empty() && !self.recursive {
+            self.stages.borrow_mut().push(super::repeat::Stage::Shared {
+                table: table.into(),
+                sql: self.sql.clone(),
+            });
+            None
+        } else {
+            Some(format!("{} AS ({})", ident(table), self.sql))
+        }
+    }
+
     pub(super) fn select_tag(&mut self, name: &str) -> Result<()> {
         let entities = self
             .tags
@@ -345,7 +359,7 @@ impl<'a> Traversers<'a> {
             .with_context(|| format!("unknown step label {name}"))?
             .clone();
         let table = self.fresh("select");
-        let base = self.sql.clone();
+        let cte = self.shared_input(&table, entities.len());
         let states = entities
             .into_iter()
             .map(|entity| {
@@ -362,34 +376,36 @@ impl<'a> Traversers<'a> {
             })
             .collect::<Vec<_>>();
         let combined = self.combine(&states);
-        self.sql = format!("WITH {} AS ({base}) {combined}", ident(&table));
+        self.sql = with_input(cte, combined);
         Ok(())
     }
 
     pub(super) fn dispatch(&mut self, step: &Step<'_>, depth: usize) -> Result<()> {
         let table = self.fresh("variant");
-        let base = self.sql.clone();
-        let cte = format!("{} AS ({base})", ident(&table));
         let mut states = Vec::new();
-        for mut state in self.lanes(&table) {
-            if !state.applicable(step)? {
-                continue;
+        for state in self.lanes(&table) {
+            if state.applicable(step)? {
+                states.push(state);
             }
-            state.ctes.push(cte.clone());
+        }
+        if states.is_empty() {
+            self.restrict("FALSE");
+            return Ok(());
+        }
+        let cte = self.shared_input(&table, states.len());
+        for state in &mut states {
+            if let Some(cte) = &cte {
+                state.ctes.push(cte.clone());
+            }
             state.next_column = self.next_column;
             state.apply(std::slice::from_ref(step), depth)?;
             // An implicit multi-edge hop may build an internal branch. All lanes
             // still carry the ordering of their common input.
             state.order.clone_from(&self.order);
             self.next_column = self.next_column.max(state.next_column);
-            states.push(state);
         }
-        if states.is_empty() {
-            self.restrict("FALSE");
-        } else {
-            let combined = self.combine(&states);
-            self.sql = format!("WITH {cte} {combined}");
-        }
+        let combined = self.combine(&states);
+        self.sql = with_input(cte, combined);
         Ok(())
     }
 
@@ -579,13 +595,16 @@ impl<'a> Traversers<'a> {
             ));
         }
         ensure!(!reads.is_empty(), "unknown property {property} for order()");
-        self.sql = format!(
-            "WITH {} AS ({}) {}",
-            ident(&seed),
-            self.sql,
-            crate::catalog::union_all(&reads)
-        );
+        let cte = self.shared_input(&seed, reads.len());
+        self.sql = with_input(cte, crate::catalog::union_all(&reads));
         Ok(())
+    }
+}
+
+pub(super) fn with_input(cte: Option<String>, sql: String) -> String {
+    match cte {
+        Some(cte) => format!("WITH {cte} {sql}"),
+        None => sql,
     }
 }
 

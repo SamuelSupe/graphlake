@@ -61,12 +61,18 @@ pub(super) async fn source_available(path: PathBuf) -> bool {
 
 pub(super) fn watch_source(path: PathBuf, stop: CancellationToken) {
     tokio::spawn(async move {
+        let mut failures = 0;
         loop {
             tokio::select! {
                 _ = stop.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(450)) => {}
             }
-            if !source_available(path.clone()).await {
+            if source_available(path.clone()).await {
+                failures = 0;
+                continue;
+            }
+            failures += 1;
+            if failures >= 2 {
                 super::telemetry::event(
                     opentelemetry::logs::Severity::Error,
                     "catalog_storage_lost",
@@ -422,7 +428,10 @@ async fn mutate_inner(
             let error = failed.err().unwrap_or_else(control::lost);
             // A preflight pause did not send a write. A lost write response can
             // hide a commit, so retire instead of serving the previous snapshot.
-            if error.code != control::UNCERTAIN {
+            if matches!(
+                error.code,
+                control::MUTATION_UNKNOWN | "coordinator_not_leader"
+            ) {
                 ha.leader.retire();
             }
             return Err(error);
@@ -628,7 +637,10 @@ pub(super) async fn change_policy(
             Ok(Some(_)) => app.access.apply_config(&body)?,
             result => {
                 let error = result.err().unwrap_or_else(control::lost);
-                if error.code != control::UNCERTAIN {
+                if matches!(
+                    error.code,
+                    control::MUTATION_UNKNOWN | "coordinator_not_leader"
+                ) {
                     leader.retire();
                 }
                 return Err(error);

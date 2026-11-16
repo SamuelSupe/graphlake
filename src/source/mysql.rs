@@ -116,8 +116,9 @@ impl Snapshot {
         let builder = OptsBuilder::from_opts(opts)
             .prefer_socket(false)
             .ssl_opts(ssl);
-        let mut conn = Conn::new(builder)
+        let mut conn = tokio::time::timeout(timeout, Conn::new(builder))
             .await
+            .context("MySQL connection timed out")?
             .context("opening MySQL connection")?;
         let timeout_ms = timeout.as_millis().clamp(1, u32::MAX as u128);
         let mut setup = vec![
@@ -457,8 +458,12 @@ fn native_scan(
             terms.push(term);
         } else if filter.op == Comparison::Eq && exact_text(&filter.column) {
             let value = filter.value.as_str()?;
-            terms.push(format!("CAST({} AS BINARY) = ?", ident(&filter.column)));
-            params.push(Value::Bytes(value.as_bytes().to_vec()));
+            let column = ident(&filter.column);
+            terms.push(format!("({column} = ? AND CAST({column} AS BINARY) = ?)"));
+            params.extend([
+                Value::Bytes(value.as_bytes().to_vec()),
+                Value::Bytes(value.as_bytes().to_vec()),
+            ]);
         } else {
             return None;
         }

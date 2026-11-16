@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use super::{PATH, Step, Traversers, condition, parse_chain, qualified, scalar_identity, text};
 use super::{
-    repeat::{OutputLimit, Repeat},
+    repeat::{OutputLimit, Repeat, Stage},
     variants::{Kind, extend_tags},
 };
 use crate::catalog::ident;
@@ -646,7 +646,7 @@ impl Traversers<'_> {
                 step = step.lanes(&seed).pop().expect("single work kind");
             }
             step.ctes.clear();
-            step.repeats = Rc::new(RefCell::new(Vec::new()));
+            step.stages = Rc::new(RefCell::new(Vec::new()));
             step.apply(steps, depth + 1)?;
             let merged = kinds
                 .iter()
@@ -816,22 +816,24 @@ impl Traversers<'_> {
                 .all(|sql| sql.len() <= 256 * 1024),
             "Gremlin repeat plan exceeds 256 KiB"
         );
-        self.repeats.borrow_mut().push(Repeat {
-            table: table.clone(),
-            seed,
-            seen,
-            initial,
-            body,
-            checked,
-            after,
-            emitted,
-            eligible,
-            post_eligible,
-            emit_before,
-            limit,
-            nested: step.repeats.take(),
-            checked_nested,
-        });
+        self.stages
+            .borrow_mut()
+            .push(Stage::Repeat(Box::new(Repeat {
+                table: table.clone(),
+                seed,
+                seen,
+                initial,
+                body,
+                checked,
+                after,
+                emitted,
+                eligible,
+                post_eligible,
+                emit_before,
+                limit,
+                nested: step.stages.take(),
+                checked_nested,
+            })));
         self.sql = format!("SELECT * FROM {}", ident(&table));
         if let Some((iteration, position)) = tracked {
             self.order = vec![(position, false), (iteration, false)];
@@ -857,7 +859,7 @@ impl Traversers<'_> {
         predicate: &[Step<'_>],
         (flag, distinct): (&str, Option<&str>),
         depth: usize,
-    ) -> Result<(String, Vec<Repeat>)> {
+    ) -> Result<(String, Vec<Stage>)> {
         let table = self.fresh("predicate");
         let row = self.fresh("predicate_row");
         let cte = format!(
@@ -869,7 +871,7 @@ impl Traversers<'_> {
         let mut check = work.clone();
         check.next_column = self.next_column;
         check.ctes = vec![cte.clone()];
-        check.repeats = Rc::default();
+        check.stages = Rc::default();
         check.sql = format!("SELECT * FROM {}", ident(&table));
         check.enter_branch(&row);
         check.apply(predicate, depth + 1)?;
@@ -902,7 +904,7 @@ impl Traversers<'_> {
              LEFT JOIN (SELECT DISTINCT {row}{key} FROM ({}) AS v) AS m ON v.{row} = m.{row}",
             check.sql
         );
-        Ok((sql, check.repeats.take()))
+        Ok((sql, check.stages.take()))
     }
 
     fn try_recursive_repeat(
@@ -944,6 +946,7 @@ impl Traversers<'_> {
             condition
         };
         let mut step = self.clone();
+        step.recursive = true;
         step.control_columns.push(seen);
         step.sql = format!(
             "SELECT v.* FROM {} AS v WHERE NOT coalesce(({condition}), FALSE)",

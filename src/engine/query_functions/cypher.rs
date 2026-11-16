@@ -47,6 +47,10 @@ pub(super) fn register(context: &SessionContext) {
     context.register_udf(ScalarUDF::from(CypherList(Signature::variadic_any(
         Volatility::Immutable,
     ))));
+    context.register_udf(ScalarUDF::from(Size(Signature::any(
+        1,
+        Volatility::Immutable,
+    ))));
     entity::register(context);
     hydrate::register(context);
     arithmetic::register(context);
@@ -970,4 +974,49 @@ fn encode_order_bytes(bytes: &[u8], key: &mut Vec<u8>) {
         }
     }
     key.extend_from_slice(&[0, 0]);
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Size(Signature);
+
+impl ScalarUDFImpl for Size {
+    fn name(&self) -> &str {
+        "__graphlake_cypher_size"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.0
+    }
+
+    fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+        if matches!(
+            args[0],
+            DataType::Null
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(_, _)
+        ) {
+            Ok(DataType::UInt64)
+        } else {
+            datafusion::common::plan_err!("size() requires a string or list")
+        }
+    }
+
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let kind = args.args[0].data_type();
+        let function = match kind {
+            DataType::Null => return args.args[0].cast_to(&DataType::UInt64, None),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                datafusion::functions::unicode::character_length()
+            }
+            _ => datafusion::functions_nested::length::array_length_udf(),
+        };
+        args.return_field = Arc::new(Field::new("length", function.return_type(&[kind])?, true));
+        function
+            .invoke_with_args(args)?
+            .cast_to(&DataType::UInt64, None)
+    }
 }

@@ -52,6 +52,7 @@ impl Snapshot {
         let guard = cancelled.clone().drop_guard();
         let stop = cancelled.clone();
         let path = path.to_owned();
+        let started = std::time::Instant::now();
         stats.request();
         let connection = tokio::task::spawn_blocking(move || -> Result<Connection> {
             ensure!(!stop.is_cancelled(), "SQLite read cancelled");
@@ -59,7 +60,15 @@ impl Snapshot {
                 path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            connection.busy_timeout(timeout.min(Duration::from_millis(100)))?;
+            let busy = stop.clone();
+            connection.busy_handler(Some(move |_| {
+                let left = timeout.saturating_sub(started.elapsed());
+                if left.is_zero() || busy.is_cancelled() {
+                    return false;
+                }
+                std::thread::sleep(left.min(Duration::from_millis(10)));
+                !busy.is_cancelled() && started.elapsed() < timeout
+            }))?;
             connection.progress_handler(1000, Some(move || stop.is_cancelled()))?;
             connection.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN")?;
             // BEGIN is deferred: reading sqlite_schema pins the snapshot before

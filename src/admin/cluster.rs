@@ -4,6 +4,7 @@ pub(super) mod control;
 pub(crate) mod csr;
 pub(crate) mod distributed;
 mod results;
+mod retention;
 pub(in crate::admin) mod store;
 mod worker;
 
@@ -19,7 +20,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use axum::{http::StatusCode, response::Response};
+use axum::{
+    http::{HeaderMap, StatusCode},
+    response::Response,
+};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,6 +41,28 @@ use super::{
 use config::{Config, Shared};
 pub(super) use results::resume;
 use store::{Job, JobState, Metadata, Objects, VersionedJob, now_ms};
+
+const WORK_BUDGET_HEADER: &str = "x-graphlake-work-budget-ms";
+
+fn work_deadline(
+    headers: &HeaderMap,
+    started: Instant,
+    legacy_deadline: u64,
+) -> ApiResult<Instant> {
+    let budget = match headers.get(WORK_BUDGET_HEADER) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| Error::invalid("invalid_work_budget", "集群请求时间预算无效"))?,
+        // Older senders omit the relative budget during a rolling upgrade.
+        None => legacy_deadline.saturating_sub(now_ms()),
+    };
+    if budget == 0 {
+        return Err(timeout());
+    }
+    Ok(started + Duration::from_millis(budget.min(86_400_000)))
+}
 
 const WAIT: Duration = Duration::from_millis(150);
 const RESULT_TTL: u64 = 30 * 60;
@@ -253,7 +279,7 @@ impl Coordinator {
     }
 
     pub fn start_cleanup(&self, shutdown: crate::CancellationToken) {
-        let objects = self.shared.objects.clone();
+        let shared = self.shared.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -261,9 +287,23 @@ impl Coordinator {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        if !matches!(tokio::time::timeout(Duration::from_secs(30), objects.expire_results()).await, Ok(Ok(()))) {
-                            super::telemetry::event(opentelemetry::logs::Severity::Warn,
-                                "retention_sweep_failed", json!({}));
+                        let timeout = Duration::from_secs(120);
+                        let (results, generations) = tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            sweeps = async {
+                                tokio::join!(
+                                    tokio::time::timeout(timeout, shared.objects.expire_results()),
+                                    tokio::time::timeout(timeout, retention::sweep(
+                                        &shared.metadata, &shared.objects, chrono::Utc::now()
+                                    ))
+                                )
+                            } => sweeps,
+                        };
+                        for (area, result) in [("results", results), ("generations", generations)] {
+                            if !matches!(result, Ok(Ok(()))) {
+                                super::telemetry::event(opentelemetry::logs::Severity::Warn,
+                                    "retention_sweep_failed", json!({"area":area}));
+                            }
                         }
                     }
                 }
@@ -453,6 +493,9 @@ impl Coordinator {
                 .map_err(storage)?
             {
                 self.shared.objects.clean_results(id, job.attempt).await;
+                if let Some(ha) = &app.ha {
+                    ha.leader.confirm().await?;
+                }
                 return Err(Error::new(
                     StatusCode::CONFLICT,
                     "duplicate_request_id",
@@ -463,7 +506,7 @@ impl Coordinator {
                 self.cancel(app, &job.owner, id).await?;
                 return Err(cancelled());
             }
-            self.dispatch(&dispatch).await?;
+            self.dispatch(&dispatch, deadline).await?;
             let mut polls = 0;
             loop {
                 let saved = self
@@ -568,7 +611,12 @@ impl Coordinator {
                         objects.clean_results(id, old_attempt).await;
                     });
                     // A subsequent GET can also dispatch this attempt if the connection drops.
-                    self.dispatch(&dispatch).await?;
+                    self.dispatch(
+                        &dispatch,
+                        Instant::now()
+                            + Duration::from_millis(job.deadline_ms.saturating_sub(now_ms())),
+                    )
+                    .await?;
                 } else {
                     self.shared.objects.clean_results(id, job.attempt).await;
                 }
@@ -621,7 +669,7 @@ impl Coordinator {
             .ok()
     }
 
-    async fn dispatch(&self, dispatch: &Dispatch) -> ApiResult<()> {
+    async fn dispatch(&self, dispatch: &Dispatch, deadline: Instant) -> ApiResult<()> {
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut busy = false;
         for url in self
@@ -632,13 +680,18 @@ impl Coordinator {
             .take(self.workers.len())
         {
             let url = url.join("/internal/v1/jobs").expect("validated worker URL");
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(timeout());
+            }
             let response = self
                 .shared
                 .client
                 .post(url)
+                .header(WORK_BUDGET_HEADER, remaining.as_millis().max(1).to_string())
                 .headers(super::telemetry::trace_headers())
                 .bearer_auth(&self.shared.token)
-                .timeout(Duration::from_secs(2))
+                .timeout(remaining.min(Duration::from_secs(2)))
                 .json(dispatch)
                 .send()
                 .await;
@@ -722,7 +775,11 @@ impl Coordinator {
         {
             return Err(storage("invalid persisted request"));
         }
-        self.dispatch(&dispatch).await
+        self.dispatch(
+            &dispatch,
+            Instant::now() + Duration::from_millis(job.deadline_ms.saturating_sub(now_ms())),
+        )
+        .await
     }
 
     async fn owned(
@@ -865,6 +922,21 @@ pub async fn serve_worker(
 #[cfg(test)]
 mod heartbeat_tests {
     use super::*;
+
+    #[test]
+    fn relative_budget_ignores_sender_wall_clock_and_keeps_local_queue_time() {
+        let received = Instant::now();
+        let mut headers = HeaderMap::new();
+        headers.insert(WORK_BUDGET_HEADER, "500".parse().unwrap());
+        assert_eq!(
+            work_deadline(&headers, received, 1).ok(),
+            Some(received + Duration::from_millis(500))
+        );
+        assert_eq!(
+            work_deadline(&headers, received, u64::MAX).ok(),
+            Some(received + Duration::from_millis(500))
+        );
+    }
 
     #[test]
     fn observations_follow_revision_progress_on_the_coordinator_clock() {

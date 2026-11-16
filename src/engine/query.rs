@@ -97,10 +97,13 @@ pub(super) async fn graph_logical_plan(
     state: &SessionState,
     statement: Statement,
 ) -> datafusion::common::Result<LogicalPlan> {
-    // SQL-to-relational lowering recursively visits those same subqueries.
-    // Grow the stack around each poll without holding an alternate stack
-    // across a suspension.
-    let mut plan = std::pin::pin!(state.statement_to_plan(statement));
+    planner_stack(state.statement_to_plan(statement)).await
+}
+
+pub(super) async fn planner_stack<T>(plan: impl Future<Output = T>) -> T {
+    // Logical and physical planners can run beneath several nested CALLs.
+    // An alternate stack is only needed for the duration of each poll.
+    let mut plan = std::pin::pin!(plan);
     std::future::poll_fn(|cx| {
         stacker::maybe_grow(2 * 1024 * 1024, 8 * 1024 * 1024, || plan.as_mut().poll(cx))
     })
@@ -156,6 +159,15 @@ pub struct QueryResult {
     pub(crate) graph_context: Option<SessionContext>,
     #[cfg(feature = "admin")]
     pub(crate) graph_csr: Option<crate::admin::cluster::csr::CypherCsr>,
+    #[cfg(feature = "admin")]
+    resources: std::sync::Weak<ResultResources>,
+    #[cfg(feature = "admin")]
+    graph_resources: Option<Arc<ResultResources>>,
+}
+
+struct ResultResources {
+    _sources: Vec<datafusion::execution::memory_pool::MemoryReservation>,
+    _lease: Lease,
 }
 
 /// Aggregate limits for active queries, including their result streams.
@@ -279,6 +291,11 @@ pub struct QueryMetrics {
 
 impl QueryResult {
     #[cfg(feature = "admin")]
+    pub(super) fn retain_graph_resources(&mut self) {
+        self.graph_resources = self.resources.upgrade();
+    }
+
+    #[cfg(feature = "admin")]
     pub(crate) async fn graph_read<T>(
         &mut self,
         future: impl Future<Output = Result<T>>,
@@ -352,6 +369,7 @@ impl QueryResult {
 pub(crate) struct QueryScope {
     pub(crate) options: QueryOptions,
     start: Instant,
+    pub(super) wall_time: chrono::DateTime<chrono::Utc>,
     pub(super) deadline: Instant,
     lease: Mutex<Option<Lease>>,
     pub(crate) runtime: Arc<RuntimeEnv>,
@@ -368,6 +386,12 @@ pub(crate) struct QueryScope {
 }
 
 impl QueryScope {
+    #[cfg(feature = "admin")]
+    pub(crate) fn remaining(&self) -> Result<Duration> {
+        self.check()?;
+        Ok(self.deadline.saturating_duration_since(Instant::now()))
+    }
+
     pub(super) async fn new(options: QueryOptions, admission: &Arc<Admission>) -> Result<Self> {
         ensure!(!options.timeout.is_zero(), "query timeout must be positive");
         ensure!(
@@ -376,6 +400,7 @@ impl QueryScope {
         );
         options.graph.validate()?;
         let start = Instant::now();
+        let wall_time = chrono::Utc::now();
         let deadline = start
             .checked_add(options.timeout)
             .context("query timeout is too large")?;
@@ -390,6 +415,7 @@ impl QueryScope {
         Ok(Self {
             options,
             start,
+            wall_time,
             deadline,
             lease: Mutex::new(Some(lease)),
             runtime,
@@ -531,9 +557,14 @@ impl QueryScope {
             .expect("query resource lease")
             .take()
             .context("query already has a result stream")?;
+        let resources = Arc::new(ResultResources {
+            _lease: lease,
+            _sources: prepared.reservations,
+        });
+        #[cfg(feature = "admin")]
+        let weak_resources = Arc::downgrade(&resources);
         let scope = Arc::clone(self);
         let stream = async_stream::try_stream! {
-            let reservations = prepared.reservations;
             let mut batches = batches;
             let completion = loop {
                 match scope.run(async { Ok(batches.try_next().await?) }).await {
@@ -555,8 +586,7 @@ impl QueryScope {
             scope.spilled_bytes.store(spilled_bytes(plan.as_ref()), Ordering::Relaxed);
             *scope.finished_ms.lock().expect("elapsed time") = Some(scope.start.elapsed().as_millis() as u64);
             drop(plan);
-            drop(reservations);
-            drop(lease);
+            drop(resources);
             completion?;
         };
         Ok(QueryResult {
@@ -569,6 +599,10 @@ impl QueryScope {
             graph_context: None,
             #[cfg(feature = "admin")]
             graph_csr: None,
+            #[cfg(feature = "admin")]
+            resources: weak_resources,
+            #[cfg(feature = "admin")]
+            graph_resources: None,
             batches: self.expiring_stream(Box::pin(RecordBatchStreamAdapter::new(schema, stream))),
             scope: Arc::clone(self),
         })
@@ -582,6 +616,7 @@ impl QueryScope {
         let state = Arc::new(Mutex::new(Output {
             stream: Some(stream),
             error: None,
+            polling: false,
             waker: None,
         }));
         let weak = Arc::downgrade(&state);
@@ -601,9 +636,10 @@ impl QueryScope {
             let Some(state) = weak.upgrade() else { return };
             let (stream, waker) = {
                 let mut state = state.lock().expect("query output");
-                let Some(stream) = state.stream.take() else {
+                let stream = state.stream.take();
+                if stream.is_none() && !state.polling {
                     return;
-                };
+                }
                 state.error = Some(error);
                 (stream, state.waker.take())
             };
@@ -625,22 +661,38 @@ impl QueryScope {
             schema,
             poll_fn(move |cx| {
                 let _guard = &guard;
+                let mut stream = {
+                    let mut state = state.lock().expect("query output");
+                    if let Some(error) = state.error.take() {
+                        return Poll::Ready(Some(Err(DataFusionError::Execution(error.into()))));
+                    }
+                    let Some(stream) = state.stream.take() else {
+                        return Poll::Ready(None);
+                    };
+                    state.polling = true;
+                    stream
+                };
+                // DataFusion may do substantial work in poll_next. The deadline
+                // task can record cancellation without blocking on that work.
+                let polled = stream.as_mut().poll_next(cx);
                 let mut state = state.lock().expect("query output");
+                state.polling = false;
                 if let Some(error) = state.error.take() {
                     return Poll::Ready(Some(Err(DataFusionError::Execution(error.into()))));
                 }
-                let Some(stream) = &mut state.stream else {
-                    return Poll::Ready(None);
-                };
-                let polled = stream.as_mut().poll_next(cx);
                 match &polled {
                     Poll::Ready(None | Some(Err(_))) => {
-                        state.stream.take();
                         state.waker.take();
                         done.cancel();
                     }
-                    Poll::Pending => state.waker = Some(cx.waker().clone()),
-                    Poll::Ready(Some(Ok(_))) => {}
+                    Poll::Pending => {
+                        state.waker = Some(cx.waker().clone());
+                        state.stream = Some(stream);
+                    }
+                    Poll::Ready(Some(Ok(_))) => {
+                        state.waker.take();
+                        state.stream = Some(stream);
+                    }
                 }
                 polled
             }),
@@ -651,6 +703,7 @@ impl QueryScope {
 struct Output {
     stream: Option<SendableRecordBatchStream>,
     error: Option<&'static str>,
+    polling: bool,
     waker: Option<Waker>,
 }
 

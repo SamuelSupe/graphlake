@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{io::Write as _, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use uuid::Uuid;
@@ -206,23 +206,34 @@ impl Managed {
                     .ok()
                     .and_then(|(_, head)| head.as_ref().or(record.head.as_ref()))
                     .map(|head| head.generation);
-                match managed
-                    .finish(&app, id, task.id, &owner, result, cancel.is_cancelled())
-                    .await
-                {
-                    Ok(true) => {
-                        if let Some(generation) = cached {
-                            app.local_tables
-                                .cached
-                                .lock()
-                                .unwrap()
-                                .insert(id, generation);
+                let mut logged = false;
+                loop {
+                    let finished = tokio::select! {
+                        _ = app.shutdown.cancelled() => break,
+                        finished = managed.finish(&app, id, task.id, &owner, &result, cancel.is_cancelled()) => finished,
+                    };
+                    match finished {
+                        Ok(true) => {
+                            if let Some(generation) = cached {
+                                app.local_tables
+                                    .cached
+                                    .lock()
+                                    .unwrap()
+                                    .insert(id, generation);
+                            }
+                            break;
                         }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        eprintln!("GraphLake managed local sync result not confirmed: {e}");
-                        app.shutdown.cancel();
+                        Ok(false) => break,
+                        Err(e) => {
+                            if !logged {
+                                let _ = writeln!(
+                                    std::io::stderr().lock(),
+                                    "GraphLake managed local sync result not confirmed, retrying: {e}"
+                                );
+                                logged = true;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
                 app.local_tables.running.lock().unwrap().remove(&key);
@@ -294,13 +305,14 @@ impl Managed {
         id: Uuid,
         run: Uuid,
         owner_id: &str,
-        outcome: Result<(LoadResult, Option<Head>)>,
+        outcome: &Result<(LoadResult, Option<Head>)>,
         cancelled: bool,
     ) -> Result<bool> {
         let leader = leader(app).map_err(api_error)?;
-        if leader.confirm().await.is_err() || owner_id != owner(leader) {
+        if leader.loss_token().is_cancelled() || owner_id != owner(leader) {
             return Ok(false);
         }
+        leader.confirm().await.map_err(api_error)?;
         for _ in 0..8 {
             let (mut record, rev) = self
                 .record(id)
@@ -313,7 +325,7 @@ impl Managed {
             {
                 return Ok(false);
             }
-            let result = match &outcome {
+            let result = match outcome {
                 Ok((result, head)) => {
                     if let Some(head) = head.clone()
                         && let Some(old) = record.head.replace(head)
@@ -335,9 +347,7 @@ impl Managed {
             if self.save(&record, rev, leader).await? {
                 return Ok(true);
             }
-            if leader.confirm().await.is_err() {
-                return Ok(false);
-            }
+            leader.confirm().await.map_err(api_error)?;
         }
         anyhow::bail!("managed table changed too often to finish sync")
     }

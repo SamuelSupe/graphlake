@@ -601,7 +601,7 @@ async fn guard(State(app): State<Arc<App>>, request: Request, next: Next) -> Res
     let started = std::time::Instant::now();
     let span = operation
         .filter(|op| !matches!(*op, "readiness" | "coordinator_active" | "session"))
-        .and_then(|op| telemetry::start_span(op, "http", Some(request.headers())));
+        .and_then(|op| telemetry::start_span(op, "http", None));
     let future = guard_request(&app, request, next, api.as_ref());
     let response = if let Some(span) = &span {
         let response = future.with_context(span.clone()).await;

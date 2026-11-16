@@ -106,7 +106,7 @@ Bolt 5.1–5.4 支持直连、自动提交、显式只读事务和托管只读�
 
 Bolt 按 `PULL` 传输结果，Gremlin 以状态 206 传输中间批次，每批最多 128 条、约 2 MiB。单条记录保留编码预算。两种驱动返回原生节点、边和路径，定点小数及超出有符号 64 位的整数使用字符串。Gremlin 路径的步骤标签和标量保真以当前遍历引擎的路径表示为限。任意 Groovy、字节码策略、动态脚本绑定和 Bolt 集群路由仍超出当前范围。Bolt 和 Gremlin 在完成时返回 `model_revision`。
 
-单机操作审计追加到 `.graphlake-auth/audit.jsonl`，HA 操作审计输出到服务日志。每行记录时间、主体、协议、操作、模型和状态，省略令牌、查询文本、参数与结果内容。部署时可由宿主机收集日志，备份包含该目录。
+单机操作审计追加到 `.graphlake-auth/audit.jsonl`，每个文件达到约 32 MiB 后轮转，保留一个 `audit.jsonl.previous`；需长期留存时将两者采集到外部系统。HA 操作审计输出到服务日志。每行记录时间、主体、协议、操作、模型和状态，省略令牌、查询文本、参数与结果内容。部署时可由宿主机收集日志，备份包含该目录。
 
 协议参考见 [Neo4j Bolt](https://neo4j.com/docs/bolt/current/) 和 [Apache TinkerPop](https://tinkerpop.apache.org/docs/3.7.4/reference/)。
 

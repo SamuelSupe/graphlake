@@ -8,11 +8,14 @@ pub(super) use cypher::register_tables;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use datafusion::{
     arrow::{
         array::{ArrayRef, Float64Array, RecordBatch, StringArray, UInt64Array},
@@ -25,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    super::{Job, JobState, Objects, now_ms, storage, worker::Worker},
+    super::{Job, JobState, Objects, WORK_BUDGET_HEADER, storage, work_deadline, worker::Worker},
     *,
 };
 use crate::{
@@ -604,8 +607,10 @@ fn vertex_record(bytes: &[u8]) -> Result<(&[u8], &[u8])> {
 
 pub(in crate::admin::cluster) async fn run_task(
     State(worker): State<Arc<Worker>>,
+    headers: HeaderMap,
     Json(task): Json<Task>,
 ) -> ApiResult<StatusCode> {
+    let started = tokio::time::Instant::now();
     let saved = worker
         .shared
         .metadata
@@ -631,12 +636,13 @@ pub(in crate::admin::cluster) async fn run_task(
         .clone()
         .try_acquire_owned()
         .map_err(|_| Error::busy())?;
-    let remaining = job.deadline_ms.saturating_sub(now_ms());
-    if remaining == 0 {
+    let deadline = work_deadline(&headers, started, job.deadline_ms)?;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
         return Err(super::super::timeout());
     }
     let scope = crate::engine::stage_scope(QueryOptions {
-        timeout: Duration::from_millis(remaining),
+        timeout: remaining,
         memory_bytes: worker.memory_bytes,
         cancellation: worker.shutdown.child_token(),
         ..Default::default()
@@ -877,8 +883,8 @@ impl<'a> Execution<'a> {
             }
             let endpoint = &peers[index];
             let output = Uuid::new_v4();
-            let remaining = self.job.deadline_ms.saturating_sub(now_ms());
-            ensure!(remaining > 0, "query deadline exceeded");
+            let remaining = self.graph.scope.remaining()?;
+            let millis = remaining.as_millis().max(1);
             let response = self
                 .worker
                 .shared
@@ -886,7 +892,8 @@ impl<'a> Execution<'a> {
                 .post(endpoint.join("/internal/v1/csr")?)
                 .headers(crate::admin::telemetry::trace_headers())
                 .bearer_auth(&self.worker.shared.token)
-                .timeout(Duration::from_millis(remaining))
+                .timeout(remaining)
+                .header(WORK_BUDGET_HEADER, millis.to_string())
                 .json(&Task {
                     id: self.id,
                     attempt: self.job.attempt,

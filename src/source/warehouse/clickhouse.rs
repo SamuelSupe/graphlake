@@ -106,6 +106,18 @@ impl ClickHouse {
             })
             .map(|column| column.name.as_str())
             .collect();
+        let datetimes = metadata_columns
+            .iter()
+            .filter(|column| {
+                let kind = column
+                    .kind
+                    .replace("Nullable(", "")
+                    .replace("LowCardinality(", "");
+                let kind = kind.trim_end_matches(')');
+                kind == "DateTime" || kind.starts_with("DateTime(")
+            })
+            .map(|column| column.name.as_str())
+            .collect::<BTreeSet<_>>();
         let selected = if columns.is_empty() {
             metadata_columns
                 .iter()
@@ -121,6 +133,8 @@ impl ClickHouse {
                 let column = ident(name);
                 if dates.contains(name) {
                     format!("toDate32({column}) AS {column}")
+                } else if datetimes.contains(name) {
+                    format!("toDateTime64({column}, 0, 'UTC') AS {column}")
                 } else {
                     column
                 }

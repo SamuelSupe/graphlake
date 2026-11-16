@@ -395,7 +395,12 @@ async fn bind_label(
             }
         }
         if let Some(scd2) = mapping.scd2 {
-            frame = temporal(frame, scd2, scope.options.graph.snapshot_time.as_deref())?;
+            frame = temporal(
+                frame,
+                scd2,
+                scope.options.graph.snapshot_time.as_deref(),
+                scope.wall_time,
+            )?;
         }
         if read.check_data
             && let Some(null_key) = label
@@ -931,7 +936,12 @@ fn filter(frame: DataFrame, predicate: &Predicate) -> Result<DataFrame> {
     Ok(frame.filter(expr)?)
 }
 
-fn temporal(frame: DataFrame, scd2: &Scd2, time: Option<&str>) -> Result<DataFrame> {
+fn temporal(
+    frame: DataFrame,
+    scd2: &Scd2,
+    time: Option<&str>,
+    wall_time: chrono::DateTime<chrono::Utc>,
+) -> Result<DataFrame> {
     let interval = if let (Some(from), Some(to)) = (&scd2.valid_from, &scd2.valid_to) {
         let ty = data_type(&frame, from)?;
         ensure!(
@@ -954,14 +964,7 @@ fn temporal(frame: DataFrame, scd2: &Scd2, time: Option<&str>) -> Result<DataFra
         let (from, to, ty) =
             interval.context("historical SCD2 queries require a validity interval")?;
         let point = typed(&Value::String(time.to_owned()), &ty)?;
-        let open = match &scd2.open_end {
-            Some(value) => to.clone().eq(typed(value, &ty)?),
-            None => to.clone().is_null(),
-        };
-        from.clone()
-            .is_null()
-            .or(from.lt_eq(point.clone()))
-            .and(open.or(to.gt(point)))
+        validity_at(from, to, point, &ty, scd2.open_end.as_ref())?
     } else if let Some(flag) = &scd2.current_flag {
         let ty = data_type(&frame, flag)?;
         column(flag).eq(typed(
@@ -969,11 +972,41 @@ fn temporal(frame: DataFrame, scd2: &Scd2, time: Option<&str>) -> Result<DataFra
             &ty,
         )?)
     } else {
-        let (_, to, ty) = interval.expect("validated SCD2 mapping");
-        match &scd2.open_end {
-            Some(value) => to.eq(typed(value, &ty)?),
-            None => to.is_null(),
+        let (from, to, ty) = interval.expect("validated SCD2 mapping");
+        if matches!(ty, DataType::Int32 | DataType::Int64) {
+            // An integer business clock has no implied epoch or unit.
+            open_interval(to, &ty, scd2.open_end.as_ref())?
+        } else {
+            use datafusion::logical_expr::ExprSchemable;
+            let point = lit(ScalarValue::TimestampNanosecond(
+                wall_time.timestamp_nanos_opt(),
+                Some("UTC".into()),
+            ))
+            .cast_to(&ty, frame.schema())?;
+            validity_at(from, to, point, &ty, scd2.open_end.as_ref())?
         }
     };
     Ok(frame.filter(expr)?)
+}
+
+fn open_interval(to: Expr, ty: &DataType, sentinel: Option<&Value>) -> Result<Expr> {
+    let null = to.clone().is_null();
+    Ok(match sentinel {
+        Some(value) => null.or(to.eq(typed(value, ty)?)),
+        None => null,
+    })
+}
+
+fn validity_at(
+    from: Expr,
+    to: Expr,
+    point: Expr,
+    ty: &DataType,
+    sentinel: Option<&Value>,
+) -> Result<Expr> {
+    Ok(from
+        .clone()
+        .is_null()
+        .or(from.lt_eq(point.clone()))
+        .and(open_interval(to.clone(), ty, sentinel)?.or(to.gt(point))))
 }

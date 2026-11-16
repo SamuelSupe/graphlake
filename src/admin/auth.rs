@@ -657,7 +657,7 @@ impl Auth {
                     *revision = Some(next);
                 }
                 Err(error) => {
-                    if error.code != super::cluster::control::UNCERTAIN {
+                    if error.code == super::cluster::control::MUTATION_UNKNOWN {
                         *revision = None;
                         if !touch {
                             shared.write_uncertain.store(true, Ordering::Release);
@@ -824,12 +824,13 @@ pub(super) async fn login(
     } else {
         &auth.password_slot
     };
-    let Ok(slot) = Arc::clone(semaphore).try_acquire_owned() else {
-        return if administrator {
-            throttled(1)
-        } else {
-            invalid_credentials()
-        };
+    let Ok(Ok(slot)) = tokio::time::timeout(
+        Duration::from_millis(250),
+        Arc::clone(semaphore).acquire_owned(),
+    )
+    .await
+    else {
+        return throttled(1);
     };
     let verifier = app.clone();
     let worker = tokio::task::spawn_blocking(move || {

@@ -764,7 +764,10 @@ async fn commit(
             Ok(Some(revision)) => revision,
             result => {
                 let error = result.err().unwrap_or_else(control::lost);
-                if error.code != control::UNCERTAIN {
+                if matches!(
+                    error.code,
+                    control::MUTATION_UNKNOWN | "coordinator_not_leader"
+                ) {
                     ha.leader.retire();
                 }
                 return Err(error);

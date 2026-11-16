@@ -518,7 +518,21 @@ fn split(
 
 fn encode_stage(plan: &Arc<dyn ExecutionPlan>, codec: &Codec) -> Option<String> {
     // DataFusion's default scan codecs do not carry the engine's reader factories.
-    if contains(plan.as_ref(), |plan| plan.is::<DataSourceExec>()) {
+    if contains(plan.as_ref(), |plan| {
+        plan.is::<DataSourceExec>()
+            || plan
+                .downcast_ref::<AggregateExec>()
+                .is_some_and(|aggregate| {
+                    // Cypher collect spill tokens refer to files owned by the query's
+                    // local accumulator registry. Never serialize them across workers.
+                    aggregate.aggr_expr().iter().any(|expr| {
+                        matches!(
+                            expr.fun().name(),
+                            "__graphlake_collect" | "__graphlake_collect_distinct"
+                        )
+                    })
+                })
+    }) {
         return None;
     }
     physical_plan_to_bytes_with_extension_codec(Arc::clone(plan), codec)

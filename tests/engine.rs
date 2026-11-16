@@ -789,13 +789,21 @@ async fn persisted_csr_keeps_old_readers_and_recovers_from_failed_refresh() -> R
         .await;
     assert!(failed.is_err());
     assert!(!interrupted.exists());
-    let mut after_failure = engine.traverse(request.clone(), opts.clone()).await?;
+    let mut after_failure = engine
+        .traverse_with_strategy(request.clone(), opts.clone(), TraversalStrategy::Cached)
+        .await?;
     assert_eq!(rows(&mut after_failure).await?.len(), 3);
     assert_eq!(
         after_failure.metrics().csr_generation.as_deref(),
         Some(first.generation.as_str())
     );
 
+    let mut live = engine.traverse(request.clone(), opts.clone()).await?;
+    assert_eq!(rows(&mut live).await?.len(), 2);
+    assert!(
+        live.metrics().csr_generation.is_none(),
+        "auto served an obsolete graph"
+    );
     let second = engine.refresh("Transfer", opts.clone()).await?;
     assert_ne!(first.generation, second.generation);
     assert_eq!(second.edges, 2);

@@ -1,4 +1,3 @@
-#[cfg(feature = "admin")]
 mod exploration;
 mod export;
 #[cfg(feature = "admin")]
@@ -239,7 +238,7 @@ impl Engine {
         };
         let scope = self.scope(options).await?;
         scope
-            .run(async {
+            .run(query::planner_stack(Box::pin(async {
                 let mut context = if matches!(language, Language::Sql) {
                     scope.session()
                 } else {
@@ -255,7 +254,7 @@ impl Engine {
                     expansions,
                     calls,
                     procedures,
-                    repeats,
+                    gremlin_stages,
                     schema_procedures,
                 ) = match language {
                     Language::Cypher => {
@@ -328,7 +327,7 @@ impl Engine {
                             plan.expansions,
                             plan.calls,
                             plan.procedures,
-                            plan.repeats,
+                            plan.gremlin_stages,
                             plan.schema_procedures,
                         )
                     }
@@ -347,7 +346,7 @@ impl Engine {
                             plan.expansions,
                             plan.calls,
                             plan.procedures,
-                            plan.repeats,
+                            plan.gremlin_stages,
                             Vec::new(),
                         )
                     }
@@ -389,7 +388,11 @@ impl Engine {
                 let explain_only =
                     matches!(&statement, Statement::Explain(explain) if !explain.options.analyze);
                 let schema_only = explain_only || zero_limit(&statement);
-                let pinned = if repeats.is_empty() || schema_only {
+                let pinned = if schema_only
+                    || gremlin_stages
+                        .iter()
+                        .all(|stage| !matches!(stage, crate::gremlin::repeat::Stage::Repeat(_)))
+                {
                     BTreeSet::new()
                 } else {
                     labels.clone()
@@ -410,7 +413,7 @@ impl Engine {
                             && labels.len() == 1
                             && calls.is_empty()
                             && expansions.is_empty()
-                            && repeats.is_empty()
+                            && gremlin_stages.is_empty()
                             && procedures.is_empty()
                             && schema_procedures.is_empty() =>
                     {
@@ -431,7 +434,7 @@ impl Engine {
                         && calls
                             .iter()
                             .all(|call| matches!(call.mode, cypher::apply::Mode::Materialize))
-                        && repeats.is_empty()
+                        && gremlin_stages.is_empty()
                         && expansions.is_empty()
                         && procedures.is_empty()
                         && schema_procedures.is_empty()
@@ -553,9 +556,9 @@ impl Engine {
                             .await?,
                     );
                 }
-                for repeat in repeats {
+                for stage in gremlin_stages {
                     prepared.reservations.push(
-                        repeat
+                        stage
                             .register(&self.catalog, &context, &scope, schema_only)
                             .await?,
                     );
@@ -624,16 +627,20 @@ impl Engine {
                     .result(&self.catalog.graph, &context, frame, prepared, destination)
                     .await?;
                 #[cfg(feature = "admin")]
-                let result = QueryResult {
-                    graph_context: (graph_context
-                        && (!graph_output.columns.is_empty() || graph_output.row_entity.is_some()))
-                    .then_some(context),
-                    graph_csr: csr.filter(|csr| csr.indexed()).cloned(),
-                    graph_output,
-                    ..result
+                let result = {
+                    let mut result = result;
+                    if graph_context
+                        && (!graph_output.columns.is_empty() || graph_output.row_entity.is_some())
+                    {
+                        result.retain_graph_resources();
+                        result.graph_context = Some(context);
+                    }
+                    result.graph_csr = csr.filter(|csr| csr.indexed()).cloned();
+                    result.graph_output = graph_output;
+                    result
                 };
                 Ok(result)
-            })
+            })))
             .await
     }
 
@@ -1117,11 +1124,9 @@ fn select_statement(statement: &Statement) -> bool {
 
 #[cfg(feature = "admin")]
 pub(crate) async fn stage_scope(options: QueryOptions) -> Result<Arc<QueryScope>> {
-    Ok(Arc::new(
-        QueryScope::new(
-            options,
-            &Arc::new(query::Admission::new(query::EngineLimits::default())?),
-        )
-        .await?,
-    ))
+    static STAGE_ADMISSION: OnceLock<Arc<query::Admission>> = OnceLock::new();
+    let admission = STAGE_ADMISSION.get_or_init(|| {
+        Arc::new(query::Admission::new(EngineLimits::default()).expect("default engine limits"))
+    });
+    Ok(Arc::new(QueryScope::new(options, admission).await?))
 }

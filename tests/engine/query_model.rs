@@ -11,6 +11,194 @@ use serde_json::json;
 use super::{local_fixture, parquet, rows, transfers};
 
 #[tokio::test]
+async fn cypher_aggregated_order_only_uses_projected_values() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let error = engine
+        .query(
+            Language::Cypher,
+            "MATCH (a:Account) RETURN a.tenant AS tenant, count(*) AS n ORDER BY a.id",
+            Default::default(),
+        )
+        .await
+        .err()
+        .context("an ungrouped order key was accepted")?;
+    assert!(format!("{error:#}").contains("ORDER BY after aggregation"));
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "MATCH (a:Account) RETURN a.tenant AS tenant, count(*) AS n ORDER BY n DESC",
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut result).await?,
+        [json!({"tenant": 1, "n": 3}), json!({"tenant": 2, "n": 1})]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn variable_path_reuses_a_constant_anchor_from_the_previous_match() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "MATCH (a:Account) WHERE a.tenant=1 AND a.id IN $ids
+         MATCH (a)-[:Transfer*1..2]->(b:Account) RETURN b.id AS id ORDER BY id",
+            QueryOptions::default().with_parameters_json(r#"{"ids":[1]}"#)?,
+        )
+        .await?;
+    let actual = rows(&mut result).await?;
+    assert!(!actual.is_empty());
+    assert_eq!(result.metrics().visits_by_depth.first(), Some(&1));
+    let mut same_match = engine.query(Language::Cypher,
+        "MATCH (a:Account)-[:Transfer*1..2]->(b:Account) WHERE a.tenant=1 AND a.id IN [1] RETURN b.id AS id ORDER BY id",
+        Default::default()).await?;
+    assert_eq!(actual, rows(&mut same_match).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cypher_inline_properties_can_reference_values_in_scope() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "UNWIND [1,3] AS i MATCH (a:Account {tenant: 1, id: i}) RETURN a.id AS id ORDER BY id",
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut result).await?,
+        [json!({"id": 1}), json!({"id": 3})]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cypher_size_counts_unicode_and_preserves_list_and_null_results() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let mut result = engine.query(Language::Cypher,
+        "WITH '中🦊a' AS text RETURN size(text) AS text_len, size([1,null,2]) AS list_len, size(null) AS null_len",
+        Default::default()).await?;
+    use futures::TryStreamExt;
+    let batch = result
+        .batches
+        .try_next()
+        .await?
+        .context("missing projected row")?;
+    for name in ["text_len", "list_len"] {
+        let array = batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<graphlake::arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(array.value(0), 3);
+    }
+    assert!(batch.column_by_name("null_len").unwrap().is_null(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn scd2_current_and_historical_use_validity_with_null_and_sentinel() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2, 3, 4])) as _,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from(vec![
+                "effective",
+                "future",
+                "expired",
+                "next",
+                "null-end",
+                "sentinel-end",
+            ])) as _,
+        ),
+        (
+            "start",
+            Arc::new(Date32Array::from(vec![
+                Some(15_000),
+                Some(40_000),
+                Some(12_000),
+                Some(40_000),
+                None,
+                Some(15_000),
+            ])) as _,
+        ),
+        (
+            "end",
+            Arc::new(Date32Array::from(vec![
+                Some(40_000),
+                Some(47_482),
+                Some(15_000),
+                None,
+                None,
+                Some(47_482),
+            ])) as _,
+        ),
+    ])?;
+    std::fs::write(dir.path().join("scd.parquet"), parquet(&batch)?)?;
+    let config = dir.path().join("scd.yaml");
+    std::fs::write(
+        &config,
+        r#"graph: history
+sources:
+  lake: {type: parquet, tables: {records: [scd.parquet]}}
+nodes:
+  Record:
+    source: lake.records
+    key: [id]
+    properties: [name]
+    scd2: {valid_from: start, valid_to: end, open_end: '2100-01-01'}
+"#,
+    )?;
+    let engine = Engine::new(Catalog::load(config)?)?;
+    for (time, expected) in [(None, "effective"), (Some("2080-01-01"), "future")] {
+        let mut result = engine
+            .query(
+                Language::Cypher,
+                "MATCH (n:Record) WHERE n.id <> 2 RETURN n.name AS name ORDER BY n.id",
+                QueryOptions {
+                    graph: GraphOptions {
+                        snapshot_time: time.map(str::to_owned),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            rows(&mut result).await?,
+            [
+                json!({"name": expected}),
+                json!({"name": "null-end"}),
+                json!({"name": "sentinel-end"})
+            ]
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn gremlin_has_label_without_a_model_mapping_matches_no_elements() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let mut result = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Missing').count()",
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(rows(&mut result).await?, [json!({"value": 0})]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cypher_correlated_call_paginates_in_input_order_across_partitions() -> Result<()> {
     let (_dir, engine) = local_fixture("key: [tenant, id]")?;
     for (body, repeated) in [
@@ -43,6 +231,67 @@ async fn cypher_correlated_call_paginates_in_input_order_across_partitions() -> 
             .collect::<Vec<_>>();
         assert_eq!(rows(&mut result).await?, expected, "{query}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cypher_correlated_call_large_page_preserves_key_and_subquery_order() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    for distinct in ["", "DISTINCT "] {
+        let query = format!(
+            "UNWIND range(1,112) + [112,1] AS k WITH k ORDER BY k DESC
+             CALL (k) {{
+                UNWIND CASE WHEN k % 3 = 0 THEN [] ELSE [2,1,3,3] END AS i
+                RETURN {distinct}k * 10 + i AS y ORDER BY y DESC LIMIT 2
+             }}
+             RETURN k,y SKIP 7 LIMIT 130"
+        );
+        let mut result = engine
+            .query(
+                Language::Cypher,
+                &query,
+                QueryOptions {
+                    partitions: 4,
+                    batch_size: 64,
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| query.clone())?;
+        let expected = (1..=112)
+            .rev()
+            .flat_map(|k| std::iter::repeat_n(k, if k == 112 || k == 1 { 2 } else { 1 }))
+            .filter(|k| k % 3 != 0)
+            .flat_map(|k| {
+                [3, if distinct.is_empty() { 3 } else { 2 }].map(|i| json!({"k":k,"y": k * 10 + i}))
+            })
+            .skip(7)
+            .take(130)
+            .collect::<Vec<_>>();
+        assert_eq!(rows(&mut result).await?, expected, "{query}");
+    }
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "UNWIND range(1,80) AS k WITH k ORDER BY k DESC
+             CALL (k) {
+                 UNWIND range(0,114) AS i WITH i LIMIT 115
+                 RETURN k * 1000 + i AS y ORDER BY y DESC SKIP 110 LIMIT 2
+             } RETURN k,y SKIP 7 LIMIT 130",
+            QueryOptions {
+                partitions: 4,
+                batch_size: 64,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let expected = (1..=80)
+        .rev()
+        .flat_map(|k| [4, 3].map(|i| json!({"k":k,"y": k * 1000 + i})))
+        .skip(7)
+        .take(130)
+        .collect::<Vec<_>>();
+    assert_eq!(rows(&mut result).await?, expected);
     Ok(())
 }
 
@@ -293,6 +542,49 @@ edges:
         );
         assert_eq!(result.metrics().reads.postgres_rows, 2);
         assert!(result.metrics().reads.postgres_arrow_bytes < 512);
+
+        let mut result = engine
+            .query(
+                Language::Cypher,
+                "UNWIND range(1,128) AS k WITH k ORDER BY k
+                 CALL (k) { MATCH (b:Node) WHERE b.id = k RETURN b.id AS id }
+                 RETURN id LIMIT 256",
+                QueryOptions {
+                    batch_size: 128,
+                    ..options.clone()
+                },
+            )
+            .await?;
+        let expected = (1..=128).map(|id| json!({"id":id})).collect::<Vec<_>>();
+        assert_eq!(rows(&mut result).await?, expected);
+        let reads = result.metrics().reads;
+        assert!((1..64).contains(&reads.requests), "{reads:?}");
+        assert_eq!(reads.postgres_rows, 128, "{reads:?}");
+        eprintln!(
+            "CALL 128 distinct matching keys: {} PostgreSQL requests",
+            reads.requests
+        );
+
+        let mut result = engine
+            .query(
+                Language::Cypher,
+                "UNWIND range(100001,100128) + [1] AS k WITH k ORDER BY k DESC
+                 CALL (k) { MATCH (b:Node) WHERE b.id = k RETURN b.id AS id }
+                 RETURN id LIMIT 1",
+                QueryOptions {
+                    batch_size: 128,
+                    ..options.clone()
+                },
+            )
+            .await?;
+        assert_eq!(rows(&mut result).await?, [json!({"id":1})]);
+        let reads = result.metrics().reads;
+        assert!((1..64).contains(&reads.requests), "{reads:?}");
+        assert_eq!(reads.postgres_rows, 1, "{reads:?}");
+        eprintln!(
+            "CALL sparse LIMIT 1: {} PostgreSQL requests",
+            reads.requests
+        );
 
         let mut result = engine
             .query(

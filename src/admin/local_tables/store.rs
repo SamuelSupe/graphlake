@@ -164,6 +164,7 @@ pub(in crate::admin) struct View {
 
 pub(in crate::admin) struct Store {
     pub root: PathBuf,
+    dirty: bool,
     pub tables: BTreeMap<String, Table>,
     _lease: File,
 }
@@ -240,6 +241,7 @@ impl Store {
         let store = Self {
             root,
             tables,
+            dirty: false,
             _lease: lease,
         };
         for table in store.tables.values() {
@@ -328,6 +330,21 @@ impl Store {
         next.insert(key, table);
         self.persist(&next)?;
         self.tables = next;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn finish(&mut self, key: String, table: Table) -> ApiResult<()> {
+        self.tables.insert(key, table);
+        self.dirty = true;
+        self.flush()
+    }
+
+    pub fn flush(&mut self) -> ApiResult<()> {
+        if self.dirty {
+            self.persist(&self.tables)?;
+            self.dirty = false;
+        }
         Ok(())
     }
 }

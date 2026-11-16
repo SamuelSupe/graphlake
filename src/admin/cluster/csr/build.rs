@@ -1010,9 +1010,30 @@ impl SnapshotWriter {
             .as_any()
             .downcast_ref::<StringArray>()
             .context("invalid CSR lookup IDs")?;
-        for offset in (0..batch.num_rows()).step_by(128) {
-            let count = (batch.num_rows() - offset).min(128);
-            let slice = batch.slice(offset, count);
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            let mut count = (batch.num_rows() - offset).min(128);
+            let slice = loop {
+                let slice = batch.slice(offset, count);
+                if self.writer.get_ref().len() + batch.get_array_memory_size() < BLOCK_BYTES / 2 {
+                    break slice;
+                }
+                let mut probe = Self::writer(&self.schema)?;
+                probe.write(&slice)?;
+                let size = probe.into_inner()?.len();
+                if size > BLOCK_BYTES && count > 1 {
+                    count /= 2;
+                    continue;
+                }
+                if self.writer.get_ref().len() + size > 2 * BLOCK_BYTES - 8 {
+                    self.flush(objects).await?;
+                }
+                ensure!(
+                    size <= 2 * BLOCK_BYTES,
+                    "a single CSR property row exceeds the block size"
+                );
+                break slice;
+            };
             let range = self
                 .ids
                 .get_or_insert_with(|| [ids.value(offset).to_owned(), String::new()]);
@@ -1039,6 +1060,7 @@ impl SnapshotWriter {
                     .try_grow(compact.get_array_memory_size())?;
                 self.column_batches.push(compact);
             }
+            offset += count;
             if self.writer.get_ref().len() >= BLOCK_BYTES || self.column_memory.size() >= 768 * 1024
             {
                 self.flush(objects).await?;

@@ -12,9 +12,9 @@ use datafusion::{
         ipc::reader::StreamReader,
     },
     catalog::{Session, TableProvider},
-    common::DataFusionError,
+    common::{DataFusionError, ScalarValue},
     execution::{SendableRecordBatchStream, TaskContext, memory_pool::MemoryConsumer},
-    logical_expr::{Expr, TableType},
+    logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType},
     physical_plan::{
         ExecutionPlan,
         stream::RecordBatchStreamAdapter,
@@ -164,14 +164,40 @@ impl TableProvider for IcebergTable {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|expr| {
+                if scan_predicate(&self.schema, expr).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         _: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut table = self.clone();
+        table.filter = table
+            .filter
+            .take()
+            .into_iter()
+            .chain(
+                filters
+                    .iter()
+                    .filter_map(|expr| scan_predicate(&self.schema, expr)),
+            )
+            .reduce(Predicate::and);
         if let Some(columns) = projection {
             table.schema = Arc::new(self.schema.project(columns)?);
         }
@@ -233,6 +259,48 @@ impl PartitionStream for IcebergTable {
         };
         Box::pin(RecordBatchStreamAdapter::new(output, stream))
     }
+}
+
+fn scan_predicate(schema: &Schema, expr: &Expr) -> Option<Predicate> {
+    let (column, op, value) = match expr {
+        Expr::IsNull(expr) => (expr.as_ref(), Comparison::IsNull, serde_json::Value::Null),
+        Expr::IsNotNull(expr) => (
+            expr.as_ref(),
+            Comparison::IsNotNull,
+            serde_json::Value::Null,
+        ),
+        Expr::BinaryExpr(expr) => {
+            let Expr::Literal(literal, _) = expr.right.as_ref() else {
+                return None;
+            };
+            let value = match literal {
+                ScalarValue::Int32(Some(value)) => i64::from(*value),
+                ScalarValue::Int64(Some(value)) => *value,
+                _ => return None,
+            };
+            let comparison = match expr.op {
+                Operator::Eq => Comparison::Eq,
+                Operator::Lt => Comparison::Lt,
+                Operator::LtEq => Comparison::Le,
+                Operator::Gt => Comparison::Gt,
+                Operator::GtEq => Comparison::Ge,
+                _ => return None,
+            };
+            (expr.left.as_ref(), comparison, value.into())
+        }
+        _ => return None,
+    };
+    let Expr::Column(column) = column else {
+        return None;
+    };
+    iceberg_predicate(
+        schema,
+        &ReadPredicate {
+            column: column.name.clone(),
+            op,
+            value,
+        },
+    )
 }
 
 fn iceberg_predicate(schema: &Schema, filter: &ReadPredicate) -> Option<Predicate> {

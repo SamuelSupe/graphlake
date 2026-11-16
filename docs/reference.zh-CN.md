@@ -115,7 +115,7 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 | `tidb` / `oceanbase` | 同样使用 MySQL 连接字段；OceanBase 仅支持 MySQL 模式租户。按语句读取，不声明跨表一致快照。 |
 | `mariadb` | 使用 MySQL 连接字段；InnoDB 只读重复读事务，使用 MariaDB 的 `max_statement_time`。 |
 | `sqlserver_native` | `host`、`port`、`database`、`user`、`password_env`，TLS 默认开启，可配置 `ca_file`。通过 TDS 直接执行生成的 SELECT；按语句读取，不声明跨表同一快照。读取账号应只授予 SELECT 和所需元数据权限。 |
-| `oracle_native` | `connect_string`、`user`、`password_env`。使用 Easy Connect 或 TNS 名称；GraphLake 进程所在机器需安装 Oracle Instant Client，库搜索路径需能找到客户端库。使用只读事务，`NUMBER(p,s)` 在可表达时映射 Decimal128，无固定精度或负标度的 NUMBER 保留为文本以避免精度丢失。Oracle DATE 保留时分秒。 |
+| `oracle_native` | `connect_string`、`user`、`password_env`。使用 Easy Connect 或 TNS 名称；GraphLake 进程所在机器需安装 Oracle Instant Client，库搜索路径需能找到客户端库。使用只读事务，`NUMBER(p,s)` 在可表达时使用整数或 Decimal128；无固定精度的 `NUMBER` 和 Oracle `FLOAT` 映射为 Float64，超出 Arrow 定点类型范围的固定精度数值保留为文本。需要精确金额、比较或业务键的列应在源视图中显式转为合适的 `NUMBER(p,s)`；无法选定固定精度和标度时，可显式以文本保留原值。Oracle DATE 保留时分秒。 |
 | `mongodb_native` | `dsn_env` 保存 `mongodb://` 或 `mongodb+srv://` 连接串。引用使用 `source.database.collection`。默认采样 1000 条推断结构，`schema_sample_size` 可设为 1–10000；空集合或采样内全为空的字段无法推断。嵌套对象展开为点分字段，数组保留为 Extended JSON 文本，ObjectId 为十六进制文本，Decimal128 保留为十进制文本。采样和后续读取发现类型不一致时失败，不做静默转换。普通游标不保证一致快照，`require_consistent_snapshot` 拒绝此来源。 |
 | `duckdb` | `path` 指向服务端数据库文件，引用使用 `source.schema.table`（常见模式为 `main`）。只读打开并使用事务；禁止外部访问与自动扩展访问，关闭 DuckDB 临时落盘，查询结果通过 GraphLake 的磁盘配额溢写。DuckDB 执行引擎预留查询内存预算的一半；读取期间文件不能由其他进程写入。 |
 | `databricks` | 工作区 `uri`、`token_env`、SQL Warehouse ID `warehouse`、`catalog`；引用使用 `source.schema.table`。通过 Statement Execution API 读取 JSON_ARRAY 分页，校验行数、游标和截断标记，超时取消语句。使用 INLINE 结果，受 Databricks 的 INLINE 大小限制；超过限制需缩小远端视图，不会返回部分结果。复杂类型应在远端视图转为标量。 |
@@ -135,7 +135,7 @@ Oracle 客户端是运行时依赖，不随 GraphLake 分发。CLI 会保留 Ora
 
 OSS/TOS/COS 自动使用带桶名的虚拟主机访问；S3/MinIO 自定义 endpoint 使用 path-style。HTTP endpoint 仅允许回环测试地址，其余连接使用 HTTPS。对象读取固定版本或强 ETag，后续范围读取保持相同版本；多对象不声明为同一快照。凭据只在服务端读取，配置中填写环境变量名。云端权限、端点和凭据链仍需在实际账户环境验证。
 
-数据源按映射列读取。DuckDB、SQL Server、Oracle、Databricks、Snowflake 和 BigQuery 会下推类型匹配的整数比较与空值判断；Iceberg 使用顶层 32/64 位整数条件在固定快照内裁剪。可下推条件来自物理映射过滤、逻辑分区，以及能证明只读取同一节点表的查询中的业务键。共享物理表只下推各用法共有的条件，列转换后的逻辑过滤仍在本地执行。GraphLake 保留查询过滤与业务键校验，字符串排序规则、隐式类型转换、复杂表达式和跨源关联由本地引擎处理。
+数据源按映射列读取。DuckDB、SQL Server、Oracle、Databricks、Snowflake 和 BigQuery 会下推类型匹配的整数比较与空值判断；Iceberg 使用顶层 32/64 位整数条件在固定快照内裁剪，查询引擎会复核下推条件。MongoDB 原生连接器可用顶层整数条件或布尔等值条件缩小读取范围。可下推条件来自物理映射过滤、逻辑分区，以及能证明只读取同一节点表的查询中的业务键。共享物理表只下推各用法共有的条件，列转换后的逻辑过滤仍在本地执行。GraphLake 保留查询过滤与业务键校验，字符串排序规则、隐式类型转换、复杂表达式和跨源关联由本地引擎处理。
 
 通过 SQL API 读取数仓时，存在可下推条件才发出额外的零行查询确认列类型，数据语句仍使用原有的快照设置。MongoDB 在采样和读取时都投影映射字段，采样不受查询过滤影响。对象存储的同表文件共享客户端，CSV 和 JSON Lines 按内存预算合并范围读取，单次最多 1 MiB；对象版本固定和逐条解码校验保持有效。
 
@@ -153,7 +153,7 @@ DuckDB 可利用行组的列最小值和最大值裁剪有序 `LIMIT` 的扫描�
 Parquet 表显式列出文件，YAML 中的相对路径以配置文件目录为准。同一表各文件的映射列须具有相同的 Arrow 类型。HTTP 服务须支持 HEAD、Range 和强 ETag。S3 使用 `AWS_REGION` 等标准 AWS 配置，也可通过 `AWS_ENDPOINT` 指定兼容服务。
 
 
-通过 Snowflake、Spanner、SAP HANA 和 SQL Server／Oracle 直连读取的时间戳映射为 Arrow 微秒时间戳，可保留 9999-12-31 等源端长时间范围的日期。Trino 按声明精度选择微秒或纳秒。当值超出对应 Arrow 类型的时间范围或小数精度时，查询返回对应列的错误。可在源端视图中对该列使用文本表示，以保留原值。
+Snowflake、Spanner、SAP HANA 和 Oracle 直连使用 Arrow 微秒时间戳。SQL Server 的 `datetime2` 和 `datetimeoffset` 在声明 7 位小数时使用纳秒保留 100 ns 精度，其余时间戳使用微秒；`datetimeoffset` 以 UTC 表示。Trino 按声明精度选择微秒或纳秒，并在服务端将带时区值转为 UTC。ClickHouse 的 `DateTime` 以时间戳读取。当值超出对应 Arrow 类型的范围或精度时，查询返回对应列的错误，例如 9999-12-31 超过纳秒时间戳的范围；可在源视图中选择微秒精度或显式读取文本。
 
 PostgreSQL 无穷日期、无穷时间戳和定点 `NaN` 在读取时报告具体值和类型。需要这些值或无精度约束的 `NUMERIC` 时，可在源端创建只读视图，将相应列转成 `text`，例如 `valid_until::text AS valid_until`。有限日期与定点数继续使用 Arrow 类型。
 
@@ -325,9 +325,9 @@ nodes:
         columns: {tenant: tenant_id, id: account_id, name: account_name}
 ```
 
-分区和 SCD2 条件在去重及端点校验前应用。普通单表节点和有键边会拒绝参与查询的重复业务键。整图分析和 CSR 刷新在构建拓扑时校验业务键，包含端点缺失的边。普通查询可复用满足键约束的 PostgreSQL 有效唯一索引。同一引擎会复用已通过完整校验的 Parquet 业务键证明，文件版本变化时重新校验。多表映射和 SCD2 折叠完整相同的记录，同键冲突默认报错。键点查和相关子查询可先筛选候选键，再校验各候选键的完整输入记录。候选键之外的冲突由扫描对应键的查询或拓扑构建发现。多表有键标签可配置 `on_conflict: prefer_first`，按输入顺序选择完整记录，优先输入内部仍须满足键唯一性。无键边保留独立的查询内身份。
+分区和 SCD2 条件在去重及端点校验前应用。普通单表节点和有键边会拒绝参与查询的重复业务键。整图分析和 CSR 刷新在构建拓扑时校验业务键，包含端点缺失的边。普通查询可复用满足键约束的 PostgreSQL 有效唯一索引。同一引擎会复用已通过完整校验的 Parquet 业务键证明，包括配置了连接的对象存储。文件或对象版本变化时重新校验。多表映射和 SCD2 折叠完整相同的记录，同键冲突默认报错。键点查和相关子查询可先筛选候选键，再校验各候选键的完整输入记录。候选键之外的冲突由扫描对应键的查询或拓扑构建发现。多表有键标签可配置 `on_conflict: prefer_first`，按输入顺序选择完整记录，优先输入内部仍须满足键唯一性。无键边保留独立的查询内身份。
 
-`snapshot_time` 可指定与 SCD2 列同类型的日期、时间戳或整数，历史区间采用 `[valid_from, valid_to)`。空起点表示无下界，空结束值默认表示无上界，可用 `open_end` 配置结束值哨兵。默认读取当前记录，可用 `current_flag` 和 `current_value` 定义当前标记。业务时间和数据源快照版本分别指定。
+`snapshot_time` 可指定与 SCD2 列同类型的日期、时间戳或整数，历史区间采用 `[valid_from, valid_to)`。空起点表示无下界；空结束值和额外配置的 `open_end` 哨兵都表示无上界。默认查询用查询开始时的 UTC 日期或时间戳判断区间是否生效。整数业务时间没有隐含单位，默认按开放结束区间选择当前行；可用显式 `snapshot_time` 指定整数时点。配置了 `current_flag` 时，默认查询以该标记及 `current_value` 为准。业务时间和数据源快照版本分别指定。
 
 ```cypher
 USING {logicalPartition: {tenant: 42}, SnapShotTime: '2026-06-01'}
@@ -358,7 +358,7 @@ REST 查询和 MCP 的 `freshness` 请求对象可收紧模型策略，字段为
 
 ## 查询语义与资源控制
 
-Cypher 支持串接 `MATCH`、`OPTIONAL MATCH`、`WITH`、`UNWIND` 和 `RETURN`，以及 `UNION [ALL]` 和返回结果的只读 `CALL {}`。相关子查询支持 `CALL (a) { ... }` 和首条 `WITH` 两种导入方式。`CALL (a)` 导入的变量在整个子查询中可见。由 `MATCH`、`OPTIONAL MATCH`、`UNWIND` 和 `WITH` 组成的相关子查询，可按导入的实体身份和标量值分组批量执行。中间 `WITH` 的聚合、去重、排序和分页分别作用于每个关联组。符合这些条件的嵌套 `CALL` 和 `UNION [ALL]` 分支也可批量执行。`UNION` 在各自的关联组内去重。最终 `RETURN` 可投影或聚合，并可对每组独立排序和分页。重复的外层输入保留各自的结果。分批执行时，查询内缓存保留近期、符合预算的关联组，并跨批次复用已求值的键。其余子查询按行求值，并在查询预算内复用重复导入键的结果。两条路径共享来源快照，输出可按查询预算溢写。紧随 `CALL` 且无排序、去重或聚合的最终 `RETURN` 可以用 `SKIP` 和 `LIMIT` 提前停止求值。相关子查询保留已有的外层排序，跨分区读取时也用该顺序分页。批量路径分批读取外层输入。可提前停止的外层分页只读取每个新关联组所需的结果前缀，已缓存的组仍可成批复用。显式排序和聚合仍需处理满足语义的输入。对于固定方向的相关 MATCH，如果分页只依赖排序键和其他窄字段，Cypher 先选出页面，再用命中行的业务键批量读取仅用于返回的目标节点属性。支持外层和子查询内分页，优化可穿过保留目标身份的 WITH、按实体去重或分组、嵌套 CALL，以及各分支从同一标签读取同名属性的 UNION ALL。排序、过滤或聚合使用的属性在对应阶段读取。`LIMIT 0` 只准备结果模式，跳过数据扫描。SQL 提供映射后的图表，大小写敏感的表名使用双引号。三种查询入口都支持 `EXPLAIN` 和 `EXPLAIN ANALYZE`。
+Cypher 支持串接 `MATCH`、`OPTIONAL MATCH`、`WITH`、`UNWIND` 和 `RETURN`，以及 `UNION [ALL]` 和返回结果的只读 `CALL {}`。相关子查询支持 `CALL (a) { ... }` 和首条 `WITH` 两种导入方式。`CALL (a)` 导入的变量在整个子查询中可见。由 `MATCH`、`OPTIONAL MATCH`、`UNWIND` 和 `WITH` 组成的相关子查询，可按导入的实体身份和标量值分组批量执行。中间 `WITH` 的聚合、去重、排序和分页分别作用于每个关联组。符合这些条件的嵌套 `CALL` 和 `UNION [ALL]` 分支也可批量执行。`UNION` 在各自的关联组内去重。最终 `RETURN` 可投影或聚合，并可对每组独立排序和分页。重复的外层输入保留各自的结果。分批执行时，查询内缓存保留近期、符合预算的关联组，并跨批次复用已求值的键。其余子查询按导入键求值，并在查询预算内复用重复键的结果。无需随输入重建关联表的子查询可复用物理计划。两条路径共享来源快照，输出可按查询预算溢写。紧随 `CALL` 且无排序、去重或聚合的最终 `RETURN` 可以用 `SKIP` 和 `LIMIT` 提前停止求值。相关子查询保留已有的外层排序，跨分区读取时也用该顺序分页。可提前停止的外层分页会按组保留当前页所需的结果前缀，较大的页可在一次规划中处理多个不同导入键，小页优先单键短路，连续空批次后可扩大批量。显式排序和聚合仍需处理满足语义的输入。对于固定方向的相关 MATCH，如果分页只依赖排序键和其他窄字段，Cypher 先选出页面，再用命中行的业务键批量读取仅用于返回的目标节点属性。支持外层和子查询内分页，优化可穿过保留目标身份的 WITH、按实体去重或分组、嵌套 CALL，以及各分支从同一标签读取同名属性的 UNION ALL。排序、过滤或聚合使用的属性在对应阶段读取。`LIMIT 0` 只准备结果模式，跳过数据扫描。SQL 提供映射后的图表，大小写敏感的表名使用双引号。三种查询入口都支持 `EXPLAIN` 和 `EXPLAIN ANALYZE`。
 
 定长有向模式可用导入的业务键和前一段查询选出的节点键限制节点与边的读取。单节点 `MATCH` 也支持与导入标量的业务键等值条件。多表映射的键条件可穿过列重命名和去重，源端能执行的条件由连接器下推。普通标量投影裁剪未使用的属性列，完整实体及冲突校验仍保留所需字段。图级分区和 SCD2 条件照常应用。跨来源使用有界候选键，后续关系和目标表共享 PostgreSQL 快照时也可在该来源执行半连接。支持比较的候选键超出内存或数量预算时，先全局去重并按需溢写，再分批向连接器下推键过滤。Parquet 根据整数候选键覆盖的行组、预计读取行数和查询内存预算选择精确谓词或范围剪枝。范围剪枝后用批次键集合校验成员关系。
 
@@ -482,7 +482,7 @@ g.V().hasLabel('Account').union(
 
 ### 远端前沿与持久化 CSR
 
-`traverse --strategy auto` 优先读取已发布的代次。在线访问时，引擎检查 PostgreSQL 节点键与出边或入边端点是否有可用的 B-tree 索引前缀。对于有稳定边键的稀疏前沿，引擎在查询的只读快照中参数化批量查边，并批量验证端点。前沿扩大后，按表行数估计切换到同一快照的单次扫描。`--strategy scan`、`batch` 和 `cached` 可固定访问方式。变长 Cypher 在起点的完整业务键已绑定且满足索引条件时也可选择前沿查找，其余模式走扫描。
+`traverse --strategy auto` 先核对已发布代次的文件或对象版本；来源变化、不能复核或按当前时间选择 SCD2 生效行时走在线查询。`--strategy cached` 可显式读取已发布代次，即使来源更新或不可用。在线访问时，引擎检查 PostgreSQL 节点键与出边或入边端点是否有可用的 B-tree 索引前缀。对于有稳定边键的稀疏前沿，引擎在查询的只读快照中参数化批量查边，并批量验证端点。前沿扩大后，按表行数估计切换到同一快照的单次扫描。`--strategy scan`、`batch` 和 `cached` 可固定访问方式。变长 Cypher 在起点的完整业务键已绑定且满足索引条件时也可选择前沿查找，其余模式走扫描。
 
 ```sh
 cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml \
@@ -568,7 +568,7 @@ YIELD id, rank
 RETURN id, rank
 ```
 
-`EXPORT TO` 可用于 Cypher、SQL 和 Gremlin。结果流被读取时由引擎写入已注册位置，以 `destination` 和 `rows` 返回摘要。扩展名选择 CSV 或 Parquet。CSV 包含表头，嵌套列用 JSON 表示，Parquet 保留列类型。使用相对路径，已有文件或对象会返回错误。S3 使用进程的 AWS 配置，暂存占用查询的溢写配额，单个对象最大 5 GiB。使用 `EXPLAIN` 或 `EXPLAIN ANALYZE` 时只处理内层查询。
+`EXPORT TO` 可用于 Cypher、SQL 和 Gremlin。结果流被读取时由引擎写入已注册位置，以 `destination` 和 `rows` 返回摘要。扩展名选择 CSV 或 Parquet。CSV 包含表头，嵌套列用 JSON 表示，NULL 输出为空字段，空字符串输出为 `""`。要让读取端可靠保留类型及空值区别，使用 Parquet。使用相对路径，已有文件或对象会返回错误。S3 使用进程的 AWS 配置，暂存占用查询的溢写配额，单个对象最大 5 GiB。使用 `EXPLAIN` 或 `EXPLAIN ANALYZE` 时只处理内层查询。
 
 ## 嵌入 Rust 应用
 

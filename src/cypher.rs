@@ -38,7 +38,7 @@ pub(crate) struct Plan {
     pub(crate) call_lookups: Vec<apply::Lookup>,
     pub procedures: Vec<procedures::Procedure>,
     pub schema_procedures: Vec<procedures::SchemaProcedure>,
-    pub repeats: Vec<crate::gremlin::repeat::Repeat>,
+    pub gremlin_stages: Vec<crate::gremlin::repeat::Stage>,
     pub(crate) indexed_csr: bool,
     pub(crate) has_row_expressions: bool,
     pub(crate) has_row_expression_lambda: bool,
@@ -90,7 +90,9 @@ pub(crate) fn plan(
         }
     }
     let _budget = RestoreBudget(EXPRESSION_WORK.replace(32_768));
-    let result = plan_query(catalog, query, partitioned_csr, indexed_csr);
+    let result = stacker::maybe_grow(3 * 1024 * 1024, 8 * 1024 * 1024, || {
+        plan_query(catalog, query, partitioned_csr, indexed_csr)
+    });
     ensure!(
         expression_step(),
         "Cypher expression planning exceeds its work limit"
@@ -110,6 +112,7 @@ fn plan_query(
     extensions.partitioned_csr = partitioned_csr;
     extensions.indexed_csr = indexed_csr;
     let mut ast = opencypher::parse(&text).map_err(|e| anyhow!("invalid Cypher: {e}"))?;
+    pattern::normalize_patterns(&mut ast);
     paths::validate_call_scopes(&ast, &extensions)?;
     collect::fold_sizes(&mut ast);
     page::defer_properties(catalog, &mut ast, &mut extensions);
@@ -317,7 +320,10 @@ pub(crate) fn check_expression_complexity(input: &str, context: &str) -> Result<
             cursor += 1;
         }
         ensure!(
-            tokens <= 8192 && operators.len() + cases <= 65 && *operators.last().unwrap() <= 128,
+            tokens <= 8192
+                && operators.len() + cases <= 65
+                && *operators.last().unwrap() <= 128
+                && operators.iter().sum::<usize>() + cases <= 256,
             "{context} exceeds the supported expression complexity"
         );
     }
@@ -487,11 +493,13 @@ impl<'a> MatchPlan<'a> {
             }
             alias
         };
-        self.predicates.extend(property_terms(
+        let terms = property_terms_with(
             &alias,
             &columns([&node.key, &node.properties]),
             pattern.properties.as_ref(),
-        )?);
+            |expr| self.expr(expr).map(Some),
+        )?;
+        self.predicates.extend(terms);
         Ok(alias)
     }
 
@@ -1271,7 +1279,7 @@ impl<'a> MatchPlan<'a> {
                     if let Some(count) = collect::size_argument(arg) {
                         return render(&count);
                     }
-                    return Ok(format!("array_length({})", render(arg)?));
+                    return Ok(format!("__graphlake_cypher_size({})", render(arg)?));
                 }
                 if function == collect::COUNT_SIZE
                     && let [arg] = args.as_slice()
@@ -1588,12 +1596,11 @@ impl<'a> MatchPlan<'a> {
                         !distinct,
                         "ORDER BY after DISTINCT requires projected values"
                     );
-                    let value = self.expr_with_aliases(&item.expr, &aliases)?;
-                    let expression = if aggregated && !aggregate.0 {
-                        format!("first_value({value})")
-                    } else {
-                        value
-                    };
+                    ensure!(
+                        !aggregated,
+                        "ORDER BY after aggregation requires projected values"
+                    );
+                    let expression = self.expr_with_aliases(&item.expr, &aliases)?;
                     projection.push(format!("{expression} AS {}", ident(&column)));
                 }
                 order.push(OrderKey {
@@ -1927,6 +1934,26 @@ fn start_terms(
         start_terms(rhs, variable, allowed, terms, bound_keys);
         return;
     }
+    if let ExprKind::Binary {
+        op: BinaryOp::In,
+        lhs,
+        rhs,
+    } = &expression.kind
+        && let ExprKind::Property { base, key } = &lhs.kind
+        && matches!(&base.kind, ExprKind::Variable(var) if var.0 == variable)
+        && allowed.contains(&key.0)
+        && let ExprKind::List(items) = &rhs.kind
+        && let Ok(values) = items.iter().map(literal).collect::<Result<Vec<_>>>()
+    {
+        let field = qualified("src", &key.0);
+        let values = values
+            .iter()
+            .map(|value| cypher_compare(&field, "=", value))
+            .collect::<Vec<_>>();
+        terms.push(disjoin(&values));
+        bound_keys.insert(key.0.clone());
+        return;
+    }
     let ExprKind::Comparison { first, rest } = &expression.kind else {
         return;
     };
@@ -1954,23 +1981,31 @@ fn property_terms(
     allowed: &[String],
     props: Option<&Properties>,
 ) -> Result<Vec<String>> {
+    property_terms_with(alias, allowed, props, |value| literal(value).map(Some))
+}
+
+fn property_terms_with(
+    alias: &str,
+    allowed: &[String],
+    props: Option<&Properties>,
+    render: impl Fn(&Expr) -> Result<Option<String>>,
+) -> Result<Vec<String>> {
+    let mut terms = Vec::new();
     match props {
-        None => Ok(Vec::new()),
-        Some(Properties::Map(values)) => values
-            .iter()
-            .map(|(key, value)| {
+        None => {}
+        Some(Properties::Map(values)) => {
+            for (key, value) in values {
                 ensure!(
                     allowed.contains(&key.0),
                     "unknown inline property {}",
                     key.0
                 );
-                Ok(cypher_compare(
-                    &qualified(alias, &key.0),
-                    "=",
-                    &literal(value)?,
-                ))
-            })
-            .collect(),
-        _ => bail!("inline properties require literal values"),
+                if let Some(value) = render(value)? {
+                    terms.push(cypher_compare(&qualified(alias, &key.0), "=", &value));
+                }
+            }
+        }
+        _ => bail!("inline properties require a property map"),
     }
+    Ok(terms)
 }

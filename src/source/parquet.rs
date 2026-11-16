@@ -42,18 +42,19 @@ use url::Url;
 use super::parquet_snapshot::{self, Part, RemoteFile, RemoteSnapshot, Snapshot};
 use super::{ReadStats, SourceVersion};
 
-#[cfg(feature = "admin")]
 pub(crate) async fn object_version(
     location: &str,
+    store: Option<&Arc<dyn ObjectStore>>,
     pool: Arc<dyn MemoryPool>,
     stats: Arc<ReadStats>,
 ) -> Result<SourceVersion> {
-    if let Some(path) = parquet_snapshot::managed_location(location)
+    if store.is_none()
+        && let Some(path) = parquet_snapshot::managed_location(location)
         && let Some(snapshot) = Snapshot::read(&path)?
     {
         return Ok(snapshot_version(location, &snapshot));
     }
-    Ok(PinnedFile::open(location, pool, stats)
+    Ok(PinnedFile::open_storage(location, store, pool, stats)
         .await?
         .version(location))
 }
@@ -337,7 +338,45 @@ impl AsyncFileReader for PinnedFile {
             if self.parallel_ranges && self.local && ranges.len() > 1 {
                 return self.read_local_ranges(ranges).await;
             }
-            // Bound concurrent object reads and keep the decoder's range order.
+            if !self.local {
+                // Merge nearby chunks without dropping object version checks or
+                // changing the order expected by the Parquet decoder.
+                let count = ranges.len();
+                let mut ordered = ranges.into_iter().enumerate().collect::<Vec<_>>();
+                ordered.sort_unstable_by_key(|(_, range)| (range.start, range.end));
+                let mut requests: Vec<(Range<u64>, Vec<(usize, Range<u64>)>)> = Vec::new();
+                for (index, range) in ordered {
+                    if range.start > range.end || range.end > self.meta.size {
+                        return Err(ParquetError::General("invalid Parquet object range".into()));
+                    }
+                    if let Some((merged, parts)) = requests.last_mut()
+                        && range.start <= merged.end.saturating_add(4096)
+                        && range.end.saturating_sub(merged.start) <= 1024 * 1024
+                    {
+                        merged.end = merged.end.max(range.end);
+                        parts.push((index, range));
+                    } else {
+                        requests.push((range.clone(), vec![(index, range)]));
+                    }
+                }
+                let mut fetched =
+                    futures::stream::iter(requests.into_iter().map(|(range, parts)| {
+                        let mut reader = self.clone();
+                        async move {
+                            let start = range.start;
+                            Ok::<_, ParquetError>((start, parts, reader.get_bytes(range).await?))
+                        }
+                    }))
+                    .buffer_unordered(8);
+                let mut result = vec![Bytes::new(); count];
+                while let Some((start, parts, bytes)) = fetched.try_next().await? {
+                    for (index, range) in parts {
+                        result[index] = bytes
+                            .slice((range.start - start) as usize..(range.end - start) as usize);
+                    }
+                }
+                return Ok(result);
+            }
             let parallelism = if self.parallel_ranges { 8 } else { 1 };
             futures::stream::iter(ranges.into_iter().map(|range| {
                 let mut reader = self.clone();
@@ -733,7 +772,10 @@ impl OpenedParquet {
         let mut metadata = Vec::new();
         #[cfg(feature = "admin")]
         let mut scan_objects = Vec::new();
-        let parallelism = if inputs.iter().all(|(_, part, _, _)| part.is_some()) {
+        let parallelism = if store.is_some()
+            || inputs.iter().all(|(location, part, _, _)| {
+                part.is_some() || location.contains("://") && !location.starts_with("file://")
+            }) {
             8
         } else {
             1
@@ -773,12 +815,12 @@ impl OpenedParquet {
         {
             let footer = builder.metadata();
             metadata.push(Arc::clone(footer));
+            file.footer = Some(Arc::clone(footer));
             if let Some(mask) = &mask {
                 ensure!(
                     usize::try_from(footer.file_metadata().num_rows())? == mask.rows,
                     "local Parquet snapshot part row count changed"
                 );
-                file.footer = Some(Arc::clone(footer));
             } else if !managed {
                 versions.push(file.version(&location));
             }
@@ -1030,5 +1072,49 @@ impl TableProvider for ParquetTable {
                 .with_limit(limit)
                 .build();
         Ok(DataSourceExec::from_data_source(config))
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_ranges_are_coalesced_without_changing_decoder_order() -> Result<()> {
+        use datafusion::execution::memory_pool::UnboundedMemoryPool;
+        use object_store::ObjectStoreExt;
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjectPath::parse("file.parquet")?;
+        let data = Bytes::from(Vec::from_iter((0..16000).map(|i| (i % 251) as u8)));
+        store.put(&path, data.clone().into()).await?;
+        let stats = Arc::new(ReadStats::default());
+        let mut reader = PinnedFile::pin(
+            store,
+            path,
+            false,
+            Arc::new(UnboundedMemoryPool::default()),
+            Arc::clone(&stats),
+        )
+        .await?;
+        let chunks = reader
+            .get_byte_ranges(vec![40..55, 0..20, 15000..15008, 19..32])
+            .await?;
+        assert_eq!(
+            chunks,
+            [
+                data.slice(40..55),
+                data.slice(0..20),
+                data.slice(15000..15008),
+                data.slice(19..32)
+            ]
+        );
+        assert_eq!(
+            stats.metrics().requests,
+            3,
+            "one HEAD and two merged range requests"
+        );
+        assert_eq!(stats.metrics().object_bytes, 63);
+        Ok(())
     }
 }

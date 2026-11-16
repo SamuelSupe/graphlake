@@ -210,7 +210,24 @@ fn arrow_schema(columns: &[ColumnInfo]) -> Result<datafusion::arrow::datatypes::
                     OracleType::Number(p, s) if *p > 0 && *s >= 0 && (*s as u8) <= *p => {
                         types::numeric(*p, *s)?
                     }
-                    OracleType::Number(_, _) | OracleType::Float(_) => DataType::Utf8,
+                    OracleType::Number(p, s) if *p > 0 && *s > 0 && *s <= 38 => {
+                        types::numeric((*p).max(*s as u8), *s)?
+                    }
+                    OracleType::Number(p, s)
+                        if *p > 0 && *s < 0 && i16::from(*p) - i16::from(*s) <= 38 =>
+                    {
+                        let precision = (i16::from(*p) - i16::from(*s)) as u8;
+                        if precision <= 18 {
+                            DataType::Int64
+                        } else {
+                            types::numeric(precision, 0)?
+                        }
+                    }
+                    // Out-of-range fixed-point numbers still have an exact
+                    // text representation; Oracle's unconstrained types do not
+                    // imply a single fixed scale for numeric comparison.
+                    OracleType::Number(p, _) if *p > 0 => DataType::Utf8,
+                    OracleType::Number(_, _) | OracleType::Float(_) => DataType::Float64,
                     OracleType::BinaryFloat => DataType::Float32,
                     OracleType::BinaryDouble => DataType::Float64,
                     OracleType::Date => DataType::Timestamp(TimeUnit::Microsecond, None),

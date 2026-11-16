@@ -204,9 +204,11 @@ class WarehouseHandler(BaseHTTPRequestHandler):
         if '"large_accounts"' in sql:
             return self.trino_large_result(sql, job, int(page))
         assert any(f'FROM "lake"."test"."{table}" ' in sql + " "
-                   for table in ("accounts", "accounts.2026.11"))
+                   for table in ("accounts", "accounts.2026.11", "dst_fold"))
+        utc = """at_timezone("recorded", 'UTC') AS "recorded" """.strip()
+        normal_sql = sql.replace(utc, '"recorded"')
         names, rows = projection(
-            sql, '"', ("id", "amount", "recorded", "payload", "_id"),
+            normal_sql, '"', ("id", "amount", "recorded", "payload", "_id"),
             [(9007199254740993, "12.25", "2026-01-02 03:04:05.123456789 Asia/Singapore", "AQI=", "AAAAAAAAAAAAAAAB"),
              (9007199254740994, None, "2026-01-01 19:04:05.123456789 UTC", "AwQ=", "AAAAAAAAAAAAAAAC")],
         )
@@ -218,7 +220,18 @@ class WarehouseHandler(BaseHTTPRequestHandler):
                      "payload": "varbinary", "_id": "ObjectId"}
             result["columns"] = [{"name": name, "type": types[name]} for name in names]
             result["nextUri"] = f"{TRINO}/executing/{job}/2"
+        if sql.endswith(" WHERE FALSE"):
+            result.pop("nextUri", None)
+            self.send_json(result)
+            return
         row = rows[int(page) - 1]
+        if "recorded" in names:
+            index = names.index("recorded")
+            if '"dst_fold"' in sql:
+                row[index] = (f"2026-11-01 0{int(page) + 4}:30:00.123456789 UTC" if utc in sql
+                              else "2026-11-01 01:30:00.123456789 America/New_York")
+            elif utc in sql:
+                row[index] = "2026-01-01 19:04:05.123456789 UTC"
         if "id" in names:
             index = names.index("id")
             row[index] = int(row[index])

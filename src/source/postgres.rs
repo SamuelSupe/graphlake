@@ -341,9 +341,9 @@ impl Snapshot {
             .with_root_certificates(roots)
             .with_no_client_auth(),
         );
-        let (client, connection) = config
-            .connect(tls.clone())
+        let (client, connection) = tokio::time::timeout(timeout, config.connect(tls.clone()))
             .await
+            .context("PostgreSQL connection timed out")?
             .context("opening PostgreSQL connection")?;
         let driver = tokio::spawn(async move {
             let _ = connection.await;
@@ -973,6 +973,39 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
         }
         Expr::BinaryExpr(binary) => {
             let op = binary.op;
+            if op == Operator::Eq {
+                let operands = [(&binary.left, &binary.right), (&binary.right, &binary.left)];
+                for (field, literal) in operands {
+                    let (
+                        Some(field),
+                        Expr::Literal(
+                            ScalarValue::Utf8(Some(value))
+                            | ScalarValue::Utf8View(Some(value))
+                            | ScalarValue::LargeUtf8(Some(value)),
+                            _,
+                        ),
+                    ) = (column(field), literal.as_ref())
+                    else {
+                        continue;
+                    };
+                    let name = ident(field.name());
+                    let lit = operand(literal)?;
+                    match types[schema.index_of(field.name()).ok()?] {
+                        Type::UUID
+                            if uuid::Uuid::parse_str(value)
+                                .is_ok_and(|uuid| uuid.to_string() == *value) =>
+                        {
+                            return Some(format!("({name} = {lit}::uuid)"));
+                        }
+                        Type::TEXT | Type::VARCHAR => {
+                            let exact =
+                                key_operand(&name, &types[schema.index_of(field.name()).ok()?])?;
+                            return Some(format!("({name} = {lit} AND {exact} = {lit})"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let (left, right) = match op {
                 Operator::And | Operator::Or => (
                     predicate(&binary.left, schema, types)?,

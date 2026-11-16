@@ -940,6 +940,60 @@ async fn local_tables_reclaims_only_masked_base_partitions() -> Result<()> {
 }
 
 #[tokio::test]
+async fn local_table_result_persistence_retries_without_shutting_down_http() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let db = rusqlite::Connection::open(root.path().join("source.db"))?;
+    db.execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL); INSERT INTO items VALUES (1, 'one', 10);")?;
+    fs::write(
+        root.path().join("payments.yaml"),
+        yaml("{type: sqlite, path: source.db}", "input.items"),
+    )?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    create(&server, "fault", "input.items").await?;
+
+    db.execute_batch("BEGIN EXCLUSIVE")?;
+    let run: Value = server
+        .request(Method::POST, &format!("{BASE}/fault/load"))
+        .json(&json!({"mode": "full"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let state = root.path().join(".graphlake-local/state.json");
+    let saved = state.with_extension("original");
+    fs::rename(&state, &saved)?;
+    fs::create_dir(&state)?;
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    db.execute_batch("COMMIT")?;
+    let done = completed(&server, "fault", run["id"].as_str().unwrap()).await?;
+    assert_eq!(done["status"], "succeeded");
+    server
+        .http
+        .get(format!("{}/healthz", server.base))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    fs::remove_dir(&state)?;
+    fs::rename(saved, &state)?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let persisted: Value = serde_json::from_slice(&fs::read(&state)?)?;
+            if persisted["payments/fault"]["history"][0]["status"] == "succeeded" {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_tables_schedule_persists_and_pauses() -> Result<()> {
     let root = tempfile::tempdir()?;
     setup_assets(root.path())?;

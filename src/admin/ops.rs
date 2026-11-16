@@ -373,7 +373,12 @@ pub(super) async fn ready(State(app): State<Arc<App>>) -> impl IntoResponse {
             );
         }
     }
-    let Ok(slot) = app.readiness.clone().try_acquire_owned() else {
+    let Ok(Ok(slot)) = tokio::time::timeout(
+        Duration::from_millis(850),
+        app.readiness.clone().acquire_owned(),
+    )
+    .await
+    else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status":"probe_in_progress"})),

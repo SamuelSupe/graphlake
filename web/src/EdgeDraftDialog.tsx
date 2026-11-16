@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { useId, useRef, useState, type FormEvent } from 'react';
 import { ArrowRightLeft } from 'lucide-react';
 import { errorText } from './api';
@@ -35,28 +36,28 @@ export function EdgeDraftDialog({ model, ends, close, create }: {
     } catch (cause) { setError(errorText(cause)); }
   }
 
-  return <Modal title="新建边类型" description="确认连接方向，创建后可配置来源表和端点字段。" close={close}>
+  return <Modal title={t('新建边类型')} description={t('确认连接方向，创建后可配置来源表和端点字段。')} close={close}>
     <form className="panel-layout" onSubmit={submit}>
       <div className="panel-body form-fields">
         <div className="edge-draft-name">
-          <label>边类型名称<input ref={nameField} required data-initial-focus placeholder="例如 Transfer" value={name}
+          <label>{t('边类型名称')}<input ref={nameField} required data-initial-focus placeholder={t('例如 Transfer')} value={name}
             aria-invalid={!!nameError} aria-describedby={nameError ? errorId : undefined}
             onChange={event => { setName(event.target.value); setNameError(''); setError(''); }} /></label>
           <p id={errorId} className={nameError ? 'inline-error' : 'sr-only'} aria-live="polite">{nameError}</p>
         </div>
-        <label>起点<select required value={from} onChange={event => { setFrom(event.target.value); setError(''); }}>
-          <option value="">选择起点节点</option>{nodes.map(node => <option key={node}>{node}</option>)}
+        <label>{t('起点')}<select required value={from} onChange={event => { setFrom(event.target.value); setError(''); }}>
+          <option value="">{t('选择起点节点')}</option>{nodes.map(node => <option key={node}>{node}</option>)}
         </select></label>
-        <label>终点<select required value={to} onChange={event => { setTo(event.target.value); setError(''); }}>
-          <option value="">选择终点节点</option>{nodes.map(node => <option key={node}>{node}</option>)}
+        <label>{t('终点')}<select required value={to} onChange={event => { setTo(event.target.value); setError(''); }}>
+          <option value="">{t('选择终点节点')}</option>{nodes.map(node => <option key={node}>{node}</option>)}
         </select></label>
         <div className="actions"><button type="button" className="button compact" disabled={!from || !to || from === to}
-          onClick={() => { setFrom(to); setTo(from); setError(''); }}><ArrowRightLeft size={15} aria-hidden="true" />交换起点与终点</button></div>
+          onClick={() => { setFrom(to); setTo(from); setError(''); }}><ArrowRightLeft size={15} aria-hidden="true" />{t('交换起点与终点')}</button></div>
         {error && <p className="inline-error" role="alert">{error}</p>}
       </div>
       <footer className="panel-footer">
-        <button type="button" className="button" onClick={close}>取消</button>
-        <button type="submit" className="button primary">创建边</button>
+        <button type="button" className="button" onClick={close}>{t('取消')}</button>
+        <button type="submit" className="button primary">{t('创建边')}</button>
       </footer>
     </form>
   </Modal>;

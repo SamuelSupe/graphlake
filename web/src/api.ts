@@ -1,3 +1,4 @@
+import { diagnosticText, t } from './locale.ts';
 export type Status = 'unchecked' | 'passed' | 'failed';
 
 export type ModelSummary = {
@@ -64,7 +65,7 @@ export async function request(path: string, options?: RequestInit): Promise<Resp
     const error = await response.json().catch(() => null);
     const code = error?.code ?? (response.status === 401 && !path.startsWith('/auth/') ? 'auth_required' : undefined);
     if (code === 'auth_required') window.dispatchEvent(new Event(authRequired));
-    throw new ApiError(error?.message ?? (code === 'auth_required' ? '请登录 GraphLake 管理后台' : '请求失败（' + response.status + '）'), code, error?.location, response.status, error?.sources ? error : undefined, error);
+    throw new ApiError(error?.message ?? (code === 'auth_required' ? t('请登录 GraphLake 管理后台') : t('请求失败（{0}）', response.status)), code, error?.location, response.status, error?.sources ? error : undefined, error);
   }
   return response;
 }
@@ -89,7 +90,7 @@ export function downloadText(text: string, filename: string) {
 }
 
 export function errorText(error: unknown) {
-  return error instanceof Error ? error.message : '操作失败';
+  return error instanceof Error ? diagnosticText(error.message) : t('操作失败');
 }
 
 export type GraphIdentity = { kind: 'node' | 'edge'; label: string; key: string[] };

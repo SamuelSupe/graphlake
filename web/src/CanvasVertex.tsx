@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { useEffect, useRef, type PointerEvent } from 'react';
 import { Box, Plus } from 'lucide-react';
 import type { Point } from './modelCanvasGeometry';
@@ -49,7 +50,7 @@ export function CanvasVertex({ name, point, tone, selected, activate, connect, l
   return <div className="graph-vertex" style={{ left: point[0], top: point[1] }}
     data-link-source={source || undefined} data-link-target={target || undefined} data-moving={moving || undefined}>
     {activate ? <button ref={button} type="button" className="graph-node" data-movable={!!move || undefined}
-      aria-label={linking ? (incoming ? '选为终点 ' : '选为起点 ') + name : name}
+      aria-label={linking ? (incoming ? t('选为终点 ') : t('选为起点 ')) + name : name}
       aria-pressed={linking ? source : selected}
       aria-describedby={hint}
       onPointerDown={event => {
@@ -98,7 +99,7 @@ export function CanvasVertex({ name, point, tone, selected, activate, connect, l
         const step = event.shiftKey ? 32 : 12;
         move.commit([point[0] + step * delta[0], point[1] + step * delta[1]]);
       }}>{content}</button> : <div className="graph-node">{content}</div>}
-    {connect && !linking && <button type="button" className="graph-port" aria-label={'从 ' + name + ' 开始连线'} title={'从 ' + name + ' 开始连线'}
+    {connect && !linking && <button type="button" className="graph-port" aria-label={t('从 {0} 开始连线', name)} title={t('从 {0} 开始连线', name)}
       onClick={() => { button.current?.focus({ preventScroll: true }); connect(); }}><Plus size={14} aria-hidden="true" /></button>}
   </div>;
 }

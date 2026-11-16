@@ -1,15 +1,18 @@
+import { t } from './locale.ts';
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Bot, Database, LayoutDashboard, LogOut, Network, Settings2, ShieldCheck, Terminal, UserRound } from 'lucide-react';
 import { api, errorText, type ModelSummary, type SavedModel } from './api';
 import { AuthGate, type Session } from './Auth';
+import { LanguageSelect } from './LanguageSelect';
 import { Access, type Grants } from './Access';
 import { Query } from './Query';
 import { useMutations } from './Mutations';
 import type { Workspace } from './Editor';
 import type { Point } from './modelCanvasGeometry';
 import { documentOf, emptyModel, modelOf } from './model';
-import { Mark, Modal, NameDialog } from './ui';
+import { Modal, NameDialog } from './ui';
+import { ConsoleNavigation } from './ConsoleNavigation';
 import { Models, type DirectoryState } from './Models';
 import type { SettingsTab } from './Settings';
 import './styles.css';
@@ -22,9 +25,9 @@ const RecoveryConsole = lazy(() => import('./RecoveryConsole'));
 const Editor = lazy(() => import('./Editor'));
 
 const nav = [
-  { key: 'graph', label: '图模型', Icon: Network },
-  { key: 'catalogs', label: '数据源', Icon: Database },
-  { key: 'query', label: '查询', Icon: Terminal },
+  { key: 'graph', label: t('图模型'), Icon: Network },
+  { key: 'catalogs', label: t('数据源'), Icon: Database },
+  { key: 'query', label: t('查询'), Icon: Terminal },
 ] as const;
 
 function modelPath(id: string, workspace: Workspace = 'graph') {
@@ -106,7 +109,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
     const leaving = current.current.replace(/\/$/, '');
     const unsaved = leaving === '/new' && dirty.current.has('')
       || leaving === '/settings' && (dirty.current.has('/settings') || dirty.current.has('/settings/mcp'));
-    if (unsaved && !replace && !window.confirm('当前页面有未保存的修改。离开当前页面？')) {
+    if (unsaved && !replace && !window.confirm(t('当前页面有未保存的修改。离开当前页面？'))) {
       if (window.location.pathname !== current.current) window.history.pushState(null, '', current.current);
       return;
     }
@@ -168,7 +171,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   });
   useEffect(() => { if (id) lastModel.current = id; }, [id]);
   useLayoutEffect(() => { window.scrollTo(0, ['/', '/catalogs', '/query'].includes(path) ? directory.current[workspace].scroll : 0); }, [path, workspace]);
-  const pageTitle = overviewPage ? 'Overview' : aiPage ? 'AI' : settingsPage ? '运行配置' : accessPage ? '权限管理'
+  const pageTitle = overviewPage ? t('平台概览') : aiPage ? 'AI' : settingsPage ? t('运行配置') : accessPage ? t('权限管理')
     : nav.find(item => item.key === workspace)!.label;
   useEffect(() => { if (!locked) document.title = 'GraphLake · ' + pageTitle; }, [locked, pageTitle]);
   const newModel = administrator && path === '/new' ? draft : undefined;
@@ -176,7 +179,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   async function importModel(file: File) {
     setImportError('');
     try {
-      if (file.size > 1024 * 1024) throw new Error('YAML 文件超过 1 MiB');
+      if (file.size > 1024 * 1024) throw new Error(t('YAML 文件超过 1 MiB'));
       const yaml = await file.text();
       const name = modelOf(yaml).graph || file.name.replace(/\.ya?ml$/i, '');
       setImported({ yaml, name });
@@ -208,51 +211,50 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
     catch (cause) { setLogoutError(errorText(cause)); setLoggingOut(false); }
   }
 
+  const account = <div className="rail-items rail-account">
+    <LanguageSelect />
+    <div className="rail-identity">
+      <UserRound size={20} aria-hidden="true" />
+      <div className="rail-identity-text">
+        {identity.enabled ? <>
+          <bdi className="rail-username" title={identity.username ?? undefined}>{identity.username}</bdi>
+          <span>{administrator ? t('管理员') : t('普通用户')}</span>
+        </> : <span>{t('未启用认证')}</span>}
+      </div>
+    </div>
+    {logout && <button className="rail-link" onClick={() => dirty.current.size ? setConfirmLogout(true) : void signOut()} disabled={loggingOut}>
+      <LogOut size={20} aria-hidden="true" /><span>{t('退出登录')}</span>
+    </button>}
+  </div>;
+
   return <div className="app-shell">
-    <a className="skip-link" href="#workspace-content">跳转到工作区</a>
-    <nav className="app-rail" aria-label="主导航">
-      <button className="rail-brand" aria-label="GraphLake 首页" onClick={() => navigate('/')}><Mark size={26} /><span>GraphLake</span></button>
-      <div className="rail-items">
-        {administrator && <a className="rail-link" href="/overview" aria-current={overviewPage ? 'page' : undefined} onClick={event => {
-          if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-          event.preventDefault();
-          navigate('/overview');
-        }}>
-          <LayoutDashboard size={20} aria-hidden="true" /><span lang="en">Overview</span>
-        </a>}
-        {nav.filter(({ key }) => key === 'query' ? canUseQuery : key === 'catalogs' ? administrator : hasModelAccess)
-        .map(({ key, label, Icon }) =>
-          <button key={key} className="rail-link" aria-current={!overviewPage && !accessPage && !settingsPage && !aiPage && workspace === key ? 'page' : undefined} onClick={() => openWorkspace(key)}>
-            <Icon size={20} aria-hidden="true" /><span>{label}</span>
-          </button>)}
-        <a className="rail-link" href="/ai" aria-current={aiPage ? 'page' : undefined} onClick={event => {
-          if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-          event.preventDefault(); navigate('/ai');
-        }}>
-          <Bot size={20} aria-hidden="true" /><span>AI</span>
-        </a>
-        {administrator && identity.enabled && <button className="rail-link" aria-current={accessPage ? 'page' : undefined} onClick={() => navigate('/access')}>
-          <ShieldCheck size={20} aria-hidden="true" /><span>权限管理</span>
-        </button>}
-        {administrator && <button className="rail-link" aria-current={settingsPage ? 'page' : undefined} onClick={() => { setSettingsTab(undefined); navigate('/settings'); }}>
-          <Settings2 size={20} aria-hidden="true" /><span>运行配置</span>
-        </button>}
-      </div>
-      <div className="rail-items rail-account">
-        <div className="rail-identity">
-          <UserRound size={20} aria-hidden="true" />
-          <div className="rail-identity-text">
-            {identity.enabled ? <>
-              <bdi className="rail-username" title={identity.username ?? undefined}>{identity.username}</bdi>
-              <span>{administrator ? '管理员' : '普通用户'}</span>
-            </> : <span>未启用认证</span>}
-          </div>
-        </div>
-        {logout && <button className="rail-link" onClick={() => dirty.current.size ? setConfirmLogout(true) : void signOut()} disabled={loggingOut}>
-          <LogOut size={20} aria-hidden="true" /><span>退出登录</span>
-        </button>}
-      </div>
-    </nav>
+    <a className="skip-link" href="#workspace-content">{t('跳转到工作区')}</a>
+    <ConsoleNavigation page={pageTitle} home={() => navigate('/')} account={account}>
+      {administrator && <a className="rail-link" href="/overview" aria-current={overviewPage ? 'page' : undefined} onClick={event => {
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        navigate('/overview');
+      }}>
+        <LayoutDashboard size={20} aria-hidden="true" /><span>{t('平台概览')}</span>
+      </a>}
+      {nav.filter(({ key }) => key === 'query' ? canUseQuery : key === 'catalogs' ? administrator : hasModelAccess)
+      .map(({ key, label, Icon }) =>
+        <button key={key} className="rail-link" aria-current={!overviewPage && !accessPage && !settingsPage && !aiPage && workspace === key ? 'page' : undefined} onClick={() => openWorkspace(key)}>
+          <Icon size={20} aria-hidden="true" /><span>{label}</span>
+        </button>)}
+      <a className="rail-link" href="/ai" aria-current={aiPage ? 'page' : undefined} onClick={event => {
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault(); navigate('/ai');
+      }}>
+        <Bot size={20} aria-hidden="true" /><span>AI</span>
+      </a>
+      {administrator && identity.enabled && <button className="rail-link" aria-current={accessPage ? 'page' : undefined} onClick={() => navigate('/access')}>
+        <ShieldCheck size={20} aria-hidden="true" /><span>{t('权限管理')}</span>
+      </button>}
+      {administrator && <button className="rail-link" aria-current={settingsPage ? 'page' : undefined} onClick={() => { setSettingsTab(undefined); navigate('/settings'); }}>
+        <Settings2 size={20} aria-hidden="true" /><span>{t('运行配置')}</span>
+      </button>}
+    </ConsoleNavigation>
     <div className="app-content" id="workspace-content" tabIndex={-1}>
     {mutations.banner && <div className="global-mutation">{mutations.banner}</div>}
     {openModels.map(model => {
@@ -265,38 +267,38 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
       return <div className="model-workspace" key={model} data-inactive={!show || undefined}
         inert={!show} aria-hidden={!show || undefined}>
         {canReadModel(model)
-          ? <Suspense fallback={<p className="empty" role="status">正在打开模型…</p>}>
+          ? <Suspense fallback={<p className="empty" role="status">{t('正在打开模型…')}</p>}>
             <Editor id={model} active={show} onDirty={onDirty} workspace={show ? page : 'query'} models={availableModels ?? []}
               allow={{ configure: administrator, edit: modelers, publish: publishers, query: canQuery(model), export: canExport(model) }}
               actor={actor} mutations={mutations} recovered={recovered?.id === model ? recovered : undefined} canvasLayouts={canvasLayouts.current}
-              close={() => navigate('/')} goTo={next => navigate(modelPath(model, next))}
+              close={() => navigate(page === 'graph' ? '/' : '/' + page)} goTo={next => navigate(modelPath(model, next))}
               changeModel={key => navigate(modelPath(key, page))}
               changed={reloadModels} created={key => navigate(modelPath(key), true)} />
             </Suspense>
           : <main className="workbench">
               <header className="workspace-header"><div className="workspace-title"><h1>{summary!.name}</h1></div>
-                <button className="button compact" onClick={() => navigate('/query')}>查询模型列表</button></header>
+                <button className="button compact" onClick={() => navigate('/query')}>{t('查询模型列表')}</button></header>
               <Query id={model} actor={actor} revision={summary!.active_revision!} draftPending={false}
                 refresh={reloadModels} visible={show} canExport={canExport(model)} />
             </main>}
       </div>;
     })}
-    {newModel && <Suspense fallback={<p className="empty" role="status">正在打开模型…</p>}>
+    {newModel && <Suspense fallback={<p className="empty" role="status">{t('正在打开模型…')}</p>}>
       <Editor key={newModel.id} id={newModel.id} initial={newModel} active onDirty={onDirty}
       allow={{ configure: true, edit: true, publish: true, query: true, export: true }} actor={actor} mutations={mutations} recovered={recovered?.id === newModel.id ? recovered : undefined} canvasLayouts={canvasLayouts.current}
       workspace={workspace} models={models ?? []} close={() => navigate('/')} goTo={next => navigate(modelPath(newModel.id, next))}
       changeModel={key => navigate(modelPath(key, workspace))} changed={reloadModels} created={key => navigate(modelPath(key), true)} />
       </Suspense>}
-    {accessPage && (administrator && identity.enabled ? <Access models={models ?? []} locked={locked} /> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
+    {accessPage && (administrator && identity.enabled ? <Access models={models ?? []} locked={locked} /> : <main className="workbench"><p className="empty">{t('此页面需要管理员权限。')}</p></main>)}
     {administrator && overviewVisited && <div hidden={!overviewPage}>
-        <Suspense fallback={<p className="empty" role="status">正在打开平台概览…</p>}>
+        <Suspense fallback={<p className="empty" role="status">{t('正在打开平台概览…')}</p>}>
           <Overview active={overviewPage && !locked} openModel={(id, page) => navigate(modelPath(id, page))}
             openSettings={tab => { setSettingsTab(tab); navigate('/settings'); }} />
         </Suspense>
       </div>}
-    {overviewPage && !administrator && <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>}
-    {settingsPage && (administrator ? <Suspense fallback={<p className="empty" role="status">正在打开运行配置…</p>}><Settings initialTab={settingsTab} openModel={(id, page) => navigate(modelPath(id, page))} models={models ?? []} locked={locked} onDirty={onDirty} /></Suspense> : <main className="workbench"><p className="empty">此页面需要管理员权限。</p></main>)}
-    {aiPage && <Suspense fallback={<p className="empty" role="status">正在打开 AI…</p>}>
+    {overviewPage && !administrator && <main className="workbench"><p className="empty">{t('此页面需要管理员权限。')}</p></main>}
+    {settingsPage && (administrator ? <Suspense fallback={<p className="empty" role="status">{t('正在打开运行配置…')}</p>}><Settings initialTab={settingsTab} openModel={(id, page) => navigate(modelPath(id, page))} models={models ?? []} locked={locked} onDirty={onDirty} /></Suspense> : <main className="workbench"><p className="empty">{t('此页面需要管理员权限。')}</p></main>)}
+    {aiPage && <Suspense fallback={<p className="empty" role="status">{t('正在打开 AI…')}</p>}>
       <AI locked={locked} authEnabled={identity.enabled}
         openServiceSettings={administrator ? () => { setSettingsTab('mcp'); navigate('/settings'); } : undefined} />
     </Suspense>}
@@ -309,18 +311,18 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
         create={() => setCreating(true)} importModel={file => void importModel(file)} />}
     </div>
     {logoutError && <p className="notice error auth-logout-error" role="alert">{logoutError}</p>}
-    {confirmLogout && !locked && <Modal layout="center" title="退出登录" close={() => setConfirmLogout(false)}>
+    {confirmLogout && !locked && <Modal layout="center" title={t('退出登录')} close={() => setConfirmLogout(false)}>
       <div className="dialog-form">
-        <p>有未保存的修改。退出登录会放弃这些修改。</p>
+        <p>{t('有未保存的修改。退出登录会放弃这些修改。')}</p>
         <div className="dialog-actions">
-          <button className="button" onClick={() => setConfirmLogout(false)} data-initial-focus>继续编辑</button>
-          <button className="button primary" onClick={() => void signOut()}>放弃修改并退出</button>
+          <button className="button" onClick={() => setConfirmLogout(false)} data-initial-focus>{t('继续编辑')}</button>
+          <button className="button primary" onClick={() => void signOut()}>{t('放弃修改并退出')}</button>
         </div>
       </div>
     </Modal>}
-    {imported && <NameDialog title="导入图模型" initial={imported.name} withId close={() => setImported(undefined)}
+    {imported && <NameDialog title={t('导入图模型')} initial={imported.name} withId close={() => setImported(undefined)}
       submit={(name, key) => {
-        if (models?.some(model => model.id === key)) throw new Error('模型标识已存在');
+        if (models?.some(model => model.id === key)) throw new Error(t('模型标识已存在'));
         let yaml = imported.yaml;
         if (modelOf(yaml).graph !== name) {
           const doc = documentOf(yaml);
@@ -330,7 +332,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
         setDraft({ id: key, yaml, revision: '', active_revision: null, status: 'unchecked' });
         navigate('/new');
       }} />}
-    {creating && <NameDialog title="新建图模型" withId close={() => setCreating(false)}
+    {creating && <NameDialog title={t('新建图模型')} withId close={() => setCreating(false)}
       submit={(name, key) => {
         setDraft({ id: key, yaml: emptyModel(name), revision: '', active_revision: null, status: 'unchecked' });
         navigate('/new');
@@ -339,8 +341,8 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
 }
 
 const recovery = /^\/recovery\/?$/.test(window.location.pathname);
-if (recovery) document.title = 'GraphLake · 灾备恢复验收';
+document.title = recovery ? t('GraphLake · 灾备恢复验收') : 'GraphLake · ' + t('图模型');
 createRoot(document.getElementById('root')!).render(recovery
-  ? <Suspense fallback={<main className="empty" role="status">正在打开恢复验收台…</main>}><RecoveryConsole /></Suspense>
+  ? <Suspense fallback={<main className="empty" role="status">{t('正在打开恢复验收台…')}</main>}><RecoveryConsole /></Suspense>
   : <AuthGate workspace={(logout, locked, identity) => <App key={identity.authorization ?? identity.username ?? '@dev'} logout={logout} locked={locked} identity={identity} />} />,
 );

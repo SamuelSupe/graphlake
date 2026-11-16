@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { useMemo, useState } from 'react';
 import { diffLines } from 'diff';
 import { modelChanges } from './modelChanges';
@@ -20,27 +21,27 @@ export function VersionDiff({ before, after }: { before: string; after: string }
   }, [before, after]);
   const hasChanges = before !== after;
   return <div className="version-diff">
-    <h3>历史版本 → 当前草稿</h3>
+    <h3>{t('历史版本 → 当前草稿')}</h3>
     {diff.changes ? diff.changes.length ? <ul className="change-summary">{diff.changes.map(change => <li key={change.section + ':' + change.name}>
-      <span className={'change-kind ' + change.kind}>{{ added: '新增', removed: '删除', changed: '修改' }[change.kind]}</span>
-      <span>{change.section} <strong>{change.name}</strong>{change.fields.length > 0 && <small> · {change.fields.join('、')}</small>}</span>
-    </li>)}</ul> : <p className="muted">{hasChanges ? '模型内容相同，仅格式或注释有变化。' : '与当前草稿一致。'}</p>
-      : <p className="notice">草稿 YAML 暂时无法解析，请按文本差异核对。</p>}
+      <span className={'change-kind ' + change.kind}>{{ added: t('新增'), removed: t('删除'), changed: t('修改') }[change.kind]}</span>
+      <span>{change.section} <strong>{change.name}</strong>{change.fields.length > 0 && <small> · {change.fields.join(t('、'))}</small>}</span>
+    </li>)}</ul> : <p className="muted">{hasChanges ? t('模型内容相同，仅格式或注释有变化。') : t('与当前草稿一致。')}</p>
+      : <p className="notice">{t('草稿 YAML 暂时无法解析，请按文本差异核对。')}</p>}
     {hasChanges && diff.rows && <>
-      <label className="check-label"><input type="checkbox" checked={unchanged} onChange={event => setUnchanged(event.target.checked)} />显示未修改行</label>
-      <div className="diff-scroll" role="region" aria-label="YAML 逐行差异" tabIndex={0}>
-        <table className="diff-table"><caption className="sr-only">删除行为历史版本内容，新增行为当前草稿内容</caption>
-          <thead><tr><th scope="col">历史行</th><th scope="col">草稿行</th><th scope="col">变化</th><th scope="col">YAML</th></tr></thead>
+      <label className="check-label"><input type="checkbox" checked={unchanged} onChange={event => setUnchanged(event.target.checked)} />{t('显示未修改行')}</label>
+      <div className="diff-scroll" role="region" aria-label={t('YAML 逐行差异')} tabIndex={0}>
+        <table className="diff-table"><caption className="sr-only">{t('删除行为历史版本内容，新增行为当前草稿内容')}</caption>
+          <thead><tr><th scope="col">{t('历史行')}</th><th scope="col">{t('草稿行')}</th><th scope="col">{t('变化')}</th><th scope="col">YAML</th></tr></thead>
           <tbody>{diff.rows.map((row, index) => (unchanged || row.kind !== 'same') && <tr key={index} className={row.kind}>
             <td>{row.oldLine}</td><td>{row.newLine}</td><td>{row.kind === 'added' ? '+' : row.kind === 'removed' ? '−' : ''}</td><td><code>{row.value || ' '}</code></td>
           </tr>)}</tbody>
         </table>
       </div>
     </>}
-    {hasChanges && !diff.rows && <p className="notice">差异较大，请展开完整 YAML 对照；变更摘要仍可用于检查模型变化。</p>}
-    <details className="full-yaml"><summary>完整 YAML 对照</summary><div className="yaml-comparison">
-      <label>历史版本<textarea readOnly value={before} rows={12} className="mono" /></label>
-      <label>当前草稿<textarea readOnly value={after} rows={12} className="mono" /></label>
+    {hasChanges && !diff.rows && <p className="notice">{t('差异较大，请展开完整 YAML 对照；变更摘要仍可用于检查模型变化。')}</p>}
+    <details className="full-yaml"><summary>{t('完整 YAML 对照')}</summary><div className="yaml-comparison">
+      <label>{t('历史版本')}<textarea readOnly value={before} rows={12} className="mono" /></label>
+      <label>{t('当前草稿')}<textarea readOnly value={after} rows={12} className="mono" /></label>
     </div></details>
   </div>;
 }

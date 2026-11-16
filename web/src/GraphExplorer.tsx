@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { memo, useDeferredValue, useEffect, useId, useImperativeHandle, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type Ref } from 'react';
 import { CircleHelp, Crosshair, Maximize, Minus, Plus, RotateCcw, X } from 'lucide-react';
 import { api, ApiError, errorText, type ExplorationMatch, type ExplorationSearch, type GraphElement, type GraphExploration, type GraphSchema, type NeighborFilter, type QueryGraphPage, type QueryResult } from './api';
@@ -8,7 +9,7 @@ import { appendGraph, combineVersions, focusNeighborhood, graphLabel, graphType,
 import { edgeCurve, edgeLanes, forceVertexLimit, packPaths, positions, scene, type Layout, type Point } from './graphLayout';
 
 const tones = ['#3277db', '#168aa6', '#6664c4', '#346494', '#3679aa', '#5850a7'];
-const layoutNames = { radial: '径向布局', layered: '分层布局', force: '力导向布局' } as const;
+const layoutNames = { radial: t('径向布局'), layered: t('分层布局'), force: t('力导向布局') } as const;
 const minZoom = .005;
 const clampZoom = (value: number) => Math.max(minZoom, Math.min(4, value));
 
@@ -115,7 +116,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
   const labelFor = (element: GraphElement) => graphLabel(element, displayLabels.get(graphType(element)));
   const accessibleLabel = (element: GraphElement) => {
     const name = labelFor(element);
-    return (element.kind === 'node' ? '节点 ' : '边 ') + element.label + ' [' + element.key.join(', ') + ']'
+    return (element.kind === 'node' ? t('节点 ') : t('边 ')) + element.label + ' [' + element.key.join(', ') + ']'
       + (name === element.label ? '' : ' · ' + name);
   };
 
@@ -127,19 +128,19 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
   }, [selected]);
 
   useImperativeHandle(ref, () => ({ append(result) {
-    if (request.current || original) return '请先完成邻居展开或返回原画布，再追加查询结果。';
+    if (request.current || original) return t('请先完成邻居展开或返回原画布，再追加查询结果。');
     if (rerunReason || page.model_revision !== result.model_revision || page.csr_generation !== result.csr_generation
       || JSON.stringify(page.graph_options) !== JSON.stringify(result.graph_options)) {
-      return '画布和查询结果的模型版本、CSR 代次或图查询范围不同，无法追加。';
+      return t('画布和查询结果的模型版本、CSR 代次或图查询范围不同，无法追加。');
     }
     const versions = combineVersions([...page.sources, ...addedFrom], result.sources);
-    if (!versions) return '画布与本次查询的数据源版本不同，无法追加。';
+    if (!versions) return t('画布与本次查询的数据源版本不同，无法追加。');
     // Unkeyed edges carry execution-local row identifiers. Keep them distinct across runs.
     const prefix = crypto.randomUUID() + ':';
     const incoming = result.graph.elements.map(element => !result.csr_generation && element.transient && element.kind === 'edge'
       ? { ...element, id: prefix + element.id } : element);
     const next = appendGraph(elements, incoming);
-    if (!next) return '追加结果会超过画布上限。移除部分元素后再试。';
+    if (!next) return t('追加结果会超过画布上限。移除部分元素后再试。');
     const nextSteps = [...new Map([...steps, ...result.graph.steps].map(step => [JSON.stringify(step), step])).values()];
     setElements(next);
     setSteps(nextSteps);
@@ -214,7 +215,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
 
   function applyPage(result: GraphExploration, filter?: NeighborFilter, batchMode = false, canvas = elements) {
     if (!result.selected) {
-      setMessage({ text: '在当前数据源中未找到该元素。', error: true });
+      setMessage({ text: t('在当前数据源中未找到该元素。'), error: true });
       return;
     }
     const merged = mergePage(batchMode ? [result.selected] : canvas, result.selected, result.graph.elements);
@@ -236,19 +237,19 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
         page: result.page_number, batchMode,
         held: merged.remaining.length ? { ...result, graph: { ...result.graph, elements: merged.remaining } } : undefined }));
       if (merged.remaining.length) {
-        setMessage({ text: '当前页还有邻居待加入。' });
+        setMessage({ text: t('当前页还有邻居待加入。') });
       } else if (batchMode) {
-        setMessage({ text: '正在查看第 ' + result.page_number + ' 批邻居。' });
+        setMessage({ text: t('正在查看第 {0} 批邻居。', result.page_number) });
       } else if (result.graph.truncated && !result.next_cursor) {
-        setMessage({ text: '当前页的部分图元素超过预览限制。' });
+        setMessage({ text: t('当前页的部分图元素超过预览限制。') });
       } else if (merged.added) {
-        setMessage({ text: '已加入 ' + merged.added + ' 个图元素。' });
+        setMessage({ text: t('已加入 {0} 个图元素。', merged.added) });
       } else {
         setMessage({ text: result.graph.elements.some(value => value.kind === 'edge')
-          ? '当前页的邻居已在画布上。' : '没有符合条件的邻居。' });
+          ? t('当前页的邻居已在画布上。') : t('没有符合条件的邻居。') });
       }
     } else if (merged.remaining.length) {
-      setMessage({ text: '画布空间不足。移除节点或聚焦子图后，可重新读取。', error: true });
+      setMessage({ text: t('画布空间不足。移除节点或聚焦子图后，可重新读取。'), error: true });
     }
     return merged;
   }
@@ -295,7 +296,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
             setTargetMatch(selection);
             rememberBatchSelection(selectionKey, selection);
           } else {
-            setSearchError('匹配元素或其端点已隐藏。请在图例中显示对应类型。');
+            setSearchError(t('匹配元素或其端点已隐藏。请在图例中显示对应类型。'));
           }
         }
         if (!loadAll || !merged || merged.remaining.length || merged.elements.length >= maxElements) break;
@@ -306,12 +307,12 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     } catch (cause) {
       if (!controller.signal.aborted) {
         if (cause instanceof ApiError && cause.code === 'graph_sources_changed') {
-          setRerunReason('来源版本已变化。已暂停探索，当前画布仍显示原结果。');
+          setRerunReason(t('来源版本已变化。已暂停探索，当前画布仍显示原结果。'));
         } else if (cause instanceof ApiError && cause.code === 'csr_snapshot_expired') {
-          setRerunReason('原 CSR 代次已清理。可用当前已发布的代次重建画布。');
+          setRerunReason(t('原 CSR 代次已清理。可用当前已发布的代次重建画布。'));
         } else if (cause instanceof ApiError && (cause.code === 'neighbor_session_expired'
           || cause.code === 'invalid_neighbor_cursor' && (batch?.cursor || previous?.cursor))) {
-          setRerunReason('无法安全恢复此页。可重跑原查询并重建画布。');
+          setRerunReason(t('无法安全恢复此页。可重跑原查询并重建画布。'));
         } else {
           setMessage({ text: errorText(cause), error: true, stale: cause instanceof ApiError && cause.code === 'active_revision_changed' });
         }
@@ -357,7 +358,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       const next = appendGraph(replace ? [] : elements, incoming);
       if (!next) {
         setContinuations(previous => [{ ...current, loaded: response }, ...previous.slice(1)]);
-        setQueryGraphError('下一批超过画布上限。移除元素或聚焦子图后可继续加载。');
+        setQueryGraphError(t('下一批超过画布上限。移除元素或聚焦子图后可继续加载。'));
         return;
       }
       setElements(next);
@@ -447,9 +448,9 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     } catch (cause) {
       if (controller.signal.aborted) return;
       if (cause instanceof ApiError && cause.code === 'graph_sources_changed') {
-        setRerunReason('来源版本已变化。已暂停探索，当前画布仍显示原结果。');
+        setRerunReason(t('来源版本已变化。已暂停探索，当前画布仍显示原结果。'));
       } else if (cause instanceof ApiError && cause.code === 'csr_snapshot_expired') {
-        setRerunReason('原 CSR 代次已清理。可用当前已发布的代次重建画布。');
+        setRerunReason(t('原 CSR 代次已清理。可用当前已发布的代次重建画布。'));
       } else {
         setSearchError(errorText(cause));
       }
@@ -471,7 +472,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
   function locateAcrossBatches(match: ExplorationMatch) {
     const item = elementsById.get(match.id);
     if ((item && !visibleIds.has(item.id)) || hiddenTypes.has(graphType(match))) {
-      setSearchError('匹配元素或其端点已隐藏。请在图例中显示对应类型。');
+      setSearchError(t('匹配元素或其端点已隐藏。请在图例中显示对应类型。'));
     } else if (item) {
       setSearchError(undefined);
       locate(item);
@@ -562,33 +563,33 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
   const transform = 'translate(' + camera.x + 'px,' + camera.y + 'px) scale(' + camera.zoom + ')';
   const nodes = visibleElements.filter(element => element.kind === 'node').length;
   const edges = visibleElements.length - nodes;
-  return <section className="graph-explorer" aria-label="结果图探索">
+  return <section className="graph-explorer" aria-label={t('结果图探索')}>
     <div className="explorer-toolbar">
-      <span className="explorer-count" aria-live="polite">{nodes} 个节点 · {edges} 条边
-        {visibleElements.length < elements.length && ' · 已隐藏 ' + (elements.length - visibleElements.length) + ' 个元素'}</span>
-      <button className="icon-button" aria-label="图探索帮助" aria-expanded={help} onClick={() => setHelp(!help)}><CircleHelp size={18} /></button>
-      <label className="explorer-layout"><span className="sr-only">结果图布局</span><select value={layout} onChange={event => {
+      <span className="explorer-count" aria-live="polite">{nodes}{t(' 个节点 · {0} 条边', edges)}
+        {visibleElements.length < elements.length && t(' · 已隐藏 {0} 个元素', (elements.length - visibleElements.length))}</span>
+      <button className="icon-button" aria-label={t('图探索帮助')} aria-expanded={help} onClick={() => setHelp(!help)}><CircleHelp size={18} /></button>
+      <label className="explorer-layout"><span className="sr-only">{t('结果图布局')}</span><select value={layout} onChange={event => {
         const next = event.target.value as Layout;
         setOverrides(new Map());
         setLayout(next);
         fit(new Map([...positions(graph, next)].filter(([id]) => visibleIds.has(id))));
       }}>{Object.entries(layoutNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select></label>
-      {layout === 'force' && graph.vertices.length > forceVertexLimit && <span className="muted small">节点较多，使用径向布局</span>}
+      {layout === 'force' && graph.vertices.length > forceVertexLimit && <span className="muted small">{t('节点较多，使用径向布局')}</span>}
       <div className="explorer-zoom">
-        <button className="icon-button" aria-label="缩小结果图" disabled={camera.zoom <= minZoom} onClick={() => setCamera(value => ({ ...value, zoom: clampZoom(value.zoom / 1.25) }))}><Minus size={16} /></button>
-        <output aria-label="当前缩放">{Number((camera.zoom * 100).toFixed(camera.zoom < .1 ? 1 : 0))}%</output>
-        <button className="icon-button" aria-label="放大结果图" disabled={camera.zoom >= 4} onClick={() => setCamera(value => ({ ...value, zoom: clampZoom(value.zoom * 1.25) }))}><Plus size={16} /></button>
-        <button className="icon-button" aria-label="适配结果图" title="适配结果图" onClick={() => fitVisible(true)}><Maximize size={15} /></button>
+        <button className="icon-button" aria-label={t('缩小结果图')} disabled={camera.zoom <= minZoom} onClick={() => setCamera(value => ({ ...value, zoom: clampZoom(value.zoom / 1.25) }))}><Minus size={16} /></button>
+        <output aria-label={t('当前缩放')}>{Number((camera.zoom * 100).toFixed(camera.zoom < .1 ? 1 : 0))}%</output>
+        <button className="icon-button" aria-label={t('放大结果图')} disabled={camera.zoom >= 4} onClick={() => setCamera(value => ({ ...value, zoom: clampZoom(value.zoom * 1.25) }))}><Plus size={16} /></button>
+        <button className="icon-button" aria-label={t('适配结果图')} title={t('适配结果图')} onClick={() => fitVisible(true)}><Maximize size={15} /></button>
       </div>
-      <button className="button compact" onClick={() => { setOverrides(new Map()); fitVisible(false); }}><RotateCcw size={14} />重置视图</button>
-      {pending?.neighbors && <button className="button compact" onClick={() => request.current?.abort()}>停止展开</button>}
-      {original && <button className="button compact" disabled={!!pending || busy} onClick={restoreCanvas}>返回原画布</button>}
-      {viewingBatch && <div className="explorer-actions" aria-label="邻居批次">
+      <button className="button compact" onClick={() => { setOverrides(new Map()); fitVisible(false); }}><RotateCcw size={14} />{t('重置视图')}</button>
+      {pending?.neighbors && <button className="button compact" onClick={() => request.current?.abort()}>{t('停止展开')}</button>}
+      {original && <button className="button compact" disabled={!!pending || busy} onClick={restoreCanvas}>{t('返回原画布')}</button>}
+      {viewingBatch && <div className="explorer-actions" aria-label={t('邻居批次')}>
         <button className="button compact" disabled={!viewingBatch.previous || !!pending || busy || isStale || !!rerunReason}
-          onClick={() => showBatch(viewingBatch, viewingBatch.previous)}>上一批</button>
-        <span className="muted small">第 {viewingBatch.page} 批</span>
+          onClick={() => showBatch(viewingBatch, viewingBatch.previous)}>{t('上一批')}</button>
+        <span className="muted small">{t('第 {0} 批', viewingBatch.page)}</span>
         <button className="button compact" disabled={!viewingBatch.cursor || !!pending || busy || isStale || !!rerunReason}
-          onClick={() => showBatch(viewingBatch, viewingBatch.cursor)}>下一批</button>
+          onClick={() => showBatch(viewingBatch, viewingBatch.cursor)}>{t('下一批')}</button>
       </div>}
     </div>
     {elements.length > 0 && <GraphLegend elements={elements} schema={schema} hidden={hiddenTypes} labels={displayLabels} color={color}
@@ -610,7 +611,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       }} />}
     {elements.length > 0 && <div className="explorer-search">
       <div className="explorer-search-controls">
-        <input type="search" aria-label="搜索画布属性" placeholder="搜索业务键、标签或属性" value={search} maxLength={256}
+        <input type="search" aria-label={t('搜索画布属性')} placeholder={t('搜索业务键、标签或属性')} value={search} maxLength={256}
           onChange={event => {
             searchRequest.current?.abort();
             setSearchResult(undefined);
@@ -618,9 +619,9 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
             setSearch(event.target.value);
           }} />
         {searchScope && <button className="button compact" disabled={!search.trim() || searching || isStale || !!rerunReason}
-          onClick={() => void searchBatches()}>{searching ? '正在搜索…' : '搜索全部批次'}</button>}
+          onClick={() => void searchBatches()}>{searching ? t('正在搜索…') : t('搜索全部批次')}</button>}
         {deferredSearch.trim() && <span className="muted small" role="status">
-          {crossSearch ? crossSearch.total + ' 个跨批匹配' : matches.length + ' 个匹配'}
+          {crossSearch ? t('{0} 个跨批匹配', crossSearch.total) : t('{0} 个匹配', matches.length)}
         </span>}
       </div>
       {searchError && <p role="alert" className="inline-error small">{searchError}</p>}
@@ -633,36 +634,36 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
         : !crossSearch && matches.length > 0 && <GraphSearchMatches key={deferredSearch} matches={matches} locate={locate} label={labelFor} />}
       {crossSearch && crossSearch.total > 100 && <div className="explorer-search-controls">
         <button className="button compact" disabled={searching || crossSearch.offset === 0}
-          onClick={() => void searchBatches(crossSearch.offset - 100)}>上一组匹配</button>
+          onClick={() => void searchBatches(crossSearch.offset - 100)}>{t('上一组匹配')}</button>
         <button className="button compact" disabled={searching || crossSearch.offset + 100 >= crossSearch.total}
-          onClick={() => void searchBatches(crossSearch.offset + 100)}>下一组匹配</button>
+          onClick={() => void searchBatches(crossSearch.offset + 100)}>{t('下一组匹配')}</button>
       </div>}
     </div>}
-    {help && <p className="explorer-help">使用缩放按钮调整视图，桌面也可用滚轮。拖动空白处平移，拖动节点可调整位置。选择节点或边查看属性，选择节点后可展开一跳邻居。</p>}
-    {visibleCurves.some(curve => !curve.element) && <p className="explorer-help">虚线表示路径中相邻的节点。查询结果中未包含它们之间的边。</p>}
+    {help && <p className="explorer-help">{t('使用缩放按钮调整视图，桌面也可用滚轮。拖动空白处平移，拖动节点可调整位置。选择节点或边查看属性，选择节点后可展开一跳邻居。')}</p>}
+    {visibleCurves.some(curve => !curve.element) && <p className="explorer-help">{t('虚线表示路径中相邻的节点。查询结果中未包含它们之间的边。')}</p>}
     {rerunReason && <div className="explorer-notice" role="alert">
       <span>{rerunReason}</span>
-      {rerun && <button className="button compact" disabled={busy || isStale} onClick={rerun}>{page.csr_generation ? '用当前 CSR 重建画布' : '重跑原查询并重建画布'}</button>}
+      {rerun && <button className="button compact" disabled={busy || isStale} onClick={rerun}>{page.csr_generation ? t('用当前 CSR 重建画布') : t('重跑原查询并重建画布')}</button>}
     </div>}
     {!!continuations.length && <div className="explorer-notice">
       <button className="button compact" disabled={!!pending || !!original || busy} onClick={() => void loadQueryGraph()}>
-        {pending?.id === '' ? '正在加载…' : '加载本次查询的下一批图元素'}
+        {pending?.id === '' ? t('正在加载…') : t('加载本次查询的下一批图元素')}
       </button>
       {continuations[0].loaded && <button className="button compact" disabled={!!pending || !!original || busy}
-        onClick={() => void loadQueryGraph(true)}>切换到本次查询的下一批</button>}
+        onClick={() => void loadQueryGraph(true)}>{t('切换到本次查询的下一批')}</button>}
       {queryGraphError && <span role="alert">{queryGraphError}</span>}
     </div>}
-    {graphTruncated && !focused && !continuations.length && <p className="explorer-help">查询图可能未包含全部元素。可从当前节点继续探索。</p>}
+    {graphTruncated && !focused && !continuations.length && <p className="explorer-help">{t('查询图可能未包含全部元素。可从当前节点继续探索。')}</p>}
     {(held || elements.length === maxElements) && <div className="explorer-notice" role="status">
       <span>{held
-        ? '画布空间不足。可切换到当前批次，或腾出空间后继续加入。'
-        : '画布已满（' + maxElements + ' 个元素）。移除节点或聚焦子图后可继续加入。'}</span>
+        ? t('画布空间不足。可切换到当前批次，或腾出空间后继续加入。')
+        : t('画布已满（{0} 个元素）。移除节点或聚焦子图后可继续加入。', maxElements)}</span>
       {held?.current && <button className="button compact" disabled={!!pending || busy || isStale || !!rerunReason}
-        onClick={() => showBatch(held, held.current)}>切换到当前批次</button>}
-      {held && visibleIds.has(held.id) && item?.id !== held.id && <button className="button compact" onClick={() => setSelected(held.id)}>返回待加入的节点</button>}
+        onClick={() => showBatch(held, held.current)}>{t('切换到当前批次')}</button>}
+      {held && visibleIds.has(held.id) && item?.id !== held.id && <button className="button compact" onClick={() => setSelected(held.id)}>{t('返回待加入的节点')}</button>}
     </div>}
     <div className="explorer-body">
-      <div className="explorer-surface" ref={surface} aria-label="结果画布" onPointerDown={event => {
+      <div className="explorer-surface" ref={surface} aria-label={t('结果画布')} onPointerDown={event => {
         if (event.target === event.currentTarget || event.target === svg.current) begin(event);
       }} onPointerMove={move} onPointerUp={end} onPointerCancel={end} onLostPointerCapture={end}>
         <svg ref={svg} className="explorer-lines" aria-hidden="true">
@@ -691,22 +692,22 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
             aria-label={accessibleLabel(element)} title={accessibleLabel(element)} aria-pressed={selected === element.id}
             onClick={() => choose(element)}>{labelFor(element)}</button>)}
         </div>
-        {!visibleElements.length && <p className="empty">{elements.length ? '当前类型筛选隐藏了所有图元素。' : '当前结果没有图元素。'}</p>}
+        {!visibleElements.length && <p className="empty">{elements.length ? t('当前类型筛选隐藏了所有图元素。') : t('当前结果没有图元素。')}</p>}
       </div>
-      {item && <aside className="explorer-inspector" ref={details} aria-label="图元素属性">
-        <div className="explorer-item-heading"><div><small>{item.kind === 'node' ? '节点' : '边'}{labelFor(item) !== item.label && ' · ' + item.label}</small><h3>{labelFor(item)}</h3></div>
-          <button className="icon-button" aria-label="关闭图元素属性" onClick={() => {
+      {item && <aside className="explorer-inspector" ref={details} aria-label={t('图元素属性')}>
+        <div className="explorer-item-heading"><div><small>{item.kind === 'node' ? t('节点') : t('边')}{labelFor(item) !== item.label && ' · ' + item.label}</small><h3>{labelFor(item)}</h3></div>
+          <button className="icon-button" aria-label={t('关闭图元素属性')} onClick={() => {
             setSelected(undefined);
             detailsInvoker.current?.focus();
           }}><X size={17} /></button></div>
-        <dl><div><dt>{item.transient ? page.csr_generation ? '快照标识' : '临时标识' : '业务键'}</dt><dd><code>{JSON.stringify(item.key)}</code></dd></div>
+        <dl><div><dt>{item.transient ? page.csr_generation ? t('快照标识') : t('临时标识') : t('业务键')}</dt><dd><code>{JSON.stringify(item.key)}</code></dd></div>
           {Object.entries(item.properties ?? {}).map(([name, value]) => <div key={name}><dt>{name}</dt><dd><code>{value ?? 'null'}</code></dd></div>)}
         </dl>
-        {item.property_preview && <p className="muted small">部分属性已截断。</p>}
-        {item.properties && !Object.keys(item.properties).length && <p className="muted small">此元素没有已映射的属性。</p>}
-        {pending?.id === item.id && !pending.neighbors && <p role="status" className="muted small">正在读取属性…</p>}
-        {item.transient && !page.csr_generation && !item.properties && <p className="muted small">此边没有业务键。返回该边可在查询结果中查看属性。</p>}
-        {(!item.properties || item.property_preview) && (!item.transient || !!page.csr_generation) && !pending && !isStale && !rerunReason && <button className="button compact" disabled={busy} onClick={() => void explore(item)}>读取属性</button>}
+        {item.property_preview && <p className="muted small">{t('部分属性已截断。')}</p>}
+        {item.properties && !Object.keys(item.properties).length && <p className="muted small">{t('此元素没有已映射的属性。')}</p>}
+        {pending?.id === item.id && !pending.neighbors && <p role="status" className="muted small">{t('正在读取属性…')}</p>}
+        {item.transient && !page.csr_generation && !item.properties && <p className="muted small">{t('此边没有业务键。返回该边可在查询结果中查看属性。')}</p>}
+        {(!item.properties || item.property_preview) && (!item.transient || !!page.csr_generation) && !pending && !isStale && !rerunReason && <button className="button compact" disabled={busy} onClick={() => void explore(item)}>{t('读取属性')}</button>}
         {item.kind === 'node' && <NeighborControls key={item.id} label={item.label} schema={schema}
           activeFilter={expansion?.id === item.id ? expansion.filter : undefined}
           next={expansion?.id === item.id ? expansion.held ? 'pending' : expansion.cursor ? 'more' : 'done' : undefined}
@@ -720,20 +721,20 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
             changeCanvas(next);
             setFocused(true);
             if (next.length === elements.length && elements.length === maxElements) {
-              setMessage({ text: '当前元素都在此节点的一跳内，可移除节点腾出空间。' });
+              setMessage({ text: t('当前元素都在此节点的一跳内，可移除节点腾出空间。') });
             }
-          }}><Crosshair size={14} />聚焦子图</button>}
+          }}><Crosshair size={14} />{t('聚焦子图')}</button>}
           <button className="button compact" disabled={!!pending} onClick={() => {
             changeCanvas(removeElement(elements, item.id));
             setSelected(undefined);
-          }}><X size={14} />{item.kind === 'node' ? '移除节点' : '移除边'}</button>
+          }}><X size={14} />{item.kind === 'node' ? t('移除节点') : t('移除边')}</button>
         </div>
-        {isStale && <p className="muted small">模型版本已切换。重新运行查询后可继续探索。</p>}
+        {isStale && <p className="muted small">{t('模型版本已切换。重新运行查询后可继续探索。')}</p>}
         {addedFrom.length > 0 && <details className="explorer-sources">
-          <summary>探索读取的来源版本</summary>{addedFrom.map(source => <p key={source.source}><code>{source.source} · {source.version}</code></p>)}
+          <summary>{t('探索读取的来源版本')}</summary>{addedFrom.map(source => <p key={source.source}><code>{source.source} · {source.version}</code></p>)}
         </details>}
         {message && <p className={message.error ? 'inline-error small' : 'muted small'} role={message.error ? 'alert' : 'status'}>{message.text}
-          {message.stale && <button className="text-button" onClick={reload}>重新加载模型</button>}</p>}
+          {message.stale && <button className="text-button" onClick={reload}>{t('重新加载模型')}</button>}</p>}
       </aside>}
     </div>
   </section>;

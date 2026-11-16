@@ -58,7 +58,7 @@ test('a valid account with no models is distinguished from a failed connection',
 });
 
 test('connection errors explain expired credentials and non-JSON proxy failures', async t => {
-  for (const [status, expected] of [[401, /令牌/], [403, /权限和访问地址/], [404, /启用/], [502, /HTTP 502/]]) {
+  for (const [status, expected] of [[401, /token is invalid or revoked/], [403, /model permissions and the service URL/], [404, /Enable and save the MCP service settings/], [502, /HTTP 502/]]) {
     await t.test(String(status), async t => {
       const calls = server(t, { initialize: () => new Response('<html>proxy error</html>', { status }) });
       await assert.rejects(inspectMcp('query', 'test-token', new AbortController().signal, () => {}), expected);
@@ -69,9 +69,9 @@ test('connection errors explain expired credentials and non-JSON proxy failures'
 
 test('inspection rejects mismatched responses and tool failures instead of reporting success', async t => {
   for (const [name, response, expected] of [
-    ['incorrect request ID', message => ({ jsonrpc: '2.0', id: message.id + 1, result: {} }), /无效的 MCP/],
+    ['incorrect request ID', message => ({ jsonrpc: '2.0', id: message.id + 1, result: {} }), /invalid MCP response/],
     ['tool denied', message => ({ jsonrpc: '2.0', id: message.id, result: { isError: true, structuredContent: { message: '权限已变更' } } }), /权限已变更/],
-    ['missing capabilities', message => ({ jsonrpc: '2.0', id: message.id, result: { structuredContent: { models: [{ id: 'graph', name: 'Graph' }], modeling_targets: [] } } }), /响应不完整/],
+    ['missing capabilities', message => ({ jsonrpc: '2.0', id: message.id, result: { structuredContent: { models: [{ id: 'graph', name: 'Graph' }], modeling_targets: [] } } }), /model permissions response is incomplete/],
   ]) {
     await t.test(name, async t => {
       const calls = server(t, { 'tools/call': message => Response.json(response(message)) });

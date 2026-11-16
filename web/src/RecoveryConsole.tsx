@@ -1,7 +1,9 @@
+import { t } from './locale.ts';
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { ArrowLeft, ShieldCheck } from 'lucide-react';
 import { errorText } from './api';
 import { Mark, Modal } from './ui';
+import { LanguageSelect } from './LanguageSelect';
 import RecoveryImport from './RecoveryImport';
 import { recovery, type Gate, type RecoveryPointCheck, type RecoveryStatus, type RestoreStatus } from './recoveryApi';
 
@@ -47,7 +49,7 @@ export default function RecoveryConsole() {
       } catch {
         if (controller.signal.aborted) return;
         // The HTTPS route may briefly be unavailable while the Coordinator loads the restored state.
-        if (++consecutiveFailures >= 4) setError('暂时无法读取进度，正在重新连接目标站。');
+        if (++consecutiveFailures >= 4) setError(t('暂时无法读取进度，正在重新连接目标站。'));
       }
       timer = window.setTimeout(() => void poll(), 900);
     }
@@ -94,7 +96,7 @@ export default function RecoveryConsole() {
     try {
       if (action === 'check') {
         const result = await recovery<Manifest>('check', token);
-        if (result.manifest_sha256 !== gate?.manifest_sha256) throw new Error('目标恢复清单已变更，请重新读取状态。');
+        if (result.manifest_sha256 !== gate?.manifest_sha256) throw new Error(t('目标恢复清单已变更，请重新读取状态。'));
         setManifest(result);
       }
       // Confirm the authoritative gate again after preflight and after approval.
@@ -127,13 +129,14 @@ export default function RecoveryConsole() {
   return <main className="recovery-console">
     <header className="recovery-heading">
       <span className="brand-mark"><Mark size={23} /></span>
-      <div><h1>{restore ? '灾备恢复' : '灾备恢复验收'}</h1><p className="muted">{window.location.host}</p></div>
-      {canCutOver && <a href="/settings" className="button compact"><ArrowLeft size={15} aria-hidden="true" />返回管理后台</a>}
+      <div><h1>{restore ? t('灾备恢复') : t('灾备恢复验收')}</h1><p className="muted">{window.location.host}</p></div>
+      <LanguageSelect />
+      {canCutOver && <a href="/settings" className="button compact"><ArrowLeft size={15} aria-hidden="true" />{t('返回管理后台')}</a>}
     </header>
     <section className="settings-card">
-      <h2>目标站</h2>
+      <h2>{t('目标站')}</h2>
       {https ? <form className="recovery-token-form" onSubmit={read}>
-        <label>恢复令牌<input type="password" autoComplete="off" spellCheck={false} required pattern="[0-9a-f]{64}" maxLength={64}
+        <label>{t('恢复令牌')}<input type="password" autoComplete="off" spellCheck={false} required pattern="[0-9a-f]{64}" maxLength={64}
           value={token} disabled={!!busy} onChange={event => {
             setToken(event.target.value);
             setGate(undefined);
@@ -141,44 +144,44 @@ export default function RecoveryConsole() {
             setManifest(undefined);
             setError('');
           }} /></label>
-        <button className="button" disabled={!!busy} type="submit">{busy === 'status' ? '正在读取…' : '读取状态'}</button>
-      </form> : <p className="notice">请从目标站 HTTPS 地址打开恢复页面。</p>}
-      {restore && <p className="recovery-verdict" role="status"><strong>暂不可切流</strong><span>完成恢复后进入业务验收。</span></p>}
+        <button className="button" disabled={!!busy} type="submit">{busy === 'status' ? t('正在读取…') : t('读取状态')}</button>
+      </form> : <p className="notice">{t('请从目标站 HTTPS 地址打开恢复页面。')}</p>}
+      {restore && <p className="recovery-verdict" role="status"><strong>{t('暂不可切流')}</strong><span>{t('完成恢复后进入业务验收。')}</span></p>}
       {gate && <p className={'recovery-verdict ' + (canCutOver ? 'ready' : '')} role="status">
-        <strong>{canCutOver ? '允许切流' : '暂不可切流'}</strong>
-        <span>{canCutOver ? '恢复验收已通过，目标站业务入口就绪。'
-          : gate.approved ? '验收已通过，等待目标站业务入口就绪。' : '等待恢复验收通过。'}</span>
+        <strong>{canCutOver ? t('允许切流') : t('暂不可切流')}</strong>
+        <span>{canCutOver ? t('恢复验收已通过，目标站业务入口就绪。')
+          : gate.approved ? t('验收已通过，等待目标站业务入口就绪。') : t('等待恢复验收通过。')}</span>
       </p>}
       {!gate && error && <p className="notice error" role="alert">{error}</p>}
     </section>
     {restore && <RecoveryImport token={token} job={restore.job} start={startRestore} />}
     {gate && <>
-      {gate.restored_backup && <p className="notice" role="status">已从 <strong>{gate.restored_backup}</strong> 完成恢复，进入验收。</p>}
+      {gate.restored_backup && <p className="notice" role="status">{t('已从 ')}<strong>{gate.restored_backup}</strong>{t(' 完成恢复，进入验收。')}</p>}
       <section className="settings-card">
-        <div className="settings-section-title"><h2>恢复清单</h2>
+        <div className="settings-section-title"><h2>{t('恢复清单')}</h2>
           <button type="button" className="button compact" disabled={!!busy} onClick={() => void perform('check')}>
-            {busy === 'check' ? '正在校验…' : '校验恢复清单'}
+            {busy === 'check' ? t('正在校验…') : t('校验恢复清单')}
           </button>
         </div>
-        {manifest && <p role="status">清单与备份摘要已匹配 · {manifest.postgres_relations} 张 PostgreSQL 表 · {manifest.parquet_files} 个 Parquet 文件 · {manifest.canaries} 条业务查询</p>}
-        <details className="form-disclosure"><summary>清单摘要</summary><code className="recovery-digest">{gate.manifest_sha256}</code></details>
+        {manifest && <p role="status">{t('清单与备份摘要已匹配 · {0} 张 PostgreSQL 表 · {1} 个 Parquet 文件 · {2} 条业务查询', manifest.postgres_relations, manifest.parquet_files, manifest.canaries)}</p>}
+        <details className="form-disclosure"><summary>{t('清单摘要')}</summary><code className="recovery-digest">{gate.manifest_sha256}</code></details>
       </section>
       <section className="settings-card">
-        <div className="settings-section-title"><h2>业务查询验收</h2>
+        <div className="settings-section-title"><h2>{t('业务查询验收')}</h2>
           {!gate.approved && <button type="button" className="button primary" disabled={!manifest || !!busy} onClick={() => setConfirm(true)}>
-            <ShieldCheck size={16} aria-hidden="true" />{busy === 'verify' ? '正在验收…' : '执行恢复验收'}
+            <ShieldCheck size={16} aria-hidden="true" />{busy === 'verify' ? t('正在验收…') : t('执行恢复验收')}
           </button>}
         </div>
-        <p className="settings-hint">{gate.approved ? '业务结果与清单中的预期结果一致。'
-          : '验收会复核实际数据和业务查询。通过后开放目标站业务入口。'}</p>
+        <p className="settings-hint">{gate.approved ? t('业务结果与清单中的预期结果一致。')
+          : t('验收会复核实际数据和业务查询。通过后开放目标站业务入口。')}</p>
       </section>
       {error && <p className="notice error" role="alert">{error}</p>}
     </>}
-    {confirm && <Modal layout="center" title="执行恢复验收" close={() => setConfirm(false)}><div className="dialog-form">
-      <p>验收通过后，目标站将允许业务流量。请确认来源数据已冻结，且当前站点是计划切换的目标。</p>
+    {confirm && <Modal layout="center" title={t('执行恢复验收')} close={() => setConfirm(false)}><div className="dialog-form">
+      <p>{t('验收通过后，目标站将允许业务流量。请确认来源数据已冻结，且当前站点是计划切换的目标。')}</p>
       <div className="dialog-actions">
-        <button type="button" className="button" data-initial-focus onClick={() => setConfirm(false)}>取消</button>
-        <button type="button" className="button primary" onClick={() => { setConfirm(false); void perform('verify'); }}>开始验收</button>
+        <button type="button" className="button" data-initial-focus onClick={() => setConfirm(false)}>{t('取消')}</button>
+        <button type="button" className="button primary" onClick={() => { setConfirm(false); void perform('verify'); }}>{t('开始验收')}</button>
       </div>
     </div></Modal>}
   </main>;

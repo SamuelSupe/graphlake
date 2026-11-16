@@ -16,7 +16,7 @@ test('scope edits preserve large numeric partition IDs and the scalar types in i
 });
 
 test('editing a partition cannot apply an empty, malformed or unsupported predicate', () => {
-  assert.throws(() => scopeJson({ time: '', consistent: false, filters: [{ column: 'id', op: 'eq', value: 'no quotes' }] }), /条件 1/);
+  assert.throws(() => scopeJson({ time: '', consistent: false, filters: [{ column: 'id', op: 'eq', value: 'no quotes' }] }), /Condition 1 needs a number, Boolean, or double-quoted string/);
   assert.throws(() => scopeDraft('{"logical_partition":[{"column":"id","op":"is_null","value":1}]}'));
   assert.throws(() => scopeDraft('{"unrecognized":true}'));
 });

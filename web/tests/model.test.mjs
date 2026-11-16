@@ -60,7 +60,7 @@ edges: {}
   assert.deepEqual(model.edges.Owns.from, { node: 'Customer', columns: [''] });
   assert.deepEqual(model.edges.Owns.to, { node: 'Account', columns: ['', ''] });
   assert.equal(model.edges.Owns.source, '');
-  assert.throws(() => addEdgeType(doc, model, 'Owns', 'Account', 'Customer'), /名称已存在/);
+  assert.throws(() => addEdgeType(doc, model, 'Owns', 'Account', 'Customer'), /name already exists/);
 });
 
 
@@ -136,7 +136,7 @@ nodes:
 edges:
   Pay: {source: ledger.public.payments}`);
   const before = modelOf(doc.toString());
-  assert.throws(() => removeGraphType(doc, before, 'sources', 'ledger'), /替换引用/);
+  assert.throws(() => removeGraphType(doc, before, 'sources', 'ledger'), /Replace the source tables that reference this data source/);
   rename(doc, before, 'sources', 'ledger', 'finance');
   const output = doc.toString();
   const after = modelOf(output);
@@ -197,7 +197,7 @@ edges: {Transfer: {from: {node: Account}, to: {node: Account}}}`;
   doc.deleteIn(['edges', 'Transfer']);
   const changes = modelChanges(before, doc.toString());
   assert.deepEqual(changes.map(({ kind, section, name }) => [kind, section, name]), [
-    ['changed', '数据源', 'lake'], ['changed', '节点', 'Account'], ['removed', '边', 'Transfer'],
+    ['changed', 'Data Sources', 'lake'], ['changed', 'Node', 'Account'], ['removed', 'Edge', 'Transfer'],
   ]);
-  assert.deepEqual(changes[1].fields, ['属性']);
+  assert.deepEqual(changes[1].fields, ['Properties']);
 });

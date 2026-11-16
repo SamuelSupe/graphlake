@@ -1,11 +1,12 @@
+import { locale, t } from './locale.ts';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChartNoAxesCombined, Table2 } from 'lucide-react';
 import { maxSampleGapMs, trendsInWindow, type ChartPoint, type RuntimeSample } from './overviewSeries';
 import { Modal } from './ui';
 
 const colors = ['#2855d9', '#a04e17'];
-const format = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
-const clock = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+const format = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
+const clock = new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 
 function TrendPlot({ points }: { points: ChartPoint[] }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -79,9 +80,9 @@ function Trend({ title, points, labels, empty, active }: {
   return <figure className="overview-panel trend">
     <figcaption className="overview-section-heading">
       <h3>{title}</h3>
-      <button type="button" className="text-button" disabled={!points.length} aria-label={'查看' + title + '采样数据'}
+      <button type="button" className="text-button" disabled={!points.length} aria-label={t('查看{0}采样数据', title)}
         aria-haspopup="dialog" onClick={() => setInspecting(points)}>
-        <Table2 size={15} aria-hidden="true" />查看数据
+        <Table2 size={15} aria-hidden="true" />{t('查看数据')}
       </button>
     </figcaption>
     <ul className="trend-legend">
@@ -94,13 +95,13 @@ function Trend({ title, points, labels, empty, active }: {
       </div>
     </> : <p className="trend-empty muted">{empty}</p>}
     {active && inspecting && <Modal
-      title={title + '采样数据'}
-      description={`${inspecting.length} 个采样点 · 按时间从近到远 · “—”表示该时刻无有效值`}
+      title={t('{0}采样数据', title)}
+      description={t('{0} 个采样点 · 按时间从近到远 · “—”表示该时刻无有效值', inspecting.length)}
       close={() => setInspecting(undefined)}>
-      <div className="panel-body trend-data" tabIndex={0} role="region" aria-label={title + '采样表'}>
+      <div className="panel-body trend-data" tabIndex={0} role="region" aria-label={t('{0}采样表', title)}>
         <table>
-          <caption className="sr-only">{title}采样数据</caption>
-          <thead><tr><th scope="col">时间</th>{labels.map(label => <th scope="col" key={label}>{label}</th>)}</tr></thead>
+          <caption className="sr-only">{title}{t('采样数据')}</caption>
+          <thead><tr><th scope="col">{t('时间')}</th>{labels.map(label => <th scope="col" key={label}>{label}</th>)}</tr></thead>
           <tbody>{[...inspecting].reverse().map(({ at, values }) => <tr key={at}>
             <th scope="row"><time dateTime={new Date(at).toISOString()}>{clock.format(at)}</time></th>
             {labels.map((label, index) => <td key={label}>{values ? format.format(values[index]) : '—'}</td>)}
@@ -116,18 +117,18 @@ export function OverviewCharts({ samples, active }: { samples: RuntimeSample[]; 
   const trends = useMemo(() => trendsInWindow(samples, minutes), [samples, minutes]);
   return <section className="overview-trends">
     <div className="overview-section-heading">
-      <h2><ChartNoAxesCombined size={17} aria-hidden="true" />运行趋势</h2>
+      <h2><ChartNoAxesCombined size={17} aria-hidden="true" />{t('运行趋势')}</h2>
       <label className="trend-period">
-        <span className="sr-only">趋势时间范围</span>
+        <span className="sr-only">{t('趋势时间范围')}</span>
         <select value={minutes} onChange={event => setMinutes(Number(event.target.value))}>
-          <option value={5}>最近 5 分钟</option>
-          <option value={15}>最近 15 分钟</option>
+          <option value={5}>{t('最近 5 分钟')}</option>
+          <option value={15}>{t('最近 15 分钟')}</option>
         </select>
       </label>
     </div>
     <div className="trend-grid">
-      <Trend title="查询负载" points={trends.query} labels={['运行中', '等待中']} empty="暂无查询负载样本" active={active} />
-      <Trend title="HTTP 请求" points={trends.requests} labels={['请求 / 分钟', '5xx / 分钟']} empty="等待两次连续采集后计算请求速率" active={active} />
+      <Trend title={t('查询负载')} points={trends.query} labels={[t('运行中'), t('等待中')]} empty={t('暂无查询负载样本')} active={active} />
+      <Trend title={t('HTTP 请求')} points={trends.requests} labels={[t('请求 / 分钟'), t('5xx / 分钟')]} empty={t('等待两次连续采集后计算请求速率')} active={active} />
     </div>
   </section>;
 }

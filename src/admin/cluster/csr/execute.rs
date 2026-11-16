@@ -641,14 +641,19 @@ pub(in crate::admin::cluster) async fn run_task(
     if remaining.is_zero() {
         return Err(super::super::timeout());
     }
-    let scope = crate::engine::stage_scope(QueryOptions {
-        timeout: remaining,
-        memory_bytes: worker.memory_bytes,
-        cancellation: worker.shutdown.child_token(),
-        ..Default::default()
-    })
-    .await
-    .map_err(query::query_error)?;
+    let scope = Arc::new(
+        QueryScope::new(
+            QueryOptions {
+                timeout: remaining,
+                memory_bytes: worker.memory_bytes,
+                cancellation: worker.shutdown.child_token(),
+                ..Default::default()
+            },
+            &worker.admission,
+        )
+        .await
+        .map_err(query::query_error)?,
+    );
     let objects = &worker.shared.objects;
     let operation = async {
         let manifest = manifest(objects, &job.model, &job.revision, task.generation).await?;

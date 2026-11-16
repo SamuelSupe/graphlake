@@ -137,6 +137,11 @@ impl WorkerProbe {
 }
 
 impl Coordinator {
+    pub(super) fn max_coordinator_query_bytes(&self) -> usize {
+        self.memory_bytes
+            .max(crate::QueryOptions::default().memory_bytes)
+    }
+
     pub fn load(path: &FsPath) -> Result<Self> {
         let (config, shared) = Config::load(path)?;
         ensure!(
@@ -278,10 +283,10 @@ impl Coordinator {
         )
     }
 
-    pub fn start_cleanup(
+    pub(super) fn start_cleanup(
         &self,
         shutdown: crate::CancellationToken,
-        leader: Option<Arc<control::Leadership>>,
+        app: std::sync::Weak<App>,
     ) {
         let shared = self.shared.clone();
         tokio::spawn(async move {
@@ -291,6 +296,8 @@ impl Coordinator {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = interval.tick() => {
+                        let Some(app) = app.upgrade() else { break };
+                        let leader = app.ha.as_ref().map(|ha| ha.leader.as_ref());
                         let timeout = Duration::from_secs(120);
                         let (results, generations) = tokio::select! {
                             _ = shutdown.cancelled() => break,
@@ -298,7 +305,7 @@ impl Coordinator {
                                 tokio::join!(
                                     tokio::time::timeout(timeout, shared.objects.expire_results()),
                                     tokio::time::timeout(timeout, retention::sweep(
-                                        &shared.metadata, &shared.objects, chrono::Utc::now(), leader.as_deref()
+                                        &shared.metadata, &shared.objects, chrono::Utc::now(), leader, Some(&app)
                                     ))
                                 )
                             } => sweeps,
@@ -366,7 +373,11 @@ impl Coordinator {
                 .map(|csr| csr.generation)
                 .or(request.csr_generation);
             let policy = freshness::policy(&engine.catalog, request.freshness.as_ref());
-            let inputs = freshness::observe(app, &engine.catalog).await;
+            let inputs = if policy == crate::FreshnessPolicy::default() {
+                Vec::new()
+            } else {
+                freshness::observe(app, &engine.catalog).await
+            };
             freshness::check(&policy, &inputs, generation.is_some())?;
             let proof = freshness::Proof::new(policy, &inputs);
             if let Some(proof) = &proof {

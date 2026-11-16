@@ -351,7 +351,7 @@ fn start(app: &Arc<App>, key: String, mode: Option<Mode>, scheduled: bool) -> Ap
             cancellation: cancel.clone(),
             ..app.options.clone()
         };
-        let result = load::run(&table, &path, mode, options).await;
+        let result = load::run(&table, &path, mode, options, &app.admission).await;
         let mut store = app.local_tables.store.lock().unwrap();
         if let Some(mut current) = store.tables.get(&key).cloned() {
             record_result(&mut current, result, cancel.is_cancelled());

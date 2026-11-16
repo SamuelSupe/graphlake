@@ -357,9 +357,14 @@ async fn mutate_inner(
             models.source_directory().to_owned(),
         )
     };
-    let base = capture(&local)?;
-    let candidate = Arc::new(tempfile::tempdir().map_err(|_| Error::storage())?);
-    restore(candidate.path(), &base)?;
+    let (base, candidate) = tokio::task::spawn_blocking(move || {
+        let base = capture(&local)?;
+        let candidate = Arc::new(tempfile::tempdir().map_err(|_| Error::storage())?);
+        restore(candidate.path(), &base)?;
+        Ok::<_, Error>((base, candidate))
+    })
+    .await
+    .map_err(|_| Error::storage())??;
     let mut models = models::Models::in_snapshot(Arc::clone(&candidate), sources.clone());
     if let Mutation::Create {
         yaml,

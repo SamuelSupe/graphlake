@@ -116,6 +116,75 @@ fn delta_mapping(path: &str, version: Option<u64>) -> Result<String> {
 }
 
 #[tokio::test]
+async fn delta_cached_snapshot_observes_commits_and_a_replaced_log() -> Result<()> {
+    use serde_json::json;
+
+    let dir = tempfile::tempdir()?;
+    let table = dir.path().join("table");
+    let log = table.join("_delta_log");
+    std::fs::create_dir_all(&log)?;
+    let schema = json!({
+        "type":"struct", "fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}],
+    });
+    let add = |id| -> Result<_> {
+        let file = format!("part-{id}.parquet");
+        let batch =
+            RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(vec![id])) as _)])?;
+        let bytes = parquet(&batch)?;
+        std::fs::write(table.join(&file), &bytes)?;
+        Ok(json!({"add":{
+            "path":file,"partitionValues":{},"size":bytes.len(),"modificationTime":0,"dataChange":true,
+        }}))
+    };
+    let commit = |version, actions: &[serde_json::Value]| -> Result<()> {
+        let file = log.join(format!("{version:020}.json"));
+        let bytes = actions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(file, format!("{bytes}\n"))?;
+        Ok(())
+    };
+    let initialize = |id| {
+        commit(
+            0,
+            &[
+                json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+                json!({"metaData":{
+                    "id":uuid::Uuid::new_v4(),"format":{"provider":"parquet","options":{}},
+                    "schemaString":schema.to_string(),"partitionColumns":[],"configuration":{},
+                }}),
+                add(id)?,
+            ],
+        )
+    };
+    initialize(1)?;
+    let mapping = delta_mapping(table.to_str().unwrap(), None)?;
+    let engine = Engine::new(serde_saphyr::from_str(&format!(
+        "graph: delta\nsources:\n{mapping}\nnodes:\n  Node: {{source: lake.transfers, key: [id]}}"
+    ))?)?;
+    let read = || async {
+        let mut result = engine
+            .query(
+                Language::Sql,
+                r#"SELECT id FROM "Node" ORDER BY id"#,
+                Default::default(),
+            )
+            .await?;
+        rows(&mut result).await
+    };
+    assert_eq!(read().await?, [json!({"id":1})]);
+    commit(1, &[add(2)?])?;
+    assert_eq!(read().await?, [json!({"id":1}), json!({"id":2})]);
+    std::fs::remove_dir_all(&log)?;
+    std::fs::create_dir(&log)?;
+    initialize(3)?;
+    assert_eq!(read().await?, [json!({"id":3})]);
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires a Delta fixture from tests/delta_fixture.py"]
 async fn delta_time_travel_preserves_partitions_removals_and_deletion_vectors() -> Result<()> {
     let fixture = delta_fixture()?;

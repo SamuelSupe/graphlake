@@ -180,8 +180,9 @@ pub(in crate::admin) async fn explore(
     crate::admin::access::check_query(&app, &principal, &id)?;
     let mut engine = if request.csr_generation.is_some() {
         let files = app.models.lock().unwrap().read_files();
+        let admission = app.admission.clone();
         let (id, revision) = (id.clone(), request.model_revision.clone());
-        tokio::task::spawn_blocking(move || files.snapshot_engine(&id, &revision))
+        tokio::task::spawn_blocking(move || files.snapshot_engine(&id, &revision, &admission))
             .await
             .map_err(|_| Error::storage())??
     } else {
@@ -189,6 +190,8 @@ pub(in crate::admin) async fn explore(
             .await?
             .2
     };
+    // A blocked neighbor scan must not consume the foreground query's slot.
+    engine.use_admission(app.exploration_admission.clone());
     let selection = crate::admin::local_tables::managed::resolve(
         &app,
         &mut engine,

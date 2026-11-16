@@ -199,7 +199,7 @@ struct MatchPlan<'a> {
     expression_joins: RefCell<Vec<clauses::ExpressionJoin>>,
     call_imports: std::rc::Rc<BTreeMap<usize, Vec<String>>>,
     lambda_inputs: RefCell<Vec<(String, String)>>,
-    order_inputs: BTreeMap<(usize, usize), String>,
+    order_inputs: BTreeMap<usize, String>,
     labels: BTreeSet<String>,
     bindings: BTreeMap<String, Binding>,
     relations: Vec<(String, usize)>,
@@ -758,10 +758,7 @@ impl<'a> MatchPlan<'a> {
             expression_step(),
             "Cypher expression planning exceeds its work limit"
         );
-        if let Some(value) = self
-            .order_inputs
-            .get(&(expression.span.start, expression.span.end))
-        {
+        if let Some(value) = self.order_inputs.get(&expr_address(expression)) {
             return Ok(value.clone());
         }
         bounded_expression(self.render_expression(expression, aliases)?)
@@ -1606,7 +1603,7 @@ impl<'a> MatchPlan<'a> {
                         items: Vec::new(),
                     };
                     inputs.visit_expr(&item.expr);
-                    for (part, output) in inputs.items {
+                    for (address, part, output) in inputs.items {
                         let name = match output {
                             Some(name) => name,
                             None => {
@@ -1618,7 +1615,7 @@ impl<'a> MatchPlan<'a> {
                         };
                         projected
                             .order_inputs
-                            .insert((part.span.start, part.span.end), qualified("d", &name));
+                            .insert(address, qualified("d", &name));
                     }
                     projected_expression = Some(projected.expr(&item.expr).context(
                         "ORDER BY after aggregation requires grouped or aggregate values",
@@ -1873,14 +1870,20 @@ impl Visitor for HasAggregate {
 
 struct AggregateOrderInputs<'a> {
     projected: &'a BTreeMap<String, String>,
-    items: Vec<(Expr, Option<String>)>,
+    items: Vec<(usize, Expr, Option<String>)>,
+}
+
+// The map is scoped to a single sort expression and used before its AST moves.
+fn expr_address(expr: &Expr) -> usize {
+    std::ptr::from_ref(expr).addr()
 }
 
 impl Visitor for AggregateOrderInputs<'_> {
     fn visit_expr(&mut self, expr: &Expr) {
         let output = self.projected.get(&expression_name(expr));
         if output.is_some() || aggregate_call(expr) {
-            self.items.push((expr.clone(), output.cloned()));
+            self.items
+                .push((expr_address(expr), expr.clone(), output.cloned()));
         } else if !matches!(
             expr.kind,
             ExprKind::Exists(_) | ExprKind::PatternComprehension { .. }

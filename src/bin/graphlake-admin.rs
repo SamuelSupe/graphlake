@@ -138,7 +138,10 @@ fn main() -> anyhow::Result<()> {
     let mut runtime = if matches!(args.command, Some(Command::Ingress { .. })) {
         tokio::runtime::Builder::new_current_thread()
     } else {
-        tokio::runtime::Builder::new_multi_thread()
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        // Keep the alternate planner stack as a fallback for unusually deep plans.
+        runtime.thread_stack_size(8 * 1024 * 1024);
+        runtime
     };
     let runtime = runtime.enable_all().build()?;
     let result = runtime.block_on(run(args));

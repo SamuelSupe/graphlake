@@ -395,12 +395,17 @@ async fn bind_label(
             }
         }
         if let Some(scd2) = mapping.scd2 {
-            frame = temporal(
+            let (filtered, _uses_clock) = temporal(
                 frame,
                 scd2,
                 scope.options.graph.snapshot_time.as_deref(),
                 scope.wall_time,
             )?;
+            frame = filtered;
+            #[cfg(feature = "admin")]
+            if _uses_clock {
+                scope.clock_labels.lock().unwrap().insert(name.into());
+            }
         }
         if read.check_data
             && let Some(null_key) = label
@@ -941,7 +946,7 @@ fn temporal(
     scd2: &Scd2,
     time: Option<&str>,
     wall_time: chrono::DateTime<chrono::Utc>,
-) -> Result<DataFrame> {
+) -> Result<(DataFrame, bool)> {
     let interval = if let (Some(from), Some(to)) = (&scd2.valid_from, &scd2.valid_to) {
         let ty = data_type(&frame, from)?;
         ensure!(
@@ -960,6 +965,7 @@ fn temporal(
     } else {
         None
     };
+    let mut uses_clock = false;
     let expr = if let Some(time) = time.filter(|time| !time.eq_ignore_ascii_case("current")) {
         let (from, to, ty) =
             interval.context("historical SCD2 queries require a validity interval")?;
@@ -977,6 +983,7 @@ fn temporal(
             // An integer business clock has no implied epoch or unit.
             open_interval(to, &ty, scd2.open_end.as_ref())?
         } else {
+            uses_clock = true;
             use datafusion::logical_expr::ExprSchemable;
             let point = lit(ScalarValue::TimestampNanosecond(
                 wall_time.timestamp_nanos_opt(),
@@ -986,7 +993,7 @@ fn temporal(
             validity_at(from, to, point, &ty, scd2.open_end.as_ref())?
         }
     };
-    Ok(frame.filter(expr)?)
+    Ok((frame.filter(expr)?, uses_clock))
 }
 
 fn open_interval(to: Expr, ty: &DataType, sentinel: Option<&Value>) -> Result<Expr> {

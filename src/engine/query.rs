@@ -195,14 +195,14 @@ struct Usage {
     spill: u64,
 }
 
-pub(super) struct Admission {
+pub(crate) struct Admission {
     limits: EngineLimits,
     usage: Mutex<Usage>,
     changed: Notify,
 }
 
 impl Admission {
-    pub(super) fn new(limits: EngineLimits) -> Result<Self> {
+    pub(crate) fn new(limits: EngineLimits) -> Result<Self> {
         ensure!(
             limits.max_queries > 0 && limits.memory_bytes > 0,
             "engine query and memory limits must be positive"
@@ -382,6 +382,8 @@ pub(crate) struct QueryScope {
     intermediate_spilled_bytes: Arc<AtomicU64>,
     pub(crate) visits_by_depth: Arc<Mutex<Vec<u64>>>,
     pub(crate) csr_generation: Mutex<Option<String>>,
+    #[cfg(feature = "admin")]
+    pub(crate) clock_labels: Mutex<std::collections::BTreeSet<String>>,
     pub(crate) algorithm: Arc<Mutex<Option<crate::GraphAlgorithmMetrics>>>,
 }
 
@@ -392,7 +394,7 @@ impl QueryScope {
         Ok(self.deadline.saturating_duration_since(Instant::now()))
     }
 
-    pub(super) async fn new(options: QueryOptions, admission: &Arc<Admission>) -> Result<Self> {
+    pub(crate) async fn new(options: QueryOptions, admission: &Arc<Admission>) -> Result<Self> {
         ensure!(!options.timeout.is_zero(), "query timeout must be positive");
         ensure!(
             options.memory_bytes > 0 && options.partitions > 0 && options.batch_size > 0,
@@ -428,6 +430,8 @@ impl QueryScope {
             intermediate_spilled_bytes: Arc::default(),
             visits_by_depth: Arc::default(),
             csr_generation: Mutex::default(),
+            #[cfg(feature = "admin")]
+            clock_labels: Mutex::default(),
             algorithm: Arc::default(),
         })
     }

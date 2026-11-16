@@ -31,6 +31,7 @@ pub(super) struct Worker {
     slots: Arc<Semaphore>,
     probes: Semaphore,
     pub(super) stage_slots: Arc<Semaphore>,
+    pub(super) admission: Arc<crate::engine::Admission>,
     pub(super) shutdown: CancellationToken,
     pub(super) arc_cache: super::csr::ArcBlocks,
     metrics: Metrics,
@@ -64,6 +65,14 @@ pub(super) fn router(
         slots: Arc::new(Semaphore::new(slots)),
         probes: Semaphore::new(2),
         stage_slots: Arc::new(Semaphore::new(remote)),
+        admission: Arc::new(
+            crate::engine::Admission::new(crate::EngineLimits {
+                max_queries: slots + remote,
+                memory_bytes: config.process_memory_mib * 1024 * 1024,
+                spill_bytes: (slots + remote) as u64 * QueryOptions::default().spill_bytes,
+            })
+            .expect("validated worker capacity"),
+        ),
         shutdown: shutdown.clone(),
         arc_cache: Default::default(),
         metrics: Metrics::new(slots),
@@ -152,7 +161,7 @@ async fn readiness(
                 .await
                 .map_err(error)?,
         );
-        SourceProbe::run(engine, options).await
+        SourceProbe::run(engine, options, &worker.admission).await
     })
     .await
     .map_err(|_| unavailable())??;
@@ -287,7 +296,8 @@ impl Worker {
         }
         let mut catalog = models::parse(&yaml, &self.source_dir.join(format!("{model}.yaml")))?;
         catalog.export_locations.clear();
-        let engine = Engine::new(catalog).map_err(query::query_error)?;
+        let engine =
+            Engine::with_admission(catalog, self.admission.clone()).map_err(query::query_error)?;
         let mut models = self.models.lock().unwrap();
         if let Some((_, _, cached)) = models
             .iter()
@@ -673,6 +683,9 @@ mod tests {
             slots: Arc::new(Semaphore::new(1)),
             probes: Semaphore::new(0),
             stage_slots: Arc::new(Semaphore::new(0)),
+            admission: Arc::new(crate::engine::Admission::new(
+                crate::EngineLimits::default(),
+            )?),
             shutdown: CancellationToken::new(),
             arc_cache: Default::default(),
             metrics: Metrics::new(1),

@@ -102,7 +102,11 @@ impl Traversers<'_> {
 
     pub(super) fn count(&mut self) {
         self.reduce(
-            "count(*)",
+            if self.bulk {
+                "CAST(sum(v.__graphlake_gremlin_bulk) AS BIGINT)"
+            } else {
+                "count(*)"
+            },
             "coalesce(q.aggregate, CAST(0 AS BIGINT))",
             Kind::Count,
         );
@@ -237,6 +241,7 @@ impl Traversers<'_> {
     }
 
     pub(super) fn range(&mut self, low: u64, high: Option<u64>) {
+        self.sliced |= low != 0 || high.is_some();
         if let Some(group) = &self.group {
             let partition = qualified("v", &group.key);
             self.retain_ranked(&partition, low, high);

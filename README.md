@@ -4,7 +4,7 @@
 
 Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremlin, and explore the results in a browser. GraphLake runs as an embedded Rust engine, a standalone Linux service, or a Coordinator with distributed Workers.
 
-[**Download v1.1.0**](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.0) · [Quickstart](docs/quickstart.md) · [Deployment](docs/deployment.md) · [中文技术参考](docs/reference.zh-CN.md)
+[**Download v1.1.1**](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.1) · [Quickstart](docs/quickstart.md) · [Deployment](docs/deployment.md) · [中文技术参考](docs/reference.zh-CN.md)
 
 ![GraphLake 1.1.0 query workbench showing three accounts and four transfers from the Parquet demo](docs/workbench.jpg)
 

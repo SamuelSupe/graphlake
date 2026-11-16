@@ -20,7 +20,7 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 
-use super::{Apply, Buffer, Catalog, QueryScope, replace};
+use super::{Apply, Buffer, Catalog, QueryScope, replace, replay};
 use crate::engine::graph_frame;
 
 pub(crate) const SINGLE_KEY_PAGE: usize = 64;
@@ -64,6 +64,21 @@ impl Apply {
         let mut memo = VecDeque::<CachedBatch>::new();
         let mut cached_bytes = 0usize;
         let mut empty_batches = 0;
+        let outer_schema = Arc::clone(outer.schema().inner());
+        context.deregister_table(seed.clone())?;
+        replay::register_seed(context, seed.clone(), outer_schema)?;
+        let keys = graph_frame(context, &plan.keys).await?;
+        let key_plan = replay::Plan::new(context, &keys).await?;
+        let group_plan =
+            if self.limit.is_none() && self.nested.is_empty() && self.lookups.is_empty() {
+                let groups = graph_frame(context, &plan.groups).await?;
+                Some(replay::Plan::new(context, &groups).await?)
+            } else {
+                None
+            };
+        let converter = RowConverter::new(vec![SortField::new(
+            keys.schema().field(0).data_type().clone(),
+        )])?;
         let mut outer = outer.execute_stream().await?;
         while let Some(batch) = outer.try_next().await? {
             let mut offset = 0;
@@ -71,18 +86,14 @@ impl Apply {
                 scope.check()?;
                 let mut rows = MAX_SEEDS.min(batch.num_rows() - offset);
                 let mut input = batch.slice(offset, rows);
-                replace(context, seed.clone(), batch.schema(), vec![input.clone()])?;
-                let keys = graph_frame(context, &plan.keys).await?.collect().await?;
+                let keys = key_plan
+                    .execute(input.clone())?
+                    .try_collect::<Vec<_>>()
+                    .await?;
                 ensure!(
                     keys.iter().map(RecordBatch::num_rows).sum::<usize>() == rows,
                     "CALL batch key projection changed the input row count"
                 );
-                let key_type = keys
-                    .first()
-                    .context("missing CALL batch keys")?
-                    .column(0)
-                    .data_type();
-                let converter = RowConverter::new(vec![SortField::new(key_type.clone())])?;
                 let keys = keys
                     .iter()
                     .map(|batch| converter.convert_columns(batch.columns()))
@@ -127,38 +138,44 @@ impl Apply {
                         .map(|column| take(column, &indexes, None))
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     let selected = RecordBatch::try_new(input.schema(), fields)?;
-                    replace(context, seed.clone(), selected.schema(), vec![selected])?;
                     let prefix = self.limit.map(|_| remaining);
-                    let _nested_budget = self
-                        .prepare_inner(
-                            catalog,
-                            context,
-                            scope,
-                            false,
-                            plan.push_group_limit
-                                && single_key
-                                && prefix.is_some_and(|n| n <= SINGLE_KEY_PAGE),
-                        )
-                        .await?;
-                    let mut frame = graph_frame(context, &plan.groups).await?;
                     let stream_prefix = prefix.filter(|_| single_key);
-                    if let Some(left) = prefix {
-                        if let Some((rank, skip)) = &plan.group_rank {
-                            let rank = col(Column::from_name(rank));
-                            frame = if single_key {
-                                // A bounded sort cannot spill. Read the ordered
-                                // prefix from a spillable sort instead.
-                                frame.sort(vec![rank.sort(true, false)])?
-                            } else {
-                                frame.filter(rank.lt_eq(lit(skip.saturating_add(left as u64))))?
-                            };
-                        } else if single_key && plan.push_group_limit {
-                            frame = frame.limit(0, Some(left))?;
+                    let _nested_budget;
+                    let (mut stream, physical) = if let Some(group_plan) = &group_plan {
+                        group_plan.execute_with_plan(selected)?
+                    } else {
+                        replace(context, seed.clone(), selected.schema(), vec![selected])?;
+                        _nested_budget = self
+                            .prepare_inner(
+                                catalog,
+                                context,
+                                scope,
+                                false,
+                                plan.push_group_limit
+                                    && single_key
+                                    && prefix.is_some_and(|n| n <= SINGLE_KEY_PAGE),
+                            )
+                            .await?;
+                        let mut frame = graph_frame(context, &plan.groups).await?;
+                        if let Some(left) = prefix {
+                            if let Some((rank, skip)) = &plan.group_rank {
+                                let rank = col(Column::from_name(rank));
+                                frame = if single_key {
+                                    // A bounded sort cannot spill. Read the ordered
+                                    // prefix from a spillable sort instead.
+                                    frame.sort(vec![rank.sort(true, false)])?
+                                } else {
+                                    frame
+                                        .filter(rank.lt_eq(lit(skip.saturating_add(left as u64))))?
+                                };
+                            } else if single_key && plan.push_group_limit {
+                                frame = frame.limit(0, Some(left))?;
+                            }
                         }
-                    }
-                    let task = Arc::new(frame.task_ctx());
-                    let physical = frame.create_physical_plan().await?;
-                    let mut stream = execute_stream(Arc::clone(&physical), task)?;
+                        let task = Arc::new(frame.task_ctx());
+                        let physical = frame.create_physical_plan().await?;
+                        (execute_stream(physical.clone(), task)?, physical)
+                    };
                     let mut buffer = Buffer::new(
                         &scope.runtime.memory_pool,
                         Some(&scope.runtime.disk_manager),

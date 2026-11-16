@@ -69,15 +69,27 @@ pub(super) async fn observe(app: &App, catalog: &Catalog) -> Vec<Observation> {
             .map(|t| (store.path(t), t.clone()))
             .collect::<BTreeMap<_, _>>()
     };
-    let mut observations = Vec::new();
-    for reference in models::physical_tables(catalog) {
-        let Ok((_, relation, Source::Parquet { tables })) = catalog.source(&reference) else {
-            continue;
-        };
-        for location in &tables[relation] {
+    use futures::{StreamExt, stream};
+
+    let locations = models::physical_tables(catalog)
+        .into_iter()
+        .flat_map(|reference| {
+            let files = match catalog.source(&reference) {
+                Ok((_, relation, Source::Parquet { tables })) => tables[relation].clone(),
+                _ => Vec::new(),
+            };
+            files
+                .into_iter()
+                .map(move |location| (reference.clone(), location))
+        });
+    let definitions = &definitions;
+    let backend = super::local_tables::managed::backend(app);
+    let backend = &backend;
+    stream::iter(locations)
+        .map(|(source, location)| async move {
             let (table, generation) =
-                if let Some(id) = source::parquet_snapshot::logical_id(location) {
-                    let current = match super::local_tables::managed::backend(app) {
+                if let Some(id) = source::parquet_snapshot::logical_id(&location) {
+                    let current = match backend {
                         Some(backend) => backend.inspect_record(id).await.ok().flatten(),
                         None => None,
                     };
@@ -85,9 +97,9 @@ pub(super) async fn observe(app: &App, catalog: &Catalog) -> Vec<Observation> {
                         Some((table, generation)) => (Some(table), generation),
                         None => (None, None),
                     }
-                } else if let Some(path) = source::parquet_snapshot::managed_location(location) {
+                } else if let Some(path) = source::parquet_snapshot::managed_location(&location) {
                     let version = source::parquet::object_version(
-                        location,
+                        &location,
                         None,
                         Arc::new(UnboundedMemoryPool::default()),
                         Arc::default(),
@@ -96,12 +108,12 @@ pub(super) async fn observe(app: &App, catalog: &Catalog) -> Vec<Observation> {
                     .ok();
                     (definitions.get(&path).cloned(), version.map(|v| v.version))
                 } else {
-                    continue;
+                    return None;
                 };
             let table = table.as_ref();
-            observations.push(Observation {
-                source: reference.clone(),
-                location: location.clone(),
+            Some(Observation {
+                source,
+                location,
                 generation,
                 result_generation: None,
                 observed_at_ms: table.and_then(|t| t.observed_at_ms),
@@ -117,10 +129,12 @@ pub(super) async fn observe(app: &App, catalog: &Catalog) -> Vec<Observation> {
                 last_status: table
                     .and_then(|t| t.history.first())
                     .map(|r| r.status.clone()),
-            });
-        }
-    }
-    observations
+            })
+        })
+        .buffered(8)
+        .filter_map(futures::future::ready)
+        .collect()
+        .await
 }
 
 pub(super) fn policy(catalog: &Catalog, request: Option<&FreshnessPolicy>) -> FreshnessPolicy {

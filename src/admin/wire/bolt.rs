@@ -350,6 +350,7 @@ impl BoltBackend for Backend {
         };
         let (revision, mut engine) = target
             .engine(&self.app)
+            .await
             .inspect_err(|error| target.audit(&self.app, "begin", "error", error.status.as_u16()))
             .map_err(query_error)?;
         let managed = crate::admin::local_tables::managed::resolve(

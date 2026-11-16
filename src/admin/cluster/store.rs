@@ -116,19 +116,38 @@ impl Metadata {
         } else {
             2000
         };
-        self.request(path, body, retry, Duration::from_millis(timeout))
-            .await
+        let response = self
+            .request(path, &body, retry, Duration::from_millis(timeout))
+            .await;
+        if read_only
+            && response.as_ref().is_err_and(|error| {
+                error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                    error.is_timeout()
+                        || error.is_connect()
+                        || error
+                            .status()
+                            .is_some_and(|status| status.is_server_error())
+                })
+            })
+        {
+            // A brief election or an overloaded quorum can outlast the fast
+            // failover pass. Retrying only reads cannot duplicate a mutation.
+            self.request(path, &body, true, Duration::from_secs(2))
+                .await
+        } else {
+            response
+        }
     }
 
     pub(super) async fn retention_range(&self, body: Value) -> Result<Value> {
-        self.request("/v3/kv/range", body, true, Duration::from_secs(2))
+        self.request("/v3/kv/range", &body, true, Duration::from_secs(2))
             .await
     }
 
     async fn request(
         &self,
         path: &str,
-        body: Value,
+        body: &Value,
         retry: bool,
         timeout: Duration,
     ) -> Result<Value> {
@@ -137,7 +156,7 @@ impl Metadata {
                 .client
                 .post(endpoint.join(path).expect("validated etcd endpoint"))
                 .timeout(timeout)
-                .json(&body);
+                .json(body);
             async move { Ok(request.send().await?.error_for_status()?.json().await?) }
         })
         .await
@@ -262,24 +281,32 @@ impl Metadata {
         leader: Option<&super::control::Leadership>,
     ) -> Result<bool> {
         const WINDOW: u64 = 5;
-        let lease = {
+        let valid = |slot: &Option<(tokio::time::Instant, u64, String)>| {
+            slot.as_ref()
+                .filter(|(expires, duration, _)| {
+                    *duration == ttl && tokio::time::Instant::now() < *expires
+                })
+                .map(|(_, _, lease)| lease.clone())
+        };
+        let cached = valid(&*self.query_lease.lock().await);
+        let lease = if let Some(lease) = cached {
+            lease
+        } else {
+            let started = tokio::time::Instant::now();
+            let response = self
+                .call("/v3/lease/grant", json!({"TTL":(ttl + WINDOW).to_string()}))
+                .await?;
+            let granted = response["ID"]
+                .as_str()
+                .context("missing etcd lease")?
+                .to_owned();
             let mut slot = self.query_lease.lock().await;
-            if let Some((expires, duration, lease)) = slot.as_ref()
-                && *duration == ttl
-                && tokio::time::Instant::now() < *expires
-            {
-                lease.clone()
-            } else {
-                let started = tokio::time::Instant::now();
-                let response = self
-                    .call("/v3/lease/grant", json!({"TTL":(ttl + WINDOW).to_string()}))
-                    .await?;
-                let lease = response["ID"]
-                    .as_str()
-                    .context("missing etcd lease")?
-                    .to_owned();
-                *slot = Some((started + Duration::from_secs(WINDOW), ttl, lease.clone()));
+            if let Some(lease) = valid(&slot) {
+                // Concurrent grants may leave an unused lease, which will expire.
                 lease
+            } else {
+                *slot = Some((started + Duration::from_secs(WINDOW), ttl, granted.clone()));
+                granted
             }
         };
         self.write(
@@ -732,4 +759,41 @@ impl Drop for UploadGuard {
 
 pub(super) fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, routing::post};
+
+    #[tokio::test]
+    async fn read_retries_when_the_fast_etcd_pass_times_out() -> Result<()> {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let router = Router::new().route(
+            "/v3/kv/range",
+            post(move || {
+                let count = seen.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if count < 2 {
+                        tokio::time::sleep(Duration::from_millis(450)).await;
+                    }
+                    Json(json!({"header":{"revision":"3"}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?).parse::<url::Url>()?;
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let metadata = Metadata::new(
+            reqwest::Client::new(),
+            vec![endpoint.clone(), endpoint],
+            "test",
+        );
+        let result = metadata.call("/v3/kv/range", json!({"key":"YQ=="})).await;
+        server.abort();
+        assert_eq!(result?["header"]["revision"], "3");
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        Ok(())
+    }
 }

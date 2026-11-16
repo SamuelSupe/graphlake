@@ -3184,6 +3184,59 @@ edges:
             "  Account:\n    key: [tenant_id, from_account_id]\n    inputs: [{table: lake.finance.nodes}, {table: lake.finance.payments}]",
         );
     fs::write(root.path().join("keyless.yaml"), keyless)?;
+    let temporal = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1, 2])) as _),
+        ("src", Arc::new(Int64Array::from(vec![1, 2])) as _),
+        ("dst", Arc::new(Int64Array::from(vec![2, 1])) as _),
+        (
+            "starts",
+            Arc::new(graphlake::arrow::array::Date32Array::from(vec![0, 0])) as _,
+        ),
+        (
+            "ends",
+            Arc::new(graphlake::arrow::array::Date32Array::from(vec![
+                Some(3),
+                None,
+            ])) as _,
+        ),
+        (
+            "business_start",
+            Arc::new(Int64Array::from(vec![0, 0])) as _,
+        ),
+        (
+            "business_end",
+            Arc::new(Int64Array::from(vec![Some(3), None])) as _,
+        ),
+    ])?;
+    let mut writer = ArrowWriter::try_new(
+        fs::File::create(root.path().join("temporal.parquet"))?,
+        temporal.schema(),
+        None,
+    )?;
+    writer.write(&temporal)?;
+    writer.close()?;
+    let temporal_model = r#"
+graph: temporal
+sources:
+  store: {type: parquet, tables: {snapshots: [temporal.parquet]}}
+nodes:
+  Account: {source: store.snapshots, key: [id]}
+edges:
+  Link:
+    source: store.snapshots
+    key: [id]
+    from: {node: Account, columns: [src]}
+    to: {node: Account, columns: [dst]}
+    scd2: {valid_from: starts, valid_to: ends}
+"#;
+    fs::write(root.path().join("temporal.yaml"), temporal_model)?;
+    fs::write(
+        root.path().join("business.yaml"),
+        temporal_model.replace(
+            "valid_from: starts, valid_to: ends",
+            "valid_from: business_start, valid_to: business_end",
+        ),
+    )?;
     let store = root.path().join("store");
     fs::create_dir(&store)?;
     let etcd = std::env::var("GRAPHLAKE_TEST_ETCD")?;
@@ -3325,6 +3378,94 @@ edges:
         .error_for_status()?
         .json()
         .await?;
+    let gremlin = "g.V().hasLabel('Account').out('Payment').count()";
+    let live: Value = coordinator
+        .query(Uuid::new_v4(), "gremlin", gremlin)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let snapshot: Value = coordinator
+        .request(Method::POST, "models/payments/query")
+        .json(&json!({
+            "request_id": Uuid::new_v4(), "language":"gremlin", "query":gremlin,
+            "model_revision":revision,"csr_generation":keyed_csr["generation"],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(snapshot["rows"], live["rows"]);
+    assert_eq!(snapshot["csr_generation"], keyed_csr["generation"]);
+    let temporal_revision = coordinator.model("temporal").await?["active_revision"].clone();
+    let temporal_query = |generation: Value| {
+        coordinator
+            .request(Method::POST, "models/temporal/query")
+            .json(&json!({
+                "request_id": Uuid::new_v4(), "language":"cypher",
+                "query":"MATCH (:Account)-[e:Link]->(:Account) RETURN e.id AS id ORDER BY id",
+                "model_revision":temporal_revision, "csr_generation":generation,
+            }))
+    };
+    for (scope, expected) in [
+        (json!({}), None),
+        (
+            json!({"snapshot_time":"1970-01-02"}),
+            Some(json!([["1"], ["2"]])),
+        ),
+    ] {
+        let saved: Value = coordinator
+            .request(Method::POST, "models/temporal/csr")
+            .json(&json!({"model_revision":temporal_revision,"graph_options":scope}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let result = temporal_query(saved["generation"].clone()).send().await?;
+        if let Some(expected) = expected {
+            assert_eq!(
+                result.error_for_status()?.json::<Value>().await?["rows"],
+                expected
+            );
+        } else {
+            assert_eq!(result.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                result.json::<Value>().await?["code"],
+                "csr_current_validity"
+            );
+        }
+    }
+    let live_temporal: Value = temporal_query(Value::Null)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(live_temporal["rows"], json!([["2"]]));
+    let business_revision = coordinator.model("business").await?["active_revision"].clone();
+    let business: Value = coordinator
+        .request(Method::POST, "models/business/csr")
+        .json(&json!({"model_revision":business_revision}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let result: Value = coordinator
+        .request(Method::POST, "models/business/query")
+        .json(&json!({
+            "request_id": Uuid::new_v4(), "language":"cypher",
+            "query":"MATCH (:Account)-[e:Link]->(:Account) RETURN e.id AS id",
+            "model_revision":business_revision, "csr_generation":business["generation"],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(result["rows"], json!([["2"]]));
     for cypher in [
         "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant) RETURN length(p) AS hops ORDER BY hops",
         "MATCH (a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant) RETURN count(*) AS hits",

@@ -150,6 +150,8 @@ pub enum Source {
         #[serde(default = "default_tls")]
         tls: bool,
         ca_file: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncate_datetime2_to_microseconds: bool,
     },
     OracleNative {
         connect_string: String,
@@ -755,6 +757,7 @@ impl Catalog {
                 password_env,
                 tls,
                 ca_file,
+                ..
             } => {
                 url::Host::parse(host).context("invalid SQL Server host")?;
                 ensure!(

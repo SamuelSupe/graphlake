@@ -14,6 +14,7 @@ use datafusion::{
     logical_expr::LogicalPlan,
     prelude::SessionContext,
 };
+use tokio_postgres::types::Type;
 
 use super::{Keys, Lookup, restrict};
 use crate::{engine::QueryScope, source::postgres::PgTable};
@@ -51,12 +52,20 @@ impl Lookup {
         if tables.values().any(|table| !first.shares_snapshot(table)) {
             return Ok(None);
         }
-        Ok(self.remote_candidates(&tables, starts))
+        let collations =
+            futures::future::try_join_all(tables.iter().map(|(&label, table)| async move {
+                Ok::<_, anyhow::Error>((label, table.key_collations().await?))
+            }))
+            .await?
+            .into_iter()
+            .collect();
+        Ok(self.remote_candidates(&tables, &collations, starts))
     }
 
     fn remote_candidates(
         &self,
         tables: &BTreeMap<&str, PgTable>,
+        collations: &BTreeMap<&str, BTreeMap<String, String>>,
         starts: &Keys,
     ) -> Option<BTreeMap<String, String>> {
         let mut filters = BTreeMap::new();
@@ -83,41 +92,97 @@ impl Lookup {
                 );
                 seed
             } else {
-                let filter = membership(edge, &step.from.columns, &previous, &from)?;
-                let sources = operands(edge, Some(&alias), &step.from.columns)?;
+                let sources = operands(
+                    edge,
+                    &collations[step.edge.as_str()],
+                    None,
+                    &step.from.columns,
+                )?;
+                let filter = membership(&sources, &previous, &from);
+                let sources = operands(
+                    edge,
+                    &collations[step.edge.as_str()],
+                    Some(&alias),
+                    &step.from.columns,
+                )?;
+                let (left, right) = equality_keys(&sources, &previous);
                 from.push_str(&format!(
-                    " JOIN {} AS {alias} ON ({}) = ({})",
-                    edge.relation(),
-                    previous.join(", "),
-                    sources.join(", ")
+                    " JOIN {} AS {alias} ON ({left}) = ({right})",
+                    edge.relation()
                 ));
                 filter
             };
             filters.insert(step.edge_alias.clone(), filter);
-            previous = operands(edge, Some(&alias), &step.to.columns)?;
+            previous = operands(
+                edge,
+                &collations[step.edge.as_str()],
+                Some(&alias),
+                &step.to.columns,
+            )?;
             let node = &tables[step.to.node.as_str()];
-            filters.insert(
-                step.to_alias.clone(),
-                membership(node, &step.keys, &previous, &from)?,
-            );
+            let keys = operands(node, &collations[step.to.node.as_str()], None, &step.keys)?;
+            filters.insert(step.to_alias.clone(), membership(&keys, &previous, &from));
         }
         Some(filters)
     }
 }
 
-fn operands(table: &PgTable, alias: Option<&str>, columns: &[String]) -> Option<Vec<String>> {
+struct Operand<'a> {
+    exact: String,
+    name: String,
+    ty: &'a Type,
+    collation: Option<&'a String>,
+}
+
+fn operands<'a>(
+    table: &'a PgTable,
+    collations: &'a BTreeMap<String, String>,
+    alias: Option<&str>,
+    columns: &[String],
+) -> Option<Vec<Operand<'a>>> {
     columns
         .iter()
-        .map(|column| table.key_sql(alias, column))
+        .map(|column| {
+            Some(Operand {
+                exact: table.key_sql(alias, column)?,
+                name: alias.map_or_else(
+                    || crate::catalog::ident(column),
+                    |alias| crate::catalog::qualified(alias, column),
+                ),
+                ty: table.column_type(column)?,
+                collation: collations.get(column),
+            })
+        })
         .collect()
 }
 
-fn membership(table: &PgTable, keys: &[String], values: &[String], from: &str) -> Option<String> {
-    Some(format!(
-        "({}) IN (SELECT {} {from})",
-        operands(table, None, keys)?.join(", "),
-        values.join(", ")
-    ))
+fn equality_keys(keys: &[Operand<'_>], values: &[Operand<'_>]) -> (String, String) {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for (key, value) in keys.iter().zip(values) {
+        if *key.ty == Type::UUID && *value.ty == Type::UUID {
+            left.push(key.name.clone());
+            right.push(value.name.clone());
+            continue;
+        }
+        left.push(key.exact.clone());
+        right.push(value.exact.clone());
+        // Match the target index's collation for the candidate condition, while
+        // keeping the exact comparison for nondeterministic collations.
+        if let Some(collation) = key.collation
+            && matches!(*key.ty, Type::TEXT | Type::VARCHAR)
+            && matches!(*value.ty, Type::TEXT | Type::VARCHAR)
+        {
+            left.push(key.name.clone());
+            right.push(format!("{} COLLATE {collation}", value.name));
+        }
+    }
+    (left.join(", "), right.join(", "))
+}
+
+fn membership(keys: &[Operand<'_>], values: &[Operand<'_>], from: &str) -> String {
+    let (left, right) = equality_keys(keys, values);
+    format!("({left}) IN (SELECT {right} {from})")
 }
 
 fn base_table(plan: &LogicalPlan) -> Option<PgTable> {

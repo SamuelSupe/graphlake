@@ -61,10 +61,15 @@ struct Target {
 }
 
 impl Target {
-    fn engine(&self, app: &App) -> ApiResult<(String, Engine)> {
+    async fn engine(&self, app: &Arc<App>) -> ApiResult<(String, Engine)> {
         super::access::check_query(app, &self.principal, &self.model)?;
-        let files = app.models.lock().unwrap().read_files();
-        let (revision, _, engine) = files.query_engine(app, &self.model, None, &self.principal)?;
+        let target = self.clone();
+        let owner = app.clone();
+        let (revision, _, engine) = app
+            .read_models(move |files| {
+                files.query_engine(&owner, &target.model, None, &target.principal)
+            })
+            .await?;
         if engine.catalog.freshness.policy != crate::FreshnessPolicy::default() {
             return Err(super::freshness::conflict(
                 "此模型的严格查询策略需通过查询 API 或 MCP 执行",
@@ -270,7 +275,7 @@ async fn execute_inner(
                 managed.cloned(),
             )
         } else {
-            let (revision, mut engine) = target.engine(app)?;
+            let (revision, mut engine) = target.engine(app).await?;
             let managed = super::local_tables::managed::resolve(
                 app,
                 &mut engine,

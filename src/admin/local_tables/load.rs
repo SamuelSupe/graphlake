@@ -17,7 +17,7 @@ use super::{
 use crate::{
     Catalog, QueryOptions,
     catalog::ident,
-    engine::{QueryScope, stage_scope},
+    engine::{Admission, QueryScope},
     source::{parquet::ParquetTable, parquet_snapshot::Snapshot},
 };
 
@@ -26,8 +26,9 @@ pub(super) async fn run(
     path: &Path,
     mode: Mode,
     options: QueryOptions,
+    admission: &Arc<Admission>,
 ) -> Result<(u64, u64, crate::source::ReadMetrics, Option<uuid::Uuid>)> {
-    let scope = stage_scope(options).await?;
+    let scope = Arc::new(QueryScope::new(options, admission).await?);
     let (loaded, total) = scope.run(load(table, path, mode, &scope)).await?;
     clean_parts(path);
     let generation = Snapshot::read(path)?

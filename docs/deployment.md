@@ -1,13 +1,13 @@
 # Deploy GraphLake
 
-The v1.1.0 release provides Linux packages for `aarch64` (ARM64) and `x86_64` (AMD64). Debian 12 with systemd is the installation baseline. For each host, keep the architecture-specific archive, its SHA-256 file, and the `BUILD-INFO` stored inside the archive.
+The v1.1.1 release provides Linux packages for `aarch64` (ARM64) and `x86_64` (AMD64). Debian 12 with systemd is the installation baseline. For each host, keep the architecture-specific archive, its SHA-256 file, and the `BUILD-INFO` stored inside the archive.
 
 ## Standalone service
 
-Download both files for the host architecture from the [v1.1.0 release](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.0). Run the commands below in the download directory. Set `artifact` to the actual archive filename without `.tar.gz`.
+Download both files for the host architecture from the [v1.1.1 release](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.1). Run the commands below in the download directory. Set `artifact` to the actual archive filename without `.tar.gz`.
 
 ```sh
-artifact=graphlake-v1.1.0-SOURCE_SHA12-linux-$(uname -m)
+artifact=graphlake-v1.1.1-SOURCE_SHA12-linux-$(uname -m)
 sha256sum -c "$artifact.tar.gz.sha256"
 release_dir="/opt/graphlake/releases/${artifact#graphlake-}"
 
@@ -62,6 +62,8 @@ Stop the standalone service, unpack the new release into a separate directory, u
 
 For an HA rollout, freeze local-table writes and take a checkpoint first. Upgrade Workers one at a time and compare the same published revision after each replacement. Start the candidate Coordinator before handing off leadership. Once all readers are upgraded, create and fully load a managed copy, compare the old and new results, and publish its `local-table://` reference. Keep the original table files and pre-upgrade catalog together for rollback. After activating managed writes, rehearse restoring that checkpoint in a clean namespace and account for changes made after the checkpoint. [Rehearsal and acceptance record](production-optimization-s7.zh-CN.md)
 
+Use the live graph for SCD2 queries that evaluate date or timestamp validity at the current time. For historical CSR queries, build the generation with an explicit `graph_options.snapshot_time`. Rebuild older CSR generations that use business-integer validity without a current flag so the manifest records their clock behavior. After rolling back a model revision, rebuild its CSR if the retired pointer has been collected. [CSR query and retention reference](../deploy/cluster.md)
+
 ## Build a package from source
 
 GitHub runs the [regression workflow](../.github/workflows/regression.yml) for pull requests and pushes to main. The [release workflow](../.github/workflows/release-build.yml) records the same commit, lockfile and fixture digests before producing Debian 12 ARM64 and AMD64 candidates. It starts each extracted archive to check its binaries, web assets, local data sync and crash recovery. Final release artifacts require the rolling-upgrade, rollback, soak, pinned-generation recovery and language binding gates. The scheduled run retains candidate evidence. Repository branch protection controls which checks a pull request must pass before merging.
@@ -77,7 +79,7 @@ docker compose -f tests/production-compose.yml down -v
 On Debian 12, install Rust 1.95 or later, a native C/C++ toolchain, binutils, LLD, Git, and Node.js 24. From a clean checkout, run:
 
 ```sh
-RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.0 dist
+RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.1 dist
 ```
 
 Run this on each target architecture or provide the corresponding cross linker and Rust target, then set `GRAPHLAKE_BUILD_TARGET` to `aarch64-unknown-linux-gnu` or `x86_64-unknown-linux-gnu`. The script checks the architecture, embedded source version, and glibc baseline and writes an accompanying source archive and checksums.

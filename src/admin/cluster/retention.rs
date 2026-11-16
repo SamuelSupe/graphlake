@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{Metadata, Objects, control::Leadership};
+use super::{App, Metadata, Objects, control::Leadership};
 
 const GRACE: TimeDelta = TimeDelta::hours(24);
 
@@ -18,33 +18,58 @@ pub(super) async fn sweep(
     objects: &Objects,
     now: DateTime<Utc>,
     leader: Option<&Leadership>,
+    app: Option<&App>,
 ) -> Result<()> {
     confirm(leader).await?;
     let csr = objects.prefix.clone().join("csr");
     let catalog = objects.prefix.clone().join("control").join("catalog");
     let retired = objects.prefix.clone().join("retired");
-    let (csr_objects, catalog_objects, markers) = tokio::try_join!(
-        inventory(objects, &csr),
+    let (roots, csr_generations, catalog_objects, markers) = tokio::try_join!(
+        live_generations(metadata, objects),
+        csr_generations(objects, &csr),
         inventory(objects, &catalog),
         inventory(objects, &retired),
     )?;
-    let mut generations = BTreeMap::<Key, Vec<ObjectMeta>>::new();
-    for object in csr_objects {
-        let Some(relative) = object.location.prefix_match(&csr) else {
-            continue;
-        };
-        let parts = relative.collect::<Vec<_>>();
-        if let [model, revision, generation, _, ..] = parts.as_slice()
-            && Uuid::parse_str(generation.as_ref()).is_ok()
-        {
-            let key = csr
-                .clone()
-                .join(model.clone())
-                .join(revision.clone())
-                .join(generation.clone());
-            generations.entry(key).or_default().push(object);
-        }
+    if let Some(app) = app {
+        prune_pointers(metadata, app, &roots.pointers).await?;
     }
+    let mut generations = BTreeMap::<Key, Vec<ObjectMeta>>::new();
+    let cutoff = now - GRACE;
+    let mut markers = markers
+        .into_iter()
+        .map(|meta| (meta.location, meta.last_modified))
+        .collect::<HashMap<_, _>>();
+    let marker_key = |generation: &Key| {
+        retired
+            .clone()
+            .join(crate::admin::models::revision(generation.as_ref()))
+    };
+    // Active generations can have thousands of blocks. The directory listing
+    // identifies generations without reading the block inventory of each one.
+    let csr_files = stream::iter(csr_generations.into_iter().filter_map(|generation| {
+        if roots.live.contains(&generation) {
+            return Some((generation, false));
+        }
+        if markers
+            .get(&marker_key(&generation))
+            .is_some_and(|at| *at > cutoff)
+        {
+            return None;
+        }
+        Some((generation, true))
+    }))
+    .map(|(generation, read)| async move {
+        let files = if read {
+            inventory(objects, &generation).await?
+        } else {
+            Vec::new()
+        };
+        Ok::<_, anyhow::Error>((generation, files))
+    })
+    .buffer_unordered(8)
+    .try_collect::<Vec<_>>()
+    .await?;
+    generations.extend(csr_files);
     for object in catalog_objects {
         if object.location.parts_count() == catalog.parts_count() + 1
             && object
@@ -55,22 +80,11 @@ pub(super) async fn sweep(
             generations.insert(object.location.clone(), vec![object]);
         }
     }
-    let mut markers = markers
-        .into_iter()
-        .map(|meta| (meta.location, meta.last_modified))
-        .collect::<HashMap<_, _>>();
-    if generations.is_empty() && markers.is_empty() {
-        return Ok(());
-    }
-    let live = live_generations(metadata, objects).await?;
-    let cutoff = now - GRACE;
     let mut actions = Vec::new();
     for (generation, files) in generations {
-        let marker = retired
-            .clone()
-            .join(crate::admin::models::revision(generation.as_ref()));
+        let marker = marker_key(&generation);
         let marked = markers.remove(&marker);
-        if live.contains(&generation) {
+        if roots.live.contains(&generation) {
             if marked.is_some() {
                 actions.push((marker, Some(Vec::new())));
             }
@@ -85,7 +99,11 @@ pub(super) async fn sweep(
             Some(_) => {}
         }
     }
-    actions.extend(markers.into_keys().map(|marker| (marker, Some(Vec::new()))));
+    actions.extend(
+        markers
+            .into_iter()
+            .filter_map(|(marker, at)| (at <= cutoff).then_some((marker, Some(Vec::new())))),
+    );
     stream::iter(actions)
         .map(Ok)
         .try_for_each_concurrent(8, |(marker, files)| async move {
@@ -121,6 +139,128 @@ pub(super) async fn sweep(
             }
         })
         .await
+}
+
+async fn csr_generations(objects: &Objects, root: &Key) -> Result<Vec<Key>> {
+    async fn children(objects: &Objects, roots: Vec<Key>) -> Result<Vec<Key>> {
+        let pages: Vec<Vec<Key>> = stream::iter(roots)
+            .map(|root| async move {
+                Ok::<_, object_store::Error>(
+                    objects
+                        .store
+                        .list_with_delimiter(Some(&root))
+                        .await?
+                        .common_prefixes,
+                )
+            })
+            .buffer_unordered(8)
+            .try_collect()
+            .await?;
+        Ok(pages.into_iter().flatten().collect())
+    }
+    let models = children(objects, vec![root.clone()]).await?;
+    let revisions = children(objects, models).await?;
+    let generations = children(objects, revisions).await?;
+    Ok(generations
+        .into_iter()
+        .filter(|key| {
+            key.filename()
+                .is_some_and(|name| Uuid::parse_str(name).is_ok())
+        })
+        .collect())
+}
+
+struct GraphPointer {
+    model: String,
+    revision: String,
+    key: Vec<u8>,
+    modified: String,
+}
+
+struct Roots {
+    live: HashSet<Key>,
+    pointers: Vec<GraphPointer>,
+}
+
+async fn prune_pointers(metadata: &Metadata, app: &App, pointers: &[GraphPointer]) -> Result<()> {
+    // Read publication state without holding an async mutation lock. Recheck
+    // under that lock before deleting, and fence HA changes in etcd as well.
+    let files = app.models.lock().unwrap().read_files();
+    let ids = pointers
+        .iter()
+        .map(|p| p.model.clone())
+        .collect::<HashSet<_>>();
+    let active = tokio::task::spawn_blocking(move || {
+        ids.into_iter()
+            .map(|id| {
+                let revision = files
+                    .active_revision(&id)
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                Ok::<_, anyhow::Error>((id, revision))
+            })
+            .collect::<Result<HashMap<_, _>>>()
+    })
+    .await??;
+    for pointer in pointers {
+        if active[&pointer.model].as_deref() == Some(&pointer.revision) {
+            continue;
+        }
+        let (ha, local) = if let Some(ha) = &app.ha {
+            let Ok(lock) = ha.catalog.try_lock() else {
+                return Ok(());
+            };
+            (Some(lock), None)
+        } else {
+            let Ok(lock) = app.users.writes.try_lock() else {
+                return Ok(());
+            };
+            (None, Some(lock))
+        };
+        let files = app.models.lock().unwrap().read_files();
+        let model = pointer.model.clone();
+        let current = tokio::task::spawn_blocking(move || files.active_revision(&model))
+            .await?
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        if current.as_deref() != Some(&pointer.revision) {
+            let fence = ha
+                .as_ref()
+                .zip(app.ha.as_ref())
+                .map(|(catalog, ha)| (catalog.1, ha.leader.as_ref()));
+            delete_pointer(metadata, pointer, fence).await?;
+        }
+        drop((ha, local));
+    }
+    Ok(())
+}
+
+async fn delete_pointer(
+    metadata: &Metadata,
+    pointer: &GraphPointer,
+    fence: Option<(i64, &Leadership)>,
+) -> Result<()> {
+    let key = STANDARD.encode(&pointer.key);
+    let mut compare = vec![json!({
+        "key": key, "target":"MOD", "result":"EQUAL", "mod_revision":pointer.modified,
+    })];
+    if let Some((catalog_revision, leader)) = fence {
+        leader
+            .admission()
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        compare.push(leader.owner());
+        compare.push(json!({
+            "key":STANDARD.encode(format!("{}/coordinator/catalog", metadata.prefix)),
+            "target":"MOD", "result":"EQUAL", "mod_revision":catalog_revision.to_string(),
+        }));
+    }
+    metadata
+        .call(
+            "/v3/kv/txn",
+            json!({
+                "compare":compare, "success":[{"request_delete_range":{"key":key}}],
+            }),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn inventory(objects: &Objects, prefix: &Key) -> Result<Vec<ObjectMeta>> {
@@ -199,7 +339,7 @@ async fn visit_range(
     }
 }
 
-async fn live_generations(metadata: &Metadata, objects: &Objects) -> Result<HashSet<Key>> {
+async fn live_generations(metadata: &Metadata, objects: &Objects) -> Result<Roots> {
     let key = |suffix: &str| format!("{}/{suffix}", metadata.prefix);
     // Every page uses the revision of the initial linearizable read. A failed
     // or compacted page aborts collection before any objects can be deleted.
@@ -218,6 +358,7 @@ async fn live_generations(metadata: &Metadata, objects: &Objects) -> Result<Hash
         live.insert(objects.control_catalog(&generation));
     }
     let prefix = key("csr/");
+    let mut pointers = Vec::new();
     visit_range(metadata, &prefix, revision, |entry| {
         let key = String::from_utf8(decode(entry, "key")?)?;
         let (model, revision) = key
@@ -225,6 +366,15 @@ async fn live_generations(metadata: &Metadata, objects: &Objects) -> Result<Hash
             .and_then(|suffix| suffix.split_once('/'))
             .context("invalid CSR pointer key")?;
         live.insert(objects.graph(model, revision, Uuid::from_slice(&decode(entry, "value")?)?));
+        pointers.push(GraphPointer {
+            model: model.to_owned(),
+            revision: revision.to_owned(),
+            key: key.into_bytes(),
+            modified: entry["mod_revision"]
+                .as_str()
+                .context("missing CSR pointer revision")?
+                .into(),
+        });
         Ok(())
     })
     .await?;
@@ -244,7 +394,7 @@ async fn live_generations(metadata: &Metadata, objects: &Objects) -> Result<Hash
         Ok(())
     })
     .await?;
-    Ok(live)
+    Ok(Roots { live, pointers })
 }
 
 #[cfg(test)]
@@ -349,11 +499,34 @@ mod tests {
             committed_at_ms: super::super::now_ms(),
         };
         let request = Uuid::new_v4();
-        leader
+        let catalog_revision = leader
             .commit("catalog", 0, &published, Some((request, &receipt)))
             .await
             .map_err(|err| anyhow::anyhow!(err.message))?
             .context("commit catalog")?;
+        let stale = Uuid::new_v4();
+        assert!(
+            metadata
+                .publish_graph("withdrawn", "revision", 0, stale, Some(&leader))
+                .await?
+        );
+        let stale_file = objects
+            .graph("withdrawn", "revision", stale)
+            .join("manifest.json");
+        objects.put_bytes(&stale_file, vec![1]).await?;
+        let roots = live_generations(&metadata, &objects).await?;
+        let pointer = roots
+            .pointers
+            .iter()
+            .find(|pointer| pointer.model == "withdrawn")
+            .unwrap();
+        delete_pointer(&metadata, pointer, Some((catalog_revision + 1, &leader))).await?;
+        assert_eq!(
+            metadata.graph("withdrawn", "revision").await?.unwrap().0,
+            stale
+        );
+        delete_pointer(&metadata, pointer, Some((catalog_revision, &leader))).await?;
+        assert!(metadata.graph("withdrawn", "revision").await?.is_none());
         for start in [0, 100, 200] {
             let writes = (start..start + 100).map(|id| json!({
                 "request_put":{
@@ -381,15 +554,16 @@ mod tests {
 
         let now = Utc::now();
         let retired = objects.prefix.clone().join("retired");
-        sweep(&metadata, &objects, now, Some(&leader)).await?;
+        sweep(&metadata, &objects, now, Some(&leader), None).await?;
         assert!(inventory(&objects, &retired).await?.is_empty());
         let later = now + GRACE + TimeDelta::seconds(1);
-        sweep(&metadata, &objects, later, Some(&leader)).await?;
-        assert_eq!(inventory(&objects, &retired).await?.len(), 1);
-        sweep(&metadata, &objects, now, Some(&leader)).await?;
+        sweep(&metadata, &objects, later, Some(&leader), None).await?;
+        assert_eq!(inventory(&objects, &retired).await?.len(), 2);
+        sweep(&metadata, &objects, now, Some(&leader), None).await?;
         objects.object_meta(&orphan).await?;
-        sweep(&metadata, &objects, later, Some(&leader)).await?;
+        sweep(&metadata, &objects, later, Some(&leader), None).await?;
         assert!(objects.object_meta(&orphan).await.is_err());
+        assert!(objects.object_meta(&stale_file).await.is_err());
         for key in old_files
             .iter()
             .chain([&old_manifest, &current_manifest, &blob])
@@ -414,9 +588,9 @@ mod tests {
                 )
                 .await?;
         }
-        sweep(&metadata, &objects, later, Some(&leader)).await?;
+        sweep(&metadata, &objects, later, Some(&leader), None).await?;
         assert_eq!(inventory(&objects, &retired).await?.len(), 2);
-        sweep(&metadata, &objects, later, Some(&leader)).await?;
+        sweep(&metadata, &objects, later, Some(&leader), None).await?;
         for key in old_files.iter().chain([&old_manifest]) {
             assert!(objects.object_meta(key).await.is_err(), "{key}");
         }

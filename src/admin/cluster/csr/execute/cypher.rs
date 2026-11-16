@@ -106,6 +106,33 @@ impl CypherCsr {
         catalog: &Catalog,
         labels: BTreeSet<String>,
     ) -> Result<Prepared> {
+        let current = self
+            .generation
+            .graph_options
+            .snapshot_time
+            .as_deref()
+            .is_none_or(|time| time.eq_ignore_ascii_case("current"));
+        let time_dependent = |label: &str| {
+            self.generation.clock_labels.as_ref().map_or_else(
+                || {
+                    catalog
+                        .mapping(label)
+                        .scd2
+                        .is_some_and(|scd2| scd2.current_flag.is_none())
+                },
+                |labels| labels.contains(label),
+            )
+        };
+        if current
+            && labels.iter().any(|label| {
+                time_dependent(label)
+                    || catalog.edges.get(label).is_some_and(|edge| {
+                        time_dependent(&edge.from.node) || time_dependent(&edge.to.node)
+                    })
+            })
+        {
+            return Err(CurrentValidity.into());
+        }
         let objects = &self.worker.shared.objects;
         let prefix = objects.graph(
             &self.job.model,

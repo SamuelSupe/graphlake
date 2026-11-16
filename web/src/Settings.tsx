@@ -1,3 +1,4 @@
+import { locale, t } from './locale.ts';
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { Plus, RefreshCw, X } from 'lucide-react';
 import { api, errorText, type ModelSummary } from './api';
@@ -6,10 +7,10 @@ import BackupStatus from './BackupStatus';
 import McpServiceSettings from './McpServiceSettings';
 
 const tabs = [
-  ['telemetry', '日志与遥测'],
-  ['health', '健康检查'],
-  ['backup', '备份与恢复'],
-  ['mcp', 'MCP 服务'],
+  ['telemetry', t('日志与遥测'), t('遥测')],
+  ['health', t('健康检查'), t('健康')],
+  ['backup', t('备份与恢复'), t('备份')],
+  ['mcp', t('MCP 服务'), 'MCP'],
 ] as const;
 export type SettingsTab = typeof tabs[number][0];
 
@@ -26,7 +27,7 @@ export type SettingsSnapshot = {
   signals: { name: Signal; failures: number; rejected: number; last_success_ms: number | null }[];
 };
 type Header = { id: number; name: string; variable: string };
-const names: Record<Signal, string> = { metrics: '指标', logs: '日志', traces: '链路' };
+const names: Record<Signal, string> = { metrics: t('指标'), logs: t('日志'), traces: t('链路') };
 
 function Toggle({ name, label, checked, change }: { name: string; label: string; checked: boolean; change: (value: boolean) => void }) {
   const id = useId();
@@ -107,14 +108,14 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     setBusy(true); setMessage(''); setError('');
     try {
       const entries = headers.map(({ name, variable }) => [name.trim().toLowerCase(), variable.trim()]);
-      if (new Set(entries.map(([name]) => name)).size !== entries.length) throw new Error('同一个 HTTP 请求头只能配置一次。');
+      if (new Set(entries.map(([name]) => name)).size !== entries.length) throw new Error(t('同一个 HTTP 请求头只能配置一次。'));
       const next = await api<SettingsSnapshot>('/settings', {
         method: 'PUT', headers: { 'If-Match': '"' + snapshot.revision + '"' },
         // PUT replaces the document, so preserve server fields this form does not edit.
         body: JSON.stringify({ ...config, headers_env: Object.fromEntries(entries) }),
       });
       adopt(next);
-      setMessage(next.restart_required ? '配置已保存。重启此进程后应用运行配置。' : '配置已保存。');
+      setMessage(next.restart_required ? t('配置已保存。重启此进程后应用运行配置。') : t('配置已保存。'));
     } catch (cause) {
       setError(errorText(cause));
       requestAnimationFrame(() => errorRef.current?.focus());
@@ -122,7 +123,7 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
   }
 
   function reloadConfig() {
-    if (dirty.current && !window.confirm('重新加载会放弃本页未保存的修改。继续？')) return;
+    if (dirty.current && !window.confirm(t('重新加载会放弃本页未保存的修改。继续？'))) return;
     if (snapshot) adopt(snapshot);
     setMessage(''); setError(''); reload(value => value + 1);
   }
@@ -131,19 +132,19 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
   const editableTab = tab === 'telemetry';
   return <main className="workbench">
     <header className="workspace-header">
-      <div className="workspace-title"><h1>运行配置</h1></div>
+      <div className="workspace-title"><h1>{t('运行配置')}</h1></div>
       <div className="workspace-context">
-        {(dirty.current || mcpDirty) && <span className="dirty"><i />未保存</span>}
+        {(dirty.current || mcpDirty) && <span className="dirty"><i />{t('未保存')}</span>}
         {editableTab && snapshot && <>
-        <button className="button compact" type="button" disabled={busy} onClick={reloadConfig}>重新加载配置</button>
-        <button className="button primary compact" type="submit" form="runtime-settings" disabled={readOnly}>{busy ? '正在保存…' : '保存配置'}</button>
+        <button className="button compact" type="button" disabled={busy} onClick={reloadConfig}>{t('重新加载配置')}</button>
+        <button className="button primary compact" type="submit" form="runtime-settings" disabled={readOnly || !dirty.current}>{busy ? t('正在保存…') : t('保存配置')}</button>
         </>}
       </div>
     </header>
-    <div className="workspace-tabs" role="tablist" aria-label="运行配置分类">
-      {tabs.map(([key, label], index) => <button key={key} id={tabButton(key)} type="button" role="tab"
+    <div className="workspace-tabs settings-tabs" role="tablist" aria-label={t('运行配置分类')}>
+      {tabs.map(([key, label, compactLabel], index) => <button key={key} id={tabButton(key)} type="button" role="tab"
         autoFocus={key === 'mcp' && initialTab === 'mcp'}
-        aria-controls={tabPanel(key)} aria-selected={key === tab} tabIndex={key === tab ? 0 : -1} onClick={() => setTab(key)} onKeyDown={event => {
+        aria-label={label} aria-controls={tabPanel(key)} aria-selected={key === tab} tabIndex={key === tab ? 0 : -1} onClick={() => setTab(key)} onKeyDown={event => {
           const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length
             : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length
             : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : null;
@@ -152,13 +153,13 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
           const key = tabs[next][0];
           setTab(key);
           document.getElementById(tabButton(key))?.focus();
-        }}>{label}</button>)}
+        }}><span className="label-full">{label}</span><span className="label-compact">{compactLabel}</span></button>)}
     </div>
     {(editableTab || tab === 'health') && error && <p ref={errorRef} tabIndex={-1} role="alert" className="notice error settings-feedback">{error}</p>}
     {editableTab && message && <p role="status" className="notice settings-feedback">{message}</p>}
     {(!config || !snapshot) && <section {...panel('telemetry')} aria-busy={!error}>
       <div className="settings-workspace">
-        {error ? <button className="button" type="button" onClick={reloadConfig}>重试读取配置</button> : <p role="status">正在读取配置…</p>}
+        {error ? <button className="button" type="button" onClick={reloadConfig}>{t('重试读取配置')}</button> : <p role="status">{t('正在读取配置…')}</p>}
       </div>
     </section>}
     {config && snapshot && <form id="runtime-settings" method="post" action="/api/v1/settings" onSubmit={save} onInvalidCapture={event => {
@@ -175,57 +176,56 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     }}>
       <section {...panel('telemetry')}><div className="settings-workspace">
         <div className="settings-card">
-          <h2 id="telemetry-title">指标、日志与链路</h2>
+          <h2 id="telemetry-title">{t('指标、日志与链路')}</h2>
           <div className="settings-status" role="status">
-            <span>当前 OTLP <strong>{snapshot.active.enabled ? '已开启' : '已关闭'}</strong></span>
-            <span>当前本地日志 <strong>{snapshot.active.log_format.toUpperCase()}</strong></span>
-            {snapshot.restart_required && <span className="settings-pending">待重启</span>}
+            <span>{t('当前 OTLP ')}<strong>{snapshot.active.enabled ? t('已开启') : t('已关闭')}</strong></span>
+            <span>{t('当前本地日志 ')}<strong>{snapshot.active.log_format.toUpperCase()}</strong></span>
+            {snapshot.restart_required && <span className="settings-pending">{t('待重启')}</span>}
           </div>
-          {snapshot.active.enabled && <p className="settings-hint">生效接收端 <code>{snapshot.active.endpoint}</code><br />
-            已启用信号 {Object.entries(names).filter(([key]) => snapshot.active[key as Signal]).map(([, name]) => name).join('、')}</p>}
-          {!snapshot.file && <p className="notice">为该进程通过 <code>--telemetry-config</code> 指定本机配置文件后，可在此编辑。</p>}
+          {snapshot.active.enabled && <p className="settings-hint">{t('生效接收端 ')}<code>{snapshot.active.endpoint}</code><br />{t('已启用信号 ')}{Object.entries(names).filter(([key]) => snapshot.active[key as Signal]).map(([, name]) => name).join(t('、'))}</p>}
+          {!snapshot.file && <p className="notice">{t('为该进程通过 ')}<code>--telemetry-config</code>{t(' 指定本机配置文件后，可在此编辑。')}</p>}
           <fieldset className="settings-fields" disabled={readOnly}>
-            <legend>本地日志</legend>
+            <legend>{t('本地日志')}</legend>
             <div className="settings-actions">
               {(['text', 'json'] as const).map(value => <label className="settings-toggle" key={value}>
                 <input name="log_format" type="radio" value={value} checked={config.log_format === value} onChange={() => change('log_format', value)} />
-                {value === 'text' ? '纯文本' : '结构化 JSON'}
+                {value === 'text' ? t('纯文本') : t('结构化 JSON')}
               </label>)}
             </div>
           </fieldset>
           <fieldset className="settings-fields" disabled={readOnly}>
-            <legend>OpenTelemetry 上报</legend>
-            <Toggle name="enabled" label="启用 OTLP 上报" checked={config.enabled} change={value => change('enabled', value)} />
-            <label>Collector 地址{config.enabled ? '（必填）' : ''}<input type="url" name="endpoint" placeholder="http://127.0.0.1:4318"
+            <legend>{t('OpenTelemetry 上报')}</legend>
+            <Toggle name="enabled" label={t('启用 OTLP 上报')} checked={config.enabled} change={value => change('enabled', value)} />
+            <label>{t('Collector 地址{0}', config.enabled ? t('（必填）') : '')}<input type="url" name="endpoint" placeholder="http://127.0.0.1:4318"
               autoCapitalize="none" spellCheck={false} required={config.enabled} value={config.endpoint ?? ''} onChange={event => change('endpoint', event.target.value || null)} /></label>
-            <p className="settings-hint">填写 OTLP/HTTP 基址。服务会追加各信号的路径。</p>
+            <p className="settings-hint">{t('填写 OTLP/HTTP 基址。服务会追加各信号的路径。')}</p>
             <div className="settings-actions">
               {(Object.keys(names) as Signal[]).map(key => <Toggle key={key} name={key} label={names[key]} checked={config[key]} change={value => change(key, value)} />)}
             </div>
-            <details className="form-disclosure"><summary>高级上报设置</summary><div className="form-fields">
+            <details className="form-disclosure"><summary>{t('高级上报设置')}</summary><div className="form-fields">
               <div className="settings-grid">
-                <label>服务名称（必填）<input name="service_name" required maxLength={128} value={config.service_name} onChange={event => change('service_name', event.target.value)} /></label>
-                <label>实例标识<input name="instance_id" maxLength={128} value={config.instance_id ?? ''} placeholder="启动时生成" onChange={event => change('instance_id', event.target.value || null)} /></label>
-                <label>链路采样率<input name="trace_sample_ratio" type="number" min="0" max="1" step="any" required value={Number.isNaN(config.trace_sample_ratio) ? '' : config.trace_sample_ratio} onChange={event => change('trace_sample_ratio', event.target.valueAsNumber)} /></label>
-                <label>指标上报间隔（毫秒）<input name="export_interval_ms" type="number" min="1000" max="300000" required value={Number.isNaN(config.export_interval_ms) ? '' : config.export_interval_ms} onChange={event => change('export_interval_ms', event.target.valueAsNumber)} /></label>
-                <label>单次上报超时（毫秒）<input name="timeout_ms" type="number" min="100" max="5000" required value={Number.isNaN(config.timeout_ms) ? '' : config.timeout_ms} onChange={event => change('timeout_ms', event.target.valueAsNumber)} /></label>
+                <label>{t('服务名称（必填）')}<input name="service_name" required maxLength={128} value={config.service_name} onChange={event => change('service_name', event.target.value)} /></label>
+                <label>{t('实例标识')}<input name="instance_id" maxLength={128} value={config.instance_id ?? ''} placeholder={t('启动时生成')} onChange={event => change('instance_id', event.target.value || null)} /></label>
+                <label>{t('链路采样率')}<input name="trace_sample_ratio" type="number" min="0" max="1" step="any" required value={Number.isNaN(config.trace_sample_ratio) ? '' : config.trace_sample_ratio} onChange={event => change('trace_sample_ratio', event.target.valueAsNumber)} /></label>
+                <label>{t('指标上报间隔（毫秒）')}<input name="export_interval_ms" type="number" min="1000" max="300000" required value={Number.isNaN(config.export_interval_ms) ? '' : config.export_interval_ms} onChange={event => change('export_interval_ms', event.target.valueAsNumber)} /></label>
+                <label>{t('单次上报超时（毫秒）')}<input name="timeout_ms" type="number" min="100" max="5000" required value={Number.isNaN(config.timeout_ms) ? '' : config.timeout_ms} onChange={event => change('timeout_ms', event.target.valueAsNumber)} /></label>
               </div>
-              <Toggle name="include_audit_identity" label="上报审计中的账号、模型及目标名称" checked={config.include_audit_identity} change={value => change('include_audit_identity', value)} />
-              <Toggle name="allow_insecure_http" label="允许通过明文 HTTP 连接非回环 Collector" checked={config.allow_insecure_http} change={value => change('allow_insecure_http', value)} />
-              {snapshot.file && <p className="settings-hint">配置文件 <code>{snapshot.file}</code></p>}
+              <Toggle name="include_audit_identity" label={t('上报审计中的账号、模型及目标名称')} checked={config.include_audit_identity} change={value => change('include_audit_identity', value)} />
+              <Toggle name="allow_insecure_http" label={t('允许通过明文 HTTP 连接非回环 Collector')} checked={config.allow_insecure_http} change={value => change('allow_insecure_http', value)} />
+              {snapshot.file && <p className="settings-hint">{t('配置文件 ')}<code>{snapshot.file}</code></p>}
             </div></details>
           </fieldset>
-          <details className="form-disclosure"><summary>Collector 请求头{headers.length > 0 && <small>{headers.length} 项</small>}</summary>
+          <details className="form-disclosure"><summary>{t('Collector 请求头')}{headers.length > 0 && <small>{headers.length}{t(' 项')}</small>}</summary>
           <fieldset className="settings-fields" disabled={readOnly}>
-            <legend>凭据绑定</legend>
-            <p className="settings-hint">填写服务主机的环境变量名。新增凭据绑定使用 <code>GRAPHLAKE_OTLP_</code> 前缀和部署允许的接收端。</p>
+            <legend>{t('凭据绑定')}</legend>
+            <p className="settings-hint">{t('填写服务主机的环境变量名。新增凭据绑定使用 ')}<code>GRAPHLAKE_OTLP_</code>{t(' 前缀和部署允许的接收端。')}</p>
             {headers.map(row => <div className="settings-header-row" key={row.id}>
-              <label>请求头名称<input name={'header_' + row.id} required maxLength={128} placeholder="authorization" spellCheck={false} value={row.name} onChange={event => { const name = event.target.value; setHeaders(values => values.map(value => value.id === row.id ? { ...value, name } : value)); changed(); }} /></label>
-              <label>环境变量<input name={'variable_' + row.id} required maxLength={128} pattern="[A-Za-z0-9_]+" placeholder="GRAPHLAKE_OTLP_AUTHORIZATION" spellCheck={false} value={row.variable} onChange={event => { const variable = event.target.value; setHeaders(values => values.map(value => value.id === row.id ? { ...value, variable } : value)); changed(); }} /></label>
-              <button className="button" type="button" aria-label={'移除请求头 ' + (row.name || '空白项')} onClick={() => { setHeaders(values => values.filter(value => value.id !== row.id)); changed(); }}><X size={16} aria-hidden="true" /></button>
+              <label>{t('请求头名称')}<input name={'header_' + row.id} required maxLength={128} placeholder="authorization" spellCheck={false} value={row.name} onChange={event => { const name = event.target.value; setHeaders(values => values.map(value => value.id === row.id ? { ...value, name } : value)); changed(); }} /></label>
+              <label>{t('环境变量')}<input name={'variable_' + row.id} required maxLength={128} pattern="[A-Za-z0-9_]+" placeholder="GRAPHLAKE_OTLP_AUTHORIZATION" spellCheck={false} value={row.variable} onChange={event => { const variable = event.target.value; setHeaders(values => values.map(value => value.id === row.id ? { ...value, variable } : value)); changed(); }} /></label>
+              <button className="button" type="button" aria-label={t('移除请求头 {0}', (row.name || t('空白项')))} onClick={() => { setHeaders(values => values.filter(value => value.id !== row.id)); changed(); }}><X size={16} aria-hidden="true" /></button>
             </div>)}
             <button className="button" type="button" disabled={headers.length >= 16} onClick={() => { setHeaders(values => [...values, { id: headerId.current++, name: '', variable: '' }]); changed(); }}>
-              <Plus size={16} aria-hidden="true" />添加请求头
+              <Plus size={16} aria-hidden="true" />{t('添加请求头')}
             </button>
           </fieldset>
           </details>
@@ -236,21 +236,21 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
       <div className="settings-workspace settings-health">
         <ModelHealth models={models} openModel={openModel} />
         <section className="settings-card">
-          <div className="settings-section-title"><h2>上报状态</h2><button className="button compact" type="button" disabled={!snapshot || refreshing}
-            onClick={() => void refreshStatus()}><RefreshCw size={14} aria-hidden="true" />刷新状态</button></div>
-          <p className="settings-hint">当前进程的上报记录。失败及拒收自进程启动累计。</p>
+          <div className="settings-section-title"><h2>{t('上报状态')}</h2><button className="button compact" type="button" disabled={!snapshot || refreshing}
+            onClick={() => void refreshStatus()}><RefreshCw size={14} aria-hidden="true" />{t('刷新状态')}</button></div>
+          <p className="settings-hint">{t('当前进程的上报记录。失败及拒收自进程启动累计。')}</p>
           {snapshot && <dl className="settings-signals" aria-live="polite">
             {snapshot.signals.map(({ name, failures, rejected, last_success_ms }) => <div key={name}>
               <dt>{names[name]}</dt><dd>{snapshot.active.enabled && snapshot.active[name] ? <>
-                <span>失败 {failures} 次</span>
-                <span>拒收 {rejected} 条</span>
-                <span>最近完整接收 {last_success_ms ? new Date(last_success_ms).toLocaleString() : '暂无'}</span>
-              </> : '已关闭'}</dd>
+                <span>{t('失败 {0} 次', failures)}</span>
+                <span>{t('拒收 {0} 条', rejected)}</span>
+                <span>{t('最近完整接收 {0}', last_success_ms ? new Date(last_success_ms).toLocaleString(locale) : t('暂无'))}</span>
+              </> : t('已关闭')}</dd>
             </div>)}
           </dl>}
           <div className="settings-links">
-            <a href="/metrics" target="_blank" rel="noreferrer">Prometheus 指标</a>
-            <a href="/readyz" target="_blank" rel="noreferrer">服务就绪探针</a>
+            <a href="/metrics" target="_blank" rel="noreferrer">{t('Prometheus 指标')}</a>
+            <a href="/readyz" target="_blank" rel="noreferrer">{t('服务就绪探针')}</a>
           </div>
         </section>
       </div>

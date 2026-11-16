@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { api, errorText, type ModelSummary } from './api';
 import type { BackupSnapshot } from './BackupStatus';
 import type { SettingsSnapshot } from './Settings';
@@ -19,7 +20,7 @@ async function probe(path: string, signal: AbortSignal, degraded = false) {
   const response = await fetch(path, { signal, cache: 'no-store' });
   // /readyz supplies a reason even when it replies with HTTP 503.
   if (!response.ok && !(degraded && response.status === 503)) {
-    throw new Error('请求失败（HTTP ' + response.status + '）');
+    throw new Error(t('请求失败（HTTP {0}）', response.status));
   }
   return response;
 }
@@ -35,7 +36,7 @@ async function metrics(signal: AbortSignal) {
   function value(name: string) {
     const sample = series.get('graphlake_' + name);
     if (sample === undefined || !Number.isFinite(sample) || sample < 0) {
-      throw new Error('服务未返回完整的运行指标');
+      throw new Error(t('服务未返回完整的运行指标'));
     }
     return sample;
   }

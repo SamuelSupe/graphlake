@@ -20,6 +20,8 @@ Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremli
 | **Sync locally** | Load selected source fields into managed Parquet tables, refresh incrementally by key and watermark, and schedule refreshes. |
 | **Operate** | Manage users, service accounts, and model-level roles. Collect audit events, Prometheus metrics, and OTLP signals. Restore an off-site checkpoint and verify a known business query before enabling traffic. |
 
+The browser console defaults to English and supports Simplified Chinese. Choose an interface language on the sign-in page or in the main navigation. The browser remembers your choice.
+
 ## Local tables and data sync
 
 In GraphLake 1.1.0, open **Local Tables** (本地表) from a graph model to load selected source columns into a managed Parquet copy. Run full or incremental refreshes on demand or on a schedule. Incremental refresh uses a primary key and watermark. The panel shows which copies are ready, when they last refreshed, and when the next run is due. Load history records each run’s outcome and row counts.

@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import type { Column } from './api';
 import { validationControl } from './model';
 
@@ -7,7 +8,7 @@ export function mappingControl(active: ReadonlySet<string>, model: string, ...pa
   return { 'data-mapping-control': key, 'aria-invalid': invalid || undefined, 'aria-describedby': invalid ? model + '-model-validation-error' : undefined };
 }
 
-export function MappingColumn({ label, value, columns, change, placeholder = '选择来源列', location, form }: {
+export function MappingColumn({ label, value, columns, change, placeholder = t('选择来源列'), location, form }: {
   label: string; value: string; columns?: Column[]; change: (value: string) => void; placeholder?: string;
   location?: ReturnType<typeof mappingControl>;
   form?: string;
@@ -16,7 +17,7 @@ export function MappingColumn({ label, value, columns, change, placeholder = '�
     onChange={event => change(event.target.value)} />;
   return <select className="mono" aria-label={label} value={value} {...location} onChange={event => change(event.target.value)}>
     <option value="">{placeholder}</option>
-    {value && !columns.some(column => column.name === value) && <option value={value}>{value}（未在表中）</option>}
+    {value && !columns.some(column => column.name === value) && <option value={value}>{value}{t('（未在表中）')}</option>}
     {columns.map(column => <option value={column.name} key={column.name}>{column.name} · {column.data_type}</option>)}
   </select>;
 }

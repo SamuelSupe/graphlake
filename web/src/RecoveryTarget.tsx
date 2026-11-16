@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { useState, type FormEvent } from 'react';
 import { ArrowUpRight } from 'lucide-react';
 import { Modal } from './ui';
@@ -15,21 +16,21 @@ export default function RecoveryTarget({ local, close }: { local: boolean; close
       window.open(site.origin + '/recovery', '_blank', 'noopener,noreferrer');
       close();
     } catch {
-      setError('请输入目标站的 HTTPS 地址。');
+      setError(t('请输入目标站的 HTTPS 地址。'));
     }
   }
 
-  return <Modal title="恢复备份" description="在目标站选择恢复点、检查并确认恢复。" close={close}>
+  return <Modal title={t('恢复备份')} description={t('在目标站选择恢复点、检查并确认恢复。')} close={close}>
     <form className="panel-layout" onSubmit={open}>
       <div className="panel-body form-fields">
-        <label>目标站地址<input type="url" required data-initial-focus placeholder="https://recovery.example.com"
+        <label>{t('目标站地址')}<input type="url" required data-initial-focus placeholder="https://recovery.example.com"
           aria-invalid={!!error} value={address} autoCapitalize="none" spellCheck={false}
           onChange={event => { setAddress(event.target.value); setError(''); }} /></label>
         {error && <p className="inline-error" role="alert">{error}</p>}
       </div>
       <footer className="panel-footer">
-        <button type="button" className="button" onClick={close}>取消</button>
-        <button type="submit" className="button primary">打开目标站<ArrowUpRight size={15} aria-hidden="true" /></button>
+        <button type="button" className="button" onClick={close}>{t('取消')}</button>
+        <button type="submit" className="button primary">{t('打开目标站')}<ArrowUpRight size={15} aria-hidden="true" /></button>
       </footer>
     </form>
   </Modal>;

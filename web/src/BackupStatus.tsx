@@ -1,3 +1,4 @@
+import { locale, t } from './locale.ts';
 import { useEffect, useState } from 'react';
 import { DatabaseBackup, RefreshCw, RotateCcw } from 'lucide-react';
 import { api, errorText } from './api';
@@ -13,24 +14,24 @@ export type BackupSnapshot = { export: Job; offline: Job; recovery_configured: b
 function JobFacts({ job }: { job: Job }) {
   return job.state === 'recorded' ? <>
     <dl className="recovery-facts">
-      <div><dt>最近尝试</dt><dd>{time(job.result.attempted_ms)}</dd></div>
-      {!job.result.ok && <div><dt>最近成功</dt><dd>{time(job.result.last_success_ms)}</dd></div>}
-      <div><dt>检查点时间</dt><dd>{time(job.result.checkpoint_ms)}</dd></div>
+      <div><dt>{t('最近尝试')}</dt><dd>{time(job.result.attempted_ms)}</dd></div>
+      {!job.result.ok && <div><dt>{t('最近成功')}</dt><dd>{time(job.result.last_success_ms)}</dd></div>}
+      <div><dt>{t('检查点时间')}</dt><dd>{time(job.result.checkpoint_ms)}</dd></div>
     </dl>
-    {job.result.artifact && <p className="settings-hint">服务器文件 <code>{job.result.artifact}</code></p>}
-  </> : <p className="muted">{job.state === 'not_recorded' ? '暂无任务记录' : '任务状态暂不可读'}</p>;
+    {job.result.artifact && <p className="settings-hint">{t('服务器文件 ')}<code>{job.result.artifact}</code></p>}
+  </> : <p className="muted">{job.state === 'not_recorded' ? t('暂无任务记录') : t('任务状态暂不可读')}</p>;
 }
 
 function JobSummary({ title, job }: { title: string; job: Job }) {
   return <section className="settings-card">
     <div className="settings-section-title"><h2>{title}</h2>
-      {job.state === 'recorded' && <span className={'status ' + (job.result.ok ? 'passed' : 'failed')}>{job.result.ok ? '成功' : '失败'}</span>}
+      {job.state === 'recorded' && <span className={'status ' + (job.result.ok ? 'passed' : 'failed')}>{job.result.ok ? t('成功') : t('失败')}</span>}
     </div>
     <JobFacts job={job} />
   </section>;
 }
 
-const time = (ms: number | null) => ms === null ? '—' : new Date(ms).toLocaleString();
+const time = (ms: number | null) => ms === null ? '—' : new Date(ms).toLocaleString(locale);
 
 export default function BackupStatus({ visible }: { visible: boolean }) {
   const [data, setData] = useState<BackupSnapshot>();
@@ -78,50 +79,50 @@ export default function BackupStatus({ visible }: { visible: boolean }) {
   }
 
   return <div className="settings-stack settings-workspace">
-    <div className="settings-section-title"><h2>备份任务</h2>
+    <div className="settings-section-title"><h2>{t('备份任务')}</h2>
       <button type="button" className="button compact" disabled={loading} onClick={() => refresh(value => value + 1)}>
-        <RefreshCw size={15} aria-hidden="true" />刷新备份状态
+        <RefreshCw size={15} aria-hidden="true" />{t('刷新备份状态')}
       </button>
     </div>
-    {loading && !data && <p role="status">正在读取备份状态…</p>}
+    {loading && !data && <p role="status">{t('正在读取备份状态…')}</p>}
     {error && <p role="alert" className="notice error">{error}</p>}
     {data && !error && <>
       <section className="settings-card">
-        <div className="settings-section-title"><h2>手动控制状态备份</h2>
+        <div className="settings-section-title"><h2>{t('手动控制状态备份')}</h2>
           {manual?.state === 'enabled' && <button type="button" className="button primary compact"
             aria-disabled={exporting || running || loading || !visible}
             onClick={() => { if (!loading) void startBackup(); }}>
-            <DatabaseBackup size={16} aria-hidden="true" />立即备份
+            <DatabaseBackup size={16} aria-hidden="true" />{t('立即备份')}
           </button>}
         </div>
         {manual?.state === 'enabled' ? <>
           <p className={exporting || running || exported ? 'settings-hint' : 'sr-only'} role="status">
-            {exporting || running ? '正在校验并写入备份…' : exported
-              ? exported.status_recorded ? '备份已保存。' : '备份已保存，但任务状态未能写入。' : ''}
+            {exporting || running ? t('正在校验并写入备份…') : exported
+              ? exported.status_recorded ? t('备份已保存。') : t('备份已保存，但任务状态未能写入。') : ''}
           </p>
           {exported && !(manual.job.state === 'recorded' && manual.job.result.artifact === exported.file) &&
-            <p className="settings-hint">本次文件 <code>{exported.file}</code></p>}
+            <p className="settings-hint">{t('本次文件 ')}<code>{exported.file}</code></p>}
           {exportError && <p className="notice error" role="alert">{exportError}</p>}
           {manual.job.state === 'recorded' && <span className={'status ' + (manual.job.result.ok ? 'passed' : 'failed')}>
-            {manual.job.result.ok ? '最近任务成功' : '最近任务失败'}
+            {manual.job.result.ok ? t('最近任务成功') : t('最近任务失败')}
           </span>}
           <JobFacts job={manual.job} />
         </> : <p className="muted">{manual?.state === 'not_configured'
-          ? <>在 Coordinator 上配置私有备份目录 <code>GRAPHLAKE_MANUAL_BACKUP_DIR</code> 后可用。</>
-          : '此操作适用于启用故障接管的 Coordinator。当前部署可按部署手册备份模型目录。'}</p>}
+          ? <>{t('在 Coordinator 上配置私有备份目录 ')}<code>GRAPHLAKE_MANUAL_BACKUP_DIR</code>{t(' 后可用。')}</>
+          : t('此操作适用于启用故障接管的 Coordinator。当前部署可按部署手册备份模型目录。')}</p>}
       </section>
       <div className="settings-grid">
-        <JobSummary title="定时控制状态备份" job={data.export} />
-        <JobSummary title="异地副本校验" job={data.offline} />
+        <JobSummary title={t('定时控制状态备份')} job={data.export} />
+        <JobSummary title={t('异地副本校验')} job={data.offline} />
       </div>
     </>}
     <section className="settings-card">
-      <div className="settings-section-title"><h2>灾备恢复</h2>
+      <div className="settings-section-title"><h2>{t('灾备恢复')}</h2>
         <button type="button" className="button compact" onClick={() => setRecoveryOpen(true)}>
-          <RotateCcw size={15} aria-hidden="true" />恢复备份
+          <RotateCcw size={15} aria-hidden="true" />{t('恢复备份')}
         </button>
       </div>
-      <p className="settings-hint">在已配置的目标站选择恢复点并完成验收。</p>
+      <p className="settings-hint">{t('在已配置的目标站选择恢复点并完成验收。')}</p>
     </section>
     {visible && recoveryOpen && <RecoveryTarget local={!!data?.recovery_configured} close={() => setRecoveryOpen(false)} />}
   </div>;

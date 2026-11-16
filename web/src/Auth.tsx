@@ -1,15 +1,17 @@
+import { t } from './locale.ts';
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { api, authRequired, errorText } from './api';
 import { clearPendingQueries } from './Query';
 import { clearPendingMutations } from './Mutations';
 import { Mark, WorkspaceLocked } from './ui';
+import { LanguageSelect } from './LanguageSelect';
 
 export type Session = { authenticated: boolean; enabled: boolean; username: string | null; administrator: boolean; subject?: string | null; authorization?: string | null; proxy_sign_in?: boolean };
 
 function Login({ expired, username, proxySignIn, signedIn }: { expired: boolean; username?: string; proxySignIn?: boolean; signedIn: (session: Session) => void }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  useEffect(() => { document.title = expired ? 'GraphLake · 会话已过期' : 'GraphLake · 登录'; }, [expired]);
+  useEffect(() => { document.title = expired ? t('GraphLake · 会话已过期') : t('GraphLake · 登录'); }, [expired]);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -44,16 +46,19 @@ function Login({ expired, username, proxySignIn, signedIn }: { expired: boolean;
 
   return <main className="auth-page">
     <section className="auth-card" aria-labelledby="login-heading">
-      <div className="auth-brand"><span className="model-icon"><Mark size={22} /></span>GraphLake</div>
-      <h1 id="login-heading">{expired ? '会话已过期' : '登录管理后台'}</h1>
-      {expired && <p className="muted">重新登录后可继续编辑本页草稿。</p>}
-      {proxySignIn && <button className="button primary" type="button" disabled={busy} onClick={() => void sso()}>使用企业账号登录</button>}
+      <div className="auth-card-heading">
+        <div className="auth-brand"><span className="model-icon"><Mark size={22} /></span>GraphLake</div>
+        <LanguageSelect />
+      </div>
+      <h1 id="login-heading">{expired ? t('会话已过期') : t('登录管理后台')}</h1>
+      {expired && <p className="muted">{t('重新登录后可继续编辑本页草稿。')}</p>}
+      {proxySignIn && <button className="button primary" type="button" disabled={busy} onClick={() => void sso()}>{t('使用企业账号登录')}</button>}
       <form onSubmit={submit} aria-busy={busy}>
-        {proxySignIn && <p className="muted">管理员恢复登录</p>}
-        <label>用户名<input name="username" autoComplete="username" defaultValue={username ?? 'admin'} maxLength={128} required /></label>
-        <label>密码<input name="password" autoComplete="current-password" type="password" maxLength={256} required autoFocus /></label>
+        {proxySignIn && <p className="muted">{t('管理员恢复登录')}</p>}
+        <label>{t('用户名')}<input name="username" autoComplete="username" defaultValue={username ?? 'admin'} maxLength={128} required /></label>
+        <label>{t('密码')}<input name="password" autoComplete="current-password" type="password" maxLength={256} required autoFocus /></label>
         {error && <p className="notice error" role="alert">{error}</p>}
-        <button className="button primary" type="submit" disabled={busy}>{busy ? '正在登录…' : '登录'}</button>
+        <button className="button primary" type="submit" disabled={busy}>{busy ? t('正在登录…') : t('登录')}</button>
       </form>
     </section>
   </main>;
@@ -121,9 +126,10 @@ export function AuthGate({ workspace }: {
   }
 
   if (!session) return <main className="auth-page"><section className="auth-card">
+    <div className="auth-card-heading"><LanguageSelect /></div>
     {error ? <><p role="alert">{error}</p><button className="button" onClick={() => {
       setError(''); setAttempt(value => value + 1);
-    }}>重试</button></> : <p role="status">正在检查登录状态…</p>}
+    }}>{t('重试')}</button></> : <p role="status">{t('正在检查登录状态…')}</p>}
   </section></main>;
 
   return <>

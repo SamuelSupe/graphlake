@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import type { GraphSchema } from './api';
 
 export type Dialect = 'cypher' | 'sql' | 'gremlin';
@@ -10,7 +11,7 @@ export function schemaCompletions(schema: GraphSchema | undefined, language: Dia
       : /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : '`' + name.replaceAll('`', '``') + '`';
   const options: QueryCompletion[] = [];
   const properties = new Map<string, string[]>();
-  for (const [types, kind] of [[schema.nodes, '节点'], [schema.edges, '边']] as const) {
+  for (const [types, kind] of [[schema.nodes, t('节点')], [schema.edges, t('边')]] as const) {
     for (const [name, type] of Object.entries(types)) {
       options.push({ label: name, type: 'class', detail: kind, apply: identifier(name) });
       for (const field of new Set([...type.key, ...type.properties])) {

@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { useRef, useState } from 'react';
 import { api, ApiError, errorText, type SavedModel } from './api';
 
@@ -44,7 +45,7 @@ export function useMutations(actor: string, receipts: boolean, updated: (model?:
   }
 
   async function run(write: Write): Promise<SavedModel> {
-    if (running.current || current.current) throw new Error('请先确认上一项模型操作的结果');
+    if (running.current || current.current) throw new Error(t('请先确认上一项模型操作的结果'));
     const request = { ...write, id: crypto.randomUUID(), at: Date.now() };
     setNotice('');
     running.current = true;
@@ -55,7 +56,7 @@ export function useMutations(actor: string, receipts: boolean, updated: (model?:
       return result;
     } catch (cause) {
       if (receipts && (!(cause instanceof ApiError) || cause.status === undefined || cause.status >= 500 || cause.status === 401)) {
-        setNotice(write.label + '的结果待确认。请查询回执或用原请求重试。');
+        setNotice(t('{0}的结果待确认。请查询回执或用原请求重试。', t(write.label)));
       } else {
         remember();
       }
@@ -75,36 +76,35 @@ export function useMutations(actor: string, receipts: boolean, updated: (model?:
       });
       if (result?.status === 'committed') {
         remember();
-        setNotice(write.label + '已提交 · 操作版本 ' + result.revision.slice(0, 12)
-          + (result.active_revision ? ' · 当时生效 ' + result.active_revision.slice(0, 12) : ' · 当时无生效版本'));
+        setNotice(t('{0}已提交 · 操作版本 {1}{2}', t(write.label), result.revision.slice(0, 12), (result.active_revision ? t(' · 当时生效 {0}', result.active_revision.slice(0, 12)) : t(' · 当时无生效版本'))));
         // Show the latest model even when a later write has already advanced it.
         updated(await api<SavedModel>('/models/' + write.model).catch(() => undefined));
       } else if (retry && Date.now() - write.at < ttl) {
         const model = await send(write);
         remember();
         updated(model);
-        setNotice(write.label + '已提交');
+        setNotice(t('{0}已提交', t(write.label)));
       } else {
         setNotice(Date.now() - write.at >= ttl
-          ? '回执保留期已过。请查看模型版本历史，确认后清除本地记录。'
-          : '还未观察到提交。可以使用原请求重试。');
+          ? t('回执保留期已过。请查看模型版本历史，确认后清除本地记录。')
+          : t('还未观察到提交。可以使用原请求重试。'));
       }
     } catch (cause) { setNotice(errorText(cause)); }
     finally { setBusy(false); running.current = false; }
   }
 
   const banner = pending && (!running.current || busy) ? <div className="notice mutation-notice">
-    <p role="status">{notice || pending.label + '的结果待确认'}</p>
+    <p role="status">{notice || t('{0}的结果待确认', t(pending.label))}</p>
     <code>{pending.id}</code>
     <div className="validation-actions">
-      <button className="button compact" disabled={busy} onClick={() => void resolve(false)}>查询回执</button>
-      <button className="button compact" disabled={busy || Date.now() - pending.at >= ttl} onClick={() => void resolve(true)}>重试原请求</button>
+      <button className="button compact" disabled={busy} onClick={() => void resolve(false)}>{t('查询回执')}</button>
+      <button className="button compact" disabled={busy || Date.now() - pending.at >= ttl} onClick={() => void resolve(true)}>{t('重试原请求')}</button>
       <button className="text-button" disabled={busy} onClick={() => {
-        if (window.confirm('请先核对模型及版本历史。清除后将无法从此页面重试原请求。')) {
+        if (window.confirm(t('请先核对模型及版本历史。清除后将无法从此页面重试原请求。'))) {
           remember(); setNotice('');
         }
-      }}>清除本地记录</button>
+      }}>{t('清除本地记录')}</button>
     </div>
-  </div> : pending ? <p role="status" className="notice mutation-notice">正在处理 {pending.label}…</p> : notice ? <p role="status" className="notice mutation-notice">{notice} <button className="text-button" onClick={() => setNotice('')}>关闭</button></p> : undefined;
+  </div> : pending ? <p role="status" className="notice mutation-notice">{t('正在处理 {0}…', t(pending.label))}</p> : notice ? <p role="status" className="notice mutation-notice">{notice} <button className="text-button" onClick={() => setNotice('')}>{t('关闭')}</button></p> : undefined;
   return { run, banner, pending: !!pending };
 }

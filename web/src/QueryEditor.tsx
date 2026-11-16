@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { useEffect, useId, useRef } from 'react';
 import { Annotation, Compartment, EditorState } from '@codemirror/state';
 import { EditorView, keymap, lineNumbers, highlightActiveLine } from '@codemirror/view';
@@ -62,10 +63,10 @@ export default function QueryEditor({ value, language, schema, change, run }: {
   }, [language, schema]);
 
   return <div className="query-code-editor">
-    <div className="code-editor-heading"><span id={labelId}>查询语句</span>
-      <button type="button" className="text-button" onClick={() => { view.current?.focus(); if (view.current) startCompletion(view.current); }}>补全</button>
+    <div className="code-editor-heading"><span id={labelId}>{t('查询语句')}</span>
+      <button type="button" className="text-button" onClick={() => { view.current?.focus(); if (view.current) startCompletion(view.current); }}>{t('补全')}</button>
     </div>
     <div ref={host} />
-    <p className="code-editor-hint" id={hintId}>Ctrl + Space 补全 · ⌘ / Ctrl + Enter 运行 · Tab 移至下一个控件</p>
+    <p className="code-editor-hint" id={hintId}>{t('Ctrl + Space 补全 · ⌘ / Ctrl + Enter 运行 · Tab 移至下一个控件')}</p>
   </div>;
 }

@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 import { useRef, useState } from 'react';
 import type { GraphIdentity } from './api';
 
@@ -11,7 +12,7 @@ export function GraphSearchMatches<T extends Match>({ matches, locate, label = m
   const [first, setFirst] = useState(0);
   const list = useRef<HTMLDivElement>(null);
   const start = Math.min(first, Math.max(0, matches.length - windowSize));
-  return <div className="explorer-match-window" ref={list} aria-label="匹配的图元素" role="region" tabIndex={0}
+  return <div className="explorer-match-window" ref={list} aria-label={t('匹配的图元素')} role="region" tabIndex={0}
     onScroll={event => setFirst(Math.max(0, Math.floor(event.currentTarget.scrollTop / rowHeight) - 2))}
     onKeyDown={event => {
       if (event.target !== event.currentTarget || !list.current) return;
@@ -26,7 +27,7 @@ export function GraphSearchMatches<T extends Match>({ matches, locate, label = m
           style={{ top: (start + index) * rowHeight, height: rowHeight }}
           onClick={() => locate(match)}>
           <span>{label(match)} [{match.key.join(', ')}]</span>
-          {match.page && <small>第 {match.page} 批</small>}
+          {match.page && <small>{t('第 {0} 批', match.page)}</small>}
         </button>)}
     </div>
   </div>;

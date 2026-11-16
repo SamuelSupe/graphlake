@@ -1,3 +1,4 @@
+import { t } from './locale.ts';
 export type Gate = { manifest_sha256: string; approved: boolean; ready: boolean; restored_backup?: string };
 export type Phase = 'validate' | 'parquet' | 'postgres' | 'control';
 export type RestoreJob = { bundle: string; phase: Phase; running: boolean; bound: boolean; failure: string | null };
@@ -20,8 +21,8 @@ export async function recovery<T>(action: 'status' | 'check' | 'verify' | 'backu
   if (response.status === 202) return undefined as T;
   const result = await response.json().catch(() => null);
   if (!response.ok) throw new Error(result?.message && response.status !== 404 ? result.message
-    : response.status === 404 ? '无法读取恢复状态，请核对目标站和恢复令牌。'
-    : '恢复服务暂不可用（' + response.status + '）');
-  if (!result) throw new Error('目标站返回了无法识别的恢复响应。');
+    : response.status === 404 ? t('无法读取恢复状态，请核对目标站和恢复令牌。')
+    : t('恢复服务暂不可用（{0}）', response.status));
+  if (!result) throw new Error(t('目标站返回了无法识别的恢复响应。'));
   return result as T;
 }

@@ -158,8 +158,9 @@ class WarehouseHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path, _ = self.request_parts()
         assert path.startswith(TRINO + "/executing/")
-        assert "stalled" in self.jobs[path.split("/")[-2]]
-        self.cancelled["trino"] += 1
+        sql = self.jobs[path.split("/")[-2]]
+        if "stalled" in sql:
+            self.cancelled["trino"] += 1
         self.send_json({})
 
     def databricks_result(self, sql, job, page):

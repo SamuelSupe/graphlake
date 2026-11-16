@@ -21,7 +21,7 @@ impl Engine {
             return Ok(false);
         }
         let mut stores = Stores::new();
-        let reads = expected.iter().map(|source| {
+        let reads = expected.iter().cloned().map(|source| {
             let read = self.pinned_version(scope, &source.source, &mut stores);
             async move { Ok::<_, anyhow::Error>(read?.await?.as_ref() == Some(&source.version)) }
         });

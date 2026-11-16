@@ -8,6 +8,7 @@
 - Add an opt-in SQL Server `datetime2` microsecond truncation setting. The default preserves strict precision checks and supports the full date range.
 - Apply configured execution budgets across foreground queries, data validation, sync, CSR builds and Worker stages. Keep bounded Coordinator capacity for schema probes and graph exploration. Reuse verified model archives and retry transient etcd read failures.
 - Retire CSR pointers for inactive model revisions and skip block inventories for live generations. Preserve leased query and catalog receipt references during cleanup.
+- Keep concurrent object-version checks compatible with the Python traversal and graph analytics bindings.
 - Default the console to English and improve responsive workflows.
 
 - Add published-model observation, reconciliation and CSR checks, free-space alerts, and S3 snapshot GC metrics to the production monitoring setup.

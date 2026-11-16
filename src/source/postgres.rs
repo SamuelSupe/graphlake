@@ -495,6 +495,45 @@ impl std::fmt::Debug for PgTable {
 }
 
 impl PgTable {
+    #[cfg(feature = "admin")]
+    pub(crate) fn watermark(&self, column: &str, checkpoint: &ScalarValue) -> Self {
+        use chrono::Datelike;
+
+        let Some(index) = self.schema.index_of(column).ok() else {
+            return self.clone();
+        };
+        if self.schema.field(index).data_type() != &checkpoint.data_type() {
+            return self.clone();
+        }
+        let bound = match (checkpoint, self.types[index].clone()) {
+            (ScalarValue::Date32(Some(days)), Type::DATE) => {
+                format!("DATE '1970-01-01' + {days}")
+            }
+            (
+                ScalarValue::TimestampMicrosecond(Some(value), _),
+                kind @ (Type::TIMESTAMP | Type::TIMESTAMPTZ),
+            ) => {
+                let Some(date) = DateTime::from_timestamp_micros(*value)
+                    .filter(|date| (1..=9999).contains(&date.year()))
+                else {
+                    return self.clone();
+                };
+                if kind == Type::TIMESTAMPTZ {
+                    format!(
+                        "TIMESTAMPTZ '{}+00:00'",
+                        date.format("%Y-%m-%d %H:%M:%S%.6f")
+                    )
+                } else {
+                    format!("TIMESTAMP '{}'", date.format("%Y-%m-%d %H:%M:%S%.6f"))
+                }
+            }
+            _ => return self.clone(),
+        };
+        let column = ident(column);
+        // Keep negative infinity visible to the existing temporal decoder.
+        self.restricted(format!("({column} >= {bound} OR {column} = '-infinity')"))
+    }
+
     pub(crate) async fn pushdown(
         &mut self,
         keys: &[String],
@@ -509,14 +548,37 @@ impl PgTable {
         if !keys.iter().all(|key| integer(key)) || !self.guarantees_unique_key(keys).await? {
             return Ok(None);
         }
-        let Some(mut terms) =
-            crate::engine::read_filters::exact_terms(&operation.filters, &self.schema, ident)
+        let Some(mut terms) = operation
+            .filters
+            .iter()
+            .map(|filter| {
+                crate::engine::read_filters::sql_term(filter, &self.schema, ident).or_else(|| {
+                    let value = filter.value.as_str()?;
+                    let ty = &self.types[self.schema.index_of(&filter.column).ok()?];
+                    if !matches!(*ty, Type::TEXT | Type::VARCHAR)
+                        || filter.op != crate::Comparison::Eq
+                        || value.contains('\0')
+                    {
+                        return None;
+                    }
+                    Some(format!(
+                        "{} COLLATE \"C\" = E'{}'",
+                        ident(&filter.column),
+                        value.replace('\\', "\\\\").replace('\'', "''")
+                    ))
+                })
+            })
+            .collect::<Option<Vec<_>>>()
         else {
             return Ok(None);
         };
         terms.extend(keys.iter().map(|key| format!("{} IS NOT NULL", ident(key))));
         let condition = terms.join(" AND ");
         match &operation.operation {
+            Native::Filter => {
+                *self = self.restricted(condition);
+                Ok(None)
+            }
             Native::Top { order, limit } => {
                 let Ok(limit) = usize::try_from(*limit) else {
                     return Ok(None);
@@ -707,7 +769,10 @@ impl TableProvider for PgTable {
             relation: self.relation.clone(),
             schema: Arc::clone(&schema),
             limit,
-            order: self.top.as_ref().map(|(order, _)| order.clone()),
+            order: self
+                .top
+                .as_ref()
+                .and_then(|(order, _)| (!order.is_empty()).then(|| order.clone())),
             filter: filters
                 .iter()
                 .map(|expr| {

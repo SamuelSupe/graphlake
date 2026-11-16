@@ -801,10 +801,30 @@ impl<'a> Execution<'a> {
         }
     }
     async fn round(&self, inputs: Vec<(usize, Step)>) -> Result<Round> {
+        let local = self.worker.workers.len() == 1
+            || self
+                .graph
+                .manifest
+                .vertices
+                .saturating_add(self.graph.manifest.edges)
+                < self.worker.distributed_min_rows as u64;
         let mut tasks =
             futures::stream::iter(inputs.into_iter().map(|(shard, input)| async move {
                 self.graph.scope.check()?;
                 let task_id = Uuid::new_v4();
+                if local {
+                    let _slot = self.local.acquire().await?;
+                    let output = partition_step(
+                        &self.graph,
+                        shard,
+                        &input,
+                        self.id,
+                        self.job.attempt,
+                        task_id,
+                    )
+                    .await?;
+                    return Ok((shard, output));
+                }
                 let objects = self.graph.objects;
                 let key = objects.stage(self.id, self.job.attempt, task_id, "csr-input");
                 let bytes = serde_json::to_vec(&input)?;

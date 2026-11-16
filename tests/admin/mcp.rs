@@ -343,6 +343,21 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
     assert_eq!(result["isError"], false, "{result}");
     assert_eq!(result["structuredContent"]["rows"], json!([["9"]]));
     assert_eq!(result["structuredContent"]["truncated"], true);
+    let strict = call_at(
+        &server,
+        query_path,
+        READER,
+        "query",
+        json!({
+            "model": "payments",
+            "language": "cypher",
+            "query": "MATCH (p:Payment) RETURN p.payment_id AS id",
+            "freshness": {"max_observation_age_seconds": 60},
+        }),
+    )
+    .await?;
+    assert_eq!(strict["isError"], true, "{strict}");
+    assert_eq!(strict["structuredContent"]["code"], "freshness_required");
     for query in [
         json!({"model":"private","language":"cypher","query":"MATCH (p) RETURN p"}),
         json!({"model":"payments","language":"cypher","query":"CREATE (p:Payment) RETURN p"}),

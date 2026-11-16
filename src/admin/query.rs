@@ -26,6 +26,7 @@ use crate::{
 use super::{
     ApiResult, App, Error,
     access::{self, AuditModel, Principal},
+    freshness,
 };
 
 const MAX_ROWS: usize = 500;
@@ -55,6 +56,8 @@ pub(super) struct Request {
     pub(super) csr_generation: Option<Uuid>,
     parameters_json: Option<String>,
     graph_options: Option<GraphScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) freshness: Option<crate::FreshnessPolicy>,
     #[serde(default)]
     capture_result: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -104,6 +107,17 @@ pub(super) struct ResultPage {
     csr_generation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     csr_stats: Option<super::cluster::csr::Stats>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    freshness: Vec<freshness::Observation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    algorithm: Option<crate::GraphAlgorithmMetrics>,
+}
+
+impl Request {
+    pub(super) fn require_consistent_snapshot(&mut self, mut graph: crate::GraphOptions) {
+        graph.require_consistent_snapshot = true;
+        self.graph_options = Some(GraphScope::Options(graph));
+    }
 }
 
 pub(super) struct Preview {
@@ -303,6 +317,11 @@ pub(super) fn validate_request(
         None => return Err(Error::invalid("invalid_language", "查询必须指定语言")),
     };
     set_timeout(&mut options, request.timeout_ms)?;
+    if let Some(policy) = &request.freshness {
+        policy
+            .validate()
+            .map_err(|e| Error::invalid("invalid_freshness", e.to_string()))?;
+    }
     if let Some(graph) = &request.graph_options {
         let graph = match graph {
             GraphScope::Options(graph) => graph.clone(),
@@ -339,6 +358,8 @@ async fn start(
     QueryResult,
     crate::Engine,
     Option<OwnedSemaphorePermit>,
+    crate::FreshnessPolicy,
+    Vec<freshness::Observation>,
 )> {
     if request.csr.is_some() || request.csr_generation.is_some() {
         return Err(Error::not_found());
@@ -364,6 +385,15 @@ async fn start(
     let (_, _, engine) = app
         .query_model(id, &request.model_revision, principal)
         .await?;
+    let policy = freshness::policy(&engine.catalog, request.freshness.as_ref());
+    let observations = freshness::observe(app, &engine.catalog).await;
+    freshness::check(&policy, &observations, false)?;
+    if policy != crate::FreshnessPolicy::default()
+        && app.published_model_revision(id).await? != request.model_revision
+    {
+        return Err(freshness::conflict("严格查询需要当前已发布的模型"));
+    }
+    options.graph.require_consistent_snapshot |= policy.require_consistent_snapshot;
     if let Some(term) = access::partition(app, principal, id)? {
         super::users::apply_partition(&engine.catalog, &mut options.graph, &term)?;
     }
@@ -373,7 +403,12 @@ async fn start(
         Box::pin(engine.query(language, &request.query, options)).await
     }
     .map_err(query_error)?;
-    Ok((active, result, engine, export))
+    if policy != crate::FreshnessPolicy::default()
+        && !freshness::versions_match(&observations, &result.versions, false)
+    {
+        return Err(freshness::conflict("本地副本在查询固定输入期间更新"));
+    }
+    Ok((active, result, engine, export, policy, observations))
 }
 
 pub(super) async fn run(
@@ -389,13 +424,18 @@ pub(super) async fn run(
     if let Some(cluster) = &app.cluster {
         return cluster.execute(&app, id, principal, request, false).await;
     }
-    let (active, result, engine, _) = start(&app, &id, &request, &principal, true).await?;
+    let (active, result, engine, _, policy, mut observations) =
+        start(&app, &id, &request, &principal, true).await?;
     let snapshot = Uuid::new_v4();
     let options = QueryOptions {
         cancellation: active.token.clone(),
         ..app.options.clone()
     };
-    let Preview { page, arrow, graph } = preview(
+    let Preview {
+        mut page,
+        arrow,
+        graph,
+    } = preview(
         result,
         &engine.catalog,
         &request,
@@ -407,6 +447,25 @@ pub(super) async fn run(
         None,
     )
     .await?;
+    freshness::recheck(
+        &app,
+        &engine.catalog,
+        &id,
+        &request.model_revision,
+        &policy,
+        &observations,
+        false,
+    )
+    .await?;
+    for item in &mut observations {
+        item.used(|path| {
+            page.sources
+                .iter()
+                .find(|version| version.source == path)
+                .map(|version| version.version.clone())
+        });
+    }
+    page.freshness = observations;
     if arrow.is_some() || graph.is_some() {
         download::save_snapshot(
             &app,
@@ -472,6 +531,8 @@ pub(super) async fn preview(
         csr_stats: cypher_csr
             .map(|csr| csr.stats(&result.metrics()))
             .or(csr_stats),
+        freshness: Vec::new(),
+        algorithm: result.metrics().algorithm,
     };
     // Reserve the largest possible elapsed-time field before adding rows.
     page.elapsed_ms = u64::MAX;
@@ -745,6 +806,17 @@ pub(super) async fn cancel(
 
 pub(super) fn query_error(error: anyhow::Error) -> Error {
     let message = explain_error(&error);
+    if let Some(detail) = error
+        .chain()
+        .map(ToString::to_string)
+        .find(|text| text.starts_with("algorithm memory budget for "))
+    {
+        return Error::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "algorithm_memory_budget",
+            detail,
+        );
+    }
     if super::cluster::distributed::snapshot_changed(&error) {
         return Error::new(
             StatusCode::CONFLICT,

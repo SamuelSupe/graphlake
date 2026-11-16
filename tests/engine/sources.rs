@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use futures::TryStreamExt;
 use graphlake::{
     Catalog, Direction, Engine, Language, QueryOptions, QueryResult, ScalarValue, TraversalKind,
@@ -74,8 +74,10 @@ async fn postgres_snapshot_and_parquet_s3_join() -> Result<()> {
         let slow = Engine::new(Catalog::load(&path)?)?;
         let slow_opts = QueryOptions { cancellation: Default::default(), ..opts.clone() };
         let cancellation = slow_opts.cancellation.clone();
+        // A key predicate defers key validation into the stream. This keeps
+        // the deliberate wait inside the read that the test will cancel.
         let mut waiting = slow.query(Language::Sql,
-            "SELECT * FROM \"Account\"", slow_opts).await?;
+            "SELECT * FROM \"Account\" WHERE tenant=1 AND id=1", slow_opts).await?;
         let reading = tokio::spawn(async move {
             let result = waiting.batches.try_next().await;
             (result, waiting)
@@ -570,6 +572,94 @@ async fn sqlite_sources_query_typed_rows_and_do_not_create_files() -> Result<()>
 }
 
 #[tokio::test]
+async fn sqlite_small_reads_preserve_order_filters_and_key_validation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let connection = rusqlite::Connection::open(dir.path().join("accounts.db"))?;
+    connection.execute_batch(
+        "CREATE TABLE accounts(id INTEGER PRIMARY KEY, status TEXT COLLATE NOCASE) STRICT;
+         WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<100000)
+           INSERT INTO accounts SELECT id, CASE id WHEN 99998 THEN 'BLOCKED' WHEN 99999 THEN 'blocked' ELSE 'active' END FROM n;
+         CREATE TABLE duplicates(id INTEGER, status TEXT) STRICT;
+         INSERT INTO duplicates VALUES (1,'active'), (1,'blocked');
+         CREATE TABLE legacy(id INTEGER PRIMARY KEY, status TEXT);
+         INSERT INTO legacy VALUES(1,'active'), (2,X'ff');",
+    )?;
+    let catalog = dir.path().join("graph.yaml");
+    std::fs::write(
+        &catalog,
+        "graph: accounts\nsources:\n  db: {type: sqlite, path: accounts.db}\nnodes:\n  Account: {source: db.accounts, key: [id], properties: [status]}\n  Duplicate: {source: db.duplicates, key: [id], properties: [status]}\n  Legacy: {source: db.legacy, key: [id], properties: [status]}\n",
+    )?;
+    let engine = Engine::new(Catalog::load(&catalog)?)?;
+    for (query, expected, read) in [
+        (
+            r#"SELECT id FROM "Account" WHERE id=99999 LIMIT 1"#,
+            Some(99999),
+            1,
+        ),
+        (
+            r#"SELECT id FROM "Account" WHERE status='blocked' LIMIT 1"#,
+            Some(99999),
+            1,
+        ),
+        (r#"SELECT id FROM "Account" LIMIT 1"#, None, 1),
+        (
+            r#"SELECT id FROM "Account" ORDER BY id DESC LIMIT 1"#,
+            Some(100000),
+            1,
+        ),
+        (
+            r#"SELECT id FROM "Account" WHERE status='blocked'"#,
+            Some(99999),
+            1,
+        ),
+        (
+            r#"SELECT id FROM "Account" WHERE status='blocked' OR id=99998 ORDER BY id LIMIT 1"#,
+            Some(99998),
+            100000,
+        ),
+    ] {
+        let mut result = engine
+            .query(Language::Sql, query, Default::default())
+            .await?;
+        let actual = rows(&mut result).await?;
+        assert_eq!(actual.len(), 1, "{query}");
+        if let Some(id) = expected {
+            assert_eq!(actual[0]["id"], id, "{query}");
+        }
+        assert_eq!(result.metrics().reads.sqlite_rows, read, "{query}");
+    }
+    let mut cypher = engine
+        .query(
+            Language::Cypher,
+            "MATCH (a:Account) WHERE a.status = 'blocked' RETURN a.id AS id LIMIT 1",
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(rows(&mut cypher).await?, [serde_json::json!({"id": 99999})]);
+    assert_eq!(cypher.metrics().reads.sqlite_rows, 1);
+    let mut result = engine
+        .query(
+            Language::Sql,
+            r#"SELECT * FROM "Account" LIMIT 0"#,
+            Default::default(),
+        )
+        .await?;
+    assert!(rows(&mut result).await?.is_empty());
+    assert_eq!(result.metrics().reads.sqlite_rows, 0);
+    for query in [
+        r#"SELECT id FROM "Duplicate" WHERE status='blocked' LIMIT 1"#,
+        r#"SELECT status FROM "Legacy" LIMIT 1"#,
+    ] {
+        let result = engine.query(Language::Sql, query, Default::default()).await;
+        match result {
+            Ok(mut result) => assert!(rows(&mut result).await.is_err(), "{query}"),
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires a writable GraphLake test S3 bucket"]
 async fn text_sources_s3_keep_versions_and_read_new_objects_on_next_query() -> Result<()> {
     let bucket = std::env::var("GRAPHLAKE_TEST_BUCKET")?;
@@ -856,4 +946,71 @@ async fn postgres_special_values_preserve_float_nulls_and_report_unrepresentable
     drop(client);
     connection.await??;
     result
+}
+
+#[tokio::test]
+async fn sqlite_direct_scan_delivers_batches_before_eof_and_interrupts() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = rusqlite::Connection::open(dir.path().join("stream.db"))?;
+    db.execute_batch(
+        "PRAGMA journal_mode=WAL; CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT) STRICT;
+        WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<50000)
+        INSERT INTO items SELECT i, printf('%0256d',i) FROM n;",
+    )?;
+    let path = dir.path().join("graph.yaml");
+    std::fs::write(
+        &path,
+        "graph: stream\nsources:\n  db: {type: sqlite, path: stream.db}\nnodes:\n  Item: {source: db.items, key: [id], properties: [name]}\n",
+    )?;
+    let engine = Engine::new_with_limits(Catalog::load(&path)?, Default::default())?;
+    let options = QueryOptions {
+        batch_size: 32,
+        ..Default::default()
+    };
+    let cancel = options.cancellation.clone();
+    let mut result = engine
+        .query(Language::Sql, r#"SELECT id, name FROM "Item""#, options)
+        .await?;
+    let first = result
+        .batches
+        .try_next()
+        .await?
+        .context("missing first SQLite batch")?;
+    assert_eq!(first.num_rows(), 32);
+    let metrics = result.metrics();
+    assert!(metrics.reads.sqlite_rows < 50000);
+    assert!((31..50000).contains(&metrics.reads.sqlite_fullscan_steps));
+    assert!(metrics.first_batch_ms.is_some());
+    cancel.cancel();
+    assert!(result.batches.try_next().await.is_err());
+    drop(result);
+    let mut followup = engine
+        .query(
+            Language::Sql,
+            r#"SELECT id FROM "Item" WHERE id=50000"#,
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut followup).await?,
+        [serde_json::json!({"id":50000})]
+    );
+    let mut ordered = engine
+        .query(
+            Language::Sql,
+            r#"SELECT id, name FROM "Item" ORDER BY name DESC"#,
+            QueryOptions {
+                memory_bytes: 32 * 1024 * 1024,
+                spill_bytes: 64 * 1024 * 1024,
+                batch_size: 256,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let rows = rows(&mut ordered).await?;
+    assert_eq!(rows.len(), 50000);
+    assert_eq!(rows[0]["id"], 50000);
+    assert_eq!(rows[49999]["id"], 1);
+    assert!(ordered.metrics().reads.snapshot_spilled_bytes > 0);
+    Ok(())
 }

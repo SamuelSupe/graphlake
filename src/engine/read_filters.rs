@@ -108,10 +108,10 @@ pub(super) fn exact(expr: &Expr, qualifier: &str, filters: &mut Vec<Predicate>) 
             op: BinaryOperator::And,
             right,
         } => exact(left, qualifier, filters) && exact(right, qualifier, filters),
-        Expr::BinaryOp { .. } | Expr::IsNull(_) | Expr::IsNotNull(_) => {
+        Expr::BinaryOp { .. } | Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::Function(_) => {
             let before = filters.len();
             extract(expr, qualifier, filters);
-            filters.len() == before + 1 && needs_sql_types(&filters[before..])
+            filters.len() == before + 1
         }
         _ => false,
     }

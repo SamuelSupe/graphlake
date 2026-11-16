@@ -33,6 +33,7 @@ pub(crate) struct Distributed {
     leader: Uuid,
     deadline_ms: u64,
     pub(crate) partitions: usize,
+    min_rows: usize,
     stats: Arc<Mutex<Stats>>,
     unavailable: Arc<Mutex<BTreeSet<url::Url>>>,
 }
@@ -90,6 +91,7 @@ impl Distributed {
         leader: Uuid,
         deadline_ms: u64,
         partitions: usize,
+        min_rows: usize,
     ) -> Self {
         Self {
             shared,
@@ -99,6 +101,7 @@ impl Distributed {
             leader,
             deadline_ms,
             partitions,
+            min_rows,
             stats: Default::default(),
             unavailable: Default::default(),
         }
@@ -136,6 +139,12 @@ impl Distributed {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let has_staged_input =
             allow_materialized_inputs && self.stats.lock().unwrap().parquet_partitions > 0;
+        if self.min_rows > 0
+            && !has_staged_input
+            && input_rows(root.as_ref()).is_some_and(|rows| rows < self.min_rows)
+        {
+            return Ok(root);
+        }
         let Some((root, stages)) =
             plan::build(Arc::clone(&root), self.partitions, has_staged_input)?
         else {
@@ -368,6 +377,25 @@ impl Distributed {
     }
 }
 
+fn input_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    fn count(plan: &dyn ExecutionPlan, stats: &StatisticsContext) -> Option<usize> {
+        let children = plan.children();
+        if children.is_empty() {
+            return stats
+                .compute(plan, &StatisticsArgs::default())
+                .ok()?
+                .num_rows
+                .get_value()
+                .copied();
+        }
+        children.into_iter().try_fold(0_usize, |sum, child| {
+            sum.checked_add(count(child.as_ref(), stats)?)
+        })
+    }
+    count(plan, &StatisticsContext::new())
+}
+
 pub(super) async fn run_task(
     State(worker): State<Arc<Worker>>,
     Json(request): Json<StageRequest<Task>>,
@@ -404,6 +432,7 @@ pub(super) async fn run_task(
         leader,
         job.deadline_ms,
         1,
+        0,
     );
     let task = request.plan;
     let remaining = job.deadline_ms.saturating_sub(now_ms());

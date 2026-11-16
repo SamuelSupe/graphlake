@@ -1,9 +1,9 @@
 import { diagnosticText, locale, t } from './locale.ts';
 import { useEffect, useRef, useState } from 'react';
 import { Activity, Square } from 'lucide-react';
-import { api, ApiError, errorText, type ModelReadiness, type ModelSummary } from './api';
+import { api, ApiError, errorText, type ModelFreshness, type ModelReadiness, type ModelSummary } from './api';
 
-type Check = { revision: string; at: number; result?: ModelReadiness; error?: string };
+type Check = { revision: string; at: number; result?: ModelReadiness; error?: string; freshness?: ModelFreshness };
 const labels: Record<ModelReadiness['status'], string> = {
   ready: t('运行正常'), source_unavailable: t('来源不可用'), mapping_invalid: t('映射不兼容'), worker_unavailable: t('Worker 异常'),
 };
@@ -42,6 +42,7 @@ export function ModelHealth({ models, openModel, visible = true }: { models: Mod
           if (cause instanceof ApiError && cause.readiness) check.result = cause.readiness;
           else check.error = errorText(cause);
         }
+        if (!controller.signal.aborted) check.freshness = await api<ModelFreshness>('/models/' + model.id + '/freshness', { signal: controller.signal }).catch(() => undefined);
         if (controller.signal.aborted) break;
         check.at = Date.now();
         setChecks(old => ({ ...old, [model.id]: check }));
@@ -51,7 +52,8 @@ export function ModelHealth({ models, openModel, visible = true }: { models: Mod
   function stop() { active.current?.abort(); active.current = null; setChecking(undefined); }
   const checkFor = (model: ModelSummary) => checks[model.id]?.revision === model.active_revision ? checks[model.id] : undefined;
   const problem = (model: ModelSummary) => !!model.archive_error || model.status === 'failed'
-    || !!checkFor(model)?.error || !!checkFor(model)?.result && checkFor(model)!.result!.status !== 'ready';
+    || !!checkFor(model)?.error || !!checkFor(model)?.result && checkFor(model)!.result!.status !== 'ready'
+    || checkFor(model)?.freshness?.refresh?.status === 'failed' || checkFor(model)?.freshness?.csr?.current === false;
   const problems = models.filter(problem);
   const shown = onlyProblems ? problems : models;
   const published = models.filter(model => model.active_revision && !model.archive_error);
@@ -92,6 +94,10 @@ export function ModelHealth({ models, openModel, visible = true }: { models: Mod
               {probe && Object.entries(probe.sources).filter(([, ok]) => !ok).map(([name]) => ' · ' + name).join('')}</li>)}
           </ul>
         </details>}
+        {(check?.freshness?.csr || check?.freshness?.auto_refresh_csr) && <p className="small">
+          {check.freshness.refresh?.status === 'failed' ? t('CSR 刷新失败{0}', check.freshness.refresh.error ? ' · ' + diagnosticText(check.freshness.refresh.error) : '') : check.freshness.refresh?.status === 'building' ? t('正在刷新 CSR') : check.freshness.csr?.current ? t('CSR 已追平本地副本') : check.freshness.csr ? t('CSR 落后于本地副本') : t('等待首次 CSR 刷新')}
+          {check.freshness.csr?.built_at_ms && t(' · 构建于 {0}', new Date(check.freshness.csr.built_at_ms).toLocaleString(locale))}
+        </p>}
         {result?.location && <p className="small">{t('异常位置：{0}', result.location.kind === 'table' ? [result.location.table, result.location.column].filter(Boolean).join('.') : result.location.label + ' · ' + (result.location.kind === 'field' ? result.location.field : result.location.column))}</p>}
         {(model.archive_error || check?.error) && <details><summary>{t('错误详情')}</summary><p className="small">{diagnosticText(model.archive_error || check?.error || '')}</p></details>}
       </li>;

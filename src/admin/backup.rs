@@ -18,17 +18,22 @@ use super::{
 };
 use crate::CancellationToken;
 
-// The backup still uses the portable v1 JSON format, including the files
-// rather than references into the HA object store.
-const LIMIT: u64 = 2 * super::cluster::control::CATALOG_BYTES_LIMIT + 4 * 1024 * 1024;
+use super::local_tables::managed::{self, Archive, Managed};
+
+mod local;
+
+const LIMIT: u64 = 2 * super::cluster::control::CATALOG_BYTES_LIMIT + 24 * 1024 * 1024;
 const FORMAT: u32 = 1;
 const MANUAL_BACKUPS: usize = 16;
+pub(super) const CLI_RESTORE_KEY: &str = "restore_cli";
 
 #[derive(Deserialize, Serialize)]
 struct State {
     catalog: CatalogState,
     policy: String,
     users: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_tables: Option<local::Local>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -82,6 +87,8 @@ pub(super) struct Exported {
     file: String,
     checkpoint_ms: u64,
     status_recorded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_directory: Option<String>,
 }
 
 const MANUAL_STATUS: &str = "manual-export-status.json";
@@ -175,6 +182,8 @@ pub(super) async fn export(
         .expect("HA requires a cluster")
         .control()
         .map_err(|_| Error::storage())?;
+    let sources = app.models.lock().unwrap().source_directory().to_owned();
+    let managed = managed::backend(&app).cloned();
     // Once accepted, keep the slot until the file and status have been written even if the client leaves.
     tokio::spawn(async move {
         let state = match tokio::time::timeout(Duration::from_secs(30), control.checkpoint()).await
@@ -183,6 +192,7 @@ pub(super) async fn export(
                 catalog,
                 policy,
                 users,
+                local_tables: None,
             }),
             Ok(Err(_)) => Err(Error::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -195,9 +205,16 @@ pub(super) async fn export(
                 "读取集群控制状态超时",
             )),
         };
+        let (state, archive) = match (state, managed) {
+            (Ok(state), Some(managed)) => match managed.backup().await {
+                Ok(archive) => (Ok(state), archive),
+                Err(error) => (Err(managed::error(error)), None),
+            },
+            (state, _) => (state, None),
+        };
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            persist_export(dir, state)
+            persist_export(dir, state, Some(&sources), archive)
         })
         .await
         .map_err(|_| Error::storage())?
@@ -207,7 +224,12 @@ pub(super) async fn export(
     .map(Json)
 }
 
-fn persist_export(dir: PathBuf, state: ApiResult<State>) -> ApiResult<Exported> {
+fn persist_export(
+    dir: PathBuf,
+    state: ApiResult<State>,
+    sources: Option<&Path>,
+    archive: Option<Archive>,
+) -> ApiResult<Exported> {
     let meta = fs::symlink_metadata(&dir).ok();
     if !dir.is_absolute()
         || !meta.as_ref().is_some_and(|meta| {
@@ -244,11 +266,11 @@ fn persist_export(dir: PathBuf, state: ApiResult<State>) -> ApiResult<Exported> 
                     }
                 }
             }
-            write(&dir.join(&file), state).map_err(|_| {
+            write(&dir.join(&file), state, sources, archive).map_err(|error| {
                 Error::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "backup_write_failed",
-                    "校验或写入备份失败，请检查模型归档和目录权限",
+                    format!("校验或写入备份失败 · {error}"),
                 )
             })
         });
@@ -256,11 +278,11 @@ fn persist_export(dir: PathBuf, state: ApiResult<State>) -> ApiResult<Exported> 
         &dir.join(MANUAL_STATUS),
         result
             .as_ref()
-            .map(|timestamp| Some(*timestamp))
+            .map(|(timestamp, _)| Some(*timestamp))
             .map_err(|error| format_error(error.clone())),
         Some(&file),
     );
-    let checkpoint_ms = result?;
+    let (checkpoint_ms, local_directory) = result?;
     super::telemetry::event(
         opentelemetry::logs::Severity::Info,
         "backup_exported",
@@ -270,6 +292,7 @@ fn persist_export(dir: PathBuf, state: ApiResult<State>) -> ApiResult<Exported> 
         file,
         checkpoint_ms,
         status_recorded: status.is_ok(),
+        local_directory,
     })
 }
 
@@ -307,18 +330,28 @@ fn checksum(state: &State) -> Result<String> {
         .collect())
 }
 
-fn verify(state: &State) -> Result<()> {
+fn verify(state: &State, target: Option<&Path>) -> Result<()> {
     access::Policy::validate_config(&state.policy).map_err(format_error)?;
     users::verify_backup(&state.users).map_err(format_error)?;
     let dir = tempfile::tempdir()?;
     ha::restore(dir.path(), &state.catalog).map_err(format_error)?;
-    let catalog = models::Models::new(dir.path().to_owned());
+    let root = target.or_else(|| state.local_tables.as_ref().map(local::Local::origin));
+    let catalog =
+        models::Models::with_sources(dir.path().to_owned(), root.unwrap_or(dir.path()).to_owned());
     let (_, broken) = catalog.check_published().map_err(format_error)?;
     ensure!(
         broken.is_empty(),
         "published model archives failed verification: {broken:?}"
     );
-    catalog.check_archive_history().map_err(format_error)
+    catalog.check_archive_history().map_err(format_error)?;
+    if let Some(root) = root {
+        if let Some(local) = &state.local_tables {
+            local.validate(&catalog, root)?;
+        } else {
+            local::validate_models(&catalog, root, &Default::default(), &Default::default())?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn read(file: &Path) -> Result<Backup> {
@@ -351,13 +384,69 @@ pub(super) fn read(file: &Path) -> Result<Backup> {
             == backup.timestamp_sha256,
         "HA backup timestamp checksum mismatch"
     );
-    verify(&backup.state)?;
+    verify(&backup.state, None)?;
     Ok(backup)
 }
 
-fn write(path: &Path, state: State) -> Result<u64> {
-    verify(&state)?;
+fn write(
+    path: &Path,
+    mut state: State,
+    sources: Option<&Path>,
+    archive: Option<Archive>,
+) -> Result<(u64, Option<String>)> {
+    let parent = parent(path);
+    ensure!(
+        matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "backup file already exists or is inaccessible"
+    );
+    let sources = sources.map(Path::canonicalize).transpose()?;
+    let disk = sources
+        .as_deref()
+        .map(|root| local::Capture::take(root, false))
+        .transpose()?
+        .flatten();
+    let remote = archive
+        .as_ref()
+        .map(|archive| local::Capture::take(archive.root.path(), true))
+        .transpose()?
+        .flatten();
+    let captured = if remote.is_some() {
+        local::Capture::combine(
+            disk,
+            remote,
+            sources
+                .as_deref()
+                .context("managed backup requires --catalog-dir")?,
+        )?
+    } else {
+        disk
+    };
     let timestamp = now_ms();
+    state.local_tables = captured
+        .map(|snapshot| snapshot.write(parent))
+        .transpose()?;
+    let local_directory = state.local_tables.as_ref().map(local::Local::directory);
+    let result = publish(path, state, sources.as_deref(), timestamp);
+    if result.is_err()
+        && let Some(dir) = &local_directory
+    {
+        let _ = fs::remove_dir_all(parent.join(dir));
+    }
+    result?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    Ok((timestamp, local_directory))
+}
+
+fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn publish(path: &Path, state: State, sources: Option<&Path>, timestamp: u64) -> Result<()> {
+    let unspecified = Path::new("/");
+    verify(&state, Some(sources.unwrap_or(unspecified)))?;
     let sha256 = checksum(&state)?;
     let backup = Backup {
         format: FORMAT,
@@ -366,10 +455,7 @@ fn write(path: &Path, state: State) -> Result<u64> {
         state,
         created_at_ms: Some(timestamp),
     };
-    let parent = path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let parent = parent(path);
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer(&mut temp, &backup)?;
     temp.flush()?;
@@ -380,34 +466,62 @@ fn write(path: &Path, state: State) -> Result<u64> {
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path)
         .context("publishing private backup file")?;
-    #[cfg(unix)]
-    fs::File::open(parent)?.sync_all()?;
-    Ok(timestamp)
+    Ok(())
 }
 
-/// Export a consistent control-plane checkpoint or restore into a fresh namespace.
 pub async fn run(config: &Path, file: &Path, recovery_dir: Option<&Path>) -> Result<()> {
-    let control = Coordinator::load(config)?.control()?;
+    run_with_catalog(config, file, recovery_dir, None)
+        .await
+        .map(|_| ())
+}
+
+/// Export a checkpoint or restore into a fresh namespace and source directory.
+pub async fn run_with_catalog(
+    config: &Path,
+    file: &Path,
+    recovery_dir: Option<&Path>,
+    catalog_dir: Option<&Path>,
+) -> Result<Option<u64>> {
+    let cluster = Coordinator::load(config)?;
+    let control = cluster.control()?;
     let Some(recovery_dir) = recovery_dir else {
         let (catalog, policy, users) = control.checkpoint().await.map_err(format_error)?;
-        write(
+        let archive = match &cluster.managed {
+            Some(managed) => managed.backup().await?,
+            None => None,
+        };
+        let (timestamp, local_directory) = write(
             file,
             State {
                 catalog,
                 policy,
                 users,
+                local_tables: None,
             },
+            catalog_dir,
+            archive,
         )?;
+        if let Some(directory) = local_directory {
+            eprintln!("GraphLake local-table backup: {directory}");
+        }
         super::telemetry::event(
             opentelemetry::logs::Severity::Info,
             "backup_exported",
             serde_json::json!({}),
         );
-        return Ok(());
+        return Ok(Some(timestamp));
     };
 
     let backup = read(file)?;
-    let recovery = super::recovery::prepare(recovery_dir, &backup.sha256).await?;
+    let mut recovery = super::recovery::prepare(recovery_dir, &backup.sha256).await?;
+    if backup.local_count() != 0 {
+        let bound = read(&recovery_dir.join("control.json"))?;
+        ensure!(
+            bound.sha256 == backup.sha256,
+            "recovery directory control.json does not match --file"
+        );
+        recovery.local_checkpoint = Some(backup.sha256.clone());
+    }
     let stop = CancellationToken::new();
     let leader = tokio::time::timeout(Duration::from_secs(2), control.acquire(&stop))
         .await
@@ -421,6 +535,43 @@ pub async fn run(config: &Path, file: &Path, recovery_dir: Option<&Path>) -> Res
                 .is_none(),
             "this namespace is reserved for UI recovery; resume from the recovery page"
         );
+        leader
+            .ensure_empty_checkpoint()
+            .await
+            .map_err(format_error)?;
+        match leader
+            .get::<String>(CLI_RESTORE_KEY)
+            .await
+            .map_err(format_error)?
+        {
+            Some((bound, _)) => ensure!(
+                bound == recovery.manifest_sha256,
+                "target is reserved for a different CLI recovery checkpoint"
+            ),
+            None => ensure!(
+                leader
+                    .commit(
+                        CLI_RESTORE_KEY,
+                        0,
+                        &recovery.manifest_sha256,
+                        None::<(uuid::Uuid, &String)>
+                    )
+                    .await
+                    .map_err(format_error)?
+                    .is_some(),
+                "could not reserve the CLI recovery namespace"
+            ),
+        }
+        let backup = if backup.local_count() != 0 {
+            let target = catalog_dir
+                .context("restoring local tables requires --catalog-dir")?
+                .canonicalize()?;
+            backup
+                .install_local(&leader, parent(file), &target, cluster.managed.as_ref())
+                .await?
+        } else {
+            backup
+        };
         backup.restore(&leader, &recovery).await
     }
     .await;
@@ -429,10 +580,73 @@ pub async fn run(config: &Path, file: &Path, recovery_dir: Option<&Path>) -> Res
     eprintln!(
         "GraphLake HA checkpoint restored. Member accounts are disabled, role memberships and legacy service tokens cleared, and sessions invalidated."
     );
-    Ok(())
+    Ok(None)
 }
 
 impl Backup {
+    pub(super) fn local_count(&self) -> usize {
+        self.state
+            .local_tables
+            .as_ref()
+            .map_or(0, local::Local::count)
+    }
+
+    pub(super) fn validate_target(&self, target: &Path) -> Result<()> {
+        if self.state.local_tables.is_some() {
+            verify(&self.state, Some(target))?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn install_local(
+        self,
+        leader: &super::cluster::control::Leadership,
+        from: &Path,
+        target: &Path,
+        managed: Option<&Managed>,
+    ) -> Result<Self> {
+        let Some(local) = &self.state.local_tables else {
+            return Ok(self);
+        };
+        ensure!(
+            !local.has_managed() || managed.is_some(),
+            "managed backup requires managed_local_tables on the target"
+        );
+        let restore_managed = local.has_managed();
+        let from = from.to_owned();
+        let destination = target.to_owned();
+        let (staged, backup) = tokio::task::spawn_blocking(move || -> Result<_> {
+            self.validate_target(&destination)?;
+            let staged = self
+                .state
+                .local_tables
+                .as_ref()
+                .unwrap()
+                .stage(&from, &destination)?;
+            Ok((staged, self))
+        })
+        .await??;
+        leader.confirm().await.map_err(format_error)?;
+        if let Some(staged) = staged {
+            local::publish(staged, target)?;
+        }
+        if restore_managed {
+            managed
+                .expect("validated managed recovery backend")
+                .restore_archive(target, leader)
+                .await?;
+        }
+        Ok(backup)
+    }
+
+    pub(super) fn verify_local_destination(&self, target: &Path) -> Result<()> {
+        self.state
+            .local_tables
+            .as_ref()
+            .context("checkpoint has no local table archive")?
+            .verify_installed(target)
+    }
+
     pub(super) async fn restore(
         self,
         leader: &super::cluster::control::Leadership,
@@ -462,9 +676,13 @@ pub fn check(file: &Path) -> Result<()> {
 /// Verify a checkpoint and report the originating timestamp when available.
 pub fn check_checkpoint(file: &Path) -> Result<Option<u64>> {
     let backup = read(file)?;
+    if let Some(local) = &backup.state.local_tables {
+        local.verify(&parent(file).join(local.directory()))?;
+    }
     println!(
-        "GraphLake HA backup verified ({} catalog files).",
-        backup.state.catalog.files.len()
+        "GraphLake HA backup verified ({} catalog files, {} local tables).",
+        backup.state.catalog.files.len(),
+        backup.local_count()
     );
     Ok(backup.created_at_ms)
 }
@@ -577,14 +795,17 @@ mod tests {
                 catalog: CatalogState::default(),
                 policy: "{}".to_owned(),
                 users: serde_json::json!({"accounts": {}, "groups": {}}),
+                local_tables: None,
             }),
+            None,
+            None,
         )
         .map_err(format_error)?;
         assert!(result.status_recorded);
         let archive = read(&dir.path().join(&result.file))?;
         assert_eq!(archive.created_at_ms, Some(result.checkpoint_ms));
 
-        let failed = persist_export(dir.path().to_owned(), Err(Error::busy()));
+        let failed = persist_export(dir.path().to_owned(), Err(Error::busy()), None, None);
         assert!(matches!(failed, Err(error) if error.code == "busy"));
         let JobStatus::Recorded(manual) = job_status(dir.path(), MANUAL_STATUS) else {
             panic!("manual export result must survive a failed subsequent attempt");

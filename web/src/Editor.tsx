@@ -155,11 +155,13 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     const sourceName = 'local_' + table.name;
     const reference = sourceName + '.data';
     const existing = model?.sources[sourceName];
-    if (existing && (existing.type !== 'parquet' || JSON.stringify(existing.tables) !== JSON.stringify({ data: [table.path] }))) {
+    const location = table.reference_path ?? table.path;
+    if (existing && (existing.type !== 'parquet' || ![location, table.path].some(path =>
+      JSON.stringify(existing.tables) === JSON.stringify({ data: [path] })))) {
       throw new Error(t('数据源名称 {0} 已被占用，请先重命名该数据源。', sourceName));
     }
     edit(doc => {
-      doc.setIn(['sources', sourceName], { type: 'parquet', tables: { data: [table.path] } });
+      doc.setIn(['sources', sourceName], { type: 'parquet', tables: { data: [location] } });
       if (switchMappings && model) for (const section of ['nodes', 'edges'] as const) {
         for (const [name, mapping] of Object.entries(model[section])) {
           if (mapping.source === table.source_table) doc.setIn([section, name, 'source'], reference);

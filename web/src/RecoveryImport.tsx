@@ -8,7 +8,7 @@ import { Modal } from './ui';
 type Candidate = { id: string; modified_ms: number | null };
 const phases: [Phase, string][] = [
   ['validate', t('校验备份')],
-  ['parquet', t('恢复 Parquet')],
+  ['parquet', t('恢复文件与本地表')],
   ['postgres', t('恢复 PostgreSQL')],
   ['control', t('导入控制状态')],
 ];
@@ -89,6 +89,7 @@ export default function RecoveryImport({ token, job, start }: {
       </div>}
       {modified != null && <p className="settings-hint">{t('副本更新时间 {0}', new Date(modified).toLocaleString(locale))}</p>}
       {verified && <p role="status">{t('控制备份与恢复清单匹配 · {0} 张 PostgreSQL 表 · {1} 个 Parquet 文件', verified.postgres_relations, verified.parquet_files)}
+        {!!verified.local_tables && t(' · {0} 张本地表', verified.local_tables)}
         {verified.checkpoint_ms != null && <>{t(' · 检查点 {0}', new Date(verified.checkpoint_ms).toLocaleString(locale))}</>}</p>}
       {startError && <p role="alert" className="notice error">{startError}</p>}
     </section>
@@ -106,7 +107,7 @@ export default function RecoveryImport({ token, job, start }: {
     {confirm && <Modal title={t('开始灾备恢复')} close={() => setConfirm(undefined)}>
       <div className="panel-layout">
         <div className="panel-body form-fields">
-          <p>{t('将从 ')}<b>{confirm.bundle}</b>{t(' 恢复数据和控制状态。请确认目标集群和 PostgreSQL 数据库专用于本次恢复。')}</p>
+          <p>{t('将从 ')}<b>{confirm.bundle}</b>{confirm.postgres_relations ? t(' 恢复数据和控制状态。请确认目标集群和 PostgreSQL 数据库专用于本次恢复。') : t(' 恢复数据和控制状态。请确认目标集群专用于本次恢复。')}</p>
           <dl className="recovery-facts">
             <div><dt>{t('目标站')}</dt><dd>{window.location.host}</dd></div>
             <div><dt>{t('恢复点')}</dt><dd>{confirm.bundle}</dd></div>

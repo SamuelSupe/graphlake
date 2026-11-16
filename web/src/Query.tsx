@@ -3,14 +3,14 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2, Download, GitFork, Network, Play, Square, Table2 } from 'lucide-react';
 import type { GraphSelection } from './GraphCanvas';
 import { GraphExplorer, type GraphExplorerHandle } from './GraphExplorer';
-import { api, ApiError, downloadFile, errorText, request, type GraphSchema, type QueryResult } from './api';
+import { api, ApiError, downloadFile, errorText, request, type FreshnessPolicy, type GraphSchema, type QueryResult } from './api';
 
 const QueryEditor = lazy(() => import('./QueryEditor'));
 const QueryScope = lazy(() => import('./QueryScope'));
 const GraphCanvas = lazy(() => import('./GraphCanvas'));
 
 type Dialect = 'cypher' | 'sql' | 'gremlin';
-type Statement = { language: Dialect; query: string; parameters_json?: string; timeout_ms?: number; model_revision: string; graph_options?: string; capture_result?: boolean; csr_generation?: string };
+type Statement = { language: Dialect; query: string; parameters_json?: string; timeout_ms?: number; model_revision: string; graph_options?: string; capture_result?: boolean; csr_generation?: string; freshness?: FreshnessPolicy };
 type HistoryItem = Statement & { at: number; status: string; needsParameters?: boolean };
 type Execution = { page: QueryResult; statement?: Statement; requestId: string };
 type Recoverable = { id: string; revision: string };
@@ -89,6 +89,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const [graphOptions, setGraphOptions] = useState('');
   const [editingScope, setEditingScope] = useState(false);
   const [captureResult, setCaptureResult] = useState(false);
+  const [freshness, setFreshness] = useState<FreshnessPolicy>({});
   const [parameterRequired, setParameterRequired] = useState(false);
   const [loadNotice, setLoadNotice] = useState('');
   const [templateName, setTemplateName] = useState('');
@@ -110,12 +111,14 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const optionsPanel = useRef<HTMLDetailsElement>(null);
   const parameterInput = useRef<HTMLTextAreaElement>(null);
   const timeoutValid = !timeout || /^\d+$/.test(timeout) && Number(timeout) >= 1 && Number(timeout) <= 60_000;
-  const canRun = !!query.trim() && timeoutValid && (!parameterRequired || language !== 'cypher' || !!parameters.trim());
+  const agesValid = [freshness.max_observation_age_seconds, freshness.max_reconciliation_age_seconds].every(age => age === undefined || Number.isInteger(age) && age >= 1 && age <= 2592000);
+  const canRun = !!query.trim() && timeoutValid && agesValid && (!parameterRequired || language !== 'cypher' || !!parameters.trim());
   const statementFromEditor = (): Statement => ({
     model_revision: revision, language, query,
     parameters_json: language === 'cypher' && parameters.trim() ? parameters : undefined,
     graph_options: generation ? undefined : graphOptions.trim() || undefined, capture_result: canExport && captureResult,
     csr_generation: language === 'cypher' ? generation : undefined,
+    freshness: { ...freshness, require_current_csr: language === 'cypher' ? freshness.require_current_csr : undefined },
     timeout_ms: timeout ? Number(timeout) : undefined,
   });
 
@@ -172,6 +175,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
     setQueries(old => ({ ...old, [statement.language]: statement.query }));
     setParameters(statement.parameters_json ?? '');
     setGraphOptions(statement.graph_options ?? '');
+    setFreshness(statement.freshness ?? {});
     setSnapshot(statement.csr_generation ? { generation: statement.csr_generation, revision: statement.model_revision } : undefined);
     setCaptureResult(!!statement.capture_result);
     setTimeoutText(statement.timeout_ms?.toString() ?? '');
@@ -395,6 +399,10 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
               onChange={event => setTimeoutText(event.target.value)} /></label>
             {canExport && <label className="check-label"><input type="checkbox" checked={captureResult}
               onChange={event => setCaptureResult(event.target.checked)} />{t('保留完整结果')}</label>}
+            <label>{t('来源观察最大年龄（秒）')}<input type="number" min={1} max={2592000} placeholder={t('模型默认')} value={freshness.max_observation_age_seconds ?? ''} onChange={event => setFreshness(old => ({...old, max_observation_age_seconds: event.target.value ? event.target.valueAsNumber : undefined}))} /></label>
+            <label>{t('全量对账最大年龄（秒）')}<input type="number" min={1} max={2592000} placeholder={t('模型默认')} value={freshness.max_reconciliation_age_seconds ?? ''} onChange={event => setFreshness(old => ({...old, max_reconciliation_age_seconds: event.target.value ? event.target.valueAsNumber : undefined}))} /></label>
+            {!agesValid && <p role="alert">{t('有效范围为 1 至 2592000 秒。')}</p>}
+            {language === 'cypher' && <label className="check-label"><input type="checkbox" checked={!!freshness.require_current_csr} onChange={event => setFreshness(old => ({...old, require_current_csr: event.target.checked}))} />{t('要求 CSR 与当前副本一致')}</label>}
             {recoverable && language === 'cypher' && (generation
               ? <button className="button compact" disabled={!!running} onClick={() => setSnapshot(undefined)}>{t('切换至实时来源')}</button>
               : <button className="button compact" disabled={!!running} onClick={() => void selectSnapshot()}>{t('使用已发布 CSR')}</button>)}
@@ -496,6 +504,11 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
           {page.csr_generation && <div><dt>{t('CSR 版本')}</dt><dd><code>{page.csr_generation}</code></dd></div>}
         </dl>
         {!!page.sources.length && <dl>{page.sources.map((source, index) => <div key={index}><dt>{source.source}</dt><dd><code>{source.version}</code><small>{source.consistency}</small></dd></div>)}</dl>}
+        {!!page.freshness?.length && <dl>{page.freshness.map((source, index) => <div key={index}><dt>{source.source}</dt><dd>
+          <small>{t('最近观察 {0} · 全量对账 {1}', source.observed_at_ms ? new Date(source.observed_at_ms).toLocaleString(locale) : t('未知'), source.reconciled_at_ms ? new Date(source.reconciled_at_ms).toLocaleString(locale) : t('未知'))}</small>
+          <small>{source.deletion_capture === 'marker_and_reconciliation' ? t('软删除与对账') : source.deletion_capture === 'reconciliation' ? t('全量对账捕获删除') : t('删除覆盖未知')}</small>
+          {source.result_generation && source.result_generation !== source.generation && <small>{t('结果读取历史代次')}</small>}
+        </dd></div>)}</dl>}
       </details>}
     </section>
     <div className="query-library">

@@ -3,6 +3,7 @@ use super::*;
 pub(super) async fn prepare<'a, 'q>(
     catalog: &'a Catalog,
     spanner: &BTreeMap<String, source::warehouse::spanner::Client>,
+    managed: &BTreeMap<uuid::Uuid, source::parquet_snapshot::RemoteSnapshot>,
     scope: &QueryScope,
     required: BTreeMap<&'a str, BTreeSet<String>>,
     filters: &BTreeMap<&str, Vec<crate::Predicate>>,
@@ -69,6 +70,27 @@ pub(super) async fn prepare<'a, 'q>(
         }
         let fields = fields.into_iter().collect::<Vec<_>>();
         let predicates = &filters[reference];
+        let native = read
+            .sql
+            .and_then(|sql| sql.native.as_ref())
+            .filter(|(label, _)| catalog.nodes[label].source == reference);
+        let single = read
+            .sql
+            .and_then(|sql| sql.single.as_deref())
+            .filter(|label| catalog.nodes[*label].source == reference);
+        let stream =
+            read.stream_raw || single.is_some() && scope.options.graph.logical_partition.is_empty();
+        let scan = sql_read::Pushdown {
+            operation: sql_read::Native::Filter,
+            filters: Vec::new(),
+        };
+        let proof = native
+            .map(|(label, plan)| (label.as_str(), plan))
+            .or_else(|| single.filter(|_| stream).map(|label| (label, &scan)));
+        #[cfg(feature = "admin")]
+        let watermark = read.watermark;
+        #[cfg(not(feature = "admin"))]
+        let watermark = None;
         let mut parquet_versions = None;
         let table: Arc<dyn TableProvider> = match source {
             Source::Duckdb { .. }
@@ -227,12 +249,14 @@ pub(super) async fn prepare<'a, 'q>(
                 let snapshot = match sqlite_snapshots.entry(name) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        let snapshot = source::sqlite::Snapshot::open(
-                            path,
-                            scope.options.timeout,
-                            Arc::clone(&scope.reads),
-                        )
-                        .await?;
+                        let snapshot = Arc::new(
+                            source::sqlite::Snapshot::open(
+                                path,
+                                scope.options.timeout,
+                                Arc::clone(&scope.reads),
+                            )
+                            .await?,
+                        );
                         versions.insert(
                             name.into(),
                             SourceVersion {
@@ -244,16 +268,22 @@ pub(super) async fn prepare<'a, 'q>(
                         entry.insert(snapshot)
                     }
                 };
-                let (table, budget) = snapshot
+                let (table, budget, pushed) = snapshot
                     .table(
                         relation,
                         &fields,
                         predicates,
+                        proof.map(|(label, plan)| (catalog.nodes[label].key.as_slice(), plan)),
+                        stream,
+                        read.stream_raw,
                         &scope.runtime,
                         scope.options.batch_size,
                         read.explain_only,
                     )
                     .await?;
+                if pushed {
+                    proven_key_label = proof.map(|(label, _)| label);
+                }
                 reservations.push(budget);
                 table
             }
@@ -316,6 +346,10 @@ pub(super) async fn prepare<'a, 'q>(
                 {
                     aggregate = table.pushdown(&catalog.nodes[label].key, operation).await?;
                 }
+                #[cfg(feature = "admin")]
+                if let Some((column, value)) = watermark {
+                    table = table.watermark(column, value);
+                }
                 let table = Arc::new(table);
                 postgres.insert(reference.to_owned(), Arc::clone(&table));
                 table
@@ -349,16 +383,23 @@ pub(super) async fn prepare<'a, 'q>(
                         entry.insert(snapshot)
                     }
                 };
-                let (table, budget) = snapshot
+                let (table, budget, pushed) = snapshot
                     .table(
                         relation,
                         &fields,
                         predicates,
+                        proof.map(|(label, plan)| (catalog.nodes[label].key.as_slice(), plan)),
+                        watermark,
+                        stream,
+                        read.stream_raw,
                         &scope.runtime,
                         scope.options.batch_size,
                         read.explain_only,
                     )
                     .await?;
+                if pushed {
+                    proven_key_label = proof.map(|(label, _)| label);
+                }
                 if !matches!(source, Source::Mysql { .. } | Source::Mariadb(_)) {
                     versions.insert(
                         reference.into(),
@@ -429,6 +470,7 @@ pub(super) async fn prepare<'a, 'q>(
                         scope.options.batch_size,
                         &scope.runtime.disk_manager,
                         read.explain_only,
+                        read.stream_raw || stream && read.lazy_validation,
                     )
                     .await
                     .with_context(|| format!("reading ClickHouse table {reference}"))?;
@@ -638,8 +680,9 @@ pub(super) async fn prepare<'a, 'q>(
                 let prune_snapshot = read.probe_source.is_none();
                 #[cfg(not(feature = "admin"))]
                 let prune_snapshot = true;
-                let (table, objects) = ParquetTable::open(
+                let (table, objects) = ParquetTable::open_with_managed(
                     &tables[relation],
+                    managed,
                     &fields,
                     Arc::clone(&scope.runtime.memory_pool),
                     Arc::clone(&scope.reads),
@@ -714,6 +757,7 @@ pub(crate) async fn table(
     reference: &str,
     columns: &[String],
     predicates: Vec<crate::Predicate>,
+    watermark: Option<(&str, &datafusion::common::ScalarValue)>,
     scope: &QueryScope,
 ) -> Result<(DataFrame, Prepared)> {
     let spanner = catalog
@@ -725,10 +769,15 @@ pub(crate) async fn table(
     let (context, _, prepared, _) = prepare(
         catalog,
         &spanner,
+        &BTreeMap::new(),
         scope,
         BTreeMap::from([(reference, columns.iter().cloned().collect())]),
         &BTreeMap::from([(reference, predicates)]),
-        model::ReadKind::default(),
+        model::ReadKind {
+            watermark,
+            stream_raw: true,
+            ..Default::default()
+        },
     )
     .await?;
     Ok((context.table("raw_0").await?, prepared))

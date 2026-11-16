@@ -90,4 +90,5 @@ Use one `graphlake-admin` process for a standalone deployment. A distributed dep
 | [Technical reference](docs/reference.zh-CN.md) | Modeling, connectors, query behavior, algorithms, APIs, and bindings |
 | [MCP server](docs/mcp.md) | AI client connection, query and modeling tools, permissions, and protocol scope |
 | [Local tables and data sync](docs/local-tables.zh-CN.md) | Full loads, incremental refresh, scheduling, and snapshot recovery |
+| [Production optimization plan](docs/production-optimization-plan.zh-CN.md) | Proposed source-read, incremental-sync, freshness, algorithm-capacity, recovery, and release-gate improvements |
 | [Changelog](CHANGELOG.md) | Release highlights and runtime boundaries |

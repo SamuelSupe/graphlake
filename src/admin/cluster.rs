@@ -4,7 +4,7 @@ pub(super) mod control;
 pub(crate) mod csr;
 pub(crate) mod distributed;
 mod results;
-mod store;
+pub(in crate::admin) mod store;
 mod worker;
 
 use std::{
@@ -30,7 +30,7 @@ use uuid::Uuid;
 use super::{
     ApiResult, App, Error,
     access::{self, Principal},
-    models,
+    freshness, models,
     ops::SourceProbe,
     query,
 };
@@ -47,12 +47,15 @@ const DISPATCH_LIMIT: u64 = 768 * 1024;
 
 pub(super) struct Coordinator {
     shared: Shared,
+    pub(super) managed: Option<super::local_tables::managed::Managed>,
     name: String,
     workers: Vec<url::Url>,
     next: AtomicUsize,
     graph_partitions: usize,
     memory_bytes: usize,
     heartbeats: Mutex<Heartbeats>,
+    csr_work: tokio::sync::Semaphore,
+    csr_refresh: Mutex<std::collections::BTreeMap<String, csr::RefreshStatus>>,
 }
 
 #[derive(Default)]
@@ -91,6 +94,8 @@ struct Dispatch {
     id: Uuid,
     attempt: Uuid,
     request: query::Request,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    managed: Vec<super::local_tables::managed::Pin>,
 }
 
 #[derive(Serialize)]
@@ -121,14 +126,25 @@ impl Coordinator {
                 == config.workers.len(),
             "duplicate cluster worker"
         );
+        let managed = config.managed_local_tables.then(|| {
+            super::local_tables::managed::Managed::new(
+                shared.metadata.clone(),
+                shared.objects.clone(),
+                config.local_snapshot_retention_seconds,
+                config.local_snapshot_gc_grace_seconds,
+            )
+        });
         Ok(Self {
             shared,
+            managed,
             name: config.name,
             workers: config.workers,
             next: AtomicUsize::new(0),
             graph_partitions: config.distributed_partitions,
             memory_bytes: config.memory_mib * 1024 * 1024,
             heartbeats: Default::default(),
+            csr_work: tokio::sync::Semaphore::new(1),
+            csr_refresh: Default::default(),
         })
     }
 
@@ -292,7 +308,7 @@ impl Coordinator {
         };
         options.timeout = query::remaining(options.timeout, started)?;
         let active = query::admit(app, id, &model, &owner, &mut options).await?;
-        let (_, yaml, _) = app
+        let (_, yaml, engine) = app
             .query_model(&model, &request.model_revision, &owner)
             .await?;
         let deadline = started
@@ -305,6 +321,18 @@ impl Coordinator {
                 .as_ref()
                 .map(|csr| csr.generation)
                 .or(request.csr_generation);
+            let policy = freshness::policy(&engine.catalog, request.freshness.as_ref());
+            let inputs = freshness::observe(app, &engine.catalog).await;
+            freshness::check(&policy, &inputs, generation.is_some())?;
+            let proof = freshness::Proof::new(policy, &inputs);
+            if let Some(proof) = &proof {
+                if app.published_model_revision(&model).await? != request.model_revision {
+                    return Err(freshness::conflict("严格查询需要当前已发布的模型"));
+                }
+                if generation.is_none() && proof.policy.require_consistent_snapshot {
+                    request.require_consistent_snapshot(options.graph.clone());
+                }
+            }
             if let Some(generation) = generation {
                 if self.graph_partitions == 0 {
                     return Err(Error::not_found());
@@ -322,6 +350,17 @@ impl Coordinator {
                         "CSR 代次已变化，请获取已发布代次",
                     ));
                 }
+                if let Some(proof) = &proof {
+                    csr::verify_freshness(
+                        self,
+                        &model,
+                        &request.model_revision,
+                        generation,
+                        &proof.policy,
+                        &inputs,
+                    )
+                    .await?;
+                }
             }
             self.shared
                 .objects
@@ -329,10 +368,49 @@ impl Coordinator {
                 .await
                 .map_err(storage)?;
             request.timeout_ms = Some(options.timeout.as_millis().max(1) as u64);
+            let managed_ids = super::local_tables::managed::referenced(&engine.catalog);
+            let managed_only = !managed_ids.is_empty()
+                && models::physical_tables(&engine.catalog)
+                    .iter()
+                    .all(|reference| {
+                        engine
+                            .catalog
+                            .source(reference)
+                            .is_ok_and(|(_, relation, source)| match source {
+                                crate::Source::Parquet { tables } => {
+                                    tables[relation].iter().all(|p| {
+                                        crate::source::parquet_snapshot::logical_id(p).is_some()
+                                    })
+                                }
+                                _ => false,
+                            })
+                    });
+            let selection = if managed_ids.is_empty() {
+                None
+            } else {
+                let backend = self
+                    .managed
+                    .as_ref()
+                    .ok_or_else(super::local_tables::managed::unavailable)?;
+                Some(
+                    backend
+                        .pin_model(
+                            managed_ids,
+                            &model,
+                            deadline.saturating_duration_since(Instant::now()).as_secs() + 120,
+                        )
+                        .await?,
+                )
+            };
             let dispatch = Dispatch {
                 id,
                 attempt: Uuid::new_v4(),
                 request,
+                managed: selection
+                    .map(|s| s.into_dispatch())
+                    .transpose()
+                    .map_err(super::local_tables::managed::error)?
+                    .unwrap_or_default(),
             };
             let job = Job {
                 model,
@@ -340,10 +418,12 @@ impl Coordinator {
                 owner,
                 export,
                 csr_generation: generation,
+                freshness: proof,
                 attempt: dispatch.attempt,
                 worker: None,
                 worker_seen_ms: now_ms(),
                 retried: false,
+                managed_only,
                 fingerprint: fingerprint(&dispatch)?,
                 state: JobState::Running,
                 deadline_ms: now_ms()
@@ -395,7 +475,7 @@ impl Coordinator {
                     .ok_or_else(expired)?;
                 if !matches!(saved.job.state, JobState::Running) {
                     self.heartbeats.lock().unwrap().jobs.remove(&id);
-                    return self.response(id, &saved.job).await;
+                    return self.response_with_freshness(app, id, &saved.job).await;
                 }
                 if self.mark_worker_lost(id, &saved).await? {
                     return Err(worker_lost());
@@ -443,7 +523,10 @@ impl Coordinator {
             return Ok(false);
         }
         let mut job = saved.job.clone();
-        if job.csr_generation.is_some() && !job.retried && now_ms() < job.deadline_ms {
+        if (job.csr_generation.is_some() || job.managed_only)
+            && !job.retried
+            && now_ms() < job.deadline_ms
+        {
             let old_attempt = job.attempt;
             let old_key = self
                 .shared

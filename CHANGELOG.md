@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add published-model observation, reconciliation and CSR checks, free-space alerts, and S3 snapshot GC metrics to the production monitoring setup.
+- Preserve healthy legacy local-table state on startup so a readers-first rollout can return to the previous release before activating new writers.
+- Gate Debian 12 release artifacts on exact-archive smoke, real-service regressions, rolling upgrade and rollback, concurrent sync and recovery, and C/Python smoke. Tie the artifacts to the regression receipt and fixture versions.
+
 ## v1.1.0
 
 - Load configured source tables into managed Parquet copies and refresh them manually or on a schedule. Incremental refresh reads from a typed watermark and replaces rows by primary key.

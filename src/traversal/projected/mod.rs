@@ -287,7 +287,7 @@ pub(crate) async fn projection_table(
     let batch_size = scope.options.batch_size;
     let graph_budget =
         MemoryConsumer::new("GraphLake projected topology").register(&scope.runtime.memory_pool);
-    let graph = Graph::read(
+    let mut graph = Graph::read(
         catalog,
         projection,
         &labels,
@@ -303,7 +303,12 @@ pub(crate) async fn projection_table(
     )
     .await?;
     let working = graph_budget.new_empty();
-    let (scores, metrics) = algorithm.run(&graph, scope, &working).await?;
+    let projection_ready_ms = scope.elapsed_ms();
+    let (scores, mut metrics) = algorithm
+        .run(&mut graph, scope, &working, &graph_budget)
+        .await?;
+    metrics.projection_ready_ms = Some(projection_ready_ms);
+    metrics.kernel_ms = Some(scope.elapsed_ms().saturating_sub(projection_ready_ms));
     let mut buffer = Buffer::new(
         &scope.runtime.memory_pool,
         Some(&scope.runtime.disk_manager),
@@ -435,6 +440,10 @@ fn metrics(name: &'static str, graph: &Graph) -> GraphAlgorithmMetrics {
         iterations: None,
         converged: None,
         components: None,
+        execution: "local_projection",
+        workspace_bytes: None,
+        projection_ready_ms: None,
+        kernel_ms: None,
     }
 }
 
@@ -474,9 +483,10 @@ impl ProjectionAlgorithm {
 
     async fn run(
         self,
-        graph: &Graph,
+        graph: &mut Graph,
         scope: &Arc<QueryScope>,
         budget: &MemoryReservation,
+        projected: &MemoryReservation,
     ) -> Result<(Scores, GraphAlgorithmMetrics)> {
         let name = match self {
             Self::PageRank { .. } => "pagerank",
@@ -532,12 +542,26 @@ impl ProjectionAlgorithm {
                 Scores::Components(sizes)
             }
             Self::Louvain(options) | Self::Leiden(options) => {
+                let working = if graph.links.iter().any(|link| link.weight > 0.0) {
+                    stats
+                        .vertices
+                        .saturating_mul(512)
+                        .saturating_add(stats.edges.saturating_mul(256))
+                } else {
+                    0
+                };
+                stats.workspace_bytes = Some(
+                    working.saturating_add(stats.vertices.saturating_mul(4 * size_of::<usize>())),
+                );
                 let (labels, count) = communities(
                     graph,
                     scope,
                     budget,
                     options,
                     matches!(self, Self::Louvain(_)),
+                    projected,
+                    working,
+                    &stats,
                 )
                 .await?;
                 stats.components = Some(count);
@@ -558,7 +582,9 @@ impl ProjectionAlgorithm {
                 Scores::Communities(labels)
             }
             Self::Node2Vec(options) => {
-                let values = embedding::train(graph, options, scope, budget).await?;
+                stats.workspace_bytes = Some(embedding::workspace(stats.vertices, options));
+                reserve_workspace(budget, scope, stats.workspace_bytes.unwrap(), &stats)?;
+                let values = embedding::train(graph, options, scope).await?;
                 stats.iterations = Some(options.epochs);
                 Scores::Embedding {
                     values,
@@ -571,22 +597,27 @@ impl ProjectionAlgorithm {
 }
 
 async fn communities(
-    graph: &Graph,
+    graph: &mut Graph,
     scope: &Arc<QueryScope>,
     reservation: &MemoryReservation,
     options: CommunityOptions,
     louvain: bool,
+    projected: &MemoryReservation,
+    workspace: usize,
+    stats: &GraphAlgorithmMetrics,
 ) -> Result<(Vec<u64>, usize)> {
     let n = graph.vertices.len();
-    reservation.try_grow(n.saturating_mul(4 * size_of::<usize>()))?;
-    if graph.links.iter().all(|link| link.weight == 0.0) {
+    reserve_workspace(
+        reservation,
+        scope,
+        n.saturating_mul(4 * size_of::<usize>()),
+        stats,
+    )?;
+    if workspace == 0 {
         return Ok(((0..n as u64).collect(), n));
     }
     let worker = reservation.new_empty();
-    worker.try_grow(
-        n.saturating_mul(512)
-            .saturating_add(graph.links.len().saturating_mul(256)),
-    )?;
+    reserve_workspace(&worker, scope, workspace, stats)?;
     let mut builder = GraphDataBuilder::new(n);
     let mut total = 0.0;
     for (i, link) in graph.links.iter().enumerate() {
@@ -600,6 +631,10 @@ async fn communities(
         }
         cooperate(scope, i).await?;
     }
+    // The community solver owns its edge list. Only projected vertex identities
+    // are needed to render the resulting labels.
+    drop(std::mem::take(&mut graph.links));
+    projected.shrink(stats.edges.saturating_mul(2 * size_of::<graph::Link>()));
     let config = LeidenConfig {
         max_iterations: options.max_iterations,
         resolution: options.resolution,
@@ -631,6 +666,18 @@ async fn communities(
         .map(|(index, label)| *identifiers.entry(*label).or_insert(index as u64))
         .collect();
     Ok((labels, identifiers.len()))
+}
+
+fn reserve_workspace(
+    reservation: &MemoryReservation,
+    scope: &QueryScope,
+    bytes: usize,
+    stats: &GraphAlgorithmMetrics,
+) -> Result<()> {
+    reservation.try_grow(bytes).map_err(|error| anyhow::anyhow!(error).context(format!(
+        "algorithm memory budget for {} ({} projected vertices, {} internal links, {} bytes working space, {} byte query budget)",
+        stats.name, stats.vertices, stats.edges, stats.workspace_bytes.unwrap_or(bytes), scope.options.memory_bytes,
+    )))
 }
 
 async fn pagerank(

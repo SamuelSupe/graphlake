@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
+    environment:
+      POSTGRES_PASSWORD: graphlake-test-password
+    ports: ["127.0.0.1:${GRAPHLAKE_FIXTURE_POSTGRES_PORT:-25432}:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  mysql:
+    image: mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+    environment:
+      MYSQL_ROOT_PASSWORD: graphlake-test-password
+      MYSQL_ROOT_HOST: "%"
+    ports: ["127.0.0.1:${GRAPHLAKE_FIXTURE_MYSQL_PORT:-23306}:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77
+    environment:
+      CLICKHOUSE_PASSWORD: graphlake-test-password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["127.0.0.1:${GRAPHLAKE_FIXTURE_CLICKHOUSE_PORT:-28123}:8123"]
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--password=graphlake-test-password", "--query=SELECT 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  etcd:
+    image: quay.io/coreos/etcd:v3.6.5@sha256:3397341272b9e0a6f44d7e3fc7c321c6efe6cbe82ce866b9b01d0c704bfc5bf3
+    command: ["etcd", "--listen-client-urls=http://0.0.0.0:2379", "--advertise-client-urls=http://127.0.0.1:2379"]
+    ports: ["127.0.0.1:${GRAPHLAKE_FIXTURE_ETCD_PORT:-22379}:2379"]
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  s3:
+    image: rustfs/rustfs@sha256:b81d16a90ee25bd9511280127ca1471788c6e874cf0f0da759645f46b2dc1d74
+    environment:
+      RUSTFS_ACCESS_KEY: graphlake-ci
+      RUSTFS_SECRET_KEY: graphlake-test-password
+    ports: ["127.0.0.1:${GRAPHLAKE_FIXTURE_S3_PORT:-29000}:9000"]

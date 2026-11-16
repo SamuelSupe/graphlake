@@ -242,11 +242,21 @@ pub(in crate::admin) async fn export(
     if let Some(cluster) = &app.cluster {
         return cluster.execute(&app, id, principal, request, true).await;
     }
-    let (active, result, _engine, download_permit) =
+    let (active, result, engine, download_permit, policy, observations) =
         start(&app, &id, &request, &principal, false).await?;
     let _export_permit = download_permit.expect("export permit");
     let budget = app.options.spill_bytes.min(SNAPSHOT_BUDGET);
     let captured = capture_all(result, budget).await?;
+    super::freshness::recheck(
+        &app,
+        &engine.catalog,
+        &id,
+        &request.model_revision,
+        &policy,
+        &observations,
+        false,
+    )
+    .await?;
     if active.token.is_cancelled() {
         return Err(Error::new(StatusCode::CONFLICT, "cancelled", "查询已取消"));
     }

@@ -180,6 +180,16 @@ impl Driver {
             };
             stats.request();
             let pushed = match operation.operation {
+                Native::Filter => {
+                    let sql = format!("{select}{condition}");
+                    let (table, budget) =
+                        read_table(connection, &sql, &runtime, &stats, &stop, batch_size, false)?;
+                    super::PushedRead {
+                        table,
+                        budget,
+                        aggregate: None,
+                    }
+                }
                 Native::Top { order, limit } => {
                     // DuckDB tries a second row-ID scan for Top-N up to 50 rows.
                     // For unfiltered, narrow integer reads one pass avoids that
@@ -203,7 +213,12 @@ impl Driver {
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let sql = format!("{select}{condition} ORDER BY {order} LIMIT {limit}");
+                    let order = if order.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ORDER BY {order}")
+                    };
+                    let sql = format!("{select}{condition}{order} LIMIT {limit}");
                     let (table, budget) =
                         read_table(connection, &sql, &runtime, &stats, &stop, batch_size, false)?;
                     super::PushedRead {

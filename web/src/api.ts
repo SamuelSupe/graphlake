@@ -30,10 +30,31 @@ export type ModelReadiness = Omit<SourceProbe, 'status'> & {
   status: SourceProbe['status'] | 'worker_unavailable';
   workers?: { worker: number; probe: SourceProbe | null }[] | null;
 };
+export type FreshnessPolicy = {
+  max_observation_age_seconds?: number;
+  max_reconciliation_age_seconds?: number;
+  require_current_csr?: boolean;
+};
+export type SourceFreshness = {
+  source: string;
+  generation: string | null;
+  result_generation?: string;
+  observed_at_ms: number | null;
+  reconciled_at_ms: number | null;
+  deletion_capture: 'unknown' | 'reconciliation' | 'marker_and_reconciliation';
+  last_status: string | null;
+};
+export type ModelFreshness = {
+  local_tables: SourceFreshness[];
+  auto_refresh_csr: boolean;
+  csr: { generation: string; built_at_ms: number | null; current: boolean } | null;
+  refresh: { status: string; error?: string } | null;
+};
 export type Listing = { schemas: string[]; tables: string[]; columns: Column[]; truncated: boolean };
 export type PathPreview = { row: number; column: string; items: { kind: 'vertex' | 'edge'; label: string; key: string }[] };
 export type QueryResult = {
   csr_generation?: string;
+  freshness?: SourceFreshness[];
   model_revision: string;
   paths: PathPreview[];
   graph: GraphFragment;

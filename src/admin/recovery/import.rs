@@ -82,6 +82,7 @@ struct CandidateCheck {
     manifest_sha256: String,
     postgres_relations: usize,
     parquet_files: usize,
+    local_tables: usize,
 }
 
 struct Stage {
@@ -92,6 +93,7 @@ struct Stage {
     inbox: PathBuf,
     target: PathBuf,
     dsn_env: String,
+    managed: Option<crate::admin::local_tables::managed::Managed>,
     job: Arc<Mutex<()>>,
     review: Arc<Mutex<()>>,
     shutdown: CancellationToken,
@@ -124,18 +126,26 @@ pub(in crate::admin) async fn serve(
     origin: String,
     target: PathBuf,
     shutdown: CancellationToken,
+    managed: Option<crate::admin::local_tables::managed::Managed>,
 ) -> Result<()> {
     leader
         .ensure_empty_checkpoint()
         .await
         .map_err(|error| anyhow::anyhow!(error.message))?;
+    ensure!(
+        leader
+            .get::<String>(backup::CLI_RESTORE_KEY)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?
+            .is_none(),
+        "this namespace is reserved for CLI recovery; retry backup restore"
+    );
     let inbox = inbox()?;
     ensure!(
         !inbox.starts_with(&target) && !target.starts_with(&inbox),
         "restore inbox and catalog must be disjoint"
     );
-    let dsn_env = std::env::var("GRAPHLAKE_RESTORE_POSTGRES_DSN_ENV")
-        .context("missing GRAPHLAKE_RESTORE_POSTGRES_DSN_ENV")?;
+    let dsn_env = std::env::var("GRAPHLAKE_RESTORE_POSTGRES_DSN_ENV").unwrap_or_default();
     // Persist the reservation before the first web request. Peers may never bootstrap a
     // normal catalog in this namespace, even before an operator picks a backup.
     if leader
@@ -160,6 +170,7 @@ pub(in crate::admin) async fn serve(
         inbox,
         target,
         dsn_env,
+        managed,
         token: configured_token()?,
         job: Arc::new(Mutex::new(())),
         review: Arc::new(Mutex::new(())),
@@ -354,12 +365,19 @@ async fn check_candidate(
                 .map_err(|_| super::failed("异地备份目录不可读"))?;
             let (backup, manifest, manifest_sha256) = read_bundle(&dir, &stage.dsn_env)
                 .map_err(|error| super::failed(error.to_string()))?;
+            backup
+                .validate_target(&stage.target)
+                .map_err(|error| super::failed(error.to_string()))?;
             Ok(Json(CandidateCheck {
                 bundle: form.bundle,
                 checkpoint_ms: backup.created_at_ms,
                 manifest_sha256,
-                postgres_relations: manifest.postgres.relations.len(),
+                postgres_relations: manifest
+                    .postgres
+                    .as_ref()
+                    .map_or(0, |pg| pg.relations.len()),
                 parquet_files: manifest.parquet.len(),
+                local_tables: backup.local_count(),
             }))
         }),
     )
@@ -377,7 +395,10 @@ fn read_bundle(dir: &FsPath, dsn_env: &str) -> Result<(backup::Backup, Manifest,
         "恢复清单与控制备份摘要不匹配"
     );
     ensure!(
-        manifest.postgres.dsn_env == dsn_env,
+        manifest
+            .postgres
+            .as_ref()
+            .is_none_or(|pg| pg.dsn_env == dsn_env),
         "清单中的 PostgreSQL 连接与目标站配置不一致"
     );
     Ok((backup, manifest, digest))
@@ -493,29 +514,37 @@ impl Stage {
                 .is_none_or(|bound| bound == &manifest_sha256),
             "此备份清单已变更，请恢复原清单"
         );
-        let postgres = data::Destination::load(&self.dsn_env)?;
-        let mut archive = data::archive(&bundle, &manifest.postgres.dump_sha256).await?;
-        let empty = data::Destination::empty(&self.dsn_env).await?;
-        if !empty {
-            ensure!(
-                job.postgres_started,
-                "目标 PostgreSQL 数据库已有对象，请配置空的恢复数据库"
-            );
-            data::Destination::verify(&manifest.postgres).await?;
+        let postgres = if let Some(pg) = &manifest.postgres {
+            let target = data::Destination::load(&self.dsn_env)?;
+            let mut archive = data::archive(&bundle, &pg.dump_sha256).await?;
+            if data::Destination::empty(&self.dsn_env).await? {
+                data::Destination::check_archive(&mut archive).await?;
+                Some((target, archive, pg))
+            } else {
+                ensure!(
+                    job.postgres_started,
+                    "目标 PostgreSQL 数据库已有对象，请配置空的恢复数据库"
+                );
+                data::Destination::verify(pg).await?;
+                None
+            }
         } else {
-            data::Destination::check_archive(&mut archive).await?;
-        }
+            None
+        };
         job.bound = Some(manifest_sha256.clone());
         self.advance(job, revision, Phase::Parquet).await?;
         data::parquet(&bundle, &self.target, &manifest).await?;
+        let backup = backup
+            .install_local(&self.leader, &bundle, &self.target, self.managed.as_ref())
+            .await?;
 
         // Pin this step before starting the transaction. On interrupt the next owner
         // can distinguish a committed restore from a target that was already populated.
-        job.postgres_started = true;
-        self.advance(job, revision, Phase::Postgres).await?;
-        if empty {
+        if let Some((postgres, archive, pg)) = postgres {
+            job.postgres_started = true;
+            self.advance(job, revision, Phase::Postgres).await?;
             postgres.restore(archive).await?;
-            data::Destination::verify(&manifest.postgres).await?;
+            data::Destination::verify(pg).await?;
         }
 
         self.advance(job, revision, Phase::Control).await?;
@@ -524,6 +553,7 @@ impl Stage {
             token_sha256: self.token.clone(),
             approved: false,
             bundle: Some(job.bundle.clone()),
+            local_checkpoint: (backup.local_count() != 0).then(|| backup.sha256.clone()),
         };
         backup.restore(&self.leader, &gate).await?;
         Ok(())

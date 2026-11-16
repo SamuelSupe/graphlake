@@ -10,17 +10,28 @@ use datafusion::{
         datatypes::{DataType, Field, Schema, SchemaRef},
     },
     catalog::TableProvider,
-    common::ScalarValue,
+    common::{DataFusionError, ScalarValue},
     execution::{
         memory_pool::{MemoryConsumer, MemoryReservation},
         runtime_env::RuntimeEnv,
     },
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
-use rusqlite::{Connection, OpenFlags, types::ValueRef};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, StatementStatus, params_from_iter,
+    types::{Value, ValueRef},
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{ReadStats, snapshot::Buffer};
-use crate::{Predicate, catalog::ident};
+use crate::{
+    Comparison, Predicate,
+    catalog::ident,
+    engine::{
+        read_filters,
+        sql_read::{Native, Pushdown},
+    },
+};
 
 pub(crate) struct Snapshot {
     connection: Arc<Mutex<Connection>>,
@@ -95,82 +106,263 @@ impl Snapshot {
     }
 
     pub(crate) async fn table(
-        &self,
+        self: &Arc<Self>,
         relation: &str,
         columns: &[String],
         filters: &[Predicate],
+        native: Option<(&[String], &Pushdown)>,
+        stream: bool,
+        raw_table: bool,
         runtime: &Arc<RuntimeEnv>,
         batch_size: usize,
         explain_only: bool,
-    ) -> Result<(Arc<dyn TableProvider>, MemoryReservation)> {
-        let relation = relation.to_owned();
-        let table_name = relation.clone();
+    ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, bool)> {
+        let name = relation.to_owned();
         let columns = columns.to_vec();
         let filters = filters.to_vec();
-        let runtime = Arc::clone(runtime);
-        let stats = Arc::clone(&self.stats);
-        let stop = self.cancelled.clone();
+        let native = native.map(|(keys, plan)| (keys.to_vec(), plan.clone()));
+        let snapshot = self.clone();
+        let runtime = runtime.clone();
         self.run(move |connection| {
-            let schema = schema(connection, &relation, &columns)?;
+            let schema = schema(connection, &name, &columns)?;
             let mut buffer = Buffer::new(
                 &runtime.memory_pool,
                 (!explain_only).then_some(&runtime.disk_manager),
             );
             if explain_only {
-                return buffer.finish_schema(schema);
+                let (table, budget) = buffer.finish_schema(schema)?;
+                return Ok((table, budget, false));
             }
-            let sql = format!(
-                "SELECT {} FROM {}{}",
-                schema
-                    .fields()
-                    .iter()
-                    .map(|field| ident(field.name()))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                ident(&relation),
-                crate::engine::read_filters::where_clause(&filters, &schema, ident)
-            );
-            let mut statement = connection.prepare(&sql)?;
-            let mut rows = statement.query([])?;
-            let raw = MemoryConsumer::new("GraphLake SQLite batch").register(&runtime.memory_pool);
-            let mut values = vec![Vec::new(); schema.fields().len()];
-            let mut count = 0;
-            loop {
-                ensure!(!stop.is_cancelled(), "SQLite read cancelled");
-                let row = rows.next()?;
-                let done = row.is_none();
-                if let Some(row) = row {
-                    for (index, field) in schema.fields().iter().enumerate() {
-                        let value = row.get_ref(index)?;
-                        let bytes = match value {
-                            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
-                            _ => 0,
-                        };
-                        raw.try_grow(bytes.saturating_add(2 * size_of::<ScalarValue>()))?;
-                        values[index].push(scalar(value, field)?);
-                    }
-                    count += 1;
-                }
-                if count > 0 && (done || count == batch_size) {
-                    let arrays = values
-                        .iter_mut()
-                        .map(|values| ScalarValue::iter_to_array(values.drain(..)))
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
-                    stats.sqlite_batch(&batch);
-                    buffer.push(batch)?;
-                    raw.free();
-                    count = 0;
-                }
-                if done {
-                    break;
-                }
+            let pushed = native
+                .as_ref()
+                .map(|(keys, plan)| native_scan(connection, &name, &schema, keys, plan))
+                .transpose()?
+                .flatten();
+            let proven = pushed.is_some();
+            let (suffix, params) = pushed.unwrap_or_else(|| {
+                (
+                    read_filters::where_clause(&filters, &schema, ident),
+                    Vec::new(),
+                )
+            });
+            let selected = schema
+                .fields()
+                .iter()
+                .map(|field| ident(field.name()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let scan = Scan {
+                schema: schema.clone(),
+                sql: format!("SELECT {selected} FROM {}{suffix}", ident(&name)),
+                params,
+                batch_size,
+            };
+            if stream && (proven || raw_table) {
+                let table = super::snapshot::stream_once(schema, move |context| {
+                    let schema = scan.schema.clone();
+                    let cancellation = snapshot.cancelled.clone().drop_guard();
+                    let pool = context.runtime_env().memory_pool.clone();
+                    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+                    let task = tokio::task::spawn_blocking(move || {
+                        let connection = snapshot
+                            .connection
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("SQLite connection poisoned"))?;
+                        snapshot.stats.request();
+                        scan.read(&connection, &snapshot, &pool, |batch| {
+                            let memory =
+                                MemoryConsumer::new("GraphLake SQLite output").register(&pool);
+                            memory.try_grow(batch.get_array_memory_size())?;
+                            Ok(sender.blocking_send((batch, memory)).is_ok())
+                        })
+                    });
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        schema,
+                        async_stream::try_stream! {
+                            let _cancel_on_drop = cancellation;
+                            while let Some((batch, _memory)) = receiver.recv().await {
+                                yield batch;
+                            }
+                            task.await.map_err(|error| DataFusionError::External(error.into()))?
+                                .map_err(|error| DataFusionError::External(error.into()))?;
+                        },
+                    ))
+                })?;
+                let budget =
+                    MemoryConsumer::new("GraphLake SQLite stream").register(&runtime.memory_pool);
+                return Ok((table, budget, proven));
             }
-            buffer.finish(schema, &stats)
+            scan.read(connection, &snapshot, &runtime.memory_pool, |batch| {
+                buffer.push(batch)?;
+                Ok(true)
+            })?;
+            let (table, budget) = buffer.finish(schema, &snapshot.stats)?;
+            Ok((table, budget, proven))
         })
         .await
-        .with_context(|| format!("reading SQLite table {table_name}"))
+        .with_context(|| format!("reading SQLite table {relation}"))
     }
+}
+
+struct Scan {
+    schema: SchemaRef,
+    sql: String,
+    params: Vec<Value>,
+    batch_size: usize,
+}
+
+impl Scan {
+    fn read(
+        self,
+        connection: &Connection,
+        snapshot: &Snapshot,
+        pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        mut emit: impl FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<()> {
+        let mut statement = connection.prepare(&self.sql)?;
+        let mut rows = statement.query(params_from_iter(self.params))?;
+        let raw = MemoryConsumer::new("GraphLake SQLite batch").register(pool);
+        let mut columns = vec![Vec::new(); self.schema.fields().len()];
+        let mut count = 0;
+        loop {
+            ensure!(!snapshot.cancelled.is_cancelled(), "SQLite read cancelled");
+            let row = rows.next()?;
+            let done = row.is_none();
+            if let Some(row) = row {
+                for (index, field) in self.schema.fields().iter().enumerate() {
+                    let value = row.get_ref(index)?;
+                    let bytes = match value {
+                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
+                        _ => 0,
+                    };
+                    raw.try_grow(bytes.saturating_add(2 * size_of::<ScalarValue>()))?;
+                    columns[index].push(scalar(value, field)?);
+                }
+                count += 1;
+            }
+            if count > 0 && (done || count == self.batch_size) {
+                let arrays = columns
+                    .iter_mut()
+                    .map(|values| ScalarValue::iter_to_array(values.drain(..)))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
+                snapshot.stats.sqlite_batch(&batch);
+                if let Some(statement) = rows.as_ref() {
+                    snapshot
+                        .stats
+                        .sqlite_fullscan(statement.reset_status(StatementStatus::FullscanStep));
+                }
+                raw.free();
+                if !emit(batch)? {
+                    break;
+                }
+                count = 0;
+            }
+            if done {
+                break;
+            }
+        }
+        drop(rows);
+        snapshot
+            .stats
+            .sqlite_fullscan(statement.get_status(StatementStatus::FullscanStep));
+        Ok(())
+    }
+}
+
+fn native_scan(
+    connection: &Connection,
+    relation: &str,
+    schema: &Schema,
+    keys: &[String],
+    plan: &Pushdown,
+) -> Result<Option<(String, Vec<Value>)>> {
+    let suffix = match &plan.operation {
+        Native::Filter => String::new(),
+        Native::Top { order, limit } => {
+            if !order.iter().all(|(name, _)| {
+                schema
+                    .field_with_name(name)
+                    .is_ok_and(|field| field.data_type().is_integer())
+            }) {
+                return Ok(None);
+            }
+            format!("{} LIMIT {limit}", super::order_by(order, ident))
+        }
+        Native::Aggregate { .. } => return Ok(None),
+    };
+    let Some((strict, without_rowid)) = connection
+        .query_row(
+            "SELECT strict, wr FROM pragma_table_list(?1) WHERE schema='main' AND type='table'",
+            [relation],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let mut primary = connection
+        .prepare("SELECT name, type FROM pragma_table_xinfo(?1) WHERE pk > 0 ORDER BY pk")?;
+    let primary = primary
+        .query_map([relation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if primary.len() != keys.len() || !primary.iter().all(|(name, _)| keys.contains(name)) {
+        return Ok(None);
+    }
+    if !strict {
+        // Only a rowid alias guarantees integer storage in a legacy rowid table.
+        // INTEGER PRIMARY KEY DESC has a separate PK index and is not an alias.
+        let rowid_alias = !without_rowid
+            && primary.len() == 1
+            && primary[0].1.eq_ignore_ascii_case("INTEGER")
+            && schema
+                .fields()
+                .iter()
+                .all(|field| field.name() == &primary[0].0)
+            && connection.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM pragma_index_list(?1) WHERE origin='pk')",
+                [relation],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if !rowid_alias {
+            return Ok(None);
+        }
+    }
+    // Bypass the decoder only for columns whose storage class is fixed.
+    if !schema.fields().iter().all(|field| {
+        matches!(
+            field.data_type(),
+            DataType::Int64 | DataType::Utf8 | DataType::Binary
+        )
+    }) {
+        return Ok(None);
+    }
+    let mut terms = keys
+        .iter()
+        .map(|key| format!("{} IS NOT NULL", ident(key)))
+        .collect::<Vec<_>>();
+    let mut params = Vec::new();
+    for predicate in &plan.filters {
+        if let Some(term) = read_filters::sql_term(predicate, schema, ident) {
+            terms.push(term);
+        } else if predicate.op == Comparison::Eq
+            && schema
+                .field_with_name(&predicate.column)
+                .is_ok_and(|field| field.data_type() == &DataType::Utf8)
+            && let Some(value) = predicate.value.as_str()
+        {
+            terms.push(format!("{} COLLATE BINARY = ?", ident(&predicate.column)));
+            params.push(Value::Text(value.to_owned()));
+        } else {
+            return Ok(None);
+        }
+    }
+    Ok(Some((
+        format!(" WHERE {}{suffix}", terms.join(" AND ")),
+        params,
+    )))
 }
 
 fn schema(connection: &Connection, relation: &str, columns: &[String]) -> Result<SchemaRef> {

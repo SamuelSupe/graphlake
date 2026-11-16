@@ -23,6 +23,13 @@ stage=$(mktemp -d)
 publish=
 trap 'rm -rf -- "$stage"; if [ -n "$publish" ]; then rm -rf -- "$publish"; fi' EXIT
 base_commit=$(git rev-parse HEAD)
+receipt=${GRAPHLAKE_REGRESSION_EVIDENCE:-}
+if [ -n "$receipt" ]; then
+    grep -Fxq "git_base=$base_commit" "$receipt"
+    grep -E '^[0-9a-f]{64}  (Cargo.lock|web/package-lock.json|tests/production-compose.yml)$' "$receipt" > "$stage/regression-inputs"
+    test "$(wc -l < "$stage/regression-inputs")" -eq 3
+    sha256sum -c "$stage/regression-inputs" >&2
+fi
 archive_source() {
     git ls-files -c -o --exclude-standard -z > "$stage/source-files"
     sort -zu "$stage/source-files" > "$stage/source-files-sorted"
@@ -89,6 +96,12 @@ install -m 0755 deploy/graphlake-ingress-ready deploy/graphlake-monitor "$stage/
     rustc -vV
     cargo --version
     printf 'glibc_required=%s\n' "$glibc_required"
+    printf 'cargo_lock_sha256=%s\nfixture_compose_sha256=%s\n' \
+        "$(sha256sum Cargo.lock | cut -d ' ' -f1)" \
+        "$(sha256sum tests/production-compose.yml | cut -d ' ' -f1)"
+    if [ -n "$receipt" ]; then
+        printf 'regression_receipt_sha256=%s\n' "$(sha256sum "$receipt" | cut -d ' ' -f1)"
+    fi
     cd "$stage/$name"
     find . -type f ! -name BUILD-INFO -print0 | sort -z | xargs -0 sha256sum
 } > "$stage/$name/BUILD-INFO"

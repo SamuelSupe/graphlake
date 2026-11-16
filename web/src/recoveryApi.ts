@@ -10,6 +10,7 @@ export type RecoveryPointCheck = {
   manifest_sha256: string;
   postgres_relations: number;
   parquet_files: number;
+  local_tables?: number;
 };
 
 export async function recovery<T>(action: 'status' | 'check' | 'verify' | 'backups' | 'import', token: string, options?: RequestInit): Promise<T> {

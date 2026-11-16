@@ -266,6 +266,7 @@ impl Drop for Lease {
 #[derive(Debug, Serialize)]
 pub struct QueryMetrics {
     pub elapsed_ms: u64,
+    pub first_batch_ms: Option<u64>,
     pub output_rows: u64,
     pub peak_reserved_bytes: usize,
     pub active_spill_bytes: u64,
@@ -298,6 +299,10 @@ impl QueryResult {
     /// Return the metrics accumulated so far. Consume the stream to completion for final counts.
     pub fn metrics(&self) -> QueryMetrics {
         QueryMetrics {
+            first_batch_ms: match self.scope.first_batch_ms.load(Ordering::Relaxed) {
+                u64::MAX => None,
+                value => Some(value),
+            },
             elapsed_ms: self
                 .scope
                 .finished_ms
@@ -353,6 +358,7 @@ pub(crate) struct QueryScope {
     pool: Arc<PeakRecordingPool>,
     pub(crate) reads: Arc<ReadStats>,
     output_rows: AtomicU64,
+    first_batch_ms: AtomicU64,
     finished_ms: Mutex<Option<u64>>,
     spilled_bytes: AtomicU64,
     intermediate_spilled_bytes: Arc<AtomicU64>,
@@ -390,6 +396,7 @@ impl QueryScope {
             pool,
             reads: Arc::default(),
             output_rows: AtomicU64::new(0),
+            first_batch_ms: AtomicU64::new(u64::MAX),
             finished_ms: Mutex::new(None),
             spilled_bytes: AtomicU64::new(0),
             intermediate_spilled_bytes: Arc::default(),
@@ -531,6 +538,12 @@ impl QueryScope {
             let completion = loop {
                 match scope.run(async { Ok(batches.try_next().await?) }).await {
                     Ok(Some(batch)) => {
+                        if batch.num_rows() != 0 {
+                            let _ = scope.first_batch_ms.compare_exchange(
+                                u64::MAX, scope.start.elapsed().as_millis() as u64,
+                                Ordering::Relaxed, Ordering::Relaxed,
+                            );
+                        }
                         scope.output_rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
                         yield batch;
                     }

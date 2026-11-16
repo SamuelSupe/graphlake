@@ -22,6 +22,16 @@ pub(super) struct Config {
     pub distributed_partitions: usize,
     #[serde(default = "default_memory")]
     pub memory_mib: usize,
+    #[serde(default = "default_process_memory")]
+    pub process_memory_mib: usize,
+    #[serde(default)]
+    pub distributed_min_rows: usize,
+    #[serde(default)]
+    pub(super) managed_local_tables: bool,
+    #[serde(default = "default_local_retention")]
+    pub(super) local_snapshot_retention_seconds: u64,
+    #[serde(default = "default_local_gc_grace")]
+    pub(super) local_snapshot_gc_grace_seconds: u64,
     ca_file: Option<PathBuf>,
     identity_file: Option<PathBuf>,
 }
@@ -60,12 +70,15 @@ impl Config {
         ensure!(
             config.distributed_partitions == 0
                 || (2..=8).contains(&config.distributed_partitions)
-                    && (2..=32).contains(&config.workers.len()),
-            "distributed execution requires 2–8 partitions and 2–32 workers"
+                    && (1..=32).contains(&config.workers.len()),
+            "distributed execution requires 2–8 partitions and 1–32 workers"
         );
         ensure!(
-            (16..=256).contains(&config.memory_mib),
-            "cluster memory_mib must be 16–256"
+            (16..=2048).contains(&config.memory_mib)
+                && (16..=2048).contains(&config.process_memory_mib)
+                && config.memory_mib * (1 + usize::from(config.distributed_partitions > 0))
+                    <= config.process_memory_mib,
+            "cluster memory_mib must fit the 16–2048 MiB process_memory_mib budget, reserving one remote stage when distributed execution is enabled"
         );
         config.validate_endpoints()?;
         let token = std::env::var(&config.token_env).context("reading cluster token")?;
@@ -84,6 +97,15 @@ impl Config {
             &config.name,
         );
         let objects = Objects::open(&config.storage, &config.name)?;
+        ensure!(
+            !config.managed_local_tables || objects.remote(),
+            "managed local tables require S3-compatible storage"
+        );
+        ensure!(
+            (1..=2_592_000).contains(&config.local_snapshot_retention_seconds)
+                && (1..=86_400).contains(&config.local_snapshot_gc_grace_seconds),
+            "invalid local snapshot retention or GC grace"
+        );
         Ok((
             config,
             Shared {
@@ -152,6 +174,10 @@ impl Config {
     }
 }
 
+fn default_process_memory() -> usize {
+    2048
+}
+
 fn metadata_endpoints<'de, D: serde::Deserializer<'de>>(
     decoder: D,
 ) -> Result<Vec<url::Url>, D::Error> {
@@ -169,4 +195,11 @@ fn metadata_endpoints<'de, D: serde::Deserializer<'de>>(
 
 fn default_memory() -> usize {
     256
+}
+
+fn default_local_retention() -> u64 {
+    86_400
+}
+fn default_local_gc_grace() -> u64 {
+    300
 }

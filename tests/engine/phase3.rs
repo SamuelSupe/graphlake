@@ -231,14 +231,18 @@ async fn mysql_snapshot_joins_delta_and_preserves_exact_types() -> Result<()> {
             "status": "active", "balance": "123456789012345678901234567890123456.78",
             "unsigned_value": "18446744073709551615", "created": "2026-11-11T00:00:00.123456Z",
         })]);
-        assert_eq!(pinned.metrics().reads.mysql_rows, 4);
+        assert_eq!(pinned.metrics().reads.mysql_rows, 1);
         assert!(pinned.versions[0].consistency.contains("MySQL InnoDB"));
         let mut joined = engine.query(Language::Cypher, TWO_HOPS, options.clone()).await?;
         assert_eq!(rows(&mut joined).await?, expected_two_hops());
         assert_eq!(joined.versions.len(), 2);
         let limited = engine.query(Language::Sql, "SELECT id FROM \"Account\"",
             QueryOptions { memory_bytes: 16, ..options }).await;
-        let error = limited.err().context("expected MySQL materialization budget failure")?;
+        let limited = match limited {
+            Ok(mut query) => rows(&mut query).await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        let error = limited.err().context("expected the MySQL scan to exceed this memory budget")?;
         assert!(format!("{error:#}").contains("Resources exhausted"));
         Ok::<(), anyhow::Error>(())
     }.await;

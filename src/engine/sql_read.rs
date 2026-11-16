@@ -11,6 +11,7 @@ use crate::{Catalog, Predicate};
 pub(crate) struct Read {
     pub(super) columns: Option<BTreeSet<String>>,
     pub(super) native: Option<(String, Pushdown)>,
+    pub(super) single: Option<String>,
 }
 
 #[derive(Clone)]
@@ -21,6 +22,7 @@ pub(crate) struct Pushdown {
 
 #[derive(Clone)]
 pub(crate) enum Native {
+    Filter,
     Top {
         order: Vec<(String, bool)>,
         limit: u64,
@@ -99,7 +101,141 @@ pub(super) fn hint(statement: &Statement, catalog: &Catalog) -> Option<Read> {
         })
         .then_some(visitor.names);
     let native = native(query, select, catalog);
-    Some(Read { columns, native })
+    // A blocking sort or grouping can exhaust the pool while the producer
+    // still needs space for its next batch. Keep the spillable snapshot there.
+    let single = match select.from.as_slice() {
+        [from]
+            if from.joins.is_empty()
+                && query.order_by.is_none()
+                && select.distinct.is_none()
+                && select.having.is_none()
+                && select.qualify.is_none()
+                && matches!(&select.group_by, GroupByExpr::Expressions(e, m) if e.is_empty() && m.is_empty()) =>
+        {
+            table(&from.relation)
+                .map(|(label, _)| label)
+                .filter(|label| direct_node(catalog, label))
+        }
+        _ => None,
+    };
+    Some(Read {
+        columns,
+        native,
+        single,
+    })
+}
+
+fn direct_node(catalog: &Catalog, label: &str) -> bool {
+    catalog
+        .nodes
+        .get(label)
+        .is_some_and(|node| node.inputs.is_empty() && node.scd2.is_none() && !node.key.is_empty())
+}
+
+/// The graph compilers wrap a direct scan in projections. Only an unordered
+/// outer LIMIT can cross these wrappers, and only if no wrapper filters rows.
+pub(super) fn graph_hint(statement: &Statement, catalog: &Catalog) -> Option<Read> {
+    let Statement::Query(root) = statement else {
+        return None;
+    };
+    let mut query = root.as_ref();
+    let mut limit = None;
+    loop {
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        let [from] = select.from.as_slice() else {
+            return None;
+        };
+        if query.with.is_some()
+            || query.fetch.is_some()
+            || query.order_by.is_some()
+            || !from.joins.is_empty()
+            || select.distinct.is_some()
+            || select.having.is_some()
+            || select.qualify.is_some()
+            || !matches!(&select.group_by, GroupByExpr::Expressions(e, m) if e.is_empty() && m.is_empty())
+            || !select.projection.iter().all(graph_projection)
+        {
+            return None;
+        }
+        if let Some(clause) = &query.limit_clause {
+            if !std::ptr::eq(query, root.as_ref()) {
+                return None;
+            }
+            let LimitClause::LimitOffset {
+                limit: Some(Expr::Value(value)),
+                offset: None,
+                limit_by,
+            } = clause
+            else {
+                return None;
+            };
+            let Value::Number(value, _) = &value.value else {
+                return None;
+            };
+            if !limit_by.is_empty() {
+                return None;
+            }
+            limit = Some(value.parse::<i64>().ok().filter(|limit| *limit > 0)? as u64);
+        }
+        if let TableFactor::Derived {
+            lateral: false,
+            subquery,
+            ..
+        } = &from.relation
+        {
+            if select.selection.is_some() {
+                return None;
+            }
+            query = subquery;
+            continue;
+        }
+        let (label, qualifier) = table(&from.relation)?;
+        let node = catalog.nodes.get(&label)?;
+        if !node.inputs.is_empty() || node.scd2.is_some() || node.key.is_empty() {
+            return None;
+        }
+        let mut filters = Vec::new();
+        if select
+            .selection
+            .as_ref()
+            .is_some_and(|expr| !super::read_filters::exact(expr, &qualifier, &mut filters))
+        {
+            return None;
+        }
+        let operation = match limit {
+            Some(limit) => Some(Native::Top {
+                limit,
+                order: Vec::new(),
+            }),
+            None if !filters.is_empty() => Some(Native::Filter),
+            None => None,
+        };
+        return Some(Read {
+            columns: None,
+            native: operation.map(|operation| (label.clone(), Pushdown { operation, filters })),
+            single: Some(label),
+        });
+    }
+}
+
+fn graph_projection(item: &SelectItem) -> bool {
+    let expr = match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return true,
+        _ => return false,
+    };
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
+        Expr::Function(function)
+            if function_name(function).as_deref() == Some("__graphlake_cypher_public") =>
+        {
+            matches!(&function.args, FunctionArguments::List(args)
+                if matches!(args.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(_)))]))
+        }
+        _ => false,
+    }
 }
 
 fn name(ident: &Ident) -> String {
@@ -250,12 +386,31 @@ fn native(query: &Query, select: &Select, catalog: &Catalog) -> Option<(String, 
             .parse::<u64>()
             .ok()
             .filter(|limit| i64::try_from(*limit).is_ok())?;
-        if limit == 0 || !limit_by.is_empty() || !select.projection.iter().all(|item| {
-            matches!(item, SelectItem::UnnamedExpr(expr) if column(expr, &qualifier).is_some())
-        }) {
+        if limit == 0
+            || !limit_by.is_empty()
+            || !select.projection.iter().all(|item| match item {
+                SelectItem::UnnamedExpr(expr) => column(expr, &qualifier).is_some(),
+                SelectItem::ExprWithAlias { expr, .. } if query.order_by.is_none() => {
+                    column(expr, &qualifier).is_some()
+                }
+                SelectItem::Wildcard(options) => options == &Default::default(),
+                _ => false,
+            })
+        {
             return None;
         }
-        let ordering = query.order_by.as_ref()?;
+        let Some(ordering) = query.order_by.as_ref() else {
+            return Some((
+                label,
+                Pushdown {
+                    operation: Native::Top {
+                        limit,
+                        order: Vec::new(),
+                    },
+                    filters,
+                },
+            ));
+        };
         let OrderByKind::Expressions(terms) = &ordering.kind else {
             return None;
         };
@@ -295,7 +450,13 @@ fn native(query: &Query, select: &Select, catalog: &Catalog) -> Option<(String, 
             },
         ] = select.projection.as_slice()
         else {
-            return None;
+            return (!filters.is_empty()).then_some((
+                label,
+                Pushdown {
+                    operation: Native::Filter,
+                    filters,
+                },
+            ));
         };
         if function.over.is_some()
             || function.filter.is_some()

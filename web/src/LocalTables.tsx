@@ -8,7 +8,7 @@ import './localTables.css';
 
 export type Mode = 'full' | 'incremental';
 type Run = { id: string; mode: Mode; trigger: string; status: string; started_at_ms: number; finished_at_ms: number | null; loaded_rows: number | null; total_rows: number | null; error: string | null };
-export type LocalTable = { name: string; source_table: string; columns: string[]; key_columns: string[]; watermark_column: string | null; mode: Mode; interval_seconds: number | null; timeout_seconds: number; revision: string; path: string; ready: boolean; next_run_at_ms: number | null; history: Run[] };
+export type LocalTable = { name: string; source_table: string; columns: string[]; key_columns: string[]; watermark_column: string | null; mode: Mode; interval_seconds: number | null; timeout_seconds: number; revision: string; path: string; reference_path?: string; schedule_paused?: boolean; ready: boolean; next_run_at_ms: number | null; reconcile_interval_seconds?: number | null; next_reconcile_at_ms?: number | null; reconciled_at_ms?: number | null; history: Run[] };
 const statuses: Record<string, string> = { running: t('同步中'), succeeded: t('同步成功'), failed: t('同步失败'), interrupted: t('已中断'), cancelled: t('已取消') };
 const time = (ms: number | null) => ms ? new Date(ms).toLocaleString(locale) : '—';
 const needsAttention = (table: LocalTable) => ['failed', 'interrupted'].includes(table.history[0]?.status);
@@ -75,7 +75,7 @@ export default function LocalTables({ saved, clean, close, attach }: {
     { label: t('本地表'), count: tables?.length, Icon: Database, kind: 'total' },
     { label: t('副本已就绪'), count: tables?.filter(table => table.ready).length, Icon: CheckCircle2, kind: 'ready' },
     { label: t('同步中'), count: tables?.filter(table => table.history[0]?.status === 'running').length, Icon: RefreshCw, kind: 'running' },
-    { label: t('定时刷新'), count: tables?.filter(table => table.interval_seconds).length, Icon: Clock3, kind: 'scheduled' },
+    { label: t('定时刷新'), count: tables?.filter(table => table.interval_seconds && !table.schedule_paused).length, Icon: Clock3, kind: 'scheduled' },
   ];
 
   return <Modal title={t('本地表与数据同步')} description={t('管理外部源表的本地副本、刷新策略与加载记录。')} size="wide" close={close}>
@@ -104,13 +104,13 @@ export default function LocalTables({ saved, clean, close, attach }: {
           <div className="sync-source-line"><span><Database size={14} aria-hidden="true" />{t('外部来源')}</span><code>{table.source_table}</code><ArrowRight size={14} aria-hidden="true" /><span className="sync-local-chip">{t('本地副本')}</span></div>
           <dl className="local-table-facts"><div className="sync-row-count"><dt>{t('最近成功行数')}</dt><dd>{success?.total_rows?.toLocaleString(locale) ?? '—'}<small>{t('行')}</small></dd></div>
             <div><dt>{t('刷新策略')}</dt><dd>{modeName(table.mode)}</dd><span><Clock3 size={12} aria-hidden="true" />{intervalName(table.interval_seconds)}</span></div>
-            <div><dt>{t('最近成功')}</dt><dd>{success ? time(success.finished_at_ms) : t('尚未完成')}</dd><span>{success ? t('耗时 {0}', duration(success)) : t('加载后可查询本地副本')}</span></div>
-            <div><dt>{t('下次刷新')}</dt><dd>{running && table.interval_seconds ? t('本次完成后计时') : table.next_run_at_ms ? time(table.next_run_at_ms) : t('未启用定时')}</dd><span>{table.watermark_column ? t('增量字段 · {0}', table.watermark_column) : t('完整读取来源表')}</span></div></dl>
+            <div><dt>{t('最近全量对账')}</dt><dd>{time(table.reconciled_at_ms ?? null)}</dd><span>{table.schedule_paused && table.reconcile_interval_seconds ? t('定时对账已暂停') : table.next_reconcile_at_ms ? t('下次 {0}', time(table.next_reconcile_at_ms)) : t('手动对账')}</span></div>
+            <div><dt>{t('下次刷新')}</dt><dd>{table.schedule_paused ? t('恢复后已暂停') : running && table.interval_seconds ? t('本次完成后计时') : table.next_run_at_ms ? time(table.next_run_at_ms) : t('未启用定时')}</dd><span>{table.watermark_column ? t('增量字段 · {0}', table.watermark_column) : t('完整读取来源表')}</span></div></dl>
           {run?.error && <p className="sync-run-error"><TriangleAlert size={14} aria-hidden="true" />{diagnosticText(run.error)}</p>}
           <footer className="local-table-actions"><div>
             {running ? <button className="button compact" disabled={locked} onClick={() => void action(table.name, 'cancel')}><Pause size={14} />{t('取消加载')}</button>
               : <button className="button compact sync-primary" disabled={locked} onClick={() => void action(table.name, 'load', { mode: table.mode })}><RefreshCw size={14} />{table.ready ? t('立即同步') : t('加载副本')}</button>}
-            <button className="button compact sync-quiet" onClick={() => setEditing(table)}><Settings2 size={14} />{t('刷新配置')}</button>
+            <button className="button compact sync-quiet" onClick={() => setEditing(table)}><Settings2 size={14} />{table.schedule_paused ? t('重新启用定时') : t('刷新配置')}</button>
             <button className="button compact sync-quiet" onClick={() => setHistory(table.name)}><History size={14} />{t('加载历史')}</button>
           </div><details className="sync-more"><summary>{t('更多操作')}<ChevronDown size={14} aria-hidden="true" /></summary><div>
             <button disabled={running || locked} onClick={event => { event.currentTarget.closest('details')?.removeAttribute('open'); void action(table.name, 'load', { mode: 'full' }); }}><ArrowDownToLine size={15} />{t('从源表全量加载')}</button>
@@ -129,7 +129,7 @@ export default function LocalTables({ saved, clean, close, attach }: {
       <div className="panel-body local-history"><div className="sync-history-summary"><History size={17} /><span>{t('最近执行')}</span><strong>{runs.length}{t(' 次')}</strong></div>
         <ol>{runs.map(run => <li key={run.id} data-state={run.status}>
           <span className="sync-timeline-dot" aria-hidden="true" />
-          <article><div className="sync-history-heading"><RunState state={run.status} /><span>{modeName(run.mode)} · {run.trigger === 'scheduled' ? t('定时触发') : t('手动触发')}</span><span>{duration(run)}</span></div>
+          <article><div className="sync-history-heading"><RunState state={run.status} /><span>{modeName(run.mode)} · {run.trigger === 'reconcile' ? t('定时对账') : run.trigger === 'scheduled' ? t('定时触发') : t('手动触发')}</span><span>{duration(run)}</span></div>
             <p className="sync-history-time"><time dateTime={new Date(run.started_at_ms).toISOString()}>{time(run.started_at_ms)}</time></p>
             <dl><div><dt>{t('本次读取')}</dt><dd>{run.loaded_rows?.toLocaleString(locale) ?? '—'} <small>{t('行')}</small></dd></div><ArrowRight size={14} aria-hidden="true" /><div><dt>{t('提交后总计')}</dt><dd>{run.total_rows?.toLocaleString(locale) ?? '—'} <small>{t('行')}</small></dd></div></dl>
             {run.error && <p className="sync-run-error"><TriangleAlert size={14} />{diagnosticText(run.error)}</p>}

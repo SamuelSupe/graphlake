@@ -627,6 +627,7 @@ pub(super) fn operation(method: &axum::http::Method, path: &str) -> Operation {
                 (&Method::GET | &Method::HEAD, ["results", _, "graph", _]) => ("result", true),
                 (&Method::POST, ["query"]) => ("query", true),
                 (&Method::GET | &Method::HEAD, ["csr"]) => ("read_csr", true),
+                (&Method::GET | &Method::HEAD, ["freshness"]) => ("read_freshness", true),
                 (&Method::POST, ["csr"]) => ("refresh_csr", false),
                 (&Method::POST, ["explore"]) => ("explore", true),
                 (&Method::POST, ["export"]) => ("export", true),

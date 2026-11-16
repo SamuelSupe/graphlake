@@ -369,6 +369,7 @@ struct Page {
     _budget: MemoryReservation,
 }
 
+#[derive(Clone)]
 struct Http {
     client: Client,
     base: Url,

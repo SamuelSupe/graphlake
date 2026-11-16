@@ -616,7 +616,7 @@ fn same_sources(left: &Catalog, right: &Catalog) -> bool {
         == serde_json::to_value(&right.sources).expect("catalog sources serialize")
 }
 
-fn physical_tables(catalog: &Catalog) -> std::collections::BTreeSet<String> {
+pub(super) fn physical_tables(catalog: &Catalog) -> std::collections::BTreeSet<String> {
     catalog
         .nodes
         .values()
@@ -934,7 +934,15 @@ pub(super) async fn validate(
         models.check_modeler_input(&draft.id, &draft.yaml, &principal)?;
         models.source_path(&draft.id)?
     };
-    let result = inspect(&draft.yaml, &path, &app.options, draft.check_data).await;
+    let result = inspect(
+        &draft.yaml,
+        &path,
+        &app.options,
+        draft.check_data,
+        &app,
+        &draft.id,
+    )
+    .await;
     let response = match result {
         Ok(schemas) => Validation {
             status: Status::Passed,
@@ -986,10 +994,19 @@ async fn inspect(
     path: &Path,
     options: &crate::QueryOptions,
     check_data: bool,
+    app: &App,
+    model: &str,
 ) -> ApiResult<BTreeMap<String, crate::arrow::datatypes::SchemaRef>> {
     let catalog = parse(yaml, path)?;
-    let engine =
+    let mut engine =
         Engine::new(catalog).map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
+    let _selection = super::local_tables::managed::resolve(
+        app,
+        &mut engine,
+        model,
+        options.timeout.as_secs() + 30,
+    )
+    .await?;
     Box::pin(engine.inspect_model(options.clone(), check_data))
         .await
         .map_err(|error| {

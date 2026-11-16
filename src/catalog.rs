@@ -79,8 +79,51 @@ pub struct Catalog {
     pub edges: BTreeMap<String, Edge>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub export_locations: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Freshness::is_default")]
+    pub freshness: Freshness,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Freshness {
+    #[serde(default)]
+    pub auto_refresh_csr: bool,
+    #[serde(default)]
+    pub policy: FreshnessPolicy,
+}
+
+impl Freshness {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct FreshnessPolicy {
+    pub max_observation_age_seconds: Option<u64>,
+    pub max_reconciliation_age_seconds: Option<u64>,
+    pub require_current_csr: bool,
+    pub require_consistent_snapshot: bool,
+}
+
+impl FreshnessPolicy {
+    pub(crate) fn validate(&self) -> Result<()> {
+        for age in [
+            self.max_observation_age_seconds,
+            self.max_reconciliation_age_seconds,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure!(
+                (1..=2_592_000).contains(&age),
+                "freshness age must be 1–2592000 seconds"
+            );
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Source {
@@ -488,48 +531,7 @@ impl Catalog {
             .map(Path::to_owned)
             .unwrap_or_default();
         for source in catalog.sources.values_mut() {
-            match source {
-                Source::Sqlite { path } | Source::Duckdb { path } => resolve_path(path, &base)?,
-                Source::Parquet { tables } => {
-                    for file in tables.values_mut().flatten() {
-                        resolve_path(file, &base)?;
-                    }
-                }
-                Source::Delta { tables } => {
-                    for table in tables.values_mut() {
-                        resolve_path(&mut table.path, &base)?;
-                    }
-                }
-                Source::Csv { tables } | Source::Jsonl { tables } => {
-                    for table in tables.values_mut() {
-                        for file in &mut table.files {
-                            resolve_path(file, &base)?;
-                        }
-                    }
-                }
-                Source::Mysql {
-                    ca_file: Some(path),
-                    ..
-                }
-                | Source::SqlserverNative {
-                    ca_file: Some(path),
-                    ..
-                }
-                | Source::SapHana {
-                    ca_file: Some(path),
-                    ..
-                } => resolve_path(path, &base)?,
-                Source::Doris(config)
-                | Source::Starrocks(config)
-                | Source::Tidb(config)
-                | Source::Oceanbase(config)
-                | Source::Mariadb(config) => {
-                    if let Some(path) = &mut config.ca_file {
-                        resolve_path(path, &base)?;
-                    }
-                }
-                _ => {}
-            }
+            source.visit_paths(|path| resolve_path(path, &base))?;
         }
         for path in catalog.export_locations.values_mut() {
             resolve_path(path, &base)?;
@@ -539,6 +541,7 @@ impl Catalog {
 
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.graph.trim().is_empty(), "graph name is required");
+        self.freshness.policy.validate()?;
         ensure!(!self.nodes.is_empty(), "at least one node type is required");
         for (name, node) in &self.nodes {
             validate_name(name)?;
@@ -1090,6 +1093,57 @@ fn validate_timestamp(value: Option<&str>) -> Result<()> {
         chrono::DateTime::parse_from_rfc3339(value).context("invalid warehouse as_of timestamp")?;
     }
     Ok(())
+}
+
+impl Source {
+    pub(crate) fn visit_paths(
+        &mut self,
+        mut visit: impl FnMut(&mut String) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Source::Sqlite { path } | Source::Duckdb { path } => visit(path)?,
+            Source::Parquet { tables } => {
+                for file in tables.values_mut().flatten() {
+                    visit(file)?;
+                }
+            }
+            Source::Delta { tables } => {
+                for table in tables.values_mut() {
+                    visit(&mut table.path)?;
+                }
+            }
+            Source::Csv { tables } | Source::Jsonl { tables } => {
+                for table in tables.values_mut() {
+                    for file in &mut table.files {
+                        visit(file)?;
+                    }
+                }
+            }
+            Source::Mysql {
+                ca_file: Some(path),
+                ..
+            }
+            | Source::SqlserverNative {
+                ca_file: Some(path),
+                ..
+            }
+            | Source::SapHana {
+                ca_file: Some(path),
+                ..
+            } => visit(path)?,
+            Source::Doris(config)
+            | Source::Starrocks(config)
+            | Source::Tidb(config)
+            | Source::Oceanbase(config)
+            | Source::Mariadb(config) => {
+                if let Some(path) = &mut config.ca_file {
+                    visit(path)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn resolve_path(path: &mut String, base: &Path) -> Result<()> {

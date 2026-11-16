@@ -41,11 +41,9 @@ impl SourceProbe {
     }
 
     pub(super) async fn run(
-        catalog: crate::Catalog,
+        engine: crate::Engine,
         mut options: crate::QueryOptions,
     ) -> ApiResult<Self> {
-        let engine = crate::Engine::new(catalog)
-            .map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
         options.timeout = options.timeout.min(Duration::from_secs(5));
         options.memory_bytes = options.memory_bytes.min(32 * 1024 * 1024);
         let (sources, mapping) = Box::pin(engine.probe_model_sources(options))
@@ -83,6 +81,9 @@ pub(super) struct Metrics {
     driver: [[AtomicU64; 2]; 2],
     query_error: [AtomicU64; 3],
     latency: Mutex<BTreeMap<(&'static str, &'static str, &'static str), Latency>>,
+    gc_failures: AtomicU64,
+    gc_deleted: AtomicU64,
+    gc_last_success_ms: AtomicU64,
 }
 
 #[derive(Default)]
@@ -151,6 +152,21 @@ impl Metrics {
             driver: Default::default(),
             query_error: Default::default(),
             latency: Default::default(),
+            gc_failures: 0.into(),
+            gc_deleted: 0.into(),
+            gc_last_success_ms: 0.into(),
+        }
+    }
+
+    pub(super) fn gc_deleted(&self) {
+        self.gc_deleted.fetch_add(1, Relaxed);
+    }
+
+    pub(super) fn gc_finished(&self, at_ms: Option<u64>) {
+        if let Some(at_ms) = at_ms {
+            self.gc_last_success_ms.store(at_ms, Relaxed);
+        } else {
+            self.gc_failures.fetch_add(1, Relaxed);
         }
     }
 
@@ -414,8 +430,11 @@ pub(super) async fn model_ready(
     }
     let (revision, yaml, catalog) = app.models.lock().unwrap().published_catalog(&id)?;
     let deadline = app.options.timeout.min(Duration::from_secs(5));
+    let mut engine = crate::Engine::new(catalog)
+        .map_err(|_| Error::invalid("invalid_model", "图模型配置无效"))?;
+    let _selection = super::local_tables::managed::resolve(&app, &mut engine, &id, 30).await?;
     let (coordinator, workers) =
-        tokio::join!(SourceProbe::run(catalog, app.options.clone()), async {
+        tokio::join!(SourceProbe::run(engine, app.options.clone()), async {
             match &app.cluster {
                 Some(cluster) => cluster
                     .probe_workers(&id, &revision, yaml, deadline)
@@ -464,6 +483,7 @@ pub(super) async fn metrics(State(app): State<Arc<App>>) -> impl IntoResponse {
         app.access.audit_failures(),
         app.ha.as_ref().map(|_| coordinator_ready(&app)),
         app.ha.as_ref().map(|ha| ha.leader.metrics().render()),
+        super::local_tables::managed::backend(&app).is_some(),
     )
 }
 
@@ -475,6 +495,7 @@ impl Metrics {
         audit_failures: u64,
         coordinator: Option<bool>,
         elections: Option<String>,
+        managed_tables: bool,
     ) -> impl IntoResponse + use<> {
         use std::fmt::Write as _;
         let metrics = self;
@@ -576,6 +597,17 @@ impl Metrics {
         }
         if let Some(elections) = elections {
             body.push_str(&elections);
+        }
+        if managed_tables {
+            let _ = writeln!(
+                body,
+                "# TYPE graphlake_managed_gc_failures_total counter\ngraphlake_managed_gc_failures_total {}\n\
+                 # TYPE graphlake_managed_gc_deleted_objects_total counter\ngraphlake_managed_gc_deleted_objects_total {}\n\
+                 # TYPE graphlake_managed_gc_last_success_timestamp_seconds gauge\ngraphlake_managed_gc_last_success_timestamp_seconds {}",
+                metrics.gc_failures.load(Relaxed),
+                metrics.gc_deleted.load(Relaxed),
+                metrics.gc_last_success_ms.load(Relaxed) as f64 / 1000.0,
+            );
         }
         (
             [(

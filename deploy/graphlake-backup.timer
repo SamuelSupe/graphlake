@@ -1,5 +1,5 @@
 [Unit]
-Description=Hourly GraphLake control-state backup
+Description=Hourly GraphLake backup
 
 [Timer]
 OnCalendar=hourly

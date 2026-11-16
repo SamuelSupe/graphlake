@@ -88,7 +88,12 @@ pub(super) fn definitions(app: &App, principal: &Principal, config: &Config) -> 
         (
             "query",
             "Run a read-only Cypher, SQL or Gremlin query against the published revision. Returns typed columns and string/null cell values. Rows are a bounded preview; inspect truncated and refine the query. Parameters are supported only for Cypher.",
-            json!({"model":model,"query":{"type":"string","minLength":1,"maxLength":65536},"language":{"type":"string","enum":["cypher","sql","gremlin"]},"parameters":{"type":"object"},"model_revision":revision,"timeout_ms":{"type":"integer","minimum":1,"maximum":config.timeout_ms.min(app.options.timeout.as_millis() as u64)}}),
+            json!({"model":model,"query":{"type":"string","minLength":1,"maxLength":65536},"language":{"type":"string","enum":["cypher","sql","gremlin"]},"parameters":{"type":"object"},"model_revision":revision,"timeout_ms":{"type":"integer","minimum":1,"maximum":config.timeout_ms.min(app.options.timeout.as_millis() as u64)},
+                "csr_generation":{"type":"string","format":"uuid"},
+                "freshness":{"type":"object","additionalProperties":false,"properties":{
+                    "max_observation_age_seconds":{"type":"integer","minimum":1,"maximum":2592000},
+                    "max_reconciliation_age_seconds":{"type":"integer","minimum":1,"maximum":2592000},
+                    "require_current_csr":{"type":"boolean"},"require_consistent_snapshot":{"type":"boolean"}}}}),
             vec!["model", "query", "language"],
             true,
         ),
@@ -155,6 +160,8 @@ struct QueryArg {
     parameters: Option<serde_json::Map<String, Value>>,
     model_revision: Option<String>,
     timeout_ms: Option<u64>,
+    freshness: Option<crate::FreshnessPolicy>,
+    csr_generation: Option<uuid::Uuid>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -289,7 +296,7 @@ pub(super) async fn call(
             };
             let request = parse(
                 json!({"request_id":uuid::Uuid::new_v4().to_string(),"model_revision":revision,"language":arg.language,"query":arg.query,
-                "parameters_json":arg.parameters.map(|value| Value::Object(value).to_string()),"timeout_ms":timeout}),
+                "parameters_json":arg.parameters.map(|value| Value::Object(value).to_string()),"timeout_ms":timeout,"csr_generation":arg.csr_generation,"freshness":arg.freshness}),
             )?;
             let response = query::run(state, Path(arg.model), actor, Json(request)).await?;
             let status = response.status();
@@ -304,7 +311,7 @@ pub(super) async fn call(
             let extra = rows.len() > config.max_rows;
             rows.truncate(config.max_rows);
             Ok(Json(json!({"columns":result["columns"],"rows":result["rows"],"model_revision":result["model_revision"],
-                "sources":result["sources"],"elapsed_ms":result["elapsed_ms"],"truncated":extra || result["truncated"] == true,"max_rows":config.max_rows})).into_response())
+                "sources":result["sources"],"freshness":result["freshness"],"csr_generation":result["csr_generation"],"elapsed_ms":result["elapsed_ms"],"truncated":extra || result["truncated"] == true,"max_rows":config.max_rows})).into_response())
         }
         "validate_model" => {
             let arg: ValidateArg = parse(args)?;

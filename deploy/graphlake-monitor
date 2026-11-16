@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run role, ingress, published-model and backup checks from a monitoring host."""
+"""Check GraphLake roles, client ingress, published data, backups and volumes."""
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
@@ -73,8 +73,10 @@ class Monitor:
         self.workers = config.get("workers", {})
         self.backups = config.get("backups", {})
         self.canaries = config.get("canaries", {})
+        self.freshness = config.get("freshness", {})
+        self.volumes = config.get("volumes", {})
         self.require_leader = config.get("require_leader", False)
-        for group in (self.nodes, self.workers, self.backups, self.canaries):
+        for group in (self.nodes, self.workers, self.backups, self.canaries, self.freshness, self.volumes):
             if len(group) > 64 or any(not ID.fullmatch(name) for name in group):
                 raise ValueError("expected at most 64 targets with valid identifiers per group")
         self.tls = ssl.create_default_context(cafile=config.get("ca_file"))
@@ -98,8 +100,22 @@ class Monitor:
                 raise ValueError("expected a service-account username")
             auth = base64.b64encode((name + ":" + os.environ[account["token_env"]]).encode()).decode()
             self.model_headers = {"Authorization": "Basic " + auth}
-        if self.canaries and not self.model_headers:
-            raise ValueError("model canaries require a service account")
+        if (self.canaries or self.freshness) and not self.model_headers:
+            raise ValueError("model canaries and freshness require an ingress and service account")
+        freshness_ages = {"max_observation_age_seconds", "max_reconciliation_age_seconds", "max_csr_age_seconds"}
+        for check in self.freshness.values():
+            if (not isinstance(check, dict) or not check
+                    or set(check) - freshness_ages - {"require_current_csr"}
+                    or any(type(value) is not int or not 1 <= value <= 366 * 86400
+                           for key, value in check.items() if key in freshness_ages)
+                    or type(check.get("require_current_csr", False)) is not bool):
+                raise ValueError("invalid model freshness budget")
+        for volume in self.volumes.values():
+            if (not isinstance(volume, dict) or set(volume) != {"path", "min_free_bytes"}
+                    or not isinstance(volume["path"], str) or not Path(volume["path"]).is_absolute()
+                    or type(volume["min_free_bytes"]) is not int or volume["min_free_bytes"] <= 0):
+                raise ValueError("invalid volume path or minimum free bytes")
+        self.freshness_failed = {}
         for url in self.nodes.values():
             checked_url(url, ("https", "http"))
         self.worker_keys = {}
@@ -111,8 +127,13 @@ class Monitor:
                 raise ValueError("invalid backup kind or maximum age")
         for canary in self.canaries.values():
             rows = canary["expected_rows"]
-            if (canary.get("language", "cypher") not in ("cypher", "sql", "gremlin")
-                    or not 1 <= len(canary["query"].strip()) <= 64 * 1024
+            request_ok = (({"query", "csr"} & canary.keys()) == {"query"}
+                          and canary.get("language", "cypher") in ("cypher", "sql", "gremlin")
+                          and isinstance(canary["query"], str) and 1 <= len(canary["query"].strip()) <= 64 * 1024
+                          or ({"query", "csr"} & canary.keys()) == {"csr"}
+                          and isinstance(canary["csr"], dict) and isinstance(canary["csr"].get("operation"), dict)
+                          and "generation" not in canary["csr"] and len(json.dumps(canary["csr"])) <= 64 * 1024)
+            if (not request_ok
                     or not isinstance(rows, list) or len(rows) > 50
                     or any(not isinstance(row, list) or len(row) > 64
                            or any(value is not None and not isinstance(value, str) for value in row) for row in rows)):
@@ -225,11 +246,17 @@ class Monitor:
         if check is None:
             return {("", "canary_unconfigured")}
         try:
-            code, result = self.json(prefix + "/query", self.model_headers, {
-                "request_id": str(uuid.uuid4()), "language": check.get("language", "cypher"),
-                "query": check["query"], "model_revision": revision,
-                "timeout_ms": min(5000, int(self.timeout * 1000)),
-            })
+            query = {"request_id": str(uuid.uuid4()), "model_revision": revision,
+                     "timeout_ms": min(5000, int(self.timeout * 1000))}
+            if "csr" in check:
+                health = self.freshness_status(name, revision)
+                head = health.get("csr")
+                if not isinstance(head, dict) or not head.get("generation"):
+                    return {("", "csr_missing")}
+                query["csr"] = {**check["csr"], "generation": head["generation"]}
+            else:
+                query.update(language=check.get("language", "cypher"), query=check["query"])
+            code, result = self.json(prefix + "/query", self.model_headers, query)
         except (OSError, ValueError, TypeError):
             return {("", "canary_unreachable")}
         if code != 200 or not isinstance(result, dict):
@@ -239,6 +266,61 @@ class Monitor:
         if result.get("truncated") or result.get("model_revision") != revision or result.get("rows") != check["expected_rows"]:
             return {("", "canary_result_mismatch")}
         return set()
+
+    def freshness_status(self, name, revision):
+        code, body = self.json(f"{self.base}/api/v1/models/{name}/freshness", self.model_headers)
+        if code != 200 or not isinstance(body, dict) or body.get("model_revision") != revision:
+            raise ValueError("freshness probe failed or revision changed")
+        return body
+
+    def freshness_problems(self, name, revision, check):
+        body = self.freshness_status(name, revision)
+        now = time.time_ns() // 1_000_000
+
+        def expired(timestamp, key):
+            limit = check.get(key)
+            return limit is not None and (type(timestamp) is not int or timestamp <= 0
+                                          or timestamp > now or now - timestamp > limit * 1000)
+
+        result = set()
+        copies = body.get("local_tables")
+        if not isinstance(copies, list):
+            raise ValueError("invalid local table freshness")
+        if not copies and {"max_observation_age_seconds", "max_reconciliation_age_seconds"} & check.keys():
+            result.add(("", "local_table_missing"))
+        for copy in copies:
+            source = copy["source"]
+            if not isinstance(source, str) or len(source) > 256:
+                raise ValueError("invalid source identity")
+            if copy.get("last_status") in {"failed", "interrupted"}:
+                result.add((source, "sync_failed"))
+            if not copy.get("generation"):
+                result.add((source, "local_table_uncommitted"))
+            if expired(copy.get("observed_at_ms"), "max_observation_age_seconds"):
+                result.add((source, "observation_stale"))
+            if expired(copy.get("reconciled_at_ms"), "max_reconciliation_age_seconds"):
+                result.add((source, "reconciliation_stale"))
+        head = body.get("csr")
+        if check.get("require_current_csr") or "max_csr_age_seconds" in check:
+            if not isinstance(head, dict) or not head.get("generation"):
+                result.add(("", "csr_missing"))
+            else:
+                if check.get("require_current_csr") and head.get("current") is not True:
+                    result.add(("", "csr_behind"))
+                if expired(head.get("built_at_ms"), "max_csr_age_seconds"):
+                    result.add(("", "csr_stale"))
+            if (body.get("refresh") or {}).get("status") == "failed":
+                result.add(("", "csr_refresh_failed"))
+        return result
+
+    def volume(self, name, config):
+        sample = self.checked(lambda: os.statvfs(config["path"]))
+        if sample is None:
+            return metric("volume_up", False, volume=name)
+        free = sample.f_bavail * sample.f_frsize
+        return (metric("volume_up", True, volume=name)
+                + metric("volume_available_bytes", free, volume=name)
+                + metric("volume_low", free < config["min_free_bytes"], volume=name))
 
     def persist_failures(self):
         if not self.state_file:
@@ -283,7 +365,18 @@ class Monitor:
                 del self.failed[retired]
             if previous != self.failed:
                 self.persist_failures()
-        return metric("model_discovery_up", discovered) + "".join(
+            freshness_jobs = {
+                name: pool.submit(self.checked, lambda name=name, revision=active[name], check=check:
+                                  self.freshness_problems(name, revision, check), {("", "freshness_unavailable")})
+                for name, check in self.freshness.items() if name in active
+            }
+            self.freshness_failed = {name: job.result() for name, job in freshness_jobs.items()}
+            for name in self.freshness.keys() - active.keys():
+                self.freshness_failed[name] = {("", "published_model_missing")}
+        freshness = "".join(metric("freshness_check_failed", True, model=name, source=source, reason=reason)
+                            for name, failures in sorted(self.freshness_failed.items())
+                            for source, reason in sorted(failures))
+        return metric("model_discovery_up", discovered) + freshness + "".join(
             metric("model_check_failed", True, model=model, source=source, reason=reason)
             for model, failures in sorted(self.failed.items()) for source, reason in sorted(failures))
 
@@ -324,6 +417,7 @@ class Monitor:
             rows.extend(metric("worker_up", bool(job.result()), worker=name) for name, job in workers.items())
             rows.extend(metric("ingress_up", bool(job.result()), protocol=name) for name, job in ingress.items())
             rows.extend(self.backup(name, config) for name, config in self.backups.items())
+            rows.extend(self.volume(name, config) for name, config in self.volumes.items())
             with self.lock:
                 self.body = "".join(rows)
                 self.last_cycle = time.time()

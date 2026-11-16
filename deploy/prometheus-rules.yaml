@@ -107,3 +107,52 @@ groups:
           severity: critical
         annotations:
           summary: GraphLake backup {{ $labels.backup }} {{ $labels.kind }} is older than its recovery point budget
+      - alert: GraphLakeFreshnessBudgetExceeded
+        expr: graphlake_monitor_freshness_check_failed == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: GraphLake model {{ $labels.model }} failed the {{ $labels.reason }} freshness check
+          description: 'Source {{ $labels.source }}. Check the committed observation, reconciliation and CSR state via the model freshness endpoint.'
+      - alert: GraphLakeVolumeLow
+        expr: graphlake_monitor_volume_low == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake volume {{ $labels.volume }} is below its free-byte budget
+      - alert: GraphLakeVolumeUnavailable
+        expr: graphlake_monitor_volume_up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake volume {{ $labels.volume }} could not be inspected
+      - alert: GraphLakeManagedGcFailed
+        expr: increase(graphlake_managed_gc_failures_total{job="graphlake-active"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake managed snapshot collection encountered an error
+      - alert: GraphLakeManagedGcStalled
+        expr: (time() - graphlake_managed_gc_last_success_timestamp_seconds{job="graphlake-active"} > 600) and on (job, instance) (graphlake_process_uptime_seconds > 600) and on (job, instance) (graphlake_coordinator_ready == 1)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake active Coordinator has no recent successful snapshot collection pass
+      - alert: GraphLakeLeadershipLost
+        expr: sum by (instance) (increase(graphlake_coordinator_leadership_losses_total{job="graphlake-coordinator"}[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake Coordinator {{ $labels.instance }} lost its leadership lease
+      - alert: GraphLakeQueryQueueSaturated
+        expr: graphlake_waiting_queries{job="graphlake-active"} > 0 and on (job, instance) graphlake_active_queries >= graphlake_query_slots
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: GraphLake query slots are saturated and requests are waiting

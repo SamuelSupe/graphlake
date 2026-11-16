@@ -2,18 +2,21 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::{
-    arrow::{buffer::Buffer, ipc::reader::StreamDecoder},
+    arrow::{array::RecordBatch, buffer::Buffer, datatypes::SchemaRef, ipc::reader::StreamDecoder},
     catalog::TableProvider,
+    common::DataFusionError,
     execution::{
         disk_manager::DiskManager,
         memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
     },
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 use serde::Deserialize;
 
 use super::{Http, credential};
 use crate::{Comparison, Source, catalog::ident, source::ReadStats};
 
+#[derive(Clone)]
 pub(crate) struct ClickHouse {
     http: Http,
     user: String,
@@ -85,6 +88,7 @@ impl ClickHouse {
         batch_size: usize,
         disk: &Arc<DiskManager>,
         explain_only: bool,
+        stream: bool,
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, String)> {
         let relation = relation.split('.').map(ident).collect::<Vec<_>>().join(".");
         let metadata_columns = self.describe(&relation, batch_size).await?;
@@ -124,7 +128,7 @@ impl ClickHouse {
             .collect::<Vec<_>>()
             .join(", ");
         let mut sql = format!("SELECT {selected} FROM {relation}");
-        let expected = if filters.is_empty() && !explain_only {
+        let expected = if filters.is_empty() && !explain_only && !stream {
             None
         } else {
             let metadata = self
@@ -174,14 +178,38 @@ impl ClickHouse {
             }
             Some(schema)
         };
-        let result = self
-            .read(
-                format!("{sql} FORMAT ArrowStream"),
-                columns,
-                batch_size,
-                Some(disk),
-            )
-            .await?;
+        let sql = format!("{sql} FORMAT ArrowStream");
+        if stream {
+            let schema = expected.context("missing ClickHouse scan schema")?;
+            let id = uuid::Uuid::new_v4().to_string();
+            let query_id = id.clone();
+            let mut driver = self.clone();
+            let table = crate::source::snapshot::stream_once(schema.clone(), move |context| {
+                let pool = context.runtime_env().memory_pool.clone();
+                let expected = schema.clone();
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    async_stream::try_stream! {
+                        let response = driver.request(sql, batch_size, &query_id).await.map_err(external)?;
+                        let mut reader = IpcRead::new(response, &pool, driver.http.stats.clone());
+                        let budget = MemoryConsumer::new("GraphLake ClickHouse IPC output").register(&pool);
+                        while let Some(batch) = reader.next().await.map_err(external)? {
+                            check_schema(&expected, &batch.schema()).map_err(external)?;
+                            budget.try_resize(batch.get_array_memory_size())?;
+                            for offset in (0..batch.num_rows()).step_by(batch_size) {
+                                yield batch.slice(offset, batch_size.min(batch.num_rows() - offset));
+                            }
+                            budget.free();
+                        }
+                        check_schema(&expected, &reader.schema().map_err(external)?).map_err(external)?;
+                    },
+                ))
+            })?;
+            let budget =
+                MemoryConsumer::new("GraphLake ClickHouse stream").register(&self.http.pool);
+            return Ok((table, budget, id));
+        }
+        let result = self.read(sql, columns, batch_size, Some(disk)).await?;
         ensure!(
             expected.is_none_or(|expected| expected.fields() == result.0.schema().fields()),
             "ClickHouse result schema changed after describing the table"
@@ -190,10 +218,11 @@ impl ClickHouse {
     }
 
     async fn describe(&mut self, relation: &str, batch_size: usize) -> Result<Vec<Column>> {
-        let (mut response, _) = self
+        let mut response = self
             .request(
                 format!("DESCRIBE TABLE {relation} FORMAT JSONEachRow"),
                 batch_size,
+                &uuid::Uuid::new_v4().to_string(),
             )
             .await?;
         let mut bytes = Vec::new();
@@ -217,8 +246,8 @@ impl ClickHouse {
         &mut self,
         sql: String,
         batch_size: usize,
-    ) -> Result<(reqwest::Response, String)> {
-        let id = uuid::Uuid::new_v4().to_string();
+        id: &str,
+    ) -> Result<reqwest::Response> {
         let timeout = self.timeout.as_secs_f64().to_string();
         let batch = batch_size.to_string();
         let request = |server_settings| {
@@ -227,7 +256,7 @@ impl ClickHouse {
                 .client
                 .post(self.http.base.clone())
                 .basic_auth(&self.user, Some(self.password.as_deref().unwrap_or("")))
-                .query(&[("query_id", id.as_str()), ("readonly", "1")]);
+                .query(&[("query_id", id), ("readonly", "1")]);
             let request = if server_settings {
                 request
             } else {
@@ -271,7 +300,7 @@ impl ClickHouse {
             response.headers().get(EXCEPTION_CODE).is_none(),
             "ClickHouse query failed"
         );
-        Ok((response, id))
+        Ok(response)
     }
 
     async fn read(
@@ -281,40 +310,15 @@ impl ClickHouse {
         batch_size: usize,
         disk: Option<&Arc<DiskManager>>,
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, String)> {
-        let (mut response, id) = self.request(sql, batch_size).await?;
-        let raw = MemoryConsumer::new("GraphLake ClickHouse IPC input").register(&self.http.pool);
-        let mut decoder = StreamDecoder::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        let response = self.request(sql, batch_size, &id).await?;
+        let mut reader = IpcRead::new(response, &self.http.pool, self.http.stats.clone());
         let mut snapshot = crate::source::snapshot::Buffer::new(&self.http.pool, disk);
-        let mut tail = [0u8; 8];
-        while let Some(chunk) = response.chunk().await? {
-            raw.try_grow(chunk.len().saturating_mul(2))?;
-            if chunk.len() >= tail.len() {
-                let offset = chunk.len() - tail.len();
-                tail.copy_from_slice(&chunk[offset..]);
-            } else {
-                let n = chunk.len();
-                tail.rotate_left(n);
-                tail[8 - n..].copy_from_slice(&chunk);
-            }
-            let mut buffer = Buffer::from(chunk);
-            while !buffer.is_empty() {
-                if let Some(batch) = decoder.decode(&mut buffer)? {
-                    self.http.stats.warehouse_batch(&batch);
-                    snapshot.push_chunks(batch, batch_size)?;
-                    raw.free();
-                    raw.try_grow(buffer.len().saturating_mul(2))?;
-                    tokio::task::yield_now().await;
-                }
-            }
+        while let Some(batch) = reader.next().await? {
+            snapshot.push_chunks(batch, batch_size)?;
+            tokio::task::yield_now().await;
         }
-        decoder.finish()?;
-        ensure!(
-            tail == [255, 255, 255, 255, 0, 0, 0, 0],
-            "ClickHouse Arrow stream has no end marker"
-        );
-        let schema = decoder
-            .schema()
-            .context("ClickHouse Arrow stream has no schema")?;
+        let schema = reader.schema()?;
         ensure!(
             columns.is_empty() || schema.fields().iter().map(|field| field.name()).eq(columns),
             "ClickHouse result columns differ from projection"
@@ -326,6 +330,76 @@ impl ClickHouse {
         };
         Ok((table, budget, id))
     }
+}
+
+struct IpcRead {
+    response: reqwest::Response,
+    decoder: StreamDecoder,
+    input: Buffer,
+    tail: [u8; 8],
+    raw: MemoryReservation,
+    stats: Arc<ReadStats>,
+}
+
+impl IpcRead {
+    fn new(response: reqwest::Response, pool: &Arc<dyn MemoryPool>, stats: Arc<ReadStats>) -> Self {
+        Self {
+            response,
+            decoder: StreamDecoder::new(),
+            input: Buffer::from(Vec::<u8>::new()),
+            tail: [0; 8],
+            raw: MemoryConsumer::new("GraphLake ClickHouse IPC input").register(pool),
+            stats,
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            while !self.input.is_empty() {
+                if let Some(batch) = self.decoder.decode(&mut self.input)? {
+                    self.stats.warehouse_batch(&batch);
+                    self.raw.try_resize(self.input.len().saturating_mul(2))?;
+                    return Ok(Some(batch));
+                }
+            }
+            let Some(chunk) = self.response.chunk().await? else {
+                self.decoder.finish()?;
+                ensure!(
+                    self.tail == [255, 255, 255, 255, 0, 0, 0, 0],
+                    "ClickHouse Arrow stream has no end marker"
+                );
+                return Ok(None);
+            };
+            self.stats.clickhouse_bytes(chunk.len());
+            self.raw.try_grow(chunk.len().saturating_mul(2))?;
+            if chunk.len() >= self.tail.len() {
+                self.tail.copy_from_slice(&chunk[chunk.len() - 8..]);
+            } else {
+                let n = chunk.len();
+                self.tail.rotate_left(n);
+                self.tail[8 - n..].copy_from_slice(&chunk);
+            }
+            self.input = Buffer::from(chunk);
+        }
+    }
+
+    fn schema(&self) -> Result<SchemaRef> {
+        self.decoder
+            .schema()
+            .context("ClickHouse Arrow stream has no schema")
+    }
+}
+
+fn check_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<()> {
+    ensure!(
+        expected.fields() == actual.fields(),
+        "ClickHouse result schema changed after describing the table"
+    );
+    Ok(())
+}
+
+fn external(error: anyhow::Error) -> DataFusionError {
+    DataFusionError::External(error.into())
 }
 
 #[derive(Deserialize)]
@@ -341,6 +415,101 @@ struct Column {
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
+
+    #[tokio::test]
+    #[ignore = "requires the ClickHouse production stream fixture"]
+    async fn single_scan_yields_before_eof_and_preserves_arrow() -> Result<()> {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use futures::TryStreamExt;
+        use std::time::Instant;
+
+        let source = Source::Clickhouse {
+            uri: std::env::var("GRAPHLAKE_TEST_CLICKHOUSE_URI")?.parse()?,
+            user: "readonly_reader".into(),
+            password_env: Some("GRAPHLAKE_TEST_CLICKHOUSE_PASSWORD".into()),
+        };
+        let context = SessionContext::new();
+        let runtime = context.runtime_env();
+        let mut control = Vec::new();
+        for (eager, cancel) in [(true, false), (false, true), (false, false)] {
+            let stats = Arc::new(ReadStats::default());
+            let mut connector = ClickHouse::new(
+                &source,
+                Duration::from_secs(30),
+                runtime.memory_pool.clone(),
+                stats.clone(),
+            )?;
+            let start = Instant::now();
+            let (table, _budget, _) = connector
+                .table(
+                    "graphlake.stream_nodes",
+                    &["id".into(), "name".into()],
+                    &[],
+                    512,
+                    &runtime.disk_manager,
+                    false,
+                    !eager,
+                )
+                .await?;
+            if !eager {
+                assert_eq!(stats.metrics().warehouse_rows, 0);
+            }
+            let mut stream = context.read_table(table)?.execute_stream().await?;
+            let first = stream
+                .try_next()
+                .await?
+                .context("missing ClickHouse first batch")?;
+            let first_ms = start.elapsed().as_millis();
+            let at_first = stats.metrics();
+            if !eager {
+                assert!(at_first.warehouse_rows < 200000);
+            }
+            if cancel {
+                drop(stream);
+                eprintln!(
+                    "ClickHouse dropped first_ms={first_ms} rows={} http_bytes={}",
+                    at_first.warehouse_rows, at_first.clickhouse_http_bytes
+                );
+                continue;
+            }
+            let mut batches = vec![first];
+            batches.extend(stream.try_collect::<Vec<_>>().await?);
+            let mut ids = Vec::new();
+            for batch in batches {
+                let batch_ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let names = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for (id, name) in batch_ids.values().iter().zip(names.iter()) {
+                    let expected = format!("{id}{}", "x".repeat(128));
+                    assert_eq!(name, Some(expected.as_str()));
+                    ids.push(*id);
+                }
+            }
+            ids.sort_unstable();
+            assert_eq!(ids.len(), 200000);
+            if eager {
+                control = ids;
+            } else {
+                assert_eq!(control, ids);
+            }
+            let final_reads = stats.metrics();
+            assert_eq!(final_reads.warehouse_rows, 200000);
+            eprintln!(
+                "ClickHouse eager={eager} first_ms={first_ms} first_rows={} first_http_bytes={} total_http_bytes={}",
+                at_first.warehouse_rows,
+                at_first.clickhouse_http_bytes,
+                final_reads.clickhouse_http_bytes
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires graphlake.nodes with an EPHEMERAL column and the ClickHouse readonly fixture"]
@@ -360,7 +529,15 @@ mod tests {
             Arc::new(ReadStats::default()),
         )?;
         let (table, _, _) = connector
-            .table("graphlake.nodes", &[], &[], 32, &runtime.disk_manager, true)
+            .table(
+                "graphlake.nodes",
+                &[],
+                &[],
+                32,
+                &runtime.disk_manager,
+                true,
+                false,
+            )
             .await?;
         let schema = table.schema();
         assert!(schema.field_with_name("id").is_ok());

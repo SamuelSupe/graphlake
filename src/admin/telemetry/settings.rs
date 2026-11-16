@@ -89,7 +89,11 @@ pub(super) fn rules(overrides: &AlertOverrides) -> Result<(AlertOverrides, Strin
     let mut enabled = Vec::with_capacity(items.len());
     for mut rule in items.drain(..) {
         let name = rule["alert"].as_str().context("invalid bundled rule")?;
-        let options = settings.get(name).context("unknown bundled rule")?;
+        let Some(options) = settings.get(name) else {
+            // Deployment rules outside the legacy settings API retain their packaged values.
+            enabled.push(rule);
+            continue;
+        };
         if !options.enabled {
             continue;
         }

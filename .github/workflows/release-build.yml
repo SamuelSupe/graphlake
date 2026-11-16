@@ -7,12 +7,23 @@ on:
         description: Release version, including the v prefix
         required: true
         type: string
+      previous_tag:
+        description: Published version to upgrade and roll back from
+        required: true
+        default: v1.1.0
+        type: string
+  schedule:
+    - cron: "24 2 * * 1"
 
 permissions:
   contents: read
 
 jobs:
+  regression:
+    uses: ./.github/workflows/regression.yml
+
   linux:
+    needs: regression
     name: Debian 12 / ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     container: debian:bookworm-slim
@@ -33,11 +44,16 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config cmake lld
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config cmake lld python3
 
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: graphlake-regression
+          path: /tmp/graphlake-regression
 
       - uses: actions/setup-node@v6
         with:
@@ -59,22 +75,134 @@ jobs:
       - name: Build and check the deployment archive
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+          GRAPHLAKE_REGRESSION_EVIDENCE: /tmp/graphlake-regression/receipt.txt
+          PYTHONDONTWRITEBYTECODE: "1"
         run: |
+          set -eu
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          RELEASE_TAG=${RELEASE_TAG:-v$version}
           test "$RELEASE_TAG" = "v$version"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          GRAPHLAKE_WEB_DIST=web/dist sh deploy/package.sh "$RELEASE_TAG" dist
+          test -z "$(git status --porcelain)"
+          archive=$(GRAPHLAKE_WEB_DIST=web/dist sh deploy/package.sh "$RELEASE_TAG" dist)
           (
             cd dist
             sha256sum -c ./*.sha256
           )
-          target/release/graphlake --version
-          target/release/graphlake-admin --version
+          unpacked=$(mktemp -d)
+          tar -xzf "$archive" -C "$unpacked" --strip-components=1
+          python3 tests/package_smoke.py "$unpacked" --git-sha "$GITHUB_SHA" > dist/package-smoke.json
+          cat dist/package-smoke.json
+          cp "$unpacked/BUILD-INFO" dist/BUILD-INFO
 
       - uses: actions/upload-artifact@v6
         with:
-          name: linux-${{ matrix.arch }}
+          name: candidate-linux-${{ matrix.arch }}
           path: dist/
+          compression-level: 0
+          if-no-files-found: error
+
+  acceptance:
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      source_digest: ${{ steps.lifecycle.outputs.source_digest }}
+    env:
+      CARGO_BUILD_JOBS: 3
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PREVIOUS_TAG: ${{ inputs.previous_tag || 'v1.1.0' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: candidate-linux-x86_64
+          path: ${{ runner.temp }}/candidate
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup override set 1.97.1
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client-16
+      - run: python3 -m pip install pyarrow==26.0.1 deltalake==1.6.6 pyroaring==1.2.0
+      - run: docker compose -f tests/production-compose.yml up -d --wait --wait-timeout 120
+      - name: Rehearse rolling upgrade, rollback and concurrent sync
+        id: lifecycle
+        shell: bash
+        run: |
+          evidence="$RUNNER_TEMP/acceptance"
+          mkdir -p "$evidence" "$RUNNER_TEMP"/{previous,current,previous-archive}
+          gh release download "$PREVIOUS_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*-linux-x86_64.tar.gz" --pattern "*-linux-x86_64.tar.gz.sha256" \
+            --dir "$RUNNER_TEMP/previous-archive"
+          for kind in previous-archive candidate; do
+            (cd "$RUNNER_TEMP/$kind" && sha256sum -c ./*.sha256) | tee "$evidence/$kind-checksums.log"
+          done
+          tar -xzf "$RUNNER_TEMP"/previous-archive/*-linux-x86_64.tar.gz -C "$RUNNER_TEMP/previous" --strip-components=1
+          tar -xzf "$RUNNER_TEMP"/candidate/*-linux-x86_64.tar.gz -C "$RUNNER_TEMP/current" --strip-components=1
+          cp "$RUNNER_TEMP/current/BUILD-INFO" "$evidence/BUILD-INFO"
+          sed -n 's/^source_tar_sha256_uncompressed=/source_digest=/p' "$evidence/BUILD-INFO" >> "$GITHUB_OUTPUT"
+          source tests/production-fixtures.sh
+          prepare_graphlake_bucket
+          current="$RUNNER_TEMP/current/bin/graphlake-admin"
+          previous="$RUNNER_TEMP/previous/bin/graphlake-admin"
+          python3 tests/release_lifecycle.py "$current" --previous "$previous" --inject-faults \
+            --work-dir "$RUNNER_TEMP/lifecycle" 2>&1 | tee "$evidence/lifecycle.log"
+          mkdir "$RUNNER_TEMP/managed-recovery"
+          python3 tests/managed_local_tables.py "$current" --isolate-worker \
+            --work-dir "$RUNNER_TEMP/managed-recovery" 2>&1 | tee "$evidence/managed-recovery.log"
+          python3 tests/sqlite_read_benchmark.py "$RUNNER_TEMP/previous/bin/graphlake" "$RUNNER_TEMP/current/bin/graphlake" \
+            --require-read-budget 2>&1 | tee "$evidence/sqlite-benchmark.log"
+      - name: Exercise Delta, service and language binding fixtures
+        shell: bash
+        run: |
+          evidence="$RUNNER_TEMP/acceptance"
+          source tests/production-fixtures.sh
+          prepare_graphlake_bucket
+          python3 tests/delta_fixture.py "$RUNNER_TEMP/delta" "s3://$GRAPHLAKE_TEST_BUCKET/delta"
+          export GRAPHLAKE_TEST_DELTA_FIXTURE="$RUNNER_TEMP/delta/fixture.json"
+          bash tests/production-services.sh 2>&1 | tee "$evidence/extended-services.log"
+          bash tests/bindings-smoke.sh 2>&1 | tee "$evidence/bindings.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: graphlake-release-acceptance
+          path: ${{ runner.temp }}/acceptance
+          if-no-files-found: error
+      - if: always()
+        run: docker compose -f tests/production-compose.yml down -v
+
+  release-artifacts:
+    if: github.event_name == 'workflow_dispatch'
+    needs: acceptance
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: candidate-linux-*
+          path: dist
+      - name: Require both archives to have the accepted source digest
+        env:
+          ACCEPTED_SOURCE_DIGEST: ${{ needs.acceptance.outputs.source_digest }}
+        run: |
+          test -n "$ACCEPTED_SOURCE_DIGEST"
+          for arch in aarch64 x86_64; do
+            grep -Fx "source_tar_sha256_uncompressed=$ACCEPTED_SOURCE_DIGEST" "dist/candidate-linux-$arch/BUILD-INFO"
+          done
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-aarch64
+          path: dist/candidate-linux-aarch64/
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-x86_64
+          path: dist/candidate-linux-x86_64/
           compression-level: 0
           if-no-files-found: error

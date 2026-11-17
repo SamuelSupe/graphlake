@@ -266,19 +266,20 @@ pub async fn serve_clustered_with_status(
     let mut listener = None;
     let ha = if coordinator_failover {
         let control = cluster.as_ref().unwrap().control()?;
+        let probe = ha::SourceProbe::new(catalog_dir.clone());
         // Wait until this host can access the shared source before contending.
         loop {
             ensure!(
                 !shutdown.is_cancelled(),
                 "Coordinator stopped before activation"
             );
-            if ha::source_available(catalog_dir.clone()).await {
+            if probe.available().await {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         let leader = control.acquire_with_metrics(&shutdown, elections).await?;
-        ha::watch_source(catalog_dir.clone(), shutdown.clone());
+        ha::watch_source(probe.clone(), shutdown.clone());
         if let Some(public_url) = &public_url
             && std::env::var_os("GRAPHLAKE_RESTORE_INBOX").is_some()
             && leader
@@ -306,7 +307,7 @@ pub async fn serve_clustered_with_status(
             }
             listener = Some(TcpListener::bind(bound).await?);
         }
-        let ha = match ha::Ha::open(leader.clone(), &catalog_dir, metadata_dir).await {
+        let ha = match ha::Ha::open(leader.clone(), probe, metadata_dir).await {
             Ok(ha) => ha,
             Err(error) => {
                 leader.release().await;

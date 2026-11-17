@@ -375,6 +375,7 @@ impl Read<'_> {
             let data = read_block(self.objects, &key, block, self.scope).await?;
             Arc::new(CachedBlock {
                 bytes: data,
+                record_offsets: OnceLock::new(),
                 _memory: compressed,
                 compress_spill: false,
             })

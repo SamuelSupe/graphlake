@@ -74,7 +74,7 @@ pub struct Engine {
     pub(crate) catalog: Arc<Catalog>,
     pub(crate) cache: Option<crate::traversal::Cache>,
     admission: Arc<query::Admission>,
-    parquet_keys: Arc<model::KeyChecks>,
+    file_keys: Arc<model::KeyChecks>,
     pub(crate) managed_parquet: Arc<BTreeMap<uuid::Uuid, source::parquet_snapshot::RemoteSnapshot>>,
     spanner: Arc<BTreeMap<String, source::warehouse::spanner::Client>>,
     trino_schemas: Arc<source::warehouse::trino::SchemaCache>,
@@ -106,7 +106,7 @@ impl Engine {
             catalog: Arc::new(catalog),
             cache: None,
             admission,
-            parquet_keys: Arc::new(Mutex::new(BTreeMap::new())),
+            file_keys: Arc::new(Mutex::new(BTreeMap::new())),
             spanner: Arc::new(spanner),
             trino_schemas: Arc::default(),
             delta_snapshots: Arc::default(),
@@ -896,7 +896,7 @@ impl Engine {
                     raw: &tables,
                     postgres: &prepared.postgres,
                     proven_key_label,
-                    parquet_keys: &self.parquet_keys,
+                    file_keys: &self.file_keys,
                 },
                 scope,
                 read,
@@ -994,7 +994,7 @@ pub(crate) struct Prepared {
 struct Raw {
     alias: String,
     schema: SchemaRef,
-    parquet_versions: Option<Vec<(String, String)>>,
+    file_versions: Option<Vec<(String, String)>>,
 }
 
 async fn materialize_edges(

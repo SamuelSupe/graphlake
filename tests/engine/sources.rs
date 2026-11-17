@@ -447,6 +447,74 @@ nodes:
 }
 
 #[tokio::test]
+async fn text_limit_reuses_only_fully_validated_file_versions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for kind in ["csv", "jsonl"] {
+        let file = dir.path().join("records");
+        let catalog = dir.path().join("model.yaml");
+        std::fs::write(
+            &catalog,
+            format!(
+                r#"graph: previews
+sources:
+  files:
+    type: {kind}
+    tables:
+      records:
+        files: [records]
+        columns: [{{name: id, data_type: Int64}}, {{name: payload, data_type: Utf8}}]
+nodes:
+  Record: {{source: files.records, key: [id], properties: [payload]}}
+"#
+            ),
+        )?;
+        let row = |i| {
+            if kind == "csv" {
+                format!("{i},{}\n", "x".repeat(160))
+            } else {
+                format!(
+                    "{}\n",
+                    serde_json::json!({"id":i,"payload":"x".repeat(160)})
+                )
+            }
+        };
+        let mut data = if kind == "csv" {
+            String::from("id,payload\n")
+        } else {
+            String::new()
+        };
+        for i in 0..8192 {
+            data.push_str(&row(i));
+        }
+        std::fs::write(&file, &data)?;
+        let engine = Engine::new(Catalog::load(&catalog)?)?;
+        let options = QueryOptions {
+            batch_size: 64,
+            partitions: 1,
+            ..Default::default()
+        };
+        let query = r#"SELECT id FROM "Record" LIMIT 1"#;
+        for cold in [true, false] {
+            let mut result = engine.query(Language::Sql, query, options.clone()).await?;
+            assert_eq!(rows(&mut result).await?, [serde_json::json!({"id":0})]);
+            let reads = result.metrics().reads;
+            assert_eq!(reads.snapshot_spilled_bytes, 0);
+            assert_eq!(reads.object_bytes >= data.len() as u64, cold);
+        }
+        data.push_str(&row(0));
+        std::fs::write(&file, data)?;
+        let error = match engine.query(Language::Sql, query, options).await {
+            Err(error) => error,
+            Ok(mut result) => rows(&mut result)
+                .await
+                .expect_err("duplicate key in new generation"),
+        };
+        assert!(format!("{error:#}").contains("duplicate business key"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn text_sources_spill_and_enforce_decoder_memory() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("graph.yaml");

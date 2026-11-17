@@ -210,7 +210,7 @@ async fn read(
                         Arc::clone(pool),
                         disk,
                         stats,
-                        true,
+                        crate::source::text::ReadMode::Probe,
                         Some(storage),
                     )
                     .await?
@@ -310,7 +310,7 @@ async fn read(
                         Arc::clone(pool),
                         disk,
                         stats,
-                        true,
+                        crate::source::text::ReadMode::Probe,
                         None,
                     )
                     .await?

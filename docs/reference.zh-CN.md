@@ -143,7 +143,7 @@ OSS/TOS/COS 自动使用带桶名的虚拟主机访问；S3/MinIO 自定义 endp
 
 通过 SQL API 读取数仓时，存在可下推条件才发出额外的零行查询确认列类型，数据语句仍使用原有的快照设置。MongoDB 在采样和读取时都投影映射字段，采样不受查询过滤影响。对象存储的同表文件共享客户端，CSV 和 JSON Lines 按内存预算合并范围读取，单次最多 1 MiB；对象版本固定和逐条解码校验保持有效。
 
-普通 SQL 的单层 `SELECT` 及显式 `ON` 连接从源读取查询引用的列，同时保留业务键、关系端点和分区条件使用的列。通配符、CTE、子查询和隐式连接列仍使用完整投影。多输入和 SCD2 继续读取用于去重及冲突判断的完整映射。CSV 和 JSON Lines 仍扫描并校验完整文件。
+普通 SQL 的单层 `SELECT` 及显式 `ON` 连接从源读取查询引用的列，同时保留业务键、关系端点和分区条件使用的列。通配符、CTE、子查询和隐式连接列仍使用完整投影。多输入和 SCD2 继续读取用于去重及冲突判断的完整映射。单表 CSV 和 JSON Lines 的 SQL 预览首次使用一个文件版本时仍完整检查业务键。同一引擎再次读取相同版本时可复用成功的校验，普通无排序 `LIMIT` 在读够行数后可以结束。任一文件版本变化都会触发重新校验。
 
 DuckDB 和 PostgreSQL 可下推单节点表的有序 `LIMIT`（无 `OFFSET`）、标量 `COUNT(*)`、`COUNT(列)` 和整型 `MIN/MAX`。源端须有能够证明整数业务键唯一的约束，有序 LIMIT 须按完整业务键排序。所有 WHERE 条件都须能精确下推，目前覆盖以 AND 连接的整数比较和空值判断。下推仍在原读快照内执行。DuckDB 直接查验映射表的完整主键。多个 DuckDB 来源共享查询内存的一半，剩余预算用于缓冲、溢写和本地运算。PostgreSQL 聚合和有序 LIMIT 都排除空业务键。业务键无约束、排序存在并列、聚合带分组或 DISTINCT，以及无法证明条件等价的查询使用本地计划。
 
@@ -163,7 +163,7 @@ PostgreSQL 无穷日期、无穷时间戳和定点 `NaN` 在读取时报告具�
 
 **CSV / JSON Lines**
 
-`type: csv` 和 `type: jsonl` 原生读取 UTF-8 文本文件，支持本地路径、HTTP(S) 和 S3。每张表的 `files` 必须显式列出文件；相对路径以 YAML 所在目录为准。HTTP 服务需要 HEAD、Range 和强 ETag，S3 使用与 Parquet 相同的 AWS 环境配置。读取按对象版本或 ETag 固定，检测到读取期间的对象变化则失败。查询内的重复扫描读取同一份受内存、磁盘预算约束的物化结果；不同文件之间没有共同提交点。
+`type: csv` 和 `type: jsonl` 原生读取 UTF-8 文本文件，支持本地路径、HTTP(S) 和 S3。每张表的 `files` 必须显式列出文件；相对路径以 YAML 所在目录为准。HTTP 服务需要 HEAD、Range 和强 ETag，S3 使用与 Parquet 相同的 AWS 环境配置。读取按对象版本或 ETag 固定，检测到读取期间的对象变化则失败。简单单表 SQL 的 `LIMIT` 计划可按批解码，重复扫描仍使用本次查询固定的文件版本。需要物化时按内存、磁盘预算缓存批次。多个文件分别固定各自的版本。
 
 文本解码复用 [Apache Arrow CSV Reader](https://arrow.apache.org/rust/arrow_csv/reader/index.html) 与 JSON Reader。列采用显式 `columns` 列表，避免自动推断破坏前导零业务键、大整数或金额精度。`nullable` 默认 `true`。支持 Boolean、Int8/16/32/64、UInt8/16/32/64、Float32/64、Utf8、Date32、Timestamp 和 Decimal128；Decimal 要求 `0 <= scale <= precision <= 38`。CSV 必须为逗号分隔、带表头格式，所有列的名字与顺序必须匹配声明，支持引号和引号内换行，空字段读为 NULL。JSON Lines 每条记录为对象，按顶层字段名读取，未声明的字段忽略，缺失字段视为 NULL；声明列的类型不匹配会失败。Decimal 推荐在 JSON 中写为字符串。
 

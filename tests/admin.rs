@@ -43,10 +43,16 @@ impl Server {
     }
 
     fn start_with(root: &Path, dsn: &str, port: u16, extra: &[&str]) -> Result<Self> {
+        let timeout: &[_] = if extra.contains(&"--timeout-ms") {
+            &[]
+        } else {
+            &["--timeout-ms", "2500"]
+        };
         let mut child = Command::new(env!("CARGO_BIN_EXE_graphlake-admin"))
             .arg("--port")
             .arg(port.to_string())
-            .args(["--timeout-ms", "2500", "--catalog-dir"])
+            .args(timeout)
+            .arg("--catalog-dir")
             .arg(root)
             .arg("--assets-dir")
             .arg(root.join("assets"))

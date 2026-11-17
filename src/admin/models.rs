@@ -20,6 +20,8 @@ use crate::{Catalog, Engine};
 
 use super::{ApiResult, App, CATALOG_LIMIT, Error, access::Principal};
 
+mod schema;
+pub(super) use schema::{mcp_schema, schema};
 pub(super) mod versions;
 
 #[derive(Clone, Copy, Serialize)]
@@ -251,7 +253,10 @@ impl Models {
                     .and_then(|active| self.archived(id, active).err().map(|error| error.message));
                 (state.active, error)
             }
-            Ok(None) => (Some(version.clone()), None),
+            Ok(None) => (
+                (!self.requires_task_publish(id, &yaml)?).then(|| version.clone()),
+                None,
+            ),
             Err(error) => (None, Some(error.message)),
         };
         Ok(Model {
@@ -564,6 +569,9 @@ impl Models {
         }
         parse(&model.yaml, &self.source_path(id)?)?;
         self.adopt(id, &model)?;
+        if self.active_revision(id)?.as_deref() != Some(expected) {
+            return Err(unpublished());
+        }
         Ok(model.revision)
     }
 
@@ -853,67 +861,6 @@ pub(super) async fn read(
     ))
 }
 
-#[derive(Serialize)]
-pub(super) struct GraphSchema {
-    graph: String,
-    nodes: BTreeMap<String, GraphNode>,
-    edges: BTreeMap<String, GraphEdge>,
-}
-
-#[derive(Serialize)]
-struct GraphNode {
-    key: Vec<String>,
-    properties: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct GraphEdge {
-    key: Vec<String>,
-    properties: Vec<String>,
-    from: crate::catalog::Endpoint,
-    to: crate::catalog::Endpoint,
-}
-
-pub(super) async fn schema(
-    State(app): State<Arc<App>>,
-    RoutePath((id, revision)): RoutePath<(String, String)>,
-    axum::Extension(principal): axum::Extension<Principal>,
-) -> ApiResult<Json<GraphSchema>> {
-    let (_, _, engine) = app.query_model(&id, &revision, &principal).await?;
-    let catalog = &engine.catalog;
-    Ok(Json(GraphSchema {
-        graph: catalog.graph.clone(),
-        nodes: catalog
-            .nodes
-            .iter()
-            .map(|(name, node)| {
-                (
-                    name.clone(),
-                    GraphNode {
-                        key: node.key.clone(),
-                        properties: node.properties.clone(),
-                    },
-                )
-            })
-            .collect(),
-        edges: catalog
-            .edges
-            .iter()
-            .map(|(name, edge)| {
-                (
-                    name.clone(),
-                    GraphEdge {
-                        key: edge.key.clone(),
-                        properties: edge.properties.clone(),
-                        from: edge.from.clone(),
-                        to: edge.to.clone(),
-                    },
-                )
-            })
-            .collect(),
-    }))
-}
-
 pub(super) async fn create(
     State(app): State<Arc<App>>,
     axum::Extension(principal): axum::Extension<Principal>,
@@ -1084,7 +1031,7 @@ async fn inspect(
         options.timeout.as_secs() + 30,
     )
     .await?;
-    Box::pin(engine.inspect_model(options, check_data))
+    let schemas = Box::pin(engine.inspect_model(options, check_data))
         .await
         .map_err(|error| {
             let mut response =
@@ -1104,7 +1051,39 @@ async fn inspect(
                 (_, site) => site,
             };
             response
-        })
+        })?;
+    let catalog = &engine.catalog;
+    for (label, semantics) in catalog
+        .nodes
+        .iter()
+        .map(|(name, node)| (name, &node.semantics))
+        .chain(
+            catalog
+                .edges
+                .iter()
+                .map(|(name, edge)| (name, &edge.semantics)),
+        )
+    {
+        if let Some(semantics) = semantics {
+            semantics.validate_types(&schemas[label]).map_err(|error| {
+                let mut response = Error::invalid("validation_failed", error.to_string());
+                response.location = Some(ValidationSite::field(label, "semantics", None));
+                response
+            })?;
+        }
+    }
+    for task in &catalog.tasks {
+        for label in task.labels() {
+            label
+                .validate_types(catalog, &schemas[label.name])
+                .map_err(|error| {
+                    let mut response = Error::invalid("validation_failed", error.to_string());
+                    response.location = Some(ValidationSite::field(label.name, "tasks", None));
+                    response
+                })?;
+        }
+    }
+    Ok(schemas)
 }
 
 pub(super) use versions::{archived_yaml, history, publish, restore_archive, rollback, unpublish};

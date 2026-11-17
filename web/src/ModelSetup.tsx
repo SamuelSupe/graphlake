@@ -13,7 +13,7 @@ export function ModelSetup({ model, issue, dirty, busy, canPublish, configure, p
   const step = !sources ? 0 : issue ? 1 : dirty ? 2 : 3;
   return <section className="model-setup" aria-label={t('建模指引')}>
     <ol className="setup-steps" aria-label={t('建模步骤')}>
-      {[t('添加数据源'), t('定义节点与边'), t('保存草稿'), t('校验并发布')].map((label, index) => <li key={label} aria-current={index === step ? 'step' : undefined}>
+      {[t('添加数据源'), t('定义节点与边'), t('保存草稿'), t('预览并发布')].map((label, index) => <li key={label} aria-current={index === step ? 'step' : undefined}>
         <span className="setup-number">{index < step ? <Check size={13} aria-hidden="true" /> : index + 1}</span>{label}
       </li>)}
     </ol>
@@ -25,7 +25,7 @@ export function ModelSetup({ model, issue, dirty, busy, canPublish, configure, p
         {issue ? <button className="button compact" disabled={busy || issue.add === 'sources' && !configure} onClick={() => issue.selection ? select(issue.selection) : add(issue.add!)}>
           {issue.selection ? t('继续配置') : issue.add === 'sources' ? t('添加数据源') : t('添加节点')}<ArrowRight size={15} aria-hidden="true" />
         </button> : dirty ? <button className="button compact" disabled={busy} onClick={save}>{t('保存草稿')}</button>
-          : <button className="button compact" disabled={!canPublish} onClick={publish}>{t('校验并发布')}</button>}
+          : <button className="button compact" disabled={!canPublish} onClick={publish}>{t('预览并发布')}</button>}
       </div>
     </div>
   </section>;

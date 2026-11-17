@@ -145,7 +145,13 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
         (
             query_path,
             "graphlake-query",
-            vec!["list_models", "get_schema", "query"],
+            vec![
+                "list_models",
+                "get_schema",
+                "list_tasks",
+                "run_task",
+                "query",
+            ],
             "get_model",
             json!({"model":"payments"}),
         ),
@@ -156,6 +162,7 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
                 "list_models",
                 "get_model",
                 "validate_model",
+                "validate_model_impact",
                 "create_model",
                 "save_model",
             ],
@@ -302,7 +309,16 @@ async fn mcp_queries_models_and_enforces_account_policy_across_restart() -> Resu
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(names, ["list_models", "get_schema", "query"]);
+    assert_eq!(
+        names,
+        [
+            "list_models",
+            "get_schema",
+            "list_tasks",
+            "run_task",
+            "query"
+        ]
+    );
     let list = call(&server, READER, "list_models", json!({})).await?;
     assert_eq!(
         list["structuredContent"]["models"]
@@ -1112,7 +1128,14 @@ async fn personal_ai_tokens_inherit_live_user_permissions_and_are_mcp_only() -> 
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(admin_tools["result"]["tools"].as_array().unwrap().len(), 8);
+    let names = admin_tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"run_task") && names.contains(&"validate_model_impact"));
+    assert!(!names.contains(&"get_mutation"));
     assert_eq!(call(&server,&admin_secret,"list_models",json!({})).await?["structuredContent"]["models"].as_array().unwrap().len(),2);
     drop(server);
     let mut server = Server::start(root.path(), "", 0)?;
@@ -1234,5 +1257,1128 @@ async fn issuing_mcp_token_after_restore_cannot_reenable_old_console_password() 
             expected
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_schema_describes_published_semantics_and_logical_types() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let data = root.path().join("grants.csv");
+    fs::write(
+        &data,
+        "tenant,id,action,seconds,start,end,current,system\n1,10,read,42,10,999,true,iam\n",
+    )?;
+    let original = r#"graph: IAM grants
+sources:
+  iam:
+    type: csv
+    tables:
+      grants:
+        files: [grants.csv]
+        columns:
+          - {name: tenant, data_type: Int64, nullable: false}
+          - {name: id, data_type: Int64, nullable: false}
+          - {name: action, data_type: Utf8}
+          - {name: seconds, data_type: 'Int64'}
+          - {name: start, data_type: Int64}
+          - {name: end, data_type: Int64}
+          - {name: current, data_type: Boolean}
+          - {name: system, data_type: Utf8}
+nodes:
+  Account: {source: iam.grants, key: [tenant, id]}
+edges:
+  GRANTED:
+    inputs:
+      - table: iam.grants
+        columns: {age: seconds}
+        casts: {age: Float64}
+    key: [tenant, id]
+    from: {node: Account, columns: [tenant, id]}
+    to: {node: Account, columns: [tenant, id]}
+    properties: [action, age, start, system]
+    scd2: {valid_from: start, valid_to: end, current_flag: current, open_end: 999}
+"#;
+    let model = "grants";
+    fs::write(root.path().join("grants.yaml"), original)?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    for (name, token, roles) in [
+        ("modeler", TOKEN, json!(["modeler", "publisher"])),
+        ("reader", READER, json!(["query"])),
+    ] {
+        server
+            .request(Method::PUT, &format!("users/{name}"))
+            .json(&json!({"service":true,"token":token,"disabled":false}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut group = json!({"members":[name],"grants":{"grants":roles}});
+        if token == READER {
+            group["partitions"] = json!({"grants":{"column":"tenant","op":"eq","value":1}});
+        }
+        server
+            .request(Method::PUT, &format!("roles/{name}"))
+            .json(&group)
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    configure(
+        &server,
+        json!({"enabled":true,"query":true,"modeling":true,"publish":true}),
+    )
+    .await?;
+
+    let query_path = "/mcp/query";
+    let mode = json!({"model":model});
+    let forbidden = call(&server, TOKEN, "get_schema", mode.clone()).await?;
+    assert_eq!(forbidden["isError"], true, "{forbidden}");
+    let old = call_at(&server, query_path, READER, "get_schema", mode.clone()).await?;
+    assert_eq!(old["isError"], false, "{old}");
+    let old = &old["structuredContent"];
+    let previous = &old["model_revision"];
+    assert_eq!(old["type_resolution"]["status"], "resolved", "{old}");
+    assert_eq!(
+        old["schema"]["nodes"]["Account"]["property_details"]["id"],
+        json!({"data_type":"Int64","nullable":false})
+    );
+    assert_eq!(
+        old["schema"]["edges"]["GRANTED"]["semantic_status"],
+        "unspecified"
+    );
+    assert_eq!(
+        old["schema"]["edges"]["GRANTED"]["property_details"]["age"]["data_type"],
+        "Float64"
+    );
+    assert_eq!(
+        old["schema"]["edges"]["GRANTED"]["temporal"],
+        json!({
+            "history":{"bounds":"[)","valid_from":"start","valid_to":null,"null_start_is_unbounded":true,"open_end":999},
+            "current":{"mode":"current_flag","field":null,"value":true}
+        })
+    );
+
+    let draft = format!(
+        r#"{original}    semantics:
+      description: IAM recorded a direct grant.
+      relation:
+        kind: entitlement
+        statement: The account was granted the action.
+        does_not_imply: [The action was used.]
+      properties:
+        age: {{unit: s, description: Age at collection}}
+        start: {{unit: ms}}
+        action: {{value_meanings: {{read: Read the resource}}}}
+      temporal: {{description: The grant record is effective in this interval.}}
+      evidence: {{source_system: system, record_key: [tenant, id], observed_at: start}}
+semantics:
+  description: Grants reported by the source.
+  limitations: [Effective access is evaluated separately.]
+"#
+    );
+    let model_path = "/mcp/modeling";
+    for invalid in [
+        draft.replace("record_key: [tenant, id]", "record_key: [tenant, end]"),
+        draft.replace("age: {unit: s", "action: {unit: s").replace(
+            "        action: {value_meanings: {read: Read the resource}}\n",
+            "",
+        ),
+        draft.replace("observed_at: start", "observed_at: action"),
+    ] {
+        let checked = call_at(
+            &server,
+            model_path,
+            TOKEN,
+            "validate_model",
+            json!({"model":model,"yaml":invalid}),
+        )
+        .await?;
+        assert_eq!(checked["isError"], true, "{checked}");
+        assert_eq!(
+            checked["structuredContent"]["location"],
+            json!({"kind":"field","label":"GRANTED","field":"semantics","index":null}),
+            "{checked}"
+        );
+    }
+
+    let saved = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "save_model",
+        json!({
+            "model":model,"yaml":draft,"revision":previous,"mutation_id":Uuid::new_v4()
+        }),
+    )
+    .await?;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let revision = &saved["structuredContent"]["revision"];
+    let after_save = call_at(&server, query_path, READER, "get_schema", mode.clone()).await?;
+    assert_eq!(after_save["structuredContent"]["model_revision"], *previous);
+    assert_eq!(
+        after_save["structuredContent"]["schema"]["semantic_status"],
+        "unspecified"
+    );
+    let published = call_at(&server, model_path, TOKEN, "publish_model", json!({
+        "model":model,"revision":revision,"active_revision":previous,"mutation_id":Uuid::new_v4()
+    })).await?;
+    assert_eq!(published["isError"], false, "{published}");
+    let schema = call_at(&server, query_path, READER, "get_schema", mode.clone()).await?;
+    let schema = &schema["structuredContent"];
+    assert_eq!(schema["model_revision"], *revision);
+    assert_eq!(
+        schema["schema"]["semantics"]["description"],
+        "Grants reported by the source."
+    );
+    let edge = &schema["schema"]["edges"]["GRANTED"];
+    assert_eq!(edge["semantics"]["relation"]["kind"], "entitlement");
+    assert_eq!(
+        edge["semantics"]["evidence"]["record_key"],
+        json!(["tenant", "id"])
+    );
+    assert_eq!(edge["property_details"]["age"]["unit"], "s");
+    assert_eq!(edge["property_details"]["age"]["data_type"], "Float64");
+    assert!(edge["property_details"].get("seconds").is_none());
+    assert!(!schema.to_string().contains("grants.csv"));
+
+    fs::rename(&data, root.path().join("grants.offline"))?;
+    for (args, status) in [
+        (mode.clone(), "unavailable"),
+        (
+            json!({"model":model,"include_types":false}),
+            "not_requested",
+        ),
+    ] {
+        let result = call_at(&server, query_path, READER, "get_schema", args).await?;
+        assert_eq!(result["isError"], false, "{result}");
+        let value = &result["structuredContent"];
+        assert_eq!(value["model_revision"], *revision);
+        assert_eq!(value["type_resolution"]["status"], status);
+        let age = &value["schema"]["edges"]["GRANTED"]["property_details"]["age"];
+        assert_eq!(
+            age,
+            &json!({"data_type":null,"nullable":null,"unit":"s","description":"Age at collection"})
+        );
+        assert!(!value.to_string().contains("grants.csv"));
+    }
+    fs::rename(root.path().join("grants.offline"), &data)?;
+
+    let invalid = draft.replace("observed_at: start", "observed_at: action");
+    let saved = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "save_model",
+        json!({"model":model,"yaml":invalid,"revision":revision,"mutation_id":Uuid::new_v4()}),
+    )
+    .await?;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let rejected = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "publish_model",
+        json!({"model":model,"revision":saved["structuredContent"]["revision"],
+            "active_revision":revision,"mutation_id":Uuid::new_v4()}),
+    )
+    .await?;
+    assert_eq!(
+        rejected["structuredContent"]["code"], "validation_failed",
+        "{rejected}"
+    );
+
+    server
+        .request(Method::POST, "models/grants/rollback")
+        .json(&json!({"revision":previous,"active_revision":revision}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let rolled_back = call_at(&server, query_path, READER, "get_schema", mode).await?;
+    assert_eq!(
+        rolled_back["structuredContent"]["model_revision"],
+        *previous
+    );
+    assert_eq!(
+        rolled_back["structuredContent"]["schema"]["semantic_status"],
+        "unspecified"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn business_tasks_return_evidence_and_gate_model_publication() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let model = include_str!("../../examples/security-tasks/model.yaml");
+    let mut tables: Value =
+        serde_json::from_str(include_str!("../../examples/security-tasks/fixture.json"))?;
+    let device = &mut tables["tables"]["security.alert_device"];
+    device["columns"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"score","data_type":"Utf8","nullable":false}));
+    for row in device["rows"].as_array_mut().unwrap() {
+        row["score"] = json!("-0.0");
+    }
+    let suite = serde_json::to_string(&tables)?;
+    let mut sources = serde_json::Map::new();
+    for (index, (reference, table)) in tables["tables"].as_object().unwrap().iter().enumerate() {
+        let file = format!("fixture-{index}.jsonl");
+        let mut contents = String::new();
+        for row in table["rows"].as_array().unwrap() {
+            use std::fmt::Write;
+            writeln!(contents, "{row}")?;
+        }
+        fs::write(root.path().join(&file), contents)?;
+        sources.insert(
+            reference.strip_prefix("security.").unwrap().into(),
+            json!({"files":[file],"columns":table["columns"]}),
+        );
+    }
+    let model = model
+        .replace(
+            "{type: sqlite, path: security.sqlite}",
+            &json!({"type":"jsonl","tables":sources}).to_string(),
+        )
+        .replace("    source: security.alert_device\n",
+            "    inputs: [{table: security.alert_device, where: [{column: score, op: eq, value: -0.0}]}]\n");
+    let suite_path = root.path().join(".tasks-security.json");
+    fs::write(&suite_path, &suite)?;
+    fs::write(root.path().join("security.yaml"), &model)?;
+    let options = ["--timeout-ms", "10000"];
+    let mut server = Server::start_with(root.path(), "", 0, &options)?;
+    server.login().await?;
+    for (name, token, roles) in [
+        ("modeler", TOKEN, json!(["modeler", "publisher"])),
+        ("reader", READER, json!(["query"])),
+    ] {
+        server
+            .request(Method::PUT, &format!("users/{name}"))
+            .json(&json!({"service":true,"token":token,"disabled":false}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut group = json!({"members":[name],"grants":{"security":roles}});
+        if token == READER {
+            group["partitions"] = json!({"security":{"column":"tenant_id","op":"eq","value":"t1"}});
+        }
+        server
+            .request(Method::PUT, &format!("roles/{name}"))
+            .json(&group)
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    configure(
+        &server,
+        json!({"enabled":true,"query":true,"modeling":true,"publish":true}),
+    )
+    .await?;
+    let model_path = "/mcp/modeling";
+    let query_path = "/mcp/query";
+    let draft = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "get_model",
+        json!({"model":"security"}),
+    )
+    .await?;
+    assert!(
+        draft["structuredContent"]["active_revision"].is_null(),
+        "{draft}"
+    );
+    let before = call_at(
+        &server,
+        query_path,
+        READER,
+        "list_tasks",
+        json!({"model":"security"}),
+    )
+    .await?;
+    assert_eq!(
+        before["structuredContent"]["code"], "unpublished",
+        "{before}"
+    );
+    let v1 = &draft["structuredContent"]["revision"];
+    let activation = |revision: &Value, active: &Value| {
+        json!({
+            "model":"security","revision":revision,"active_revision":active
+        })
+    };
+    let mutation = |revision: &Value, active: &Value| {
+        let mut value = activation(revision, active);
+        value["mutation_id"] = json!(Uuid::new_v4());
+        value
+    };
+
+    let wrong_unit = call_at(
+        &server, model_path, TOKEN, "validate_model",
+        json!({"model":"security","yaml":model.replace("observed_at_ms: {unit: ms}", "observed_at_ms: {unit: s}")}),
+    ).await?;
+    assert_eq!(
+        wrong_unit["structuredContent"]["location"]["field"], "tasks",
+        "{wrong_unit}"
+    );
+    let initial = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "validate_model_impact",
+        activation(v1, &Value::Null),
+    )
+    .await?;
+    assert_eq!(
+        initial["structuredContent"]["status"], "passed",
+        "{initial}"
+    );
+    let published = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "publish_model",
+        mutation(v1, &Value::Null),
+    )
+    .await?;
+    assert_eq!(
+        published["structuredContent"]["active_revision"], *v1,
+        "{published}"
+    );
+    let listed = call_at(
+        &server,
+        query_path,
+        READER,
+        "list_tasks",
+        json!({"model":"security"}),
+    )
+    .await?;
+    assert_eq!(
+        listed["structuredContent"]["tasks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        listed["structuredContent"]["tasks"][0]["validation"]["report_id"],
+        initial["structuredContent"]["report_id"]
+    );
+
+    let offboard = &tables["cases"][0];
+    let alert = &tables["cases"][2];
+    let run_args = |case: &Value| {
+        json!({"model":"security","model_revision":v1,
+        "task":case["task"],"parameters":case["parameters"]})
+    };
+    for case in [offboard, alert] {
+        let outcome = call_at(&server, query_path, READER, "run_task", run_args(case)).await?;
+        assert_eq!(
+            outcome["structuredContent"]["execution_status"], "complete",
+            "{outcome}"
+        );
+        assert_eq!(outcome["structuredContent"]["scope"]["tenant_id"], "t1");
+        let mut actual = outcome["structuredContent"]["findings"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let mut expected = case["expected"]["findings"].as_array().unwrap().clone();
+        actual.sort_by_key(Value::to_string);
+        expected.sort_by_key(Value::to_string);
+        assert_eq!(actual, expected);
+    }
+    let mut outside_scope = run_args(offboard);
+    outside_scope["parameters"]["tenant_id"] = json!("t2");
+    let denied = call_at(&server, query_path, READER, "run_task", outside_scope).await?;
+    assert_eq!(
+        denied["structuredContent"]["code"], "invalid_task_parameters",
+        "{denied}"
+    );
+    let denied = call(&server, READER, "validate_model_impact", activation(v1, v1)).await?;
+    assert_eq!(denied["isError"], true);
+    let mut stale = run_args(alert);
+    stale["model_revision"] = json!("z".repeat(43));
+    let denied = call_at(&server, query_path, READER, "run_task", stale).await?;
+    assert_eq!(
+        denied["structuredContent"]["code"], "active_revision_changed",
+        "{denied}"
+    );
+
+    let regression = model.replace("    source: security.granted\n",
+        "    inputs: [{table: security.granted, where: [{column: resource_id, op: ne, value: analytics}]}]\n");
+    let save = |yaml: &str, revision: &Value| {
+        json!({"model":"security","yaml":yaml,
+        "revision":revision,"mutation_id":Uuid::new_v4()})
+    };
+    let positive_zero = model.replace("value: -0.0", "value: 0.0");
+    let saved = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "save_model",
+        save(&positive_zero, v1),
+    )
+    .await?;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let zero_revision = &saved["structuredContent"]["revision"];
+    let report = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "validate_model_impact",
+        activation(zero_revision, v1),
+    )
+    .await?;
+    let case = &report["structuredContent"]["cases"][2];
+    assert_eq!(case["status"], "failed", "{report}");
+    assert_eq!(case["baseline_matches"], true, "{case}");
+    assert_eq!(case["candidate_matches"], false, "{case}");
+    assert_eq!(case["removed"][0]["evidence"][0]["record_id"], "ad1");
+    assert_eq!(
+        report["structuredContent"]["mapping_changes"]["ALERT_DEVICE"],
+        json!(["inputs"])
+    );
+    let saved = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "save_model",
+        save(&regression, zero_revision),
+    )
+    .await?;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let v2 = &saved["structuredContent"]["revision"];
+    let report = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "validate_model_impact",
+        activation(v2, v1),
+    )
+    .await?;
+    assert_eq!(report["structuredContent"]["status"], "failed", "{report}");
+    let case = &report["structuredContent"]["cases"][0];
+    assert_eq!(case["baseline_matches"], true);
+    assert_eq!(case["candidate_matches"], false);
+    assert_eq!(case["removed"][0]["evidence"][1]["record_id"], "g1");
+    assert_eq!(
+        report["structuredContent"]["mapping_changes"]["GRANTED"],
+        json!(["inputs", "source"])
+    );
+    let http_report: Value = server
+        .request(Method::POST, "models/security/impact")
+        .json(&json!({"revision":v2,"active_revision":v1}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        http_report["report_id"],
+        report["structuredContent"]["report_id"]
+    );
+    let rejected = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "publish_model",
+        mutation(v2, v1),
+    )
+    .await?;
+    assert_eq!(
+        rejected["structuredContent"]["code"], "business_impact_failed",
+        "{rejected}"
+    );
+    let response = server
+        .request(Method::POST, "models/security/publish")
+        .json(&json!({"revision":v2,"active_revision":v1}))
+        .send()
+        .await?;
+    assert_eq!(
+        response.json::<Value>().await?["code"],
+        "business_impact_failed"
+    );
+
+    let without_version = model.replace(", source_version: source_version}", "}");
+    let saved = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "save_model",
+        save(&without_version, v2),
+    )
+    .await?;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let evidence_revision = &saved["structuredContent"]["revision"];
+    let report = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "validate_model_impact",
+        activation(evidence_revision, v1),
+    )
+    .await?;
+    assert_eq!(report["structuredContent"]["status"], "failed", "{report}");
+    let case = &report["structuredContent"]["cases"][0];
+    assert_eq!(case["baseline_matches"], true);
+    assert_eq!(case["candidate_matches"], false);
+    let changed = &case["changed"][0];
+    assert_eq!(changed[0]["evidence"][1]["source_version"], "fixture-1");
+    assert!(changed[1]["evidence"][1].get("source_version").is_none());
+    let rejected = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "publish_model",
+        mutation(evidence_revision, v1),
+    )
+    .await?;
+    assert_eq!(
+        rejected["structuredContent"]["code"], "business_impact_failed",
+        "{rejected}"
+    );
+
+    let removal = model.replace(
+        "tasks: [offboarded_account_exposure, alert_identity_device_context]\n",
+        "",
+    );
+    let saved = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "save_model",
+        save(&removal, evidence_revision),
+    )
+    .await?;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let v3 = &saved["structuredContent"]["revision"];
+    let rejected = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "publish_model",
+        mutation(v3, v1),
+    )
+    .await?;
+    assert_eq!(
+        rejected["structuredContent"]["code"], "task_policy_mismatch",
+        "{rejected}"
+    );
+
+    let mut versionless = tables.clone();
+    for case in versionless["cases"].as_array_mut().unwrap() {
+        let expected = &mut case["expected"];
+        if let Some(anchor) = expected["anchor"].as_object_mut() {
+            anchor.remove("source_version");
+        }
+        for finding in expected["findings"].as_array_mut().unwrap() {
+            for evidence in finding["evidence"].as_array_mut().unwrap() {
+                evidence.as_object_mut().unwrap().remove("source_version");
+            }
+        }
+    }
+    fs::write(&suite_path, serde_json::to_string(&versionless)?)?;
+    let rejected = server
+        .request(Method::POST, "models/security/rollback")
+        .json(&json!({"revision":v1,"active_revision":v1}))
+        .send()
+        .await?;
+    assert_eq!(
+        rejected.json::<Value>().await?["code"],
+        "business_impact_failed"
+    );
+    let saved = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "save_model",
+        save(&without_version, v3),
+    )
+    .await?;
+    assert_eq!(saved["structuredContent"]["revision"], *evidence_revision);
+    let published = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "publish_model",
+        mutation(evidence_revision, v1),
+    )
+    .await?;
+    assert_eq!(
+        published["structuredContent"]["active_revision"], *evidence_revision,
+        "{published}"
+    );
+    fs::write(&suite_path, &suite)?;
+
+    let documented = model.replace(
+        "Synthetic identity, grant and alert evidence",
+        "Evidence from synthetic grant and alert sources",
+    );
+    let saved = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "save_model",
+        save(&documented, evidence_revision),
+    )
+    .await?;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let v4 = &saved["structuredContent"]["revision"];
+    let published = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "publish_model",
+        mutation(v4, evidence_revision),
+    )
+    .await?;
+    assert_eq!(
+        published["structuredContent"]["active_revision"], *v4,
+        "{published}"
+    );
+    let rollback_preview: Value = server
+        .request(Method::POST, "models/security/impact/rollback")
+        .json(&json!({"revision":evidence_revision,"active_revision":v4}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(rollback_preview["status"], "failed");
+    let affected = &rollback_preview["cases"][0];
+    assert_eq!(affected["baseline_matches"], true);
+    assert_eq!(affected["candidate_matches"], false);
+    assert_eq!(
+        affected["baseline_findings"],
+        affected["candidate_findings"]
+    );
+    assert_eq!(
+        affected["changed"][0][0]["evidence"][1]["source_version"],
+        "fixture-1"
+    );
+    assert!(
+        affected["changed"][0][1]["evidence"][1]
+            .get("source_version")
+            .is_none()
+    );
+    let rejected = server
+        .request(Method::POST, "models/security/rollback")
+        .json(&json!({"revision":evidence_revision,"active_revision":v4}))
+        .send()
+        .await?;
+    assert_eq!(
+        rejected.json::<Value>().await?["code"],
+        "business_impact_failed"
+    );
+    server
+        .request(Method::POST, "models/security/rollback")
+        .json(&json!({"revision":v1,"active_revision":v4}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let report = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "validate_model_impact",
+        activation(v4, v1),
+    )
+    .await?;
+    assert_eq!(report["structuredContent"]["status"], "passed", "{report}");
+    for case in report["structuredContent"]["cases"].as_array().unwrap() {
+        assert_eq!(case["baseline_matches"], true, "{case}");
+        assert_eq!(case["candidate_matches"], true, "{case}");
+        for field in ["added", "removed", "changed"] {
+            assert_eq!(case[field], json!([]), "{case}");
+        }
+    }
+
+    drop(server);
+    let mut server = Server::start_with(root.path(), "", 0, &options)?;
+    let restarted = call_at(&server, query_path, READER, "run_task", run_args(alert)).await?;
+    assert_eq!(
+        restarted["structuredContent"]["execution_status"], "complete",
+        "{restarted}"
+    );
+    assert_eq!(
+        restarted["structuredContent"]["coverage"]["accounts_with_multiple_identities"],
+        json!(["okta:alice"])
+    );
+    let mut incomplete_suite = tables.clone();
+    incomplete_suite["tables"]
+        .as_object_mut()
+        .unwrap()
+        .remove("security.used_ip");
+    fs::write(&suite_path, serde_json::to_string(&incomplete_suite)?)?;
+    let uncovered = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "validate_model_impact",
+        activation(v4, v1),
+    )
+    .await?;
+    assert_eq!(
+        uncovered["structuredContent"]["status"], "inconclusive",
+        "{uncovered}"
+    );
+    assert_eq!(
+        uncovered["structuredContent"]["cases"][2]["status"], "not_covered",
+        "{uncovered}"
+    );
+    fs::write(&suite_path, format!("{suite}\n"))?;
+    let stale = call_at(&server, query_path, READER, "run_task", run_args(alert)).await?;
+    assert_eq!(
+        stale["structuredContent"]["code"], "task_unvalidated",
+        "{stale}"
+    );
+    fs::remove_file(&suite_path)?;
+    let rejected = call_at(
+        &server,
+        model_path,
+        TOKEN,
+        "publish_model",
+        mutation(v4, v1),
+    )
+    .await?;
+    assert_eq!(
+        rejected["structuredContent"]["code"], "missing_task_suite",
+        "{rejected}"
+    );
+
+    server.login().await?;
+    let suite_endpoint = "models/security/task-suite";
+    let http_activation = json!({"revision":v4,"active_revision":v1});
+    server
+        .request(Method::PUT, "users/suite-modeler")
+        .json(&json!({"password":PASSWORD,"disabled":false}))
+        .send()
+        .await?
+        .error_for_status()?;
+    server
+        .request(Method::PUT, "roles/suite-modeler")
+        .json(&json!({"members":["suite-modeler"],"grants":{"security":["modeler"]}}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let login = server
+        .guest(Method::POST, "auth/login")
+        .json(&json!({"username":"suite-modeler","password":PASSWORD}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let modeler_cookie = login.headers()["set-cookie"]
+        .to_str()?
+        .split(';')
+        .next()
+        .unwrap();
+    assert_eq!(
+        server
+            .guest(Method::GET, suite_endpoint)
+            .header("Cookie", modeler_cookie)
+            .send()
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        server
+            .guest(Method::PUT, suite_endpoint)
+            .header("Cookie", modeler_cookie)
+            .json(&json!({"revision":null,"content":suite}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        server
+            .guest(Method::POST, "models/security/impact/rollback")
+            .header("Cookie", modeler_cookie)
+            .json(&http_activation)
+            .send()
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    server
+        .request(Method::PUT, suite_endpoint)
+        .json(&json!({"revision":null,"content":suite}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let mounted: Value = server
+        .request(Method::GET, suite_endpoint)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(mounted["source"], "console");
+    assert_eq!(mounted["content"], suite);
+    assert_eq!(
+        server
+            .request(Method::PUT, suite_endpoint)
+            .json(&json!({"revision":null,"content":suite}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let preview: Value = server
+        .request(Method::POST, "models/security/impact")
+        .json(&http_activation)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(preview["status"], "passed");
+    assert_eq!(preview["suite_revision"], mounted["revision"]);
+
+    let edits = [format!("{suite}\n"), format!("{suite}\n\n")];
+    let write = |content: &str| {
+        server
+            .request(Method::PUT, suite_endpoint)
+            .json(&json!({"revision":mounted["revision"],"content":content}))
+            .send()
+    };
+    let (left, right) = tokio::join!(write(&edits[0]), write(&edits[1]));
+    let responses = [left?.status(), right?.status()];
+    let winner = match responses {
+        [
+            StatusCode::OK,
+            StatusCode::CONFLICT | StatusCode::TOO_MANY_REQUESTS,
+        ] => 0,
+        [
+            StatusCode::CONFLICT | StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::OK,
+        ] => 1,
+        _ => panic!("expected exactly one suite save to succeed: {responses:?}"),
+    };
+    let latest: Value = server
+        .request(Method::GET, suite_endpoint)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(latest["content"], edits[winner]);
+    assert_eq!(
+        write(&edits[1 - winner]).await?.status(),
+        StatusCode::CONFLICT
+    );
+    let rejected = server.request(Method::POST, "models/security/publish")
+        .json(&json!({"revision":v4,"active_revision":v1,"preview":{"report_id":preview["report_id"]}}))
+        .send().await?;
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        rejected.json::<Value>().await?["code"],
+        "impact_preview_changed"
+    );
+    let business: Value = server
+        .request(Method::GET, "models/security/impact")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(business["active"], "stale");
+    let current: Value = server
+        .request(Method::POST, "models/security/impact")
+        .json(&http_activation)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    server.request(Method::POST, "models/security/publish")
+        .json(&json!({"revision":v4,"active_revision":v1,"preview":{"report_id":current["report_id"]}}))
+        .send().await?.error_for_status()?;
+    let business: Value = server
+        .request(Method::GET, "models/security/impact")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(business["active"], "passed");
+
+    let restored_draft: Value = server
+        .request(Method::PUT, "models/security")
+        .header("If-Match", format!("\"{}\"", v4.as_str().unwrap()))
+        .json(&json!({"yaml":model}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(restored_draft["revision"], *v1);
+    let rollback_target = json!({"revision":v1,"active_revision":v4});
+    let preview_activation = |path: &'static str| {
+        server
+            .request(Method::POST, path)
+            .json(&rollback_target)
+            .send()
+    };
+    let draft_report: Value = preview_activation("models/security/impact")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let rollback_report: Value = preview_activation("models/security/impact/rollback")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(draft_report["status"], "passed");
+    assert_eq!(rollback_report["status"], "passed");
+    assert_ne!(draft_report["report_id"], rollback_report["report_id"]);
+    let rollback = |report: &Value| {
+        server.request(Method::POST, "models/security/rollback")
+        .json(&json!({"revision":v1,"active_revision":v4,"preview":{"report_id":report["report_id"]}}))
+        .send()
+    };
+    let wrong_action = rollback(&draft_report).await?;
+    assert_eq!(wrong_action.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        wrong_action.json::<Value>().await?["code"],
+        "impact_preview_changed"
+    );
+    server
+        .request(Method::PUT, suite_endpoint)
+        .json(&json!({"revision":latest["revision"],"content":suite}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let stale = rollback(&rollback_report).await?;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        stale.json::<Value>().await?["code"],
+        "impact_preview_changed"
+    );
+    let fresh: Value = preview_activation("models/security/impact/rollback")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let rolled_back: Value = rollback(&fresh).await?.error_for_status()?.json().await?;
+    assert_eq!(rolled_back["active_revision"], *v1);
+
+    let strict_yaml =
+        format!("{model}\nfreshness:\n  policy:\n    max_observation_age_seconds: 60\n");
+    let strict_draft: Value = server
+        .request(Method::PUT, "models/security")
+        .header("If-Match", format!("\"{}\"", v1.as_str().unwrap()))
+        .json(&json!({"yaml":strict_yaml}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    server
+        .request(Method::POST, "models/security/publish")
+        .json(&json!({"revision":strict_draft["revision"],"active_revision":v1}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut strict_task = run_args(alert);
+    strict_task["model_revision"] = strict_draft["revision"].clone();
+    let strict = call_at(&server, query_path, READER, "run_task", strict_task).await?;
+    assert_eq!(
+        strict["structuredContent"]["code"], "freshness_required",
+        "{strict}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_model_preview_is_bound_to_the_reviewed_draft() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    setup_assets(root.path())?;
+    setup_credentials(root.path())?;
+    let yaml = include_str!("../../examples/text/graph.yaml");
+    fs::write(root.path().join("graph.yaml"), yaml)?;
+    fs::write(
+        root.path().join("accounts.csv"),
+        include_str!("../../examples/text/accounts.csv"),
+    )?;
+    fs::write(
+        root.path().join("transfers.jsonl"),
+        include_str!("../../examples/text/transfers.jsonl"),
+    )?;
+    let mut server = Server::start(root.path(), "", 0)?;
+    server.login().await?;
+    let initial: Value = server
+        .request(Method::GET, "models/graph")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let active = &initial["active_revision"];
+    let save = |current: &Value, yaml: &str| {
+        server
+            .request(Method::PUT, "models/graph")
+            .header("If-Match", format!("\"{}\"", current.as_str().unwrap()))
+            .json(&json!({"yaml":yaml}))
+            .send()
+    };
+    let first: Value = save(&initial["revision"], &format!("{yaml}\n# drafted once\n"))
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let preview = |target: &Value| {
+        server
+            .request(Method::POST, "models/graph/impact")
+            .json(&json!({"revision":target,"active_revision":active}))
+            .send()
+    };
+    let report: Value = preview(&first["revision"])
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(report["status"], "not_required");
+
+    let second: Value = save(&first["revision"], &format!("{yaml}\n# drafted twice\n"))
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let publish = |target: &Value, id: &Value| {
+        server
+            .request(Method::POST, "models/graph/publish")
+            .json(&json!({"revision":target,"active_revision":active,"preview":{"report_id":id},"mutation_id":Uuid::new_v4()}))
+            .send()
+    };
+    assert_eq!(
+        publish(&first["revision"], &report["report_id"])
+            .await?
+            .status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    let mismatched = publish(&second["revision"], &report["report_id"]).await?;
+    assert_eq!(mismatched.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        mismatched.json::<Value>().await?["code"],
+        "impact_preview_changed"
+    );
+    let fresh: Value = preview(&second["revision"])
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(fresh["report_id"].is_string());
+    let published: Value = publish(&second["revision"], &fresh["report_id"])
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(published["active_revision"], second["revision"]);
     Ok(())
 }

@@ -4,11 +4,10 @@ import { t } from './locale.ts';
 
 const supportsPopover = 'popover' in HTMLElement.prototype;
 
-export function WorkspaceTools({ children }: { children: ReactNode }) {
+export function WorkspaceTools({ children, label = t('更多工具') }: { children: ReactNode; label?: string }) {
   const id = useId();
   const panel = useRef<HTMLDivElement>(null);
   const fallback = useRef<HTMLDetailsElement>(null);
-  const label = t('更多工具');
   const trigger = <>{label}<ChevronDown size={14} aria-hidden="true" /></>;
 
   function dismissAfterAction(event: MouseEvent<HTMLDivElement>) {

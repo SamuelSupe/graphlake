@@ -9,6 +9,7 @@ import { SourceBrowser, type TableSelection } from './SourceBrowser';
 import { MappingColumn, mappingControl } from './MappingColumn';
 import { SourceConfig } from './SourceConfig';
 import { TemporalConfig } from './TemporalConfig';
+import { SemanticsConfig } from './SemanticsConfig';
 
 export type Edit = (change: (doc: YamlDocument) => void) => void;
 
@@ -152,6 +153,7 @@ export function Inspector({ model, selected, edit, select, openYaml, columns, id
         </details>}
       </section>
       <section className="inspector-section">
+        <SemanticsConfig id={id} item={item} path={path} edit={edit} invalid={invalid} edge={section === 'edges'} />
         <TemporalConfig id={id} item={item} path={path} columns={multipleInputs ? undefined : physical} edit={edit} invalid={invalid} />
         <button className="button danger" onClick={onRemove} disabled={section === 'nodes' && Object.keys(model.nodes).length <= 1}>
           <Trash2 size={16} />{t('删除{0}', kind)}

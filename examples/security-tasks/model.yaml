@@ -1,0 +1,129 @@
+graph: Security investigation example
+semantics:
+  description: Synthetic identity, grant and alert evidence
+  limitations: [This fixture covers recorded grants and events.]
+tasks: [offboarded_account_exposure, alert_identity_device_context]
+sources:
+  security: {type: sqlite, path: security.sqlite}
+nodes:
+  Person:
+    source: security.person
+    key: [tenant_id, namespace, person_id]
+    properties: [departed_at_ms, record_id, source_system, observed_at_ms, source_version]
+    semantics:
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  Account:
+    source: security.account
+    key: [tenant_id, account_id]
+  Role:
+    source: security.role
+    key: [tenant_id, role_id]
+  Resource:
+    source: security.resource
+    key: [tenant_id, resource_id]
+  Alert:
+    source: security.alert
+    key: [tenant_id, alert_id]
+    properties: [happened_at_ms, record_id, source_system, observed_at_ms, source_version]
+    semantics:
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  Device:
+    source: security.device
+    key: [tenant_id, device_id]
+  IP:
+    source: security.ip
+    key: [tenant_id, address]
+edges:
+  IDENTIFIED_AS:
+    source: security.identified_as
+    key: [tenant_id, record_id]
+    from: {node: Account, columns: [tenant_id, account_id]}
+    to: {node: Person, columns: [tenant_id, namespace, person_id]}
+    properties: [valid_from_ms, valid_to_ms, source_system, observed_at_ms, source_version]
+    semantics:
+      relation: {kind: identity_link}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  GRANTED:
+    source: security.granted
+    key: [tenant_id, record_id]
+    from: {node: Account, columns: [tenant_id, account_id]}
+    to: {node: Resource, columns: [tenant_id, resource_id]}
+    properties: [action, valid_from_ms, valid_to_ms, source_system, observed_at_ms, source_version]
+    scd2: {valid_from: valid_from_ms, valid_to: valid_to_ms}
+    semantics:
+      relation: {kind: entitlement}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  MEMBER_OF:
+    source: security.member_of
+    key: [tenant_id, record_id]
+    from: {node: Account, columns: [tenant_id, account_id]}
+    to: {node: Role, columns: [tenant_id, role_id]}
+    properties: [valid_from_ms, valid_to_ms, source_system, observed_at_ms, source_version]
+    semantics:
+      relation: {kind: entitlement}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  ROLE_GRANT:
+    source: security.role_grant
+    key: [tenant_id, record_id]
+    from: {node: Role, columns: [tenant_id, role_id]}
+    to: {node: Resource, columns: [tenant_id, resource_id]}
+    properties: [action, valid_from_ms, valid_to_ms, source_system, observed_at_ms, source_version]
+    semantics:
+      relation: {kind: entitlement}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  ACCESSED:
+    source: security.accessed
+    key: [tenant_id, record_id]
+    from: {node: Account, columns: [tenant_id, account_id]}
+    to: {node: Resource, columns: [tenant_id, resource_id]}
+    properties: [action, outcome, happened_at_ms, source_system, observed_at_ms, source_version]
+    semantics:
+      relation: {kind: observed_use}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  ALERT_ACCOUNT:
+    source: security.alert_account
+    key: [tenant_id, record_id]
+    from: {node: Alert, columns: [tenant_id, alert_id]}
+    to: {node: Account, columns: [tenant_id, account_id]}
+    properties: [source_system, observed_at_ms, source_version]
+    semantics:
+      relation: {kind: observed_use}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  ALERT_DEVICE:
+    source: security.alert_device
+    key: [tenant_id, record_id]
+    from: {node: Alert, columns: [tenant_id, alert_id]}
+    to: {node: Device, columns: [tenant_id, device_id]}
+    properties: [source_system, observed_at_ms, source_version]
+    semantics:
+      relation: {kind: observed_use}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  USED_DEVICE:
+    source: security.used_device
+    key: [tenant_id, record_id]
+    from: {node: Account, columns: [tenant_id, account_id]}
+    to: {node: Device, columns: [tenant_id, device_id]}
+    properties: [happened_at_ms, source_system, observed_at_ms, source_version]
+    semantics:
+      relation: {kind: correlation}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}
+  USED_IP:
+    source: security.used_ip
+    key: [tenant_id, record_id]
+    from: {node: Account, columns: [tenant_id, account_id]}
+    to: {node: IP, columns: [tenant_id, address]}
+    properties: [happened_at_ms, source_system, observed_at_ms, source_version]
+    semantics:
+      relation: {kind: correlation}
+      properties: {observed_at_ms: {unit: ms}}
+      evidence: {source_system: source_system, record_key: [tenant_id, record_id], observed_at: observed_at_ms, source_version: source_version}

@@ -13,6 +13,11 @@ mod scalar;
 mod source;
 mod traversal;
 
+pub use catalog::semantics::{
+    EvidenceSemantics, LabelSemantics, ModelSemantics, PropertySemantics, RelationKind,
+    RelationSemantics, TemporalSemantics,
+};
+pub use catalog::tasks::BusinessTask;
 pub use catalog::{
     Catalog, Comparison, ConflictPolicy, DeltaTable, Edge, Endpoint, Freshness, FreshnessPolicy,
     GraphInput, MysqlConnection, Node, ObjectFormat, Predicate, Scd2, Source, StorageConfig,

@@ -1,8 +1,10 @@
 import { diagnosticText, t } from './locale.ts';
 import type { useMutations } from './Mutations';
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, Waypoints, X } from 'lucide-react';
-import { api, ApiError, errorText, type Column, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
+import { api, ApiError, errorText, type BusinessStatus, type Column, type ImpactReport, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
+import { BusinessImpact, impactLabels, type ImpactTarget } from './BusinessImpact';
+import { BusinessTasks } from './BusinessTasks';
 import { newConnector } from './connectors';
 import { AddSource } from './AddSource';
 import { Catalogs } from './Catalogs';
@@ -57,7 +59,11 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const [catalogSelection, setCatalogSelection] = useState<string>();
   const [browsing, setBrowsing] = useState<string>();
   const [localTables, setLocalTables] = useState(false);
-  const [modal, setModal] = useState<Section | 'yaml' | 'title' | 'versions' | 'unpublish' | 'nodes-list' | 'edges-list'>();
+  const [modal, setModal] = useState<Section | 'yaml' | 'title' | 'versions' | 'unpublish' | 'nodes-list' | 'edges-list' | 'business-tasks' | 'business-impact'>();
+  const [business, setBusiness] = useState<BusinessStatus>();
+  const [businessRefresh, setBusinessRefresh] = useState(0);
+  const [lastImpact, setLastImpact] = useState<ImpactReport>();
+  const [impactTarget, setImpactTarget] = useState<ImpactTarget>();
   const [loading, setLoading] = useState(!initial);
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -77,8 +83,10 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
 
   function refresh() {
     if (dirty && !window.confirm(t('重新加载会丢弃未保存的修改。继续？'))) return;
+    setModal(undefined);
     setNotice(undefined);
     setTableColumns(new Map());
+    setLastImpact(undefined);
     setReload(value => value + 1);
   }
 
@@ -101,6 +109,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     setSaved(recovered);
     setYaml(current => saved && current === saved.yaml ? recovered.yaml : current);
     setChecked(undefined);
+    setLastImpact(undefined);
+    setBusinessRefresh(value => value + 1);
   // Apply only when a previously interrupted write is resolved.
   }, [recovered]);
 
@@ -130,7 +140,26 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   useEffect(() => () => onDirty(dirtyId, false), [dirtyId, onDirty]);
   const validation = checked?.yaml === yaml ? checked.result : undefined;
   const status = validation?.status ?? (!dirty && saved ? saved.status : 'unchecked');
-  const statusText = status === 'passed' && validation ? (validation.check_data ? t('数据校验通过') : t('结构校验通过')) : undefined;
+  const statusText = status === 'passed' ? (validation ? validation.check_data ? t('数据校验通过') : t('结构校验通过') : t('模型校验通过'))
+    : status === 'failed' ? t('模型校验失败') : undefined;
+  const savedRevision = saved?.revision;
+  const activeRevision = saved?.active_revision;
+  const canReviewImpact = allow.edit || allow.publish;
+  useEffect(() => {
+    if (!canReviewImpact || !savedRevision) return;
+    const controller = new AbortController();
+    api<BusinessStatus>('/models/' + id + '/impact', { signal: controller.signal }).then(value => {
+      if (!controller.signal.aborted) setBusiness(value);
+    }, () => {
+      if (!controller.signal.aborted) setBusiness(undefined);
+    });
+    return () => controller.abort();
+  }, [id, savedRevision, activeRevision, canReviewImpact, businessRefresh, reload]);
+
+  const captureImpact = useCallback((report: ImpactReport | undefined) => {
+    setLastImpact(report);
+    if (report) setBusinessRefresh(value => value + 1);
+  }, []);
 
   const selected = model && selection && Object.hasOwn(model[selection.section], selection.name) ? selection : undefined;
 
@@ -140,6 +169,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     else setYaml(value);
     setNotice(undefined);
     setChecked(undefined);
+    setLastImpact(undefined);
     setLocating(undefined);
   }
 
@@ -227,7 +257,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     } finally { setChecking(false); }
   }
 
-  async function activate(revision: string | undefined, action: 'publish' | 'rollback' | 'unpublish' | 'restore', backup?: string) {
+  async function activate(revision: string | undefined, action: 'publish' | 'rollback' | 'unpublish' | 'restore', backup?: string, preview?: { report_id: string }) {
     if (!saved || activating || !allow.publish) return;
     setActivating(true);
     setNotice(undefined);
@@ -236,12 +266,14 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         model: id, label: { publish: '发布模型', rollback: '回退模型', unpublish: '下线模型', restore: '恢复归档' }[action],
         path: '/models/' + id + (action === 'restore' ? '/history/' + revision : '/' + action),
         method: action === 'restore' ? 'PUT' : 'POST',
-        body: JSON.stringify(action === 'restore' ? { yaml: backup } : { revision, active_revision: saved.active_revision }),
+        body: JSON.stringify(action === 'restore' ? { yaml: backup } : { revision, active_revision: saved.active_revision, preview }),
       });
       // Version switches leave the working draft intact, including unsaved edits.
       if (saved.revision !== response.revision) setChecked(undefined);
       setSaved(response);
       if (!dirty) setYaml(current => current === yaml ? response.yaml : current);
+      setLastImpact(undefined);
+      setBusinessRefresh(value => value + 1);
       setModal(undefined);
       changed();
       setNotice({ text: action === 'unpublish' ? t('模型已下线，草稿和历史版本已保留')
@@ -249,10 +281,31 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         : (action === 'publish' ? t('已发布版本 ') : t('已回退至版本 ')) + revision?.slice(0, 10) });
     } catch (cause) {
       if (action === 'restore') throw cause;
-      setModal(undefined);
+      if (!preview) setModal(undefined);
       setNotice({ text: errorText(cause), error: true, location: action === 'publish' && cause instanceof ApiError ? cause.location : undefined, yaml });
       if (action === 'publish') changed();
+      if (preview) {
+        setLastImpact(undefined);
+        setBusinessRefresh(value => value + 1);
+        throw cause;
+      }
     } finally { setActivating(false); }
+  }
+
+  function previewImpact(action: ImpactTarget['action'], revision = saved?.revision) {
+    if (!saved || !revision || !canReviewImpact) return;
+    setImpactTarget({ action, revision, active_revision: saved.active_revision });
+    if (action !== 'rollback') setLastImpact(undefined);
+    setModal('business-impact');
+  }
+
+  async function saveSuite(revision: string | null, content: string) {
+    await mutations.run({
+      model: id, label: t('保存固定场景'), path: '/models/' + id + '/task-suite', method: 'PUT',
+      body: JSON.stringify({ revision, content }),
+    });
+    setLastImpact(undefined);
+    setBusinessRefresh(value => value + 1);
   }
 
   function openSource() {
@@ -331,7 +384,19 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       return next;
     });
   }
-  const canPublish = allow.publish && Boolean(model && saved?.revision && !dirty && !busy && saved.revision !== saved.active_revision);
+  const canPublish = allow.publish && Boolean(model && saved?.revision && !dirty && !busy
+    && (saved.revision !== saved.active_revision || business?.active === 'stale'));
+  const draftImpact = !dirty && lastImpact?.revision === savedRevision && lastImpact?.active_revision === activeRevision
+    && lastImpact?.suite_revision === business?.suite_revision ? lastImpact : undefined;
+  const businessStatus = canReviewImpact && (business?.required || Boolean(model?.tasks.length) || draftImpact) && <div className="business-status" role="status">
+    <StatusLabel status={draftImpact?.status === 'passed' ? 'passed' : draftImpact && draftImpact.status !== 'not_required' ? 'failed' : 'unchecked'}
+      text={draftImpact ? t('草稿业务预览 · {0}', impactLabels[draftImpact.status])
+        : dirty ? t('草稿业务校验 · 保存后可预览')
+          : business?.required && business.suite_revision === null ? t('草稿业务校验 · 缺少固定场景')
+            : t('草稿业务校验 · 待预览')} />
+    {business?.active && <StatusLabel status={business.active === 'passed' ? 'passed' : 'failed'}
+      text={business.active === 'passed' ? t('生效版本业务校验 · 通过') : t('生效版本业务校验 · 需重新发布')} />}
+  </div>;
   const inspectorSelection: Selection | undefined = workspace === 'catalogs'
     ? model && catalogSelection && Object.hasOwn(model.sources, catalogSelection) ? { section: 'sources', name: catalogSelection } : undefined
     : selected;
@@ -437,15 +502,18 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       <div className="catalog-controls">
         {allow.configure && <button className="button compact" disabled={!saved.revision} onClick={() => setLocalTables(true)}>{t('本地表与同步')}</button>}
         <button className="button compact" disabled={!dirty || busy || !!incomplete} title={incomplete?.message} onClick={() => void save()}>{saving ? t('保存中…') : t('保存草稿')}</button>
-        <button className="button primary compact" disabled={!canPublish} onClick={() => saved.revision && void activate(saved.revision, 'publish')}>{t('校验并发布')}</button>
+        <button className="button primary compact" disabled={!canPublish} onClick={() => previewImpact('publish')}>{t('预览并发布')}</button>
         {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span role="status"><StatusLabel status={status} text={statusText} /></span>}
         <WorkspaceTools>
           <button type="button" className="tool-button" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>
           <button type="button" className="tool-button" disabled={busy} onClick={() => void validate(true)}><ShieldCheck size={16} aria-hidden="true" />{t('校验数据')}</button>
           <button type="button" className="tool-button" onClick={openYaml}><Braces size={16} aria-hidden="true" />{t('查看 YAML')}</button>
           <button type="button" className="tool-button" disabled={busy || !saved.revision} onClick={refresh}><RefreshCw size={16} aria-hidden="true" />{t('重新加载')}</button>
+          {canReviewImpact && <button type="button" className="tool-button" disabled={busy || dirty || !saved.revision}
+                onClick={() => previewImpact('check')}><ShieldCheck size={16} aria-hidden="true" />{t('校验业务场景')}</button>}
         </WorkspaceTools>
       </div>
+      {businessStatus}
       <Catalogs model={model} selected={catalogSelection} configure={name => {
         inspectorInvoker.current = document.activeElement as HTMLElement;
         setCatalogSelection(name);
@@ -476,8 +544,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
                 onClick={() => void save()}><Save size={16} aria-hidden="true" />{saving ? t('保存中…') : t('保存草稿')}</button>}
             {showingYaml && allow.edit && <button className="tool-button" disabled={busy || !!yamlError}
               onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>}
-            {allow.publish && (showingYaml || saved.active_revision || !allow.edit) && <button className="tool-button tool-primary" disabled={!canPublish} onClick={() => void activate(saved.revision, 'publish')}>
-              <Upload size={16} aria-hidden="true" />{activating ? t('正在切换…') : t('校验并发布')}
+            {allow.publish && (showingYaml || saved.active_revision || !allow.edit) && <button className="tool-button tool-primary" disabled={!canPublish} onClick={() => previewImpact('publish')}>
+              <Upload size={16} aria-hidden="true" />{activating ? t('正在切换…') : t('预览并发布')}
             </button>}
             {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span className="draft-status graph-status" role="status"><StatusLabel status={status} text={statusText} /></span>}
             <WorkspaceTools key={showingYaml ? 'yaml' : 'canvas'}>
@@ -487,12 +555,18 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
               {!showingYaml && allow.edit && <button type="button" className="tool-button" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>}
               {allow.edit && <button type="button" className="tool-button" disabled={busy || !!yamlError} onClick={() => void validate(true)}><ShieldCheck size={16} aria-hidden="true" />{t('校验数据')}</button>}
               <button type="button" className="tool-button" disabled={!saved.revision || activating} onClick={() => setModal('versions')}><History size={16} aria-hidden="true" />{t('版本历史')}</button>
+              {canReviewImpact && model && <button type="button" className="tool-button" disabled={busy} onClick={() => setModal('business-tasks')}>
+                <ShieldCheck size={16} aria-hidden="true" />{t('业务任务')}
+              </button>}
+              {canReviewImpact && <button type="button" className="tool-button" disabled={busy || dirty || !saved.revision}
+                onClick={() => previewImpact('check')}><ShieldCheck size={16} aria-hidden="true" />{t('校验业务场景')}</button>}
             </WorkspaceTools>
           </div>
         </div>
         {!showingYaml && model && !saved.active_revision && allow.edit && <ModelSetup configure={allow.configure} publishAllowed={allow.publish} model={model} issue={incomplete} dirty={dirty} busy={!!busy} canPublish={canPublish}
-          add={section => section === 'sources' ? openSource() : setModal(section)} select={setSelection} save={() => void save()} publish={() => void activate(saved.revision, 'publish')} />}
+          add={section => section === 'sources' ? openSource() : setModal(section)} select={setSelection} save={() => void save()} publish={() => previewImpact('publish')} />}
         {(showingYaml || saved.active_revision) && incomplete && <p className="notice">{incomplete.message}</p>}
+        {businessStatus}
         {notices}
         {showingYaml ? <ModelYamlEditor id={id} yaml={yaml} error={yamlError} errorLine={current?.line} editable={allow.edit} busy={busy}
           change={changeText} />
@@ -583,7 +657,24 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       archiveError={saved.archive_error}
       restore={allow.publish ? (revision, backup) => activate(revision, 'restore', backup) : undefined}
       offline={allow.publish && saved.active_revision ? () => setModal('unpublish') : undefined}
-      rollback={allow.publish ? revision => void activate(revision, 'rollback') : undefined} />}
+      rollback={allow.publish ? revision => previewImpact('rollback', revision) : undefined} />}
+    {modal === 'business-tasks' && model && <BusinessTasks id={id} selected={model.tasks}
+      toggle={allow.edit ? (task, enabled) => edit(doc => {
+        const next = enabled ? [...model.tasks, task] : model.tasks.filter(value => value !== task);
+        if (next.length) doc.set('tasks', next);
+        else doc.delete('tasks');
+      }) : undefined}
+      saveSuite={allow.configure && saved?.revision ? saveSuite : undefined} close={() => setModal(undefined)} />}
+    {modal === 'business-impact' && impactTarget && <BusinessImpact id={id} target={impactTarget}
+      busy={activating || mutations.pending} onReport={impactTarget.action === 'rollback' ? undefined : captureImpact}
+      confirm={async reportId => {
+        if (impactTarget.action === 'check') return;
+        if (saved?.active_revision !== impactTarget.active_revision
+          || impactTarget.action === 'publish' && (dirty || saved?.revision !== impactTarget.revision)) {
+          throw new ApiError(t('模型版本已变化，请重新加载后打开预览。'), 'revision_conflict');
+        }
+        await activate(impactTarget.revision, impactTarget.action, undefined, { report_id: reportId });
+      }} reloadModel={refresh} close={() => setModal(impactTarget.action === 'rollback' ? 'versions' : undefined)} />}
     {modal === 'unpublish' && <Modal layout="center" title={t('下线模型')} close={() => setModal(undefined)}>
       <div className="dialog-form">
         <p>{t('下线后将拒绝新的查询、导出和邻居展开。草稿和历史版本会保留，可以重新发布。')}</p>

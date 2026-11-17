@@ -164,6 +164,8 @@ async fn load(
         .context("invalid source table")?;
     let catalog = Catalog {
         graph: "local_table_load".into(),
+        semantics: None,
+        tasks: Default::default(),
         sources: BTreeMap::from([(source_name.into(), table.source.clone())]),
         nodes: BTreeMap::new(),
         edges: BTreeMap::new(),

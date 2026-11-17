@@ -1,0 +1,254 @@
+{"tables": {
+    "security.person": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "namespace", "data_type": "Utf8", "nullable": false}, {"name": "person_id", "data_type": "Utf8", "nullable": false}, {"name": "departed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "namespace": "hr", "person_id": "alice", "departed_at_ms": 10000, "record_id": "hr-alice", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "namespace": "hr", "person_id": "alice", "departed_at_ms": 10000, "record_id": "hr-alice", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "namespace": "hr", "person_id": "bob", "departed_at_ms": null, "record_id": "hr-bob", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "namespace": "hr", "person_id": "bob", "departed_at_ms": null, "record_id": "hr-bob", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "namespace": "external", "person_id": "alice", "departed_at_ms": null, "record_id": "ext-alice", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "namespace": "external", "person_id": "alice", "departed_at_ms": null, "record_id": "ext-alice", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.account": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "account_id", "data_type": "Utf8", "nullable": false}],
+      "rows": [
+        {"tenant_id": "t1", "account_id": "azure:alice"},
+        {"tenant_id": "t2", "account_id": "azure:alice"},
+        {"tenant_id": "t1", "account_id": "okta:alice"},
+        {"tenant_id": "t2", "account_id": "okta:alice"},
+        {"tenant_id": "t1", "account_id": "okta:reused"},
+        {"tenant_id": "t2", "account_id": "okta:reused"},
+        {"tenant_id": "t1", "account_id": "okta:bob"},
+        {"tenant_id": "t2", "account_id": "okta:bob"}
+      ]
+    },
+    "security.role": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "role_id", "data_type": "Utf8", "nullable": false}],
+      "rows": [
+        {"tenant_id": "t1", "role_id": "analyst"},
+        {"tenant_id": "t2", "role_id": "analyst"}
+      ]
+    },
+    "security.resource": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "resource_id", "data_type": "Utf8", "nullable": false}],
+      "rows": [
+        {"tenant_id": "t1", "resource_id": "analytics"},
+        {"tenant_id": "t2", "resource_id": "analytics"},
+        {"tenant_id": "t1", "resource_id": "expired"},
+        {"tenant_id": "t2", "resource_id": "expired"},
+        {"tenant_id": "t1", "resource_id": "retired"},
+        {"tenant_id": "t2", "resource_id": "retired"},
+        {"tenant_id": "t1", "resource_id": "documents"},
+        {"tenant_id": "t2", "resource_id": "documents"},
+        {"tenant_id": "t1", "resource_id": "reused"},
+        {"tenant_id": "t2", "resource_id": "reused"}
+      ]
+    },
+    "security.alert": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "alert_id", "data_type": "Utf8", "nullable": false}, {"name": "happened_at_ms", "data_type": "Int64", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "alert_id": "a1", "happened_at_ms": 14000, "record_id": "alert-1", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "alert_id": "a1", "happened_at_ms": 14000, "record_id": "alert-1", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "alert_id": "a2", "happened_at_ms": 16000, "record_id": "alert-2", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "alert_id": "a2", "happened_at_ms": 16000, "record_id": "alert-2", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.device": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "device_id", "data_type": "Utf8", "nullable": false}],
+      "rows": [
+        {"tenant_id": "t1", "device_id": "laptop"},
+        {"tenant_id": "t2", "device_id": "laptop"},
+        {"tenant_id": "t1", "device_id": "shared"},
+        {"tenant_id": "t2", "device_id": "shared"}
+      ]
+    },
+    "security.ip": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "address", "data_type": "Utf8", "nullable": false}],
+      "rows": [
+        {"tenant_id": "t1", "address": "192.0.2.8"},
+        {"tenant_id": "t2", "address": "192.0.2.8"}
+      ]
+    },
+    "security.identified_as": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "account_id", "data_type": "Utf8", "nullable": true}, {"name": "namespace", "data_type": "Utf8", "nullable": true}, {"name": "person_id", "data_type": "Utf8", "nullable": true}, {"name": "valid_from_ms", "data_type": "Int64", "nullable": true}, {"name": "valid_to_ms", "data_type": "Int64", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "i1", "account_id": "azure:alice", "namespace": "hr", "person_id": "alice", "valid_from_ms": null, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "i1", "account_id": "azure:alice", "namespace": "hr", "person_id": "alice", "valid_from_ms": null, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "i2", "account_id": "okta:alice", "namespace": "hr", "person_id": "alice", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "i2", "account_id": "okta:alice", "namespace": "hr", "person_id": "alice", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "i3", "account_id": "okta:reused", "namespace": "hr", "person_id": "alice", "valid_from_ms": 1000, "valid_to_ms": 15000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "i3", "account_id": "okta:reused", "namespace": "hr", "person_id": "alice", "valid_from_ms": 1000, "valid_to_ms": 15000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "i4", "account_id": "okta:reused", "namespace": "hr", "person_id": "bob", "valid_from_ms": 15000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "i4", "account_id": "okta:reused", "namespace": "hr", "person_id": "bob", "valid_from_ms": 15000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "i5", "account_id": "okta:bob", "namespace": "hr", "person_id": "bob", "valid_from_ms": null, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "i5", "account_id": "okta:bob", "namespace": "hr", "person_id": "bob", "valid_from_ms": null, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "i6", "account_id": "okta:alice", "namespace": "external", "person_id": "alice", "valid_from_ms": 12000, "valid_to_ms": 16000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "i6", "account_id": "okta:alice", "namespace": "external", "person_id": "alice", "valid_from_ms": 12000, "valid_to_ms": 16000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.granted": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "account_id", "data_type": "Utf8", "nullable": true}, {"name": "resource_id", "data_type": "Utf8", "nullable": true}, {"name": "action", "data_type": "Utf8", "nullable": true}, {"name": "valid_from_ms", "data_type": "Int64", "nullable": true}, {"name": "valid_to_ms", "data_type": "Int64", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "g1", "account_id": "azure:alice", "resource_id": "analytics", "action": "read", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "g1", "account_id": "azure:alice", "resource_id": "analytics", "action": "read", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "g2", "account_id": "azure:alice", "resource_id": "expired", "action": "write", "valid_from_ms": 1000, "valid_to_ms": 20000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "g2", "account_id": "azure:alice", "resource_id": "expired", "action": "write", "valid_from_ms": 1000, "valid_to_ms": 20000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "g3", "account_id": "azure:alice", "resource_id": "retired", "action": "read", "valid_from_ms": 1000, "valid_to_ms": 15000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "g3", "account_id": "azure:alice", "resource_id": "retired", "action": "read", "valid_from_ms": 1000, "valid_to_ms": 15000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "g4", "account_id": "okta:reused", "resource_id": "reused", "action": "read", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "g4", "account_id": "okta:reused", "resource_id": "reused", "action": "read", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.member_of": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "account_id", "data_type": "Utf8", "nullable": true}, {"name": "role_id", "data_type": "Utf8", "nullable": true}, {"name": "valid_from_ms", "data_type": "Int64", "nullable": true}, {"name": "valid_to_ms", "data_type": "Int64", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "m1", "account_id": "okta:alice", "role_id": "analyst", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "m1", "account_id": "okta:alice", "role_id": "analyst", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.role_grant": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "role_id", "data_type": "Utf8", "nullable": true}, {"name": "resource_id", "data_type": "Utf8", "nullable": true}, {"name": "action", "data_type": "Utf8", "nullable": true}, {"name": "valid_from_ms", "data_type": "Int64", "nullable": true}, {"name": "valid_to_ms", "data_type": "Int64", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "rg1", "role_id": "analyst", "resource_id": "documents", "action": "read", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "rg1", "role_id": "analyst", "resource_id": "documents", "action": "read", "valid_from_ms": 1000, "valid_to_ms": null, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.accessed": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "account_id", "data_type": "Utf8", "nullable": true}, {"name": "resource_id", "data_type": "Utf8", "nullable": true}, {"name": "action", "data_type": "Utf8", "nullable": true}, {"name": "outcome", "data_type": "Utf8", "nullable": true}, {"name": "happened_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "e1", "account_id": "okta:reused", "resource_id": "reused", "action": "read", "outcome": "success", "happened_at_ms": 12000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "e1", "account_id": "okta:reused", "resource_id": "reused", "action": "read", "outcome": "success", "happened_at_ms": 12000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "e2", "account_id": "okta:reused", "resource_id": "reused", "action": "read", "outcome": "success", "happened_at_ms": 16000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "e2", "account_id": "okta:reused", "resource_id": "reused", "action": "read", "outcome": "success", "happened_at_ms": 16000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "e3", "account_id": "azure:alice", "resource_id": "retired", "action": "read", "outcome": "success", "happened_at_ms": 13000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "e3", "account_id": "azure:alice", "resource_id": "retired", "action": "read", "outcome": "success", "happened_at_ms": 13000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "e4", "account_id": "okta:alice", "resource_id": "documents", "action": "read", "outcome": "failure", "happened_at_ms": 18000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "e4", "account_id": "okta:alice", "resource_id": "documents", "action": "read", "outcome": "failure", "happened_at_ms": 18000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "e5", "account_id": "okta:alice", "resource_id": "documents", "action": "read", "outcome": null, "happened_at_ms": 19000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "e5", "account_id": "okta:alice", "resource_id": "documents", "action": "read", "outcome": null, "happened_at_ms": 19000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "e6", "account_id": "okta:alice", "resource_id": "documents", "action": "read", "outcome": "success", "happened_at_ms": 20000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "e6", "account_id": "okta:alice", "resource_id": "documents", "action": "read", "outcome": "success", "happened_at_ms": 20000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.alert_account": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "alert_id", "data_type": "Utf8", "nullable": true}, {"name": "account_id", "data_type": "Utf8", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "aa1", "alert_id": "a1", "account_id": "okta:alice", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "aa1", "alert_id": "a1", "account_id": "okta:alice", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "aa2", "alert_id": "a1", "account_id": "okta:reused", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "aa2", "alert_id": "a1", "account_id": "okta:reused", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "aa3", "alert_id": "a2", "account_id": "okta:reused", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "aa3", "alert_id": "a2", "account_id": "okta:reused", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.alert_device": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "alert_id", "data_type": "Utf8", "nullable": true}, {"name": "device_id", "data_type": "Utf8", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "ad1", "alert_id": "a1", "device_id": "laptop", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "ad1", "alert_id": "a1", "device_id": "laptop", "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.used_device": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "account_id", "data_type": "Utf8", "nullable": true}, {"name": "device_id", "data_type": "Utf8", "nullable": true}, {"name": "happened_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "ud1", "account_id": "okta:alice", "device_id": "shared", "happened_at_ms": 13000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "ud1", "account_id": "okta:alice", "device_id": "shared", "happened_at_ms": 13000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "ud2", "account_id": "okta:bob", "device_id": "laptop", "happened_at_ms": 14000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "ud2", "account_id": "okta:bob", "device_id": "laptop", "happened_at_ms": 14000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    },
+    "security.used_ip": {
+      "columns": [{"name": "tenant_id", "data_type": "Utf8", "nullable": true}, {"name": "record_id", "data_type": "Utf8", "nullable": false}, {"name": "account_id", "data_type": "Utf8", "nullable": true}, {"name": "address", "data_type": "Utf8", "nullable": true}, {"name": "happened_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_system", "data_type": "Utf8", "nullable": true}, {"name": "observed_at_ms", "data_type": "Int64", "nullable": true}, {"name": "source_version", "data_type": "Utf8", "nullable": true}],
+      "rows": [
+        {"tenant_id": "t1", "record_id": "ip1", "account_id": "okta:alice", "address": "192.0.2.8", "happened_at_ms": 13000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "ip1", "account_id": "okta:alice", "address": "192.0.2.8", "happened_at_ms": 13000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "ip2", "account_id": "okta:bob", "address": "192.0.2.8", "happened_at_ms": 13000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "ip2", "account_id": "okta:bob", "address": "192.0.2.8", "happened_at_ms": 13000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t1", "record_id": "ip3", "account_id": "okta:reused", "address": "192.0.2.8", "happened_at_ms": 20000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        {"tenant_id": "t2", "record_id": "ip3", "account_id": "okta:reused", "address": "192.0.2.8", "happened_at_ms": 20000, "source_system": "synthetic", "observed_at_ms": 20000, "source_version": "fixture-1"}
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "offboarded",
+      "task": "offboarded_account_exposure",
+      "tenant_id": "t1",
+      "parameters": {"namespace": "hr", "person_id": "alice", "as_of": "1970-01-01T00:00:20Z", "window_start": "1970-01-01T00:00:10Z", "window_end": "1970-01-01T00:00:20Z"},
+      "expected": {
+        "subject": "found",
+        "anchor": {"label": "Person", "tenant_id": "t1", "source_system": "synthetic", "record_id": "hr-alice", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        "findings": [
+          {"kind": "residual_grant", "values": {"account_id": "azure:alice", "resource_id": "analytics", "action": "read"}, "evidence": [{"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "GRANTED", "tenant_id": "t1", "source_system": "synthetic", "record_id": "g1", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "residual_role_grant", "values": {"account_id": "okta:alice", "role_id": "analyst", "resource_id": "documents", "action": "read"}, "evidence": [{"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i2", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "MEMBER_OF", "tenant_id": "t1", "source_system": "synthetic", "record_id": "m1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "ROLE_GRANT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "rg1", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "successful_access_after_departure", "values": {"account_id": "okta:reused", "resource_id": "reused", "action": "read", "happened_at_ms": "12000", "outcome": "success"}, "evidence": [{"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i3", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "ACCESSED", "tenant_id": "t1", "source_system": "synthetic", "record_id": "e1", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "successful_access_after_departure", "values": {"account_id": "azure:alice", "resource_id": "retired", "action": "read", "happened_at_ms": "13000", "outcome": "success"}, "evidence": [{"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "ACCESSED", "tenant_id": "t1", "source_system": "synthetic", "record_id": "e3", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "failed_access_after_departure", "values": {"account_id": "okta:alice", "resource_id": "documents", "action": "read", "happened_at_ms": "18000", "outcome": "failure"}, "evidence": [{"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i2", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "ACCESSED", "tenant_id": "t1", "source_system": "synthetic", "record_id": "e4", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "unknown_access_outcome", "values": {"account_id": "okta:alice", "resource_id": "documents", "action": "read", "happened_at_ms": "19000", "outcome": null}, "evidence": [{"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i2", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "ACCESSED", "tenant_id": "t1", "source_system": "synthetic", "record_id": "e5", "observed_at_ms": 20000, "source_version": "fixture-1"}]}
+        ]
+      }
+    },
+    {
+      "id": "still_employed",
+      "task": "offboarded_account_exposure",
+      "tenant_id": "t1",
+      "parameters": {"namespace": "hr", "person_id": "bob", "as_of": "1970-01-01T00:00:20Z", "window_start": "1970-01-01T00:00:10Z", "window_end": "1970-01-01T00:00:20Z"},
+      "expected": {
+        "subject": "no_departure_at_as_of",
+        "anchor": {"label": "Person", "tenant_id": "t1", "source_system": "synthetic", "record_id": "hr-bob", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        "findings": [
+
+        ]
+      }
+    },
+    {
+      "id": "shared_ip_alert",
+      "task": "alert_identity_device_context",
+      "tenant_id": "t1",
+      "parameters": {"alert_id": "a1", "window_start": "1970-01-01T00:00:10Z", "window_end": "1970-01-01T00:00:20Z"},
+      "expected": {
+        "subject": "found",
+        "anchor": {"label": "Alert", "tenant_id": "t1", "source_system": "synthetic", "record_id": "alert-1", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        "findings": [
+          {"kind": "direct_account", "values": {"account_id": "okta:alice"}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa1", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "direct_account", "values": {"account_id": "okta:reused"}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa2", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "direct_device", "values": {"device_id": "laptop"}, "evidence": [{"label": "ALERT_DEVICE", "tenant_id": "t1", "source_system": "synthetic", "record_id": "ad1", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "identity_assignment", "values": {"account_id": "okta:alice", "namespace": "hr", "person_id": "alice", "valid_from_ms": "1000", "valid_to_ms": null}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i2", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "identity_assignment", "values": {"account_id": "okta:alice", "namespace": "external", "person_id": "alice", "valid_from_ms": "12000", "valid_to_ms": "16000"}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i6", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "identity_assignment", "values": {"account_id": "okta:reused", "namespace": "hr", "person_id": "alice", "valid_from_ms": "1000", "valid_to_ms": "15000"}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa2", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i3", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "device_correlation", "values": {"account_id": "okta:alice", "device_id": "shared", "happened_at_ms": "13000"}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "USED_DEVICE", "tenant_id": "t1", "source_system": "synthetic", "record_id": "ud1", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "account_device_correlation", "values": {"account_id": "okta:bob", "device_id": "laptop", "happened_at_ms": "14000"}, "evidence": [{"label": "ALERT_DEVICE", "tenant_id": "t1", "source_system": "synthetic", "record_id": "ad1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "USED_DEVICE", "tenant_id": "t1", "source_system": "synthetic", "record_id": "ud2", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "shared_ip_correlation", "values": {"account_id": "okta:alice", "related_account_id": "okta:bob", "address": "192.0.2.8", "happened_at_ms": "13000", "related_at_ms": "13000"}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "USED_IP", "tenant_id": "t1", "source_system": "synthetic", "record_id": "ip1", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "USED_IP", "tenant_id": "t1", "source_system": "synthetic", "record_id": "ip2", "observed_at_ms": 20000, "source_version": "fixture-1"}]}
+        ]
+      }
+    },
+    {
+      "id": "alert_after_transfer",
+      "task": "alert_identity_device_context",
+      "tenant_id": "t1",
+      "parameters": {"alert_id": "a2", "window_start": "1970-01-01T00:00:10Z", "window_end": "1970-01-01T00:00:20Z"},
+      "expected": {
+        "subject": "found",
+        "anchor": {"label": "Alert", "tenant_id": "t1", "source_system": "synthetic", "record_id": "alert-2", "observed_at_ms": 20000, "source_version": "fixture-1"},
+        "findings": [
+          {"kind": "direct_account", "values": {"account_id": "okta:reused"}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa3", "observed_at_ms": 20000, "source_version": "fixture-1"}]},
+          {"kind": "identity_assignment", "values": {"account_id": "okta:reused", "namespace": "hr", "person_id": "bob", "valid_from_ms": "15000", "valid_to_ms": null}, "evidence": [{"label": "ALERT_ACCOUNT", "tenant_id": "t1", "source_system": "synthetic", "record_id": "aa3", "observed_at_ms": 20000, "source_version": "fixture-1"}, {"label": "IDENTIFIED_AS", "tenant_id": "t1", "source_system": "synthetic", "record_id": "i4", "observed_at_ms": 20000, "source_version": "fixture-1"}]}
+        ]
+      }
+    },
+    {
+      "id": "missing_alert",
+      "task": "alert_identity_device_context",
+      "tenant_id": "t1",
+      "parameters": {"alert_id": "unknown", "window_start": "1970-01-01T00:00:10Z", "window_end": "1970-01-01T00:00:20Z"},
+      "expected": {
+        "subject": "not_found",
+        "anchor": null,
+        "findings": [
+
+        ]
+      }
+    }
+  ]
+}

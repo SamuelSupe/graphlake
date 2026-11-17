@@ -23,7 +23,7 @@ use super::{
     ApiResult, App, Error,
     access::{self, Principal},
     cluster::control::{self, CatalogState, Leadership, Receipt},
-    models,
+    models, tasks,
     users::{self, Role},
 };
 use crate::CancellationToken;
@@ -203,6 +203,9 @@ pub(super) fn restore(dir: &Path, state: &CatalogState) -> ApiResult<()> {
 
 fn catalog_file(name: &str) -> bool {
     if let Some(suffix) = name.strip_prefix(".graphlake-") {
+        if let Some(id) = suffix.strip_suffix(".tasks.json") {
+            return models::valid_id(id);
+        }
         if let Some(id) = suffix.strip_suffix(".json") {
             return models::valid_id(id);
         }
@@ -235,6 +238,7 @@ pub(super) enum Mutation {
         revision: String,
         yaml: String,
     },
+    SaveTaskSuite(tasks::SaveTaskSuite),
 }
 
 pub(super) async fn mutate(
@@ -319,6 +323,15 @@ async fn mutate_inner(
         .await
         .map_err(|_| control::timeout())?;
     ha.leader.confirm().await?;
+    let suite_expected = match &mutation {
+        Mutation::SaveTaskSuite(request) => {
+            if principal != Principal::Admin {
+                return Err(access::forbidden());
+            }
+            Some(request.revision.clone())
+        }
+        _ => None,
+    };
     let role = match mutation {
         Mutation::Create { .. } | Mutation::Save { .. } => Role::Modeler,
         _ => Role::Publisher,
@@ -382,10 +395,9 @@ async fn mutate_inner(
     }
     let mut options = app.options.clone();
     options.timeout = options.timeout.min(Duration::from_secs(8));
+    let activating = matches!(mutation, Mutation::Publish(_) | Mutation::Rollback(_));
     let prepared = async {
-        if matches!(mutation, Mutation::Publish(_) | Mutation::Rollback(_))
-            && !source_available(sources.clone()).await
-        {
+        if activating && !source_available(sources.clone()).await {
             return Err(control::timeout());
         }
         models.apply_ha(id, mutation, &options, app).await
@@ -419,6 +431,18 @@ async fn mutate_inner(
     users::check(app, &principal, id, role)?;
     if let Some(template) = template {
         users::check(app, &principal, &template, Role::Modeler)?;
+    }
+    if let Some(expected) = suite_expected {
+        tasks::check_suite_revision(&app.models.lock().unwrap(), id, expected.as_deref())?;
+    }
+    if activating {
+        models.check_activation_policy(
+            id,
+            model
+                .active_revision
+                .as_deref()
+                .ok_or_else(Error::storage)?,
+        )?;
     }
     if tokio::time::Instant::now() >= deadline {
         return Err(control::timeout());

@@ -10,11 +10,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use object_store::{
-    ClientOptions, ObjectStore, ObjectStoreExt, PutMode,
-    aws::AmazonS3Builder,
-    client::{HttpClient, HttpConnector, ReqwestConnector},
-    local::LocalFileSystem,
-    path::Path as Key,
+    ObjectStore, ObjectStoreExt, PutMode, local::LocalFileSystem, path::Path as Key,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -421,17 +417,6 @@ pub(in crate::admin) struct Objects {
     pub(super) csr_manifests: Arc<std::sync::Mutex<super::csr::ManifestCache>>,
 }
 
-#[derive(Debug)]
-struct ArrowDownloadConnector;
-
-impl HttpConnector for ArrowDownloadConnector {
-    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        // The Arrow response has an idle deadline. A request-wide HTTP timeout
-        // would cut off a progressing download while Hyper applies backpressure.
-        ReqwestConnector::default().connect(&options.clone().with_timeout_disabled())
-    }
-}
-
 impl Objects {
     pub fn open(location: &str, cluster: &str) -> Result<Self> {
         let (store, arrow_store, prefix): (Arc<dyn ObjectStore>, Arc<dyn ObjectStore>, _) =
@@ -444,13 +429,8 @@ impl Objects {
                             .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b)),
                     "invalid cluster S3 bucket"
                 );
-                let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-                let store = builder.clone().build()?;
-                let arrow = builder
-                    .with_credentials(store.credentials().clone())
-                    .with_http_connector(ArrowDownloadConnector)
-                    .build()?;
-                (Arc::new(store), Arc::new(arrow), Key::parse(prefix)?)
+                let (store, arrow_store) = super::s3::open(bucket)?;
+                (store, arrow_store, Key::parse(prefix)?)
             } else {
                 let path = Path::new(location);
                 ensure!(
@@ -588,14 +568,7 @@ impl Objects {
             .join("models")
             .join(model)
             .join(revision);
-        match self
-            .store
-            .put_opts(&key, yaml.into_bytes().into(), PutMode::Create.into())
-            .await
-        {
-            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        self.put_immutable(&key, yaml.into_bytes()).await
     }
 
     pub async fn read_model(&self, model: &str, revision: &str) -> Result<String> {
@@ -796,50 +769,6 @@ pub(super) fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use axum::{Json, Router, routing::post};
-
-    #[tokio::test]
-    async fn arrow_storage_response_can_outlast_the_regular_http_deadline() -> Result<()> {
-        use axum::{body::Body, http::Request, routing::get};
-        use object_store::client::HttpRequestBody;
-
-        let router = Router::new().route(
-            "/result.arrow",
-            get(|| async {
-                Body::from_stream(futures::stream::once(async {
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"arrow result"))
-                }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let uri = format!("http://{}/result.arrow", listener.local_addr()?);
-        let server = tokio::spawn(async move { axum::serve(listener, router).await });
-        let options = ClientOptions::new()
-            .with_allow_http(true)
-            .with_timeout(Duration::from_millis(45));
-        let request = || Request::builder().uri(&uri).body(HttpRequestBody::empty());
-        let response = ReqwestConnector::default()
-            .connect(&options)?
-            .execute(request()?)
-            .await;
-        match response {
-            Ok(response) => assert!(response.into_body().bytes().await.is_err()),
-            Err(error) => assert_eq!(error.kind(), object_store::client::HttpErrorKind::Timeout),
-        }
-        let client = ArrowDownloadConnector.connect(&options)?;
-        let bytes = tokio::time::timeout(Duration::from_secs(3), async {
-            client
-                .execute(request().unwrap())
-                .await?
-                .into_body()
-                .bytes()
-                .await
-        })
-        .await??;
-        server.abort();
-        assert_eq!(&bytes[..], b"arrow result");
-        Ok(())
-    }
 
     #[tokio::test]
     async fn read_retries_when_the_fast_etcd_pass_times_out() -> Result<()> {

@@ -5,6 +5,7 @@ pub(crate) mod csr;
 pub(crate) mod distributed;
 mod results;
 mod retention;
+mod s3;
 pub(in crate::admin) mod store;
 mod worker;
 

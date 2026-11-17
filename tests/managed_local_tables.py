@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
 from local_backup_recovery import Site, MODEL, GRAPH_QUERY, postgres, process_with_env, until
@@ -52,7 +52,7 @@ def proxy(upstream, rules, *, offline=None, reject=None):
             if offline is not None and offline.is_set():
                 self.close_connection = True
                 return
-            if reject is not None and reject(self.command, self.path):
+            if reject is not None and reject(self.command, unquote(urlsplit(self.path).path)):
                 self.send_error(403)
                 return
             data = self.rfile.read(int(self.headers.get('Content-Length', 0)))
@@ -135,7 +135,7 @@ def head_transaction(state_key, old):
 def s3_command(args, key):
     return ['curl', '--silent', '--max-time', '4', '--aws-sigv4', 'aws:amz:us-east-1:s3',
             '--user', os.environ['AWS_ACCESS_KEY_ID'] + ':' + os.environ['AWS_SECRET_ACCESS_KEY'],
-            os.environ['AWS_ENDPOINT'] + '/' + args.bucket + '/' + key]
+            os.environ['AWS_ENDPOINT'] + '/' + args.bucket + '/' + quote(key, safe='/')]
 
 
 def object_exists(args, key):
@@ -159,7 +159,8 @@ def worker(site, root, config, env, hidden, *, isolate, label):
     command = [site.cli, '--cluster-config', config, '--port', str(site.worker_port), 'worker',
                '--source-dir', root]
     if isolate:
-        names = ','.join(k for k in env if k.startswith('AWS_') or k == 'S6_WORKER_TOKEN')
+        names = ','.join(k for k in env if k.startswith('AWS_') or k in {
+            'S6_WORKER_TOKEN', 'GRAPHLAKE_CLUSTER_S3_BACKEND'})
         command = ['sudo', '-n', '--preserve-env=' + names, 'unshare', '--mount', '--propagation', 'private',
                    'sh', '-ec', 'for hidden in "$1" "$2"; do mount -t tmpfs tmpfs "$hidden"; '
                    'test -z "$(ls -A "$hidden")"; done; echo $$ > "$3"; shift 3; exec "$@"', 'worker', *hidden, pid_file, *command]
@@ -201,6 +202,8 @@ def exercise(args, root, dsn, relation):
         config += 'managed_local_tables: true\nlocal_snapshot_retention_seconds: 1\nlocal_snapshot_gc_grace_seconds: 1\n'
         standby.config.write_text(config)
         standby.env = {**original.env}
+        if args.standby_s3_backend:
+            standby.env['GRAPHLAKE_CLUSTER_S3_BACKEND'] = args.standby_s3_backend
         standby.password = original.password
         shutil.copy2(original.root / ".graphlake-auth/password.phc", standby.root / ".graphlake-auth/password.phc")
         original.config.write_text(config.replace(args.etcd, old_etcd, 1))
@@ -267,7 +270,7 @@ edges:
             'revision': version['revision'], 'active_revision': draft['active_revision']}))['active_revision']
 
         def old_data(method, path, _):
-            return method == 'GET' and path.endswith('.parquet') and before['upload'] in path
+            return method == 'GET' and urlsplit(path).path.endswith('.parquet') and before['upload'] in path
         work = Hold(old_data)
         archive = Hold(old_data)
         worker_hold.append(work)
@@ -281,7 +284,8 @@ edges:
                 'backup', 'export', '--file', package,
             ], env={**original.env, 'AWS_ENDPOINT': export_s3}, check=True, capture_output=True)
             try:
-                assert work.seen.wait(15) and archive.seen.wait(15), 'both readers must be reading G1'
+                assert work.seen.wait(15), 'the query must be reading G1'
+                assert archive.seen.wait(15), 'the backup must be reading G1'
                 assert len(records(args, keyroot + '/pin/' + table + '/')) >= 2
                 postgres(dsn, '-c', f'UPDATE {relation} SET version=11,target=3 WHERE id=1')
                 middle = original.load('full')
@@ -365,7 +369,7 @@ edges:
 
 
         selected = value(lookup(args, state_key)[0])['head']
-        work_lost = Hold(lambda method, path, _: method == 'GET' and path.endswith('.parquet')
+        work_lost = Hold(lambda method, path, _: method == 'GET' and urlsplit(path).path.endswith('.parquet')
                          and selected['upload'] in path)
         worker_hold.append(work_lost)
         query_id = str(uuid4())
@@ -403,6 +407,8 @@ edges:
     }))
     offline = 'postgresql://reader@127.0.0.1:1/unavailable?sslmode=disable'
     with Site(args, root / 'restored', offline, target=True) as restored:
+        if args.standby_s3_backend:
+            restored.env['GRAPHLAKE_CLUSTER_S3_BACKEND'] = args.standby_s3_backend
         with restored.config.open('a') as config:
             config.write('managed_local_tables: true\n')
         subprocess.run([restored.cli, '--cluster-config', restored.config, '--catalog-dir', restored.root,
@@ -418,7 +424,10 @@ edges:
         restored.login()
         assert restored.query(revision) == query_before
         assert restored.table()['generation'] == first and restored.table()['schedule_paused']
-        print(json.dumps({'restored_backup_generation': first, 'restored_s3_query_matched': True}), flush=True)
+        print(json.dumps({'restored_backup_generation': first, 'restored_s3_query_matched': True,
+                          'writer_backend': original.env.get('GRAPHLAKE_CLUSTER_S3_BACKEND', 'object_store'),
+                          'standby_and_restore_backend': restored.env.get('GRAPHLAKE_CLUSTER_S3_BACKEND', 'object_store')}),
+              flush=True)
 
 
 if __name__ == '__main__':
@@ -427,6 +436,8 @@ if __name__ == '__main__':
     parser.add_argument('--etcd', default=os.environ.get('GRAPHLAKE_TEST_ETCD', 'http://127.0.0.1:22379'))
     parser.add_argument('--bucket', default=os.environ.get('GRAPHLAKE_TEST_BUCKET', 'graphlake-ci'))
     parser.add_argument('--isolate-worker', action='store_true')
+    parser.add_argument('--standby-s3-backend', choices=['object_store', 'opendal'])
+    parser.add_argument('--s3-prefix', help='extra prefix inside the test bucket')
     parser.add_argument('--work-dir', type=Path)
     args = parser.parse_args()
     if args.work_dir:

@@ -330,10 +330,18 @@ impl Snapshot {
         }
         let mut snapshot =
             super::snapshot::Buffer::new(&runtime.memory_pool, Some(&runtime.disk_manager));
-        let mut batches = query.batches(conn, runtime.memory_pool.clone());
+        // Dropping an active result normally drains it before disconnecting.
+        // Own the connection for the scan so conversion errors and cancellation kill it.
+        let mut owned = OwnedConnection(self.conn.take());
+        let mut batches = query.batches(
+            owned.0.as_mut().expect("owned read connection"),
+            runtime.memory_pool.clone(),
+        );
         while let Some(batch) = batches.try_next().await? {
             snapshot.push(batch)?;
         }
+        drop(batches);
+        self.conn = owned.0.take();
         let (table, budget) = snapshot.finish(schema, &self.stats)?;
         Ok((table, budget, proven))
     }

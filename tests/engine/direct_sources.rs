@@ -452,7 +452,9 @@ nodes:
 #[tokio::test]
 #[ignore = "requires a disposable MySQL 8.4 server in GRAPHLAKE_TEST_MYSQL"]
 async fn mysql_single_scan_is_lazy_and_releases_the_read_connection() -> Result<()> {
+    use anyhow::Context;
     use mysql_async::{Conn, Opts, prelude::Queryable};
+    use std::time::Duration;
     let opts = Opts::from_url(&std::env::var("GRAPHLAKE_TEST_MYSQL")?)?;
     let mut server = Conn::new(opts).await?;
     let schema = format!("graphlake_{}", uuid::Uuid::new_v4().simple());
@@ -480,6 +482,44 @@ async fn mysql_single_scan_is_lazy_and_releases_the_read_connection() -> Result<
         server.query_drop(format!("ALTER TABLE {schema}.items ADD COLUMN extra INT")).await?;
         let mut next = engine.query(Language::Sql, r#"SELECT id FROM "Item" WHERE id=20000"#, Default::default()).await?;
         assert_eq!(rows(&mut next).await?, [serde_json::json!({"id":20000})]);
+        server.query_drop(format!(
+            "CREATE VIEW {schema}.slow AS SELECT id, IF(SLEEP(0.01)=0,payload,'') AS payload FROM {schema}.items"
+        )).await?;
+        // TiDB uses the same MySQL wire adapter in materialized mode. Use
+        // a slow MySQL view as a deterministic fixture for cancellation.
+        let materialized: Catalog = serde_saphyr::from_str(&format!("graph: slow\nsources:\n  db: {{type: tidb, dsn_env: GRAPHLAKE_TEST_MYSQL, tls: false}}\nnodes:\n  Slow: {{source: db.{schema}.slow, key: [id], properties: [payload]}}\n"))?;
+        let engine = Engine::new(materialized)?;
+        let options = QueryOptions { batch_size: 32, ..Default::default() };
+        let cancel = options.cancellation.clone();
+        let pending = tokio::spawn(async move {
+            engine.query(Language::Sql, r#"SELECT payload FROM "Slow""#, options).await
+        });
+        let slow_scan = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let processes: Vec<(u64, String)> = server.query(
+                    "SELECT ID, INFO FROM information_schema.PROCESSLIST WHERE ID<>CONNECTION_ID() AND STATE='User sleep' AND INFO IS NOT NULL"
+                ).await?;
+                if let Some((id, _)) = processes.into_iter().find(|(_, sql)| sql.contains(&schema)) {
+                    return Ok::<_, anyhow::Error>(id);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await??;
+        cancel.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(3), pending).await??.is_err());
+        let disconnected = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let active: Option<u64> = server.query_first(format!(
+                    "SELECT ID FROM information_schema.PROCESSLIST WHERE ID={slow_scan}"
+                )).await?;
+                if active.is_none() { return Ok::<_, anyhow::Error>(()) }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await;
+        if disconnected.is_err() {
+            server.query_drop(format!("KILL CONNECTION {slow_scan}")).await?;
+        }
+        disconnected.context("cancelled materialized MySQL query left its connection running")??;
         Ok::<_, anyhow::Error>(())
     }.await;
     server.query_drop(format!("DROP DATABASE {schema}")).await?;

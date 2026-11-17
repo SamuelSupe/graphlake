@@ -3516,11 +3516,9 @@ edges:
         assert_eq!(result["rows"], live["rows"], "{cypher}");
         if cypher.contains("*0..0") {
             assert_eq!(result["csr_stats"]["rounds"], 0);
-        } else {
-            assert!(
-                result["csr_stats"]["remote_partitions"].as_u64().unwrap() > 0,
-                "{result}"
-            );
+        } else if !cypher.contains("hortestPath") {
+            assert_eq!(result["csr_stats"]["remote_partitions"], 0, "{result}");
+            assert_eq!(result["csr_stats"]["exchange_bytes"], 0, "{result}");
         }
         if cypher.contains("{amount:") {
             assert!(

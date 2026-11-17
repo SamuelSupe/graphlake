@@ -1530,6 +1530,7 @@ fn join_match(
                 },
             )
         });
+    let first_expansion = plan.expansions.len();
     let (right_sql, right_columns, consume_predicate) = match_input(
         catalog,
         pattern,
@@ -1539,6 +1540,21 @@ fn join_match(
         base,
         lookup.as_ref(),
     )?;
+    if let Some((imports, false)) = anchor {
+        for expansion in &mut plan.expansions[first_expansion..] {
+            if expansion.mixed.is_none()
+                && catalog.edges[&expansion.edge].from.node == catalog.edges[&expansion.edge].to.node
+                && expansion.starts.is_empty()
+                && expansion.start_variable.as_ref().is_some_and(|name| {
+                    matches!(left.scope.columns.get(name), Some(Value::Entity(binding))
+                        if binding.node && !binding.dynamic && binding.label == expansion.start_node)
+                        && imports.explicit.is_none_or(|names| names.contains(name))
+                })
+            {
+                expansion.start_seed = Some(imports.seed.to_owned());
+            }
+        }
+    }
     let mut bound_anchor = None;
     if let Some(lookup) = lookup
         && lookup

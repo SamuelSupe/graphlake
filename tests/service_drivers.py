@@ -3,7 +3,10 @@
 import os
 import json
 from base64 import b64encode
+from contextlib import ExitStack
+import socket
 import sys
+from urllib.parse import urlsplit
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -27,6 +30,33 @@ def assert_rejected(action, error_type, check):
         assert check(error), error
     else:
         raise AssertionError("request unexpectedly succeeded")
+
+
+
+def check_bolt_handshake_capacity(bolt, user, token):
+    address = urlsplit(bolt)
+    # Bolt 5.1 negotiates HELLO and LOGON separately.
+    handshake = bytes.fromhex("6060b01700000105000000000000000000000000")
+    hello = bytes.fromhex("b101a18a") + b"user_agent" + bytes.fromhex("85") + b"audit"
+    with GraphDatabase.driver(bolt, auth=(user, token)) as driver, ExitStack() as stack:
+        session = stack.enter_context(driver.session(database="payments"))
+        tx = stack.enter_context(session.begin_transaction())
+        assert tx.run("RETURN 1 AS n").single()["n"] == 1
+        for _ in range(15):
+            conn = stack.enter_context(socket.create_connection((address.hostname, address.port), timeout=2))
+            reader = stack.enter_context(conn.makefile("rb"))
+            conn.sendall(handshake)
+            assert reader.read(4) == bytes.fromhex("00000105")
+            conn.sendall(len(hello).to_bytes(2, "big") + hello + b"\x00\x00")
+            size = int.from_bytes(reader.read(2), "big")
+            assert reader.read(size).startswith(bytes.fromhex("b170"))
+            assert reader.read(2) == b"\x00\x00"
+        # One authenticated session and 15 stalled LOGONs used to exhaust
+        # the shared pool, including for a client ready to authenticate.
+        with driver.session(database="payments") as fresh:
+            assert fresh.run("RETURN 2 AS n").single()["n"] == 2
+        assert tx.run("RETURN 3 AS n").single()["n"] == 3
+        tx.rollback()
 
 
 def main(http, bolt, revision):
@@ -74,9 +104,20 @@ def main(http, bolt, revision):
             assert row["r"].start_node == row["a"] and row["r"].end_node == row["b"]
             assert isinstance(row["p"], Path) and row["p"].relationships == (row["r"],)
             assert row["p"].nodes == (row["a"], row["b"])
+        with driver.session(database="payments", fetch_size=16) as session:
+            rows = list(session.run(
+                "MATCH p=(a:CustomerAccount)-[r:Payment]->(b:Merchant) "
+                "RETURN r.payment_id AS id,p ORDER BY id"
+            ))
+            assert [item["id"] for item in rows] == sorted(item["id"] for item in rows)
+            assert all(isinstance(item["p"], Path) and item["p"].relationships[0]["payment_id"] == item["id"]
+                       for item in rows), rows
+            assert any(item["id"] == 2000 for item in rows)
 
         with driver.session(database="payments", fetch_size=257) as session:
             assert sum(1 for _ in session.run("UNWIND range(0,10000) AS n RETURN n")) == 10001
+
+    check_bolt_handshake_capacity(bolt, user, token)
 
     client = Client(ws, "g", username=user, password="wrong-token",
                     message_serializer=GraphSONSerializersV3d0())

@@ -30,17 +30,25 @@ pub(super) struct LocalTables {
     running: Mutex<BTreeMap<String, CancellationToken>>,
     slots: Arc<Semaphore>,
     workspace: Option<tempfile::TempDir>,
-    cached: Mutex<BTreeMap<Uuid, Uuid>>,
+    cached: Mutex<BTreeMap<Uuid, (Uuid, managed::WorkspaceVersion)>>,
     create_work: tokio::sync::Mutex<()>,
 }
 
 impl LocalTables {
     pub fn open(root: PathBuf, managed: bool) -> anyhow::Result<Self> {
+        let store = Store::open(root)?;
+        let workspace = managed
+            .then(|| {
+                tempfile::Builder::new()
+                    .prefix("managed-sync-")
+                    .tempdir_in(&store.root)
+            })
+            .transpose()?;
         Ok(Self {
-            store: Mutex::new(Store::open(root)?),
+            store: Mutex::new(store),
             running: Mutex::default(),
             slots: Arc::new(Semaphore::new(2)),
-            workspace: managed.then(tempfile::tempdir).transpose()?,
+            workspace,
             cached: Mutex::default(),
             create_work: tokio::sync::Mutex::new(()),
         })

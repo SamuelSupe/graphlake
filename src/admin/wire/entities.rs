@@ -20,10 +20,12 @@ use super::super::query::{
 use super::{ApiResult, Error, result_limit, value_at};
 use crate::{
     Catalog, QueryResult, ScalarValue,
-    arrow::array::{Array, ArrayRef, StructArray},
+    arrow::array::{Array, ArrayRef, RecordBatch, StructArray},
     catalog::ident,
     engine::query_graph::GraphColumn,
 };
+
+pub(super) type Hydrated = BTreeMap<Identity, (BoltValue, usize)>;
 
 type Pending<'a, T> = Pin<Box<dyn Future<Output = ApiResult<T>> + Send + 'a>>;
 
@@ -42,6 +44,7 @@ pub(super) fn value<'a>(
     shape: Option<&'a GraphColumn>,
     variant: bool,
     budget: &'a mut usize,
+    prefetched: &'a Hydrated,
 ) -> Pending<'a, BoltValue> {
     Box::pin(async move {
         if array.is_null(row) {
@@ -62,7 +65,10 @@ pub(super) fn value<'a>(
                 Some(GraphColumn::Record(fields)) if variant => fields.get(field.name()),
                 shape => shape,
             };
-            return value(catalog, result, column, row, shape, false, budget).await;
+            return value(
+                catalog, result, column, row, shape, false, budget, prefetched,
+            )
+            .await;
         }
         Ok(match shape {
             Some(GraphColumn::Entity { label, node }) => {
@@ -116,7 +122,14 @@ pub(super) fn value<'a>(
                     row,
                 )
                 .ok_or_else(invalid)?;
-                path(catalog, result, &nodes, &edges, labels, budget).await?
+                path(
+                    catalog,
+                    result,
+                    path_ids(catalog, &nodes, &edges, labels, *budget)?,
+                    budget,
+                    prefetched,
+                )
+                .await?
             }
             Some(GraphColumn::Path { labels: None }) => {
                 // GraphSON Path permits vertices, edges, and scalar steps in the same list.
@@ -132,7 +145,11 @@ pub(super) fn value<'a>(
                         Some("vertex" | "edge") => {
                             let node = text_key(kinds.as_ref(), i).as_deref() == Some("vertex");
                             let id = tagged(catalog, node, record, i)?;
-                            values.push(hydrate(catalog, result, &id, budget).await?);
+                            values.push(if let Some(value) = cached(prefetched, &id, budget)? {
+                                value
+                            } else {
+                                hydrate(catalog, result, &id, budget).await?
+                            });
                         }
                         Some("value") => {
                             let keys = list(
@@ -166,8 +183,19 @@ pub(super) fn value<'a>(
                 }
                 let mut values = Vec::new();
                 for i in 0..items.len() {
-                    values
-                        .push(value(catalog, result, &items, i, Some(item), false, budget).await?);
+                    values.push(
+                        value(
+                            catalog,
+                            result,
+                            &items,
+                            i,
+                            Some(item),
+                            false,
+                            budget,
+                            prefetched,
+                        )
+                        .await?,
+                    );
                 }
                 BoltValue::List(values)
             }
@@ -188,6 +216,7 @@ pub(super) fn value<'a>(
                             shapes.get(field.name()),
                             false,
                             budget,
+                            prefetched,
                         )
                         .await?,
                     );
@@ -331,6 +360,7 @@ async fn hydrate(
     hydrate_many(catalog, result, BTreeSet::from([id.clone()]), budget)
         .await?
         .remove(id)
+        .map(|(value, _)| value)
         .ok_or_else(invalid)
 }
 
@@ -339,7 +369,10 @@ async fn hydrate_many(
     result: &mut QueryResult,
     identities: BTreeSet<Identity>,
     budget: &mut usize,
-) -> ApiResult<BTreeMap<Identity, BoltValue>> {
+) -> ApiResult<Hydrated> {
+    if identities.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let context = result.graph_context.clone().ok_or_else(invalid)?;
     let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for id in identities {
@@ -385,6 +418,7 @@ async fn hydrate_many(
                     let get = |name: &str| batch.column_by_name(name);
                     let id = from_fields(catalog, &label, node_type, row, &keys, get)
                         .ok_or_else(invalid)?;
+                    let before = *budget;
                     let properties = property_values(catalog, &id, row, get, budget)?;
                     let value = if node_type {
                         BoltValue::Node(node(&id, properties, budget)?)
@@ -392,7 +426,7 @@ async fn hydrate_many(
                         let ends = endpoints(catalog, &label, row, get).ok_or_else(invalid)?;
                         BoltValue::Relationship(edge(&id, properties, ends, budget)?)
                     };
-                    hydrated.insert(id, value);
+                    hydrated.insert(id, (value, before - *budget));
                 }
             }
         }
@@ -450,14 +484,13 @@ fn edge(
     })
 }
 
-async fn path(
+fn path_ids(
     catalog: &Catalog,
-    result: &mut QueryResult,
     nodes: &ArrayRef,
     edges: &ArrayRef,
     labels: &(Option<String>, Option<String>),
-    budget: &mut usize,
-) -> ApiResult<BoltValue> {
+    budget: usize,
+) -> ApiResult<(Vec<Identity>, Vec<Identity>)> {
     if nodes.len() != edges.len() + 1 {
         return Err(invalid());
     }
@@ -483,7 +516,7 @@ async fn path(
         .len()
         .saturating_add(edges.len())
         .saturating_mul(std::mem::size_of::<Identity>())
-        > *budget
+        > budget
     {
         return Err(result_limit());
     }
@@ -493,8 +526,98 @@ async fn path(
     let edges = (0..edges.len())
         .map(|row| read(edges, &labels.1, false, row))
         .collect::<ApiResult<Vec<_>>>()?;
-    let unique = nodes.iter().chain(&edges).cloned().collect();
-    let mut hydrated = hydrate_many(catalog, result, unique, budget).await?;
+    Ok((nodes, edges))
+}
+
+fn cached(values: &Hydrated, id: &Identity, budget: &mut usize) -> ApiResult<Option<BoltValue>> {
+    let Some((value, bytes)) = values.get(id) else {
+        return Ok(None);
+    };
+    *budget = budget.checked_sub(*bytes).ok_or_else(result_limit)?;
+    Ok(Some(value.clone()))
+}
+
+pub(super) async fn prefetch_paths(
+    catalog: &Catalog,
+    result: &mut QueryResult,
+    batch: &RecordBatch,
+    rows: std::ops::Range<usize>,
+) -> ApiResult<Hydrated> {
+    let mut ids = BTreeSet::new();
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let Some(GraphColumn::Path { labels }) = result.graph_output.columns.get(field.name())
+        else {
+            continue;
+        };
+        for row in rows.clone() {
+            if column.is_null(row) {
+                continue;
+            }
+            if let Some(labels) = labels {
+                let record = column
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(invalid)?;
+                let nodes = list(
+                    record.column_by_name("nodes").ok_or_else(invalid)?.as_ref(),
+                    row,
+                )
+                .ok_or_else(invalid)?;
+                let edges = list(
+                    record
+                        .column_by_name("relationships")
+                        .ok_or_else(invalid)?
+                        .as_ref(),
+                    row,
+                )
+                .ok_or_else(invalid)?;
+                let (nodes, edges) = path_ids(catalog, &nodes, &edges, labels, super::ROW_BYTES)?;
+                ids.extend(nodes);
+                ids.extend(edges);
+            } else {
+                let steps = list(column.as_ref(), row).ok_or_else(invalid)?;
+                let record = steps
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(invalid)?;
+                let kinds = record.column_by_name("kind").ok_or_else(invalid)?;
+                for i in 0..steps.len() {
+                    if let Some(kind @ ("vertex" | "edge")) = text_key(kinds.as_ref(), i).as_deref()
+                    {
+                        ids.insert(tagged(catalog, kind == "vertex", record, i)?);
+                    }
+                }
+            }
+            if ids.len() > 512 {
+                return Ok(BTreeMap::new());
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    hydrate_many(catalog, result, ids, &mut (2 * super::ROW_BYTES)).await
+}
+
+async fn path(
+    catalog: &Catalog,
+    result: &mut QueryResult,
+    (nodes, edges): (Vec<Identity>, Vec<Identity>),
+    budget: &mut usize,
+    prefetched: &Hydrated,
+) -> ApiResult<BoltValue> {
+    let unique = nodes.iter().chain(&edges).cloned().collect::<BTreeSet<_>>();
+    let missing = unique
+        .iter()
+        .filter(|id| !prefetched.contains_key(*id))
+        .cloned()
+        .collect();
+    let mut hydrated = hydrate_many(catalog, result, missing, budget).await?;
+    for id in unique {
+        if let Some(value) = cached(prefetched, &id, budget)? {
+            hydrated.insert(id, (value, 0));
+        }
+    }
     let mut path = BoltPath {
         nodes: Vec::new(),
         rels: Vec::new(),
@@ -507,7 +630,7 @@ async fn path(
         let index = if let Some(&index) = node_indices.get(&id) {
             index
         } else {
-            let Some(BoltValue::Node(node)) = hydrated.remove(&id) else {
+            let Some((BoltValue::Node(node), _)) = hydrated.remove(&id) else {
                 return Err(invalid());
             };
             let index = path.nodes.len();
@@ -521,7 +644,7 @@ async fn path(
         let (index, start) = if let Some(&entry) = edge_indices.get(&id) {
             entry
         } else {
-            let Some(BoltValue::Relationship(edge)) = hydrated.remove(&id) else {
+            let Some((BoltValue::Relationship(edge), _)) = hydrated.remove(&id) else {
                 return Err(invalid());
             };
             let entry = (path.rels.len(), edge.start_node_id);

@@ -123,8 +123,14 @@ impl OpenResults {
     }
 }
 
+pub(crate) struct SessionSlots {
+    pub(crate) pending: Arc<tokio::sync::Semaphore>,
+    pub(crate) active: Arc<tokio::sync::Semaphore>,
+}
+
 /// Handles a single Bolt TCP connection.
 pub struct Connection<R, W, B: BoltBackend> {
+    capacity: Option<(Arc<SessionSlots>, tokio::sync::OwnedSemaphorePermit)>,
     reader: ChunkReader<R>,
     writer: ChunkWriter<W>,
     backend: Arc<B>,
@@ -181,6 +187,7 @@ where
             auth_validator,
             state: ConnectionState::Negotiation,
             authenticated: false,
+            capacity: None,
             credential: None,
             auth_timeout: None,
             auth_deadline: None,
@@ -196,6 +203,32 @@ where
 
     /// Sets the message size limit that applies before authentication
     /// (capped by the general maximum message size).
+    pub(crate) fn set_slots(
+        &mut self,
+        capacity: Option<(Arc<SessionSlots>, tokio::sync::OwnedSemaphorePermit)>,
+    ) {
+        self.capacity = capacity;
+    }
+
+    fn next_slot(
+        &self,
+        active: bool,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, BoltError> {
+        self.capacity
+            .as_ref()
+            .map(|(slots, _)| {
+                let pool = if active {
+                    &slots.active
+                } else {
+                    &slots.pending
+                };
+                pool.clone().try_acquire_owned().map_err(|_| {
+                    BoltError::ResourceExhausted("Bolt connection capacity reached".into())
+                })
+            })
+            .transpose()
+    }
+
     pub(crate) fn set_max_unauthenticated_message_size(&mut self, bytes: usize) {
         self.max_unauthenticated_message_size = bytes;
         self.apply_message_size_limit();
@@ -570,6 +603,7 @@ where
             None
         };
 
+        let active = self.next_slot(true)?;
         let credentials_expired = auth_info
             .as_ref()
             .is_some_and(|info| info.credentials_expired);
@@ -586,6 +620,9 @@ where
 
         self.send_message(&ServerMessage::Success { metadata })
             .await?;
+        if let (Some((_, current)), Some(active)) = (&mut self.capacity, active) {
+            *current = active;
+        }
         self.authenticated = true;
         self.apply_message_size_limit();
         self.state = self.state.transition_success(&ClientMessage::Logon {
@@ -595,6 +632,7 @@ where
     }
 
     async fn handle_logoff(&mut self) -> Result<(), BoltError> {
+        let pending = self.next_slot(false)?;
         // Clear any in-flight state: abort pending transaction, discard results.
         if let (Some(session), Some(tx)) = (&self.session, self.transaction.take()) {
             let _ = self.backend.rollback(session, &tx).await;
@@ -610,6 +648,9 @@ where
             metadata: BoltDict::new(),
         })
         .await?;
+        if let (Some((_, current)), Some(pending)) = (&mut self.capacity, pending) {
+            *current = pending;
+        }
         self.authenticated = false;
         self.credential = None;
         self.apply_message_size_limit();

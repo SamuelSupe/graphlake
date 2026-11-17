@@ -371,7 +371,6 @@ async fn load(
         && checkpoint.is_some()
         && deleted.is_none()
         && loaded > 0
-        && loaded <= scope.options.batch_size as u64
         && delta_bytes <= overlay::MAX_DELTA_BYTES
         && let Some(total) = tokio::task::block_in_place(|| {
             key_index::incremental(
@@ -421,7 +420,7 @@ async fn load(
             }
         }
         let selective = if candidate.is_none()
-            && loaded <= scope.options.batch_size as u64
+            && delta_bytes <= overlay::MAX_DELTA_BYTES
             && let [key] = config.key_columns.as_slice()
             && incoming
                 .schema()

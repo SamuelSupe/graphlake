@@ -660,7 +660,7 @@ pub(in crate::admin::cluster) async fn run_task(
         let graph = Graph {
             prefix: objects.graph(&job.model, &job.revision, task.generation),
             objects,
-            manifest: Arc::new(manifest),
+            manifest: manifest,
             budget: MemoryConsumer::new("GraphLake CSR worker")
                 .register(&scope.runtime.memory_pool),
             scope: &scope,
@@ -812,7 +812,12 @@ impl<'a> Execution<'a> {
         }
     }
     async fn round(&self, inputs: Vec<(usize, Step)>) -> Result<Round> {
-        let local = self.worker.workers.len() == 1
+        self.run_round(inputs, false).await
+    }
+
+    async fn run_round(&self, inputs: Vec<(usize, Step)>, local: bool) -> Result<Round> {
+        let local = local
+            || self.worker.workers.len() == 1
             || self
                 .graph
                 .manifest
@@ -1033,7 +1038,7 @@ pub(in crate::admin::cluster) async fn query_csr(
                 worker,
                 job,
                 id,
-                Arc::new(manifest),
+                manifest,
                 &scope,
                 types,
                 direction,

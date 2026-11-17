@@ -308,6 +308,49 @@ async fn cypher_correlated_call_large_page_preserves_key_and_subquery_order() ->
 }
 
 #[tokio::test]
+async fn cypher_correlated_call_expands_only_the_imported_vertices_across_batches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    rusqlite::Connection::open(dir.path().join("ring.db"))?.execute_batch(
+        "CREATE TABLE vertices (id INTEGER PRIMARY KEY) STRICT;
+         CREATE TABLE edges (id INTEGER PRIMARY KEY, src INTEGER, dst INTEGER) STRICT;
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<64)
+         INSERT INTO vertices SELECT i FROM n;
+         INSERT INTO edges SELECT id, id, id%64+1 FROM vertices;",
+    )?;
+    let config = dir.path().join("ring.yaml");
+    std::fs::write(
+        &config,
+        "graph: ring
+sources:
+  db: {type: sqlite, path: ring.db}
+nodes:
+  N: {source: db.vertices, key: [id]}
+edges:
+  E: {source: db.edges, key: [id], from: {node: N, columns: [src]}, to: {node: N, columns: [dst]}}
+",
+    )?;
+    let engine = Engine::new(Catalog::load(config)?)?;
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "MATCH (p:N) WHERE p.id <= 33 WITH p ORDER BY p.id
+         CALL (p) { MATCH (p)-[:E*1..2]->(q:N) RETURN q.id AS to }
+         RETURN p.id AS start_id, to ORDER BY start_id, to",
+            QueryOptions {
+                batch_size: 64,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let expected = (1..=33)
+        .flat_map(|from| [from + 1, from + 2].map(|to| json!({"start_id":from,"to":to})))
+        .collect::<Vec<_>>();
+    assert_eq!(rows(&mut result).await?, expected);
+    assert_eq!(result.metrics().visits_by_depth.get(1).copied(), Some(33));
+    Ok(())
+}
+
+#[tokio::test]
 async fn cypher_row_call_replays_ordered_parquet_reads_for_each_key() -> Result<()> {
     let (_dir, engine) = local_fixture("key: [tenant, id]")?;
     let mut result = engine

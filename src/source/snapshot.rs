@@ -143,26 +143,31 @@ impl Buffer {
                 .saturating_add(bytes)
                 > limit.saturating_sub(self.source_reservation) / 4
         {
-            let file = disk.create_tmp_file("materializing a GraphLake source snapshot")?;
-            let mut writer = StreamWriter::try_new_with_options(
-                file.open_writer()?,
-                &batch.schema(),
-                IpcWriteOptions::default().try_with_compression(self.compression)?,
-            )?;
-            for previous in self.memory.drain(..) {
-                writer.write(&previous)?;
-            }
+            self.file = Some(crate::blocking(|| {
+                let file = disk.create_tmp_file("materializing a GraphLake source snapshot")?;
+                let mut writer = StreamWriter::try_new_with_options(
+                    file.open_writer()?,
+                    &batch.schema(),
+                    IpcWriteOptions::default().try_with_compression(self.compression)?,
+                )?;
+                for previous in self.memory.drain(..) {
+                    writer.write(&previous)?;
+                }
+                Ok::<_, anyhow::Error>(DiskBuffer { file, writer })
+            })?);
             self.budget.free();
-            self.file = Some(DiskBuffer { file, writer });
         }
         self.budget.try_grow(bytes)?;
         let chunks = (0..batch.num_rows())
             .step_by(batch_size)
             .map(|offset| batch.slice(offset, batch_size.min(batch.num_rows() - offset)));
         if let Some(DiskBuffer { writer, .. }) = &mut self.file {
-            for chunk in chunks {
-                writer.write(&chunk)?;
-            }
+            crate::blocking(|| {
+                for chunk in chunks {
+                    writer.write(&chunk)?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
             self.budget.shrink(bytes);
         } else {
             self.memory.extend(chunks);
@@ -185,7 +190,7 @@ impl Buffer {
         order: Vec<SortExpr>,
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation)> {
         let table: Arc<dyn TableProvider> = if let Some(DiskBuffer { file, writer }) = self.file {
-            writer.into_inner()?.finish()?;
+            crate::blocking(|| writer.into_inner()?.finish().map_err(anyhow::Error::from))?;
             stats.snapshot_spill(file.size().unwrap_or_default());
             let table = StreamingTable::try_new(
                 Arc::clone(&schema),
@@ -258,9 +263,11 @@ impl PartitionStream for Partition {
         let stream = async_stream::try_stream! {
             let path = file.path().context("source snapshot has no local path")
                 .map_err(|error| datafusion::common::DataFusionError::External(error.into()))?;
-            let reader = StreamReader::try_new_buffered(File::open(path)?, None)?;
+            let mut reader = crate::blocking(|| Ok::<_, datafusion::common::DataFusionError>(
+                StreamReader::try_new_buffered(File::open(path)?, None)?
+            ))?;
             let budget = MemoryConsumer::new("GraphLake source snapshot read").register(context.memory_pool());
-            for batch in reader {
+            while let Some(batch) = crate::blocking(|| reader.next()) {
                 let batch = batch?;
                 let bytes = ipc_batch_bytes(&batch);
                 budget.try_grow(bytes)?;

@@ -1332,7 +1332,7 @@ edges:
     .await?;
 
     let query_path = "/mcp/query";
-    let mode = json!({"model":model});
+    let mode = json!({"model":model,"include_types":true});
     let forbidden = call(&server, TOKEN, "get_schema", mode.clone()).await?;
     assert_eq!(forbidden["isError"], true, "{forbidden}");
     let old = call_at(&server, query_path, READER, "get_schema", mode.clone()).await?;
@@ -1446,10 +1446,7 @@ semantics:
     fs::rename(&data, root.path().join("grants.offline"))?;
     for (args, status) in [
         (mode.clone(), "unavailable"),
-        (
-            json!({"model":model,"include_types":false}),
-            "not_requested",
-        ),
+        (json!({"model":model}), "not_requested"),
     ] {
         let result = call_at(&server, query_path, READER, "get_schema", args).await?;
         assert_eq!(result["isError"], false, "{result}");

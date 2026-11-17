@@ -68,11 +68,11 @@ impl Apply {
         context.deregister_table(seed.clone())?;
         replay::register_seed(context, seed.clone(), outer_schema)?;
         let keys = graph_frame(context, &plan.keys).await?;
-        let key_plan = replay::Plan::new(context, &keys).await?;
+        let key_plan = replay::Plan::new(context, &keys, seed.clone()).await?;
         let group_plan =
             if self.limit.is_none() && self.nested.is_empty() && self.lookups.is_empty() {
                 let groups = graph_frame(context, &plan.groups).await?;
-                Some(replay::Plan::new(context, &groups).await?)
+                Some(replay::Plan::new(context, &groups, seed.clone()).await?)
             } else {
                 None
             };
@@ -144,7 +144,12 @@ impl Apply {
                     let (mut stream, physical) = if let Some(group_plan) = &group_plan {
                         group_plan.execute_with_plan(selected)?
                     } else {
-                        replace(context, seed.clone(), selected.schema(), vec![selected])?;
+                        replace(
+                            context,
+                            seed.clone(),
+                            selected.schema(),
+                            vec![selected.clone()],
+                        )?;
                         _nested_budget = self
                             .prepare_inner(
                                 catalog,
@@ -172,7 +177,7 @@ impl Apply {
                                 frame = frame.limit(0, Some(left))?;
                             }
                         }
-                        let task = Arc::new(frame.task_ctx());
+                        let task = replay::with_seed(frame.task_ctx(), seed.clone(), selected);
                         let physical = frame.create_physical_plan().await?;
                         (execute_stream(physical.clone(), task)?, physical)
                     };

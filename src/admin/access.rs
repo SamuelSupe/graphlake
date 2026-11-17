@@ -395,7 +395,7 @@ impl Policy {
         if let Some(audit) = audit {
             let mut entry = serde_json::to_vec(&entry).expect("serializable audit event");
             entry.push(b'\n');
-            if let Err(error) = audit.lock().unwrap().append(&entry) {
+            if let Err(error) = crate::blocking(|| audit.lock().unwrap().append(&entry)) {
                 self.audit_failures.fetch_add(1, Ordering::Relaxed);
                 eprintln!("GraphLake audit write failed: {error}");
             }

@@ -16,15 +16,21 @@ use object_store::{
 use crate::StorageConfig;
 use sha2::{Digest, Sha256};
 
-type S3Connection = (String, [u8; 32], Instant, Arc<dyn ObjectStore>);
+type Connection = ([u8; 32], Instant, Arc<dyn ObjectStore>);
 
-pub(super) fn s3_from_env(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
-    static CONNECTIONS: OnceLock<Mutex<VecDeque<S3Connection>>> = OnceLock::new();
+fn cached(
+    config: &[u8],
+    include_env: impl Fn(&std::ffi::OsStr) -> bool,
+    connect: impl FnOnce() -> Result<Arc<dyn ObjectStore>>,
+) -> Result<Arc<dyn ObjectStore>> {
+    static CONNECTIONS: OnceLock<Mutex<VecDeque<Connection>>> = OnceLock::new();
     let mut settings = std::env::vars_os()
-        .filter(|(key, _)| key.as_encoded_bytes().starts_with(b"AWS_"))
+        .filter(|(key, _)| include_env(key))
         .collect::<Vec<_>>();
     settings.sort_unstable();
     let mut fingerprint = Sha256::new();
+    fingerprint.update(config.len().to_le_bytes());
+    fingerprint.update(config);
     for (key, value) in settings {
         for part in [key.as_encoded_bytes(), value.as_encoded_bytes()] {
             fingerprint.update(part.len().to_le_bytes());
@@ -33,26 +39,36 @@ pub(super) fn s3_from_env(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     }
     let fingerprint: [u8; 32] = fingerprint.finalize().into();
     let mut connections = CONNECTIONS.get_or_init(Mutex::default).lock().unwrap();
-    connections.retain(|(_, _, opened, _)| opened.elapsed() < Duration::from_secs(300));
+    connections.retain(|(_, opened, _)| opened.elapsed() < Duration::from_secs(300));
     if let Some(index) = connections
         .iter()
-        .position(|(name, env, _, _)| name == bucket && env == &fingerprint)
+        .position(|(key, _, _)| key == &fingerprint)
     {
         let entry = connections.remove(index).expect("located S3 connection");
-        let store = entry.3.clone();
+        let store = entry.2.clone();
         connections.push_back(entry);
         return Ok(store);
     }
-    let store: Arc<dyn ObjectStore> = Arc::new(
-        AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .build()?,
-    );
+    let store = connect()?;
     if connections.len() == 32 {
         connections.pop_front();
     }
-    connections.push_back((bucket.into(), fingerprint, Instant::now(), store.clone()));
+    connections.push_back((fingerprint, Instant::now(), store.clone()));
     Ok(store)
+}
+
+pub(super) fn s3_from_env(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+    cached(
+        bucket.as_bytes(),
+        |key| key.as_encoded_bytes().starts_with(b"AWS_"),
+        || {
+            Ok(Arc::new(
+                AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .build()?,
+            ))
+        },
+    )
 }
 
 pub(crate) fn validate(config: &StorageConfig) -> Result<()> {
@@ -138,6 +154,31 @@ fn secret(name: &str) -> Result<String> {
 
 pub(crate) fn open(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
     validate(config)?;
+    let credentials = [
+        &config.access_key_env,
+        &config.secret_key_env,
+        &config.session_token_env,
+        &config.account_key_env,
+        &config.service_account_env,
+    ];
+    let settings = serde_json::to_vec(config)?;
+    cached(
+        &settings,
+        |key| {
+            let key_bytes = key.as_encoded_bytes();
+            [b"AWS_".as_slice(), b"AZURE_", b"GOOGLE_"]
+                .iter()
+                .any(|prefix| key_bytes.starts_with(prefix))
+                || credentials
+                    .iter()
+                    .filter_map(|name| name.as_deref())
+                    .any(|name| key == name)
+        },
+        || connect(config),
+    )
+}
+
+fn connect(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
     Ok(match config.provider.as_str() {
         "azure" => {
             let mut builder = if config.account_key_env.is_some() {

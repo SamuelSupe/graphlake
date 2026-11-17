@@ -14,7 +14,12 @@ use datafusion::{
     prelude::SessionContext,
 };
 
-struct Seed(RecordBatch);
+struct Seed(RecordBatch, TableReference);
+
+pub(crate) fn seed_batch(context: &TaskContext, name: &str) -> Option<RecordBatch> {
+    let seed = context.session_config().get_extension::<Seed>()?;
+    (seed.1 == TableReference::bare(name)).then(|| seed.0.clone())
+}
 
 #[derive(Debug)]
 struct SeedScan(SchemaRef);
@@ -50,13 +55,30 @@ pub(super) fn register_seed(
     Ok(())
 }
 
+pub(super) fn with_seed(
+    context: TaskContext,
+    name: TableReference,
+    seed: RecordBatch,
+) -> Arc<TaskContext> {
+    let config = context
+        .session_config()
+        .clone()
+        .with_extension(Arc::new(Seed(seed, name)));
+    Arc::new(context.with_session_config(config))
+}
+
 pub(super) struct Plan {
     physical: Arc<dyn ExecutionPlan>,
     state: datafusion::execution::SessionState,
+    seed: TableReference,
 }
 
 impl Plan {
-    pub(super) async fn new(context: &SessionContext, frame: &DataFrame) -> Result<Self> {
+    pub(super) async fn new(
+        context: &SessionContext,
+        frame: &DataFrame,
+        seed: TableReference,
+    ) -> Result<Self> {
         let mut state = context.state();
         // Dynamic filters share state with their original producer and cannot
         // be rebound by DataFusion's physical plan reset.
@@ -66,7 +88,11 @@ impl Plan {
         )?;
         let frame = DataFrame::new(state.clone(), frame.logical_plan().clone());
         let physical = frame.create_physical_plan().await?;
-        Ok(Self { physical, state })
+        Ok(Self {
+            physical,
+            state,
+            seed,
+        })
     }
 
     pub(super) fn execute(&self, seed: RecordBatch) -> Result<SendableRecordBatchStream> {
@@ -79,14 +105,9 @@ impl Plan {
     ) -> Result<(SendableRecordBatchStream, Arc<dyn ExecutionPlan>)> {
         // Each task owns its seed, even when cancellation leaves upstream work
         // unwinding while the next key starts.
-        let config = self
-            .state
-            .config()
-            .clone()
-            .with_extension(Arc::new(Seed(seed)));
-        let task = TaskContext::from(&self.state).with_session_config(config);
+        let task = with_seed(TaskContext::from(&self.state), self.seed.clone(), seed);
         let plan = reset_plan_states(self.physical.clone())?;
-        let stream = execute_stream(plan.clone(), Arc::new(task))?;
+        let stream = execute_stream(plan.clone(), task)?;
         Ok((stream, plan))
     }
 }

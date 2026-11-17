@@ -33,21 +33,36 @@ use futures::TryStreamExt;
 
 use super::{super::encode_equivalence, Files, Store};
 
-pub(super) fn finish(store: &Store, files: Files, ty: &DataType) -> Result<ScalarValue> {
-    // Accumulator::evaluate is synchronous, including on a current-thread
-    // executor. Drive DataFusion's two spillable sorts on a separate executor.
-    let output = std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(async {
-                tokio::select! {
-                    result = ordered_winners(store, files, ty) => result,
-                    _ = store.cancellation.cancelled() => Err(DataFusionError::Execution("query cancelled".into())),
-                    _ = tokio::time::sleep_until(store.deadline) => Err(DataFusionError::Execution("query deadline exceeded".into())),
-                }
-            })
-        }).join().map_err(|_| DataFusionError::Execution("distinct collect spill worker panicked".into()))?
-    })?;
+pub(super) fn finish(store: Arc<Store>, files: Files, ty: &DataType) -> Result<ScalarValue> {
+    // Accumulator::evaluate is synchronous, even when called from a current-thread runtime.
+    static RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    let runtime = RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let worker = store.clone();
+    let ty_owned = ty.clone();
+    runtime.spawn(async move {
+        let result = tokio::select! {
+            result = ordered_winners(&worker, files, &ty_owned) => result,
+            _ = worker.cancellation.cancelled() => Err(DataFusionError::Execution("query cancelled".into())),
+            _ = tokio::time::sleep_until(worker.deadline) => Err(DataFusionError::Execution("query deadline exceeded".into())),
+        };
+        let _ = send.send(result);
+    });
+    let wait = || {
+        receive.recv().map_err(|_| {
+            DataFusionError::Execution("distinct collect spill worker stopped".into())
+        })?
+    };
+    let output = crate::blocking(wait)?;
     let budget = MemoryConsumer::new("materializing the distinct collect list")
         .register(&store.runtime.memory_pool);
     let copy = if ty.is_nested() || matches!(ty, DataType::Dictionary(..)) {
@@ -273,7 +288,7 @@ impl PartitionStream for Runs {
         let stream = async_stream::try_stream! {
             let mut sequence = 0u64;
             for file in &files {
-                for batch in open(file)? {
+                for batch in file.reader()? {
                     let batch = batch?;
                     let values = batch.column(0).as_any().downcast_ref::<ListArray>().expect("collect values");
                     let orders = batch.column(1).as_any().downcast_ref::<ListArray>().expect("collect order");

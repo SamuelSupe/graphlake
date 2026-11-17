@@ -121,17 +121,22 @@ async fn serve(app: &Arc<App>, socket: WebSocket, pending: tokio::sync::OwnedSem
             request
         };
         if credential.is_none() {
-            if !send(
-                &mut output,
-                request.id,
-                407,
-                "SASL PLAIN authentication required",
-                Vec::new(),
-                json!({}),
-                request.binary,
-            )
-            .await
-            {
+            if !matches!(
+                tokio::time::timeout_at(
+                    auth_deadline,
+                    send(
+                        &mut output,
+                        request.id,
+                        407,
+                        "SASL PLAIN authentication required",
+                        Vec::new(),
+                        json!({}),
+                        request.binary,
+                    )
+                )
+                .await,
+                Ok(true)
+            ) {
                 return;
             }
             credential = receive(
@@ -187,7 +192,7 @@ async fn serve(app: &Arc<App>, socket: WebSocket, pending: tokio::sync::OwnedSem
             _authenticated_slot = Some(slot);
         }
         if let Some(ha) = &app.ha
-            && ha.leader.confirm().await.is_err()
+            && (ha.recovery_pending() || !ha.leader.eligible())
         {
             return;
         }

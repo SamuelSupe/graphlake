@@ -362,6 +362,27 @@ impl Records {
         Ok(())
     }
 
+    async fn write_batch(
+        &mut self,
+        objects: &Objects,
+        prefix: &Key,
+        blocks: Vec<(u64, u64, Vec<u8>)>,
+    ) -> Result<()> {
+        use futures::{StreamExt, TryStreamExt};
+        let offset = self.blocks.len();
+        let mut writes = futures::stream::iter(blocks.into_iter().enumerate().map(
+            |(i, (first, last, bytes))| {
+                let key = prefix.clone().join((offset + i).to_string());
+                async move { write_block_data(objects, &key, first, last, bytes, true).await }
+            },
+        ))
+        .buffered(2);
+        while let Some(block) = writes.try_next().await? {
+            self.blocks.push(block);
+        }
+        Ok(())
+    }
+
     async fn flush(&mut self, objects: &Objects, prefix: &Key) -> Result<()> {
         if !self.pending.is_empty() {
             let pending = std::mem::take(&mut self.pending);
@@ -726,7 +747,7 @@ pub(super) async fn build(
                     if let Some(block) = edges.queue(id, &record, BLOCK_BYTES)? {
                         ready.push(block);
                     }
-                    if let Some(block) = identities.queue(id, key.data(), 32 * 1024)? {
+                    if let Some(block) = identities.queue(id, key.data(), BLOCK_BYTES)? {
                         identity_blocks.push(block);
                     }
                     adjacency[partition(from, partitions)].push(
@@ -752,14 +773,10 @@ pub(super) async fn build(
                 }
                 (ready, identity_blocks)
             };
-            for (first, last, bytes) in ready {
-                edges.write(objects, &edge_path, first, last, bytes).await?;
-            }
-            for (first, last, bytes) in identity_blocks {
-                identities
-                    .write(objects, &identity_path, first, last, bytes)
-                    .await?;
-            }
+            tokio::try_join!(
+                edges.write_batch(objects, &edge_path, ready),
+                identities.write_batch(objects, &identity_path, identity_blocks),
+            )?;
         }
         identities.flush(objects, &identity_path).await?;
         manifest
@@ -771,15 +788,21 @@ pub(super) async fn build(
     }
     edges.flush(objects, &edge_path).await?;
     manifest.edge_keys = edges.blocks;
-    for (shard, runs) in adjacency.into_iter().enumerate() {
-        runs.publish(
-            scope,
-            objects,
-            prefix,
-            shard,
-            &mut manifest.partitions[shard],
-        )
-        .await?;
+    {
+        use futures::{StreamExt, TryStreamExt};
+        let shards = adjacency
+            .into_iter()
+            .zip(std::mem::take(&mut manifest.partitions))
+            .enumerate();
+        manifest.partitions =
+            futures::stream::iter(shards.map(|(shard, (runs, mut partition))| async move {
+                runs.publish(scope, objects, prefix, shard, &mut partition)
+                    .await?;
+                Ok::<_, anyhow::Error>(partition)
+            }))
+            .buffered(2)
+            .try_collect()
+            .await?;
     }
     manifest.bytes = manifest
         .edge_keys

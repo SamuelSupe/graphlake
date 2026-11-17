@@ -258,7 +258,7 @@ pub(in crate::admin) fn timeout() -> Error {
 }
 
 impl Control {
-    pub(super) fn new(meta: Metadata, objects: Objects) -> Self {
+    pub(in crate::admin) fn new(meta: Metadata, objects: Objects) -> Self {
         Self { meta, objects }
     }
 
@@ -634,66 +634,77 @@ impl Leadership {
         } else {
             self.validate(renew, until).await
         };
-        let mut window = self.window.lock().unwrap();
-        if self.stop.is_cancelled() {
-            return Err(lost());
-        }
-        let result = match result {
-            Err(reason) if reason.definitive() => Err(reason),
-            Ok(_) if Instant::now() >= window.until => {
-                Err(ConfirmationFailure::SafetyWindowExpired)
+        let (reason, loss) = {
+            let mut window = self.window.lock().unwrap();
+            if self.stop.is_cancelled() {
+                return Err(lost());
             }
-            result => result,
-        };
-        match result {
-            Ok(started) => {
-                // A check started before a pause cannot clear that pause.
-                if window.generation == generation {
-                    if renew {
-                        window.until = window.until.max(started + LOCAL_VALIDITY);
+            let result = match result {
+                Err(reason) if reason.definitive() => Err(reason),
+                Ok(_) if Instant::now() >= window.until => {
+                    Err(ConfirmationFailure::SafetyWindowExpired)
+                }
+                result => result,
+            };
+            match result {
+                Ok(started) => {
+                    // A check started before a pause cannot clear that pause.
+                    if window.generation == generation {
+                        if renew {
+                            window.until = window.until.max(started + LOCAL_VALIDITY);
+                        }
+                        if window.uncertain.is_cancelled() {
+                            window.uncertain = CancellationToken::new();
+                            window.generation += 1;
+                        }
                     }
-                    if window.uncertain.is_cancelled() {
-                        window.uncertain = CancellationToken::new();
+                    return if window.uncertain.is_cancelled() {
+                        Err(interrupted())
+                    } else {
+                        Ok(window.uncertain.clone())
+                    };
+                }
+                Err(reason) => {
+                    let loss = if reason.definitive() {
+                        Some(reason)
+                    } else if Instant::now() >= window.until {
+                        Some(ConfirmationFailure::SafetyWindowExpired)
+                    } else {
+                        None
+                    };
+                    if !window.uncertain.is_cancelled() {
+                        window.uncertain.cancel();
                         window.generation += 1;
                     }
-                }
-                if window.uncertain.is_cancelled() {
-                    Err(interrupted())
-                } else {
-                    Ok(window.uncertain.clone())
-                }
-            }
-            Err(reason) => {
-                let loss = if reason.definitive() {
-                    Some(reason)
-                } else if Instant::now() >= window.until {
-                    Some(ConfirmationFailure::SafetyWindowExpired)
-                } else {
-                    None
-                };
-                if !window.uncertain.is_cancelled() {
-                    window.uncertain.cancel();
-                    window.generation += 1;
-                }
-                self.metrics.record(|counts| {
-                    counts.failures[reason as usize] += 1;
-                    if let Some(loss) = loss {
-                        counts.losses[loss as usize] += 1;
+                    if let Some(reason) = loss {
+                        window.loss = Some(reason);
+                        self.stop.cancel();
                     }
-                });
-                if let Some(reason) = loss {
-                    window.loss = Some(reason);
-                    self.stop.cancel();
-                    crate::admin::telemetry::event(
-                        opentelemetry::logs::Severity::Error,
-                        "coordinator_leadership_lost",
-                        json!({"reason":reason.reason()}),
-                    );
-                    Err(lost())
-                } else {
-                    Err(interrupted())
+                    (reason, loss)
                 }
             }
+        };
+        // Publish the fence before touching metrics or the filesystem.
+        let metrics = self.metrics.clone();
+        tokio::task::spawn_blocking(move || {
+            metrics.record(|counts| {
+                counts.failures[reason as usize] += 1;
+                if let Some(loss) = loss {
+                    counts.losses[loss as usize] += 1;
+                }
+            });
+        })
+        .await
+        .ok();
+        if let Some(reason) = loss {
+            crate::admin::telemetry::event(
+                opentelemetry::logs::Severity::Error,
+                "coordinator_leadership_lost",
+                json!({"reason":reason.reason()}),
+            );
+            Err(lost())
+        } else {
+            Err(interrupted())
         }
     }
 

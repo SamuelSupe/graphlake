@@ -71,6 +71,7 @@ pub fn accept_ws<S, B>(
         max_unauthenticated_message_size: DEFAULT_MAX_UNAUTHENTICATED_MESSAGE_SIZE,
         handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
         closed: None,
+        slots: None,
     };
     let started = Instant::now();
     tokio::spawn(async move {
@@ -104,6 +105,7 @@ where
         max_unauthenticated_message_size: DEFAULT_MAX_UNAUTHENTICATED_MESSAGE_SIZE,
         handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
         closed: None,
+        slots: None,
     };
     run_handshake_and_connection(adapted, peer_addr, context, Instant::now()).await;
     Ok(())

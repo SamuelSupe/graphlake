@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Keep driver traffic off the etcd leadership confirmation path, and reclaim eligible managed local snapshots even when a refresh retires another generation.
+- Reuse graph and connection state across reads, bound slow downloads and automatic retries, and preserve indexed local refreshes for batches larger than 1,024 rows.
+- MCP `get_schema` returns published structure by default. Pass `include_types: true` for live type resolution.
+
 ## v1.1.2
 
 - Use the same GraphLake logo on the sign-in page, console navigation, and browser tab.

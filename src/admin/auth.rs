@@ -517,9 +517,10 @@ impl Auth {
                 self.reconcile(shared, &mut revision).await.ok()?;
             }
         }
-        let now = SystemTime::now();
         let (principal, update) = {
             let mut sessions = self.sessions.lock().unwrap();
+            // A concurrent touch may already have advanced the session timestamp.
+            let now = SystemTime::now();
             if !sessions.check(token, now, touch && self.shared.is_none()) {
                 return None;
             }
@@ -539,16 +540,18 @@ impl Auth {
         }
         if update {
             let auth = self.clone();
-            match tokio::spawn(async move { auth.apply(SessionChange::Touch(token, now)).await })
-                .await
-            {
+            match tokio::spawn(async move { auth.apply(SessionChange::Touch(token)).await }).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error))
                     if error.status.is_server_error()
                         && self.shared.as_ref().is_none_or(|shared| {
                             !shared.write_uncertain.load(Ordering::Acquire)
                         })
-                        && self.sessions.lock().unwrap().check(token, now, false) => {}
+                        && self
+                            .sessions
+                            .lock()
+                            .unwrap()
+                            .check(token, SystemTime::now(), false) => {}
                 _ => return None,
             }
         }
@@ -621,7 +624,7 @@ impl Auth {
 
     async fn apply(&self, change: SessionChange) -> super::ApiResult<()> {
         if let Some(shared) = &self.shared {
-            let touch = matches!(change, SessionChange::Touch(..));
+            let touch = matches!(change, SessionChange::Touch(_));
             let mut revision = shared.revision.lock().await;
             let previous = if let Some(previous) = *revision {
                 previous
@@ -688,14 +691,15 @@ impl Auth {
 }
 
 enum SessionChange {
-    Touch(Token, SystemTime),
+    Touch(Token),
     Replace(Option<Token>, Option<(Token, Principal)>),
 }
 
 impl SessionChange {
     fn apply(self, sessions: &mut Sessions) -> super::ApiResult<bool> {
         match self {
-            Self::Touch(token, now) => {
+            Self::Touch(token) => {
+                let now = SystemTime::now();
                 if !sessions.check(token, now, false) {
                     return Err(Error::new(
                         StatusCode::UNAUTHORIZED,

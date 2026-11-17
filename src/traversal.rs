@@ -16,7 +16,10 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use datafusion::{
-    arrow::datatypes::{DataType, Field, Schema, SchemaRef},
+    arrow::{
+        array::{Array, RecordBatch},
+        datatypes::{DataType, Field, Schema, SchemaRef},
+    },
     common::{DataFusionError, ScalarValue, tree_node::TreeNodeRecursion},
     execution::{
         SendableRecordBatchStream, TaskContext,
@@ -339,6 +342,7 @@ struct TraversalExec {
     properties: Arc<PlanProperties>,
     visits: Arc<Mutex<Vec<u64>>>,
     remote: Option<Remote>,
+    shared_topology: Option<Arc<tokio::sync::OnceCell<(Arc<Topology>, MemoryReservation)>>>,
 }
 
 impl TraversalExec {
@@ -402,6 +406,9 @@ impl TraversalExec {
         ));
         Self {
             input,
+            shared_topology:
+                matches!(&mode, Mode::Expand(expansion) if expansion.start_seed.is_some())
+                    .then(|| Arc::new(tokio::sync::OnceCell::new())),
             mode,
             properties,
             visits,
@@ -513,6 +520,7 @@ impl ExecutionPlan for TraversalExec {
         };
         let mut plan = Self::new(input, self.mode.clone(), Arc::clone(&self.visits));
         plan.remote = self.remote.clone();
+        plan.shared_topology = self.shared_topology.clone();
         Ok(Arc::new(plan))
     }
 
@@ -531,6 +539,7 @@ impl ExecutionPlan for TraversalExec {
         let mode = self.mode.clone();
         let input = self.input.clone();
         let remote = self.remote.clone();
+        let shared_topology = self.shared_topology.clone();
         let visits = Arc::clone(&self.visits);
         let stream = async_stream::try_stream! {
             let reservation = MemoryConsumer::new("GraphLake traversal").register(&context.runtime_env().memory_pool);
@@ -557,10 +566,18 @@ impl ExecutionPlan for TraversalExec {
                         _ => None,
                     };
                     let topology = match topology {
-                        Some(graph) => graph,
-                        None => inputs.load(Arc::clone(&context), &reservation).await.map_err(external)?,
+                        Some(graph) => Arc::new(graph),
+                        None => if let Some(shared) = &shared_topology {
+                            shared.get_or_try_init(|| async {
+                                let budget = reservation.new_empty();
+                                let topology = inputs.load(context.clone(), &budget).await?;
+                                Ok::<_, anyhow::Error>((Arc::new(topology), budget))
+                            }).await.map_err(external)?.0.clone()
+                        } else {
+                            Arc::new(inputs.load(context.clone(), &reservation).await.map_err(external)?)
+                        },
                     };
-                    (Arc::new(topology), inputs.starts.clone())
+                    (topology, inputs.starts.clone())
                 }
             };
             let expand = matches!(mode, Mode::Expand(_));
@@ -590,13 +607,19 @@ impl ExecutionPlan for TraversalExec {
                     return;
                 }
                 Mode::Expand(expansion) => {
-                    let starts = match (bound_start, starts) {
+                    let seed = expansion.start_seed.as_deref().and_then(|seed| {
+                        crate::cypher::apply::replay::seed_batch(&context, seed)
+                    });
+                    let starts = if let (Some(seed), Some(variable)) = (seed, &expansion.start_variable) {
+                        Box::new(imported_starts(&topology, &seed, variable, &reservation)
+                            .map_err(external)?.into_iter()) as Box<dyn Iterator<Item = usize> + Send>
+                    } else { match (bound_start, starts) {
                         (Some(key), _) => Box::new(topology.node_id(&key).map_err(external)?.into_iter())
                             as Box<dyn Iterator<Item = usize> + Send>,
                         (None, Some(plan)) => Box::new(select_starts(&topology, execute_stream(plan, context)?, &reservation)
                             .await.map_err(external)?.into_iter()) as Box<dyn Iterator<Item = usize> + Send>,
                         (None, None) => Box::new(0..topology.keys.num_rows()),
-                    };
+                    }};
                     (starts, Target::All, TraversalKind::Paths { min_hops: expansion.min }, expansion.max)
                 }
             };
@@ -608,6 +631,51 @@ impl ExecutionPlan for TraversalExec {
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+}
+
+fn imported_starts(
+    topology: &Topology,
+    seed: &RecordBatch,
+    variable: &str,
+    reservation: &MemoryReservation,
+) -> Result<Vec<usize>> {
+    use datafusion::arrow::array::StructArray;
+    let entity = seed
+        .column_by_name(variable)
+        .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+        .context("missing imported traversal vertex")?;
+    let properties = entity
+        .column_by_name("properties")
+        .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+        .context("missing imported traversal key fields")?;
+    let schema = topology.keys.schema();
+    let keys = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            properties
+                .column_by_name(field.name())
+                .cloned()
+                .context("missing imported traversal key")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    reservation.try_grow(seed.num_rows().saturating_mul(2 * size_of::<usize>()))?;
+    let converter = row_converter(&schema)?;
+    let keys = converter.convert_columns(&keys)?;
+    let mut starts = keys
+        .iter()
+        .enumerate()
+        .filter_map(|(row, key)| {
+            entity
+                .is_valid(row)
+                .then(|| topology.index.get(key.data()).copied())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    // Preserve traversal order and visit each imported vertex once.
+    starts.sort_unstable();
+    starts.dedup();
+    Ok(starts)
 }
 
 async fn single_start(mut stream: SendableRecordBatchStream) -> Result<Option<Vec<ScalarValue>>> {

@@ -86,6 +86,29 @@ fn recover(record: &mut Record, owner: &str, running: bool) -> bool {
     true
 }
 
+// The private workspace anchor is replaced atomically by load::run.
+#[derive(PartialEq, Eq)]
+pub(in crate::admin::local_tables) struct WorkspaceVersion {
+    size: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl WorkspaceVersion {
+    fn read(path: &std::path::Path) -> Option<Self> {
+        let info = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            size: info.len(),
+            modified: info.modified().ok()?,
+            #[cfg(unix)]
+            inode: info.ino(),
+        })
+    }
+}
+
 type LoadResult = (u64, u64, crate::source::ReadMetrics, Option<Uuid>);
 
 impl Managed {
@@ -210,11 +233,6 @@ impl Managed {
                     }
                 };
                 drop(permit);
-                let cached = result
-                    .as_ref()
-                    .ok()
-                    .and_then(|(_, head)| head.as_ref().or(record.head.as_ref()))
-                    .map(|head| head.generation);
                 let mut logged = false;
                 let confirmation_deadline = tokio::time::sleep(Duration::from_secs(30));
                 tokio::pin!(confirmation_deadline);
@@ -226,17 +244,7 @@ impl Managed {
                         finished = managed.finish(&app, id, task.id, &owner, &result, cancel.is_cancelled()) => finished,
                     };
                     match finished {
-                        Ok(true) => {
-                            if let Some(generation) = cached {
-                                app.local_tables
-                                    .cached
-                                    .lock()
-                                    .unwrap()
-                                    .insert(id, generation);
-                            }
-                            break;
-                        }
-                        Ok(false) => break,
+                        Ok(_) => break,
                         Err(e) => {
                             if !logged {
                                 let _ = writeln!(
@@ -281,7 +289,10 @@ impl Managed {
             Some(head) => Some(self.snapshot(id, head).await?),
             None => None,
         };
-        if cached.is_none() || cached != record.head.as_ref().map(|h| h.generation) {
+        let committed = record.head.as_ref().map(|h| h.generation);
+        if !cached.is_some_and(|(generation, version)| {
+            Some(generation) == committed && Some(version) == WorkspaceVersion::read(&path)
+        }) {
             let root = path.parent().unwrap();
             match tokio::fs::remove_dir_all(root).await {
                 Ok(()) => {}
@@ -292,6 +303,14 @@ impl Managed {
             if let Some(previous) = &previous {
                 self.download(id, previous, &path).await?;
             }
+        }
+        // A failure before replacing the anchor leaves the downloaded generation reusable.
+        if let (Some(generation), Some(version)) = (committed, WorkspaceVersion::read(&path)) {
+            app.local_tables
+                .cached
+                .lock()
+                .unwrap()
+                .insert(id, (generation, version));
         }
         let (loaded, rows, reads, _) = load::run(
             &record.table,
@@ -310,6 +329,15 @@ impl Managed {
             .upload(id, run.id, &path, previous.as_ref(), None)
             .await?;
         let generation = next.as_ref().map(|h| h.generation);
+        if let (Some(generation), Some(version)) =
+            (generation.or(committed), WorkspaceVersion::read(&path))
+        {
+            app.local_tables
+                .cached
+                .lock()
+                .unwrap()
+                .insert(id, (generation, version));
+        }
         Ok(((loaded, rows, reads, generation), next))
     }
 
@@ -383,6 +411,19 @@ impl Managed {
                 if recover(&mut record, &owner, running) {
                     let _ = self.save(&record, rev, leader).await;
                 }
+                continue;
+            }
+            let failures = record
+                .table
+                .history
+                .iter()
+                .take_while(|run| run.status == "failed")
+                .count();
+            if failures > 0
+                && record.table.history[0].finished_at_ms.is_some_and(|last| {
+                    now().saturating_sub(last) < 30_000 * (1 << (failures - 1).min(5))
+                })
+            {
                 continue;
             }
             if [

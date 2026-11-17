@@ -35,6 +35,8 @@ pub(crate) struct Expansion {
     pub filters: Vec<String>,
     pub starts: Vec<String>,
     pub anchored: bool,
+    pub start_variable: Option<String>,
+    pub start_seed: Option<String>,
     #[cfg(feature = "admin")]
     pub finishes: BTreeMap<String, Vec<String>>,
 }

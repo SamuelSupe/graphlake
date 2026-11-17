@@ -71,6 +71,8 @@ ExecStart=/opt/graphlake/current/bin/graphlake-admin --catalog-dir /var/lib/grap
 
 `--driver-model` 启用 Gremlin 并设定默认模型，`--bolt-port` 另启用 Bolt。Bolt 通过数据库名选择模型。Gremlin 将遍历源别名 `g` 映射到模型 ID，值 `g` 表示默认模型。账号只有一个授权模型且无权访问默认模型时，默认选该账号的模型。未配置 JSON 文件的旧部署仍可使用环境变量 `GRAPHLAKE_DRIVER_TOKEN`，供驱动账号 `graphlake` 访问默认模型。启用实时轮换时把该账号和需要保留的授权迁入 JSON 文件，并从服务环境移除旧令牌。JSON 文件存在时以其内容为准。
 
+Bolt 和 Gremlin 各有 16 个认证中连接名额和 16 个已认证会话名额。认证中连接最多等待 5 秒。HA 模式下，驱动使用本地主权窗口准入；心跳维护该窗口，权威写入仍由 etcd 围栏保护。
+
 ```sh
 curl -u "svc/analytics:$GRAPHLAKE_TOKEN" http://127.0.0.1:7337/api/v1/models
 ```
@@ -234,3 +236,6 @@ headers_env:
 如已有企业 IdP，可由受信任的 HTTPS 代理完成 OIDC 或 SAML 登录并强制 MFA，再将稳定的用户名映射到 GraphLake 中预创建的本地账号和角色。为后端设置 `GRAPHLAKE_PROXY_IDENTITY_SECRET`。代理必须从所有外部请求删除 `X-GraphLake-Proxy-User` 和 `X-GraphLake-Proxy-Secret`，仅在通过 IdP 验证时重写为已验证用户名与共享随机凭据。跨主机的代理到后端链路须经私有认证隧道或 mTLS。此模式的后端监听路由不得能被其他客户端直接访问，代理内部日志不能记录共享凭据。
 
 加入代理身份后，普通用户必须在每个会话请求携带有效的代理身份，GraphLake 登录页提供「使用企业账号登录」。内置 `admin` 继续使用本地恢复密码，生产部署可把管理员密码入口限制在维护网络或 VPN。企业会话及 MFA 策略由 IdP 和代理管理，GraphLake 的退出操作清理本应用会话。服务账号继续使用独立令牌。
+
+
+Arrow 下载独占下载名额；无进度 60 秒或传输累计 15 分钟后释放。托管本地表的同步工作区位于配置的数据目录所在文件系统。连续同步或 CSR 自动构建失败时，自动重试从 30 秒开始退避，最高 16 分钟；手动重试仍可立即发起。

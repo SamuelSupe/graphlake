@@ -451,6 +451,8 @@ fn ranged(
         filters: Vec::new(),
         starts: Vec::new(),
         anchored: false,
+        start_variable: None,
+        start_seed: None,
         #[cfg(feature = "admin")]
         finishes,
     });

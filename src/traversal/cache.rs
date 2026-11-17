@@ -28,7 +28,7 @@ const MAGIC: &[u8; 8] = b"GLCSR001";
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const IPC_ROWS: usize = 8192;
 #[cfg(unix)]
-const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RETAINED_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct Cache {
@@ -235,9 +235,10 @@ impl Cache {
                 Err(error) => return Err(error.into()),
             };
             #[cfg(unix)]
+            let mut recent = recent.lock().unwrap();
+            #[cfg(unix)]
             let (id, file_check) = {
                 let id = file_id(&file)?;
-                let mut recent = recent.lock().unwrap();
                 if let Some(index) = recent.iter().position(|entry| {
                     entry.id == id && entry.path == path && entry.direction == direction
                 }) {
@@ -263,7 +264,6 @@ impl Cache {
             {
                 let reserved = loaded._budget.size();
                 if reserved <= MAX_RETAINED_BYTES && file_id(&file_check)? == id {
-                    let mut recent = recent.lock().unwrap();
                     recent.retain(|entry| entry.path != path || entry.direction != direction);
                     while recent.len() >= 4
                         || recent.iter().map(|entry| entry.reserved).sum::<usize>() + reserved

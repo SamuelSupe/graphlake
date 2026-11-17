@@ -396,12 +396,34 @@ impl Http {
             token.set_sensitive(true);
             headers.insert(AUTHORIZATION, token);
         }
-        let client = Client::builder()
-            .default_headers(headers)
-            .user_agent(concat!("GraphLake/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout)
-            .build()?;
+        use sha2::{Digest, Sha256};
+        type Key = (Option<[u8; 32]>, Duration);
+        static CLIENTS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::VecDeque<(Key, Client)>>,
+        > = std::sync::OnceLock::new();
+        let key = (
+            headers
+                .get(AUTHORIZATION)
+                .map(|value| Sha256::digest(value.as_bytes()).into()),
+            timeout,
+        );
+        let mut clients = CLIENTS.get_or_init(Default::default).lock().unwrap();
+        let client = if let Some(i) = clients.iter().position(|(cached, _)| *cached == key) {
+            let entry = clients.remove(i).expect("cached warehouse client");
+            let client = entry.1.clone();
+            clients.push_front(entry);
+            client
+        } else {
+            let client = Client::builder()
+                .default_headers(headers)
+                .user_agent(concat!("GraphLake/", env!("CARGO_PKG_VERSION")))
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
+                .build()?;
+            clients.push_front((key, client.clone()));
+            clients.truncate(16);
+            client
+        };
         Ok(Self {
             client,
             base,

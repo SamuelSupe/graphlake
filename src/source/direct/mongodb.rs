@@ -128,21 +128,49 @@ impl Driver {
         };
         let uri = std::env::var(dsn_env)
             .with_context(|| format!("missing MongoDB connection string in {dsn_env}"))?;
-        let mut options = ClientOptions::parse(uri)
-            .await
-            .context("invalid MongoDB connection string")?;
-        if let Some(mongodb::options::Tls::Enabled(tls)) = &options.tls {
-            ensure!(
-                tls.allow_invalid_certificates != Some(true),
-                "MongoDB TLS requires certificate verification"
-            );
-        }
-        options.app_name = Some("GraphLake".into());
-        options.connect_timeout = Some(timeout);
-        options.server_selection_timeout = Some(timeout);
-        options.max_pool_size = Some(2);
+        use sha2::{Digest, Sha256};
+        type Key = ([u8; 32], Duration, tokio::runtime::Id);
+        type ClientCell = Arc<tokio::sync::OnceCell<Client>>;
+        static CLIENTS: std::sync::Mutex<std::collections::VecDeque<(Key, ClientCell)>> =
+            std::sync::Mutex::new(std::collections::VecDeque::new());
+        let key = (
+            Sha256::digest(uri.as_bytes()).into(),
+            timeout,
+            tokio::runtime::Handle::current().id(),
+        );
+        let cell = {
+            let mut clients = CLIENTS.lock().unwrap();
+            let entry = clients
+                .iter()
+                .position(|(cached, _)| *cached == key)
+                .and_then(|index| clients.remove(index))
+                .unwrap_or_else(|| (key, Arc::default()));
+            let cell = entry.1.clone();
+            clients.push_front(entry);
+            clients.truncate(16);
+            cell
+        };
+        let client = cell
+            .get_or_try_init(|| async {
+                let mut options = ClientOptions::parse(uri)
+                    .await
+                    .context("invalid MongoDB connection string")?;
+                if let Some(mongodb::options::Tls::Enabled(tls)) = &options.tls {
+                    ensure!(
+                        tls.allow_invalid_certificates != Some(true),
+                        "MongoDB TLS requires certificate verification"
+                    );
+                }
+                options.app_name = Some("GraphLake".into());
+                options.connect_timeout = Some(timeout);
+                options.server_selection_timeout = Some(timeout);
+                options.max_pool_size = Some(2);
+                Ok::<_, anyhow::Error>(Client::with_options(options)?)
+            })
+            .await?
+            .clone();
         Ok(Self {
-            client: Client::with_options(options)?,
+            client,
             sample_size: *schema_sample_size,
             timeout,
             runtime,

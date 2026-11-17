@@ -414,6 +414,7 @@ pub(in crate::admin) struct Objects {
     remote: bool,
     bucket: Option<String>,
     pub(super) prefix: Key,
+    pub(super) csr_manifests: Arc<super::csr::ManifestCache>,
 }
 
 impl Objects {
@@ -455,6 +456,7 @@ impl Objects {
                 .and_then(|uri| uri.split('/').next())
                 .map(str::to_owned),
             prefix: prefix.join("graphlake-v1").join(cluster),
+            csr_manifests: Default::default(),
         })
     }
 

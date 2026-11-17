@@ -217,7 +217,7 @@ pub(in crate::admin) async fn mcp_schema(
     }
     // Keep the published schema available when sources are offline or metadata slots are full.
     // Connector diagnostics may contain connection information and stay out of this response.
-    let types = if include_types && let Ok(_permit) = app.metadata_work.try_acquire() {
+    let types = if include_types && let Ok(_permit) = app.schema_work.try_acquire() {
         tokio::time::timeout(options.timeout, async {
             let _selection = super::super::local_tables::managed::resolve(
                 app,

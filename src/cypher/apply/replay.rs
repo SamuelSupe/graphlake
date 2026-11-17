@@ -21,6 +21,10 @@ pub(crate) fn seed_batch(context: &TaskContext, name: &str) -> Option<RecordBatc
     (seed.1 == TableReference::bare(name)).then(|| seed.0.clone())
 }
 
+pub(crate) fn has_seed(context: &TaskContext) -> bool {
+    context.session_config().get_extension::<Seed>().is_some()
+}
+
 #[derive(Debug)]
 struct SeedScan(SchemaRef);
 

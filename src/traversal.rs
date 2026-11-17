@@ -405,10 +405,11 @@ impl TraversalExec {
             Boundedness::Bounded,
         ));
         Self {
+            // Start selection can depend on the replay seed. The node and
+            // edge inputs are bound to the same snapshot for the whole query.
+            shared_topology: matches!((&input, &mode), (Input::Live(_), Mode::Expand(_)))
+                .then(|| Arc::new(tokio::sync::OnceCell::new())),
             input,
-            shared_topology:
-                matches!(&mode, Mode::Expand(expansion) if expansion.start_seed.is_some())
-                    .then(|| Arc::new(tokio::sync::OnceCell::new())),
             mode,
             properties,
             visits,
@@ -539,7 +540,11 @@ impl ExecutionPlan for TraversalExec {
         let mode = self.mode.clone();
         let input = self.input.clone();
         let remote = self.remote.clone();
-        let shared_topology = self.shared_topology.clone();
+        let shared_topology = self
+            .shared_topology
+            .as_ref()
+            .filter(|_| crate::cypher::apply::replay::has_seed(&context))
+            .cloned();
         let visits = Arc::clone(&self.visits);
         let stream = async_stream::try_stream! {
             let reservation = MemoryConsumer::new("GraphLake traversal").register(&context.runtime_env().memory_pool);
@@ -607,7 +612,7 @@ impl ExecutionPlan for TraversalExec {
                     return;
                 }
                 Mode::Expand(expansion) => {
-                    let starts = if let Some(seed) = expansion.imported_keys(&context).map_err(external)? {
+                    let starts = if let Some(seed) = expansion.imported_keys(&context, expansion.mixed.is_some()).map_err(external)? {
                         let tag = expansion.start_seed.as_ref().and_then(|start| start.tag);
                         Box::new(imported_starts(&topology, &seed, tag, &reservation)
                             .map_err(external)?.into_iter()) as Box<dyn Iterator<Item = usize> + Send>

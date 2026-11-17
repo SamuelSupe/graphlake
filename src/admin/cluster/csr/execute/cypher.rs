@@ -461,7 +461,7 @@ impl PartitionStream for Paths {
                 }
                 if targets.is_empty() { return; }
             }
-            let mut imported = expansion.imported_keys(&ctx).map_err(external)?;
+            let mut imported = expansion.imported_keys(&ctx, false).map_err(external)?;
             let seeded = imported.is_some();
             let mut starts = if seeded { Vec::new() } else { starts }.into_iter();
             let mut imported_seen = BTreeSet::new();

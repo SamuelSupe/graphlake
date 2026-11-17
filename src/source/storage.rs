@@ -9,7 +9,7 @@ use object_store::{
     ObjectStore,
     aws::{AmazonS3Builder, AmazonS3ConfigKey},
     azure::MicrosoftAzureBuilder,
-    gcp::GoogleCloudStorageBuilder,
+    gcp::{GoogleCloudStorageBuilder, GoogleConfigKey},
     path::Path,
 };
 
@@ -161,7 +161,36 @@ pub(crate) fn open(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
         &config.account_key_env,
         &config.service_account_env,
     ];
-    let settings = serde_json::to_vec(config)?;
+    let file_credentials = if config.provider == "gcs" && config.service_account_env.is_none() {
+        let builder = GoogleCloudStorageBuilder::from_env();
+        match builder.get_config_value(&GoogleConfigKey::ServiceAccountKey) {
+            Some(_) => None,
+            None => {
+                let file = builder
+                    .get_config_value(&GoogleConfigKey::ServiceAccount)
+                    .or_else(|| builder.get_config_value(&GoogleConfigKey::ApplicationCredentials))
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        let (env, file) = if cfg!(windows) {
+                            ("APPDATA", "gcloud/application_default_credentials.json")
+                        } else {
+                            (
+                                "HOME",
+                                ".config/gcloud/application_default_credentials.json",
+                            )
+                        };
+                        std::env::var_os(env).map(|home| std::path::PathBuf::from(home).join(file))
+                    });
+                file.as_deref()
+                    .map(credential_digest)
+                    .transpose()?
+                    .flatten()
+            }
+        }
+    } else {
+        None
+    };
+    let settings = serde_json::to_vec(&(config, file_credentials))?;
     cached(
         &settings,
         |key| {
@@ -169,6 +198,7 @@ pub(crate) fn open(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
             [b"AWS_".as_slice(), b"AZURE_", b"GOOGLE_"]
                 .iter()
                 .any(|prefix| key_bytes.starts_with(prefix))
+                || (config.provider == "gcs" && key == "SERVICE_ACCOUNT")
                 || credentials
                     .iter()
                     .filter_map(|name| name.as_deref())
@@ -176,6 +206,16 @@ pub(crate) fn open(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
         },
         || connect(config),
     )
+}
+
+fn credential_digest(path: &std::path::Path) -> Result<Option<[u8; 32]>> {
+    // GCS loads a credential file once when building a client. Rotating at the
+    // same path must change the key even if the old client has a live token.
+    match std::fs::read(path) {
+        Ok(contents) => Ok(Some(Sha256::digest(&contents).into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn connect(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
@@ -256,4 +296,29 @@ fn connect(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
             Arc::new(builder.build()?)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_file_rotation_replaces_the_cached_client() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let open = || {
+            let key =
+                serde_json::to_vec(&("credential_file_fixture", credential_digest(file.path())?))?;
+            cached(
+                &key,
+                |_| false,
+                || Ok(Arc::new(object_store::memory::InMemory::new())),
+            )
+        };
+        std::fs::write(file.path(), b"first")?;
+        let old = open()?;
+        assert!(Arc::ptr_eq(&old, &open()?));
+        std::fs::write(file.path(), b"other")?;
+        assert!(!Arc::ptr_eq(&old, &open()?));
+        Ok(())
+    }
 }

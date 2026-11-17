@@ -313,6 +313,7 @@ async fn cypher_correlated_call_expands_only_the_imported_vertices_across_batche
     rusqlite::Connection::open(dir.path().join("ring.db"))?.execute_batch(
         "CREATE TABLE vertices (id INTEGER PRIMARY KEY) STRICT;
          CREATE TABLE edges (id INTEGER PRIMARY KEY, src INTEGER, dst INTEGER) STRICT;
+         CREATE TABLE empty_edges (id INTEGER PRIMARY KEY, src INTEGER, dst INTEGER) STRICT;
          WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<64)
          INSERT INTO vertices SELECT i FROM n;
          INSERT INTO edges SELECT id, id, id%64+1 FROM vertices;",
@@ -327,26 +328,35 @@ nodes:
   N: {source: db.vertices, key: [id]}
 edges:
   E: {source: db.edges, key: [id], from: {node: N, columns: [src]}, to: {node: N, columns: [dst]}}
+  F: {source: db.empty_edges, key: [id], from: {node: N, columns: [src]}, to: {node: N, columns: [dst]}}
 ",
     )?;
     let engine = Engine::new(Catalog::load(config)?)?;
-    let mut result = engine
-        .query(
-            Language::Cypher,
-            "MATCH (p:N) WHERE p.id <= 33 WITH p ORDER BY p.id
-         CALL (p) { MATCH (p)-[:E*1..2]->(q:N) RETURN q.id AS to }
-         RETURN p.id AS start_id, to ORDER BY start_id, to",
-            QueryOptions {
-                batch_size: 64,
-                ..Default::default()
-            },
-        )
-        .await?;
     let expected = (1..=33)
         .flat_map(|from| [from + 1, from + 2].map(|to| json!({"start_id":from,"to":to})))
         .collect::<Vec<_>>();
-    assert_eq!(rows(&mut result).await?, expected);
-    assert_eq!(result.metrics().visits_by_depth.get(1).copied(), Some(33));
+    for types in [":E", ":E|F", ""] {
+        let mut result = engine
+            .query(
+                Language::Cypher,
+                &format!(
+                    "MATCH (p:N) WHERE p.id <= 33 WITH p ORDER BY p.id
+                    CALL (p) {{ MATCH (p)-[{types}*1..2]->(q:N) RETURN q.id AS to }}
+                    RETURN p.id AS start_id, to ORDER BY start_id, to"
+                ),
+                QueryOptions {
+                    batch_size: 64,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(rows(&mut result).await?, expected, "{types}");
+        assert_eq!(
+            result.metrics().visits_by_depth.get(1).copied(),
+            Some(33),
+            "{types}"
+        );
+    }
     Ok(())
 }
 

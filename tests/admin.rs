@@ -3474,6 +3474,7 @@ edges:
     assert_eq!(result["rows"], json!([["2"]]));
     for cypher in [
         "MATCH (m:Merchant) WHERE m.tenant_id = 1 AND m.to_merchant_id = 7 WITH m CALL (m) { MATCH (m)-[:Payment*1..2]-(a:Account) RETURN a.from_account_id AS account } RETURN account ORDER BY account",
+        "MATCH (m:Merchant) WHERE m.tenant_id = 1 AND m.to_merchant_id = 7 WITH m CALL (m) { MATCH (m)-[*1..2]-(a:Account) RETURN a.from_account_id AS account } RETURN account ORDER BY account",
         "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant) RETURN length(p) AS hops ORDER BY hops",
         "MATCH (a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*1..2]->(m:Merchant) RETURN count(*) AS hits",
         "MATCH p=(a:Account {tenant_id:1,from_account_id:9007199254740993})-[:Payment*0..0]-(b:Account {tenant_id:1,from_account_id:9007199254740993}) RETURN length(p) AS hops, [e IN relationships(p) | id(e)] AS edges, [n IN nodes(p) | id(n)] AS vertices",

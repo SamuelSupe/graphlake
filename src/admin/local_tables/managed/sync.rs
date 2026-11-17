@@ -3,6 +3,7 @@ use std::{io::Write as _, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Result, ensure};
 use uuid::Uuid;
 
+use super::files::preserve_parquet_anchor;
 use super::metadata::{Historical, Pending};
 use super::{Head, Managed, Record, api_error, error, unavailable};
 use crate::{
@@ -293,16 +294,23 @@ impl Managed {
         if !cached.is_some_and(|(generation, version)| {
             Some(generation) == committed && Some(version) == WorkspaceVersion::read(&path)
         }) {
-            let root = path.parent().unwrap();
-            match tokio::fs::remove_dir_all(root).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            tokio::fs::create_dir_all(root).await?;
             if let Some(previous) = &previous {
                 self.download(id, previous, &path).await?;
+            } else {
+                let root = path.parent().unwrap();
+                match tokio::fs::remove_dir_all(root).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                tokio::fs::create_dir_all(root).await?;
             }
+        }
+        // Keep the authoritative files through the local rewrite and S3/etcd
+        // publish. The next run can reclaim them once it knows the committed head.
+        crate::blocking(|| load::clean_parts(&path));
+        if previous.as_ref().is_some_and(|s| s.snapshot.is_none()) {
+            preserve_parquet_anchor(&path).await?;
         }
         // A failure before replacing the anchor leaves the downloaded generation reusable.
         if let (Some(generation), Some(version)) = (committed, WorkspaceVersion::read(&path)) {

@@ -35,7 +35,6 @@ pub(super) async fn run(
 ) -> Result<(u64, u64, crate::source::ReadMetrics, Option<uuid::Uuid>)> {
     let scope = Arc::new(QueryScope::new(options, admission).await?);
     let (loaded, total) = scope.run(load(table, path, mode, &scope)).await?;
-    clean_parts(path);
     let generation = Snapshot::read(path)?
         .filter(|snapshot| {
             snapshot
@@ -616,7 +615,7 @@ fn lookback(value: &ScalarValue, distance: u64) -> Result<ScalarValue> {
     })
 }
 
-fn clean_parts(path: &Path) {
+pub(super) fn clean_parts(path: &Path) {
     if let Err(error) = overlay::clean(path) {
         eprintln!("GraphLake local-table part cleanup failed: {error}");
     }

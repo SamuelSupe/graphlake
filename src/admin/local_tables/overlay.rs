@@ -408,7 +408,7 @@ pub(super) fn publish(
     Ok(true)
 }
 
-fn links_unavailable(error: &io::Error) -> bool {
+pub(super) fn links_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::Unsupported

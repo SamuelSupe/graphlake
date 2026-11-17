@@ -71,11 +71,10 @@ pub(super) fn finish(store: Arc<Store>, files: Files, ty: &DataType) -> Result<S
         1
     };
     budget.try_grow(output.bytes.saturating_mul(copy))?;
-    let reader = output.reader()?;
     let values = if output.rows == 0 {
         new_empty_array(ty)
     } else {
-        build_values(reader, ty, output.rows, output.bytes)?
+        crate::blocking(|| build_values(output.reader()?, ty, output.rows, output.bytes))?
     };
     Ok(ScalarValue::List(Arc::new(
         SingleRowListArrayBuilder::new(values).build_list_array(),
@@ -201,11 +200,14 @@ async fn spool(
     schema: &SchemaRef,
     columns: &[usize],
 ) -> Result<Output> {
-    let file = store
-        .runtime
-        .disk_manager
-        .create_tmp_file("assembling a distinct Cypher collect list")?;
-    let mut writer = StreamWriter::try_new(file.open_writer()?, schema)?;
+    let (file, mut writer) = crate::blocking(|| {
+        let file = store
+            .runtime
+            .disk_manager
+            .create_tmp_file("assembling a distinct Cypher collect list")?;
+        let writer = StreamWriter::try_new(file.open_writer()?, schema)?;
+        Ok::<_, DataFusionError>((file, writer))
+    })?;
     let mut rows = 0usize;
     let mut bytes = 0usize;
     while let Some(batch) = stream.try_next().await? {
@@ -224,9 +226,12 @@ async fn spool(
                 .to_data()
                 .get_slice_memory_size()?,
         );
-        writer.write(&batch)?;
+        crate::blocking(|| writer.write(&batch))?;
     }
-    writer.into_inner()?.finish()?;
+    crate::blocking(|| {
+        writer.into_inner()?.finish()?;
+        Ok::<_, DataFusionError>(())
+    })?;
     store
         .spilled
         .fetch_add(file.size().unwrap_or_default(), Ordering::Relaxed);
@@ -288,7 +293,8 @@ impl PartitionStream for Runs {
         let stream = async_stream::try_stream! {
             let mut sequence = 0u64;
             for file in &files {
-                for batch in file.reader()? {
+                let mut reader = crate::blocking(|| file.reader())?;
+                while let Some(batch) = crate::blocking(|| reader.next()) {
                     let batch = batch?;
                     let values = batch.column(0).as_any().downcast_ref::<ListArray>().expect("collect values");
                     let orders = batch.column(1).as_any().downcast_ref::<ListArray>().expect("collect order");
@@ -385,7 +391,8 @@ impl PartitionStream for SavedWinners {
     fn execute(&self, _: Arc<TaskContext>) -> SendableRecordBatchStream {
         let file = Arc::clone(&self.file);
         let stream = async_stream::try_stream! {
-            for batch in open(&file)? {
+            let mut reader = crate::blocking(|| open(&file))?;
+            while let Some(batch) = crate::blocking(|| reader.next()) {
                 yield batch?;
                 tokio::task::yield_now().await;
             }

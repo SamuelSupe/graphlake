@@ -1542,24 +1542,46 @@ fn join_match(
     )?;
     if let Some((imports, false)) = anchor {
         for expansion in &mut plan.expansions[first_expansion..] {
-            if expansion.mixed.is_none()
-                && expansion.starts.is_empty()
-                && expansion.start_variable.as_ref().is_some_and(|name| {
-                    matches!(left.scope.columns.get(name), Some(Value::Entity(binding))
-                        if binding.node && !binding.dynamic && binding.label == expansion.start_node)
-                        && imports.explicit.is_none_or(|names| names.contains(name))
-                })
+            let Some(name) = &expansion.start_variable else {
+                continue;
+            };
+            let Some(Value::Entity(binding)) = left.scope.columns.get(name) else {
+                continue;
+            };
+            if !binding.node
+                || binding.dynamic
+                || imports.explicit.is_some_and(|names| !names.contains(name))
             {
+                continue;
+            }
+            let tag = if let Some(mixed) = &expansion.mixed {
+                if !mixed.starts.get(&binding.label).is_some_and(Vec::is_empty) {
+                    continue;
+                }
+                expansion.start_node.clone_from(&binding.label);
+                None
+            } else {
+                if !expansion.starts.is_empty() || binding.label != expansion.start_node {
+                    continue;
+                }
                 let edge = &catalog.edges[&expansion.edge];
                 let second = expansion.start_node == edge.to.node;
-                expansion.start_seed = Some(crate::traversal::StartSeed {
-                    table: imports.seed.to_owned(),
-                    keys: catalog.nodes[&expansion.start_node].key.clone(),
-                    tag: (edge.from.node != edge.to.node).then(|| {
-                        (second, if second { 1 + catalog.nodes[&edge.from.node].key.len() } else { 1 })
-                    }),
-                });
-            }
+                (edge.from.node != edge.to.node).then(|| {
+                    (
+                        second,
+                        if second {
+                            1 + catalog.nodes[&edge.from.node].key.len()
+                        } else {
+                            1
+                        },
+                    )
+                })
+            };
+            expansion.start_seed = Some(crate::traversal::StartSeed {
+                table: imports.seed.to_owned(),
+                keys: catalog.nodes[&expansion.start_node].key.clone(),
+                tag,
+            });
         }
     }
     let mut bound_anchor = None;

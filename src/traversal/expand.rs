@@ -59,6 +59,7 @@ impl Expansion {
     pub(crate) fn imported_keys(
         &self,
         context: &datafusion::execution::TaskContext,
+        tagged: bool,
     ) -> Result<Option<datafusion::arrow::array::RecordBatch>> {
         use anyhow::Context;
         use datafusion::arrow::{
@@ -75,13 +76,18 @@ impl Expansion {
             .column_by_name(variable)
             .and_then(|column| column.as_any().downcast_ref::<StructArray>())
             .context("missing imported traversal vertex")?;
-        let properties = entity
-            .column_by_name("properties")
-            .and_then(|column| column.as_any().downcast_ref::<StructArray>())
-            .context("missing imported traversal key fields")?;
+        let (properties, keys) = if tagged {
+            (entity, vec!["label", "key"])
+        } else {
+            let properties = entity
+                .column_by_name("properties")
+                .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+                .context("missing imported traversal key fields")?;
+            (properties, start.keys.iter().map(String::as_str).collect())
+        };
         let mut fields = Vec::new();
         let mut arrays = Vec::new();
-        for key in &start.keys {
+        for key in keys {
             let index = properties
                 .fields()
                 .find(key)

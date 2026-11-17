@@ -2353,7 +2353,7 @@ async fn ordinary_model_preview_is_bound_to_the_reviewed_draft() -> Result<()> {
     let publish = |target: &Value, id: &Value| {
         server
             .request(Method::POST, "models/graph/publish")
-            .json(&json!({"revision":target,"active_revision":active,"preview":{"report_id":id}}))
+            .json(&json!({"revision":target,"active_revision":active,"preview":{"report_id":id},"mutation_id":Uuid::new_v4()}))
             .send()
     };
     assert_eq!(

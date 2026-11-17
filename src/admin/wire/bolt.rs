@@ -34,6 +34,7 @@ pub(in crate::admin) async fn serve(app: Arc<App>, listener: TcpListener) -> Res
         .auth(backend)
         .max_sessions(16)
         .max_pending_sessions(16)
+        .max_pending_sessions_per_peer(8)
         .max_unauthenticated_message_size(4096)
         .max_message_size(256 * 1024)
         .handshake_timeout(Duration::from_secs(5))

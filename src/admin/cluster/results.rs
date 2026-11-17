@@ -199,7 +199,7 @@ impl Coordinator {
             .shared
             .objects
             .artifact(id, job.attempt, "result.arrow");
-        let result = self.shared.objects.get(&key).await.map_err(storage)?;
+        let result = self.shared.objects.get_arrow(&key).await?;
         if job.export {
             job.state = JobState::Downloaded;
             if !self

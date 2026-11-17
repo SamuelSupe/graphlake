@@ -218,7 +218,9 @@ edges:
   Grant: {{source: input.public.{relation}, key: [id], from: {{node: Account, columns: [id]}}, to: {{node: Account, columns: [target]}}}}
 '''
         (original.root / 'accounts.yaml').write_text(yaml)
-        old_coordinator = original.coordinator('original', AWS_ENDPOINT=sync_s3)
+        coordinator_tmp = root / 'coordinator-tmp'
+        coordinator_tmp.mkdir()
+        old_coordinator = original.coordinator('original', AWS_ENDPOINT=sync_s3, TMPDIR=str(coordinator_tmp))
         original.login()
         draft = ok(original.call(MODEL))
         local = ok(original.call(MODEL + '/local-tables', {
@@ -231,6 +233,10 @@ edges:
         table = location.split('://')[1]
         state_key = keyroot + '/state/' + table
         first = original.load('full')['committed_generation']
+        assert list(coordinator_tmp.glob('graphlake-managed-sync-*/**/*.parquet'))
+        assert list(coordinator_tmp.glob('graphlake-local-keys-*/*.sqlite'))
+        assert not list((original.root / '.graphlake-local').glob('managed-sync-*'))
+        assert not list((original.root / '.graphlake-local').rglob('*.sqlite'))
         before = value(lookup(args, state_key)[0])['head']
         assert before['generation'] == first
         prefix = objectroot + '/' + table + '/'

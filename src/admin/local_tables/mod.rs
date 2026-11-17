@@ -37,26 +37,14 @@ pub(super) struct LocalTables {
 impl LocalTables {
     pub fn open(root: PathBuf, managed: bool) -> anyhow::Result<Self> {
         let store = Store::open(root)?;
-        let workspace = if managed {
-            // The store lock excludes other writers using this data directory.
-            // A crash can leave behind uncommitted local copies of S3 snapshots.
-            let prefix = "managed-sync-";
-            for entry in std::fs::read_dir(&store.root)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir()
-                    && entry.file_name().to_string_lossy().starts_with(prefix)
-                {
-                    std::fs::remove_dir_all(entry.path())?;
-                }
-            }
-            Some(
+        // The catalog may be shared over NFS. The mutable S3 sync workspace is node-local.
+        let workspace = managed
+            .then(|| {
                 tempfile::Builder::new()
-                    .prefix(prefix)
-                    .tempdir_in(&store.root)?,
-            )
-        } else {
-            None
-        };
+                    .prefix("graphlake-managed-sync-")
+                    .tempdir()
+            })
+            .transpose()?;
         Ok(Self {
             workspace,
             store: Mutex::new(store),

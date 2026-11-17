@@ -27,12 +27,9 @@ pub(super) fn set_generation(tx: &Transaction, id: Uuid) -> Result<()> {
 }
 
 fn cache_path(anchor: &Path) -> Result<PathBuf> {
-    // In HA the anchor belongs to the coordinator's private data workspace.
+    // SQLite WAL requires a local filesystem even when the catalog is shared.
     let anchor = std::path::absolute(anchor)?;
-    let dir = anchor
-        .parent()
-        .expect("absolute snapshot path")
-        .join(cache_name());
+    let dir = std::env::temp_dir().join(cache_name());
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {

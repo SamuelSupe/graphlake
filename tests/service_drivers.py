@@ -40,23 +40,36 @@ def check_bolt_handshake_capacity(bolt, user, token):
     # Bolt 5.1 negotiates HELLO and LOGON separately.
     handshake = bytes.fromhex("6060b01700000105000000000000000000000000")
     hello = bytes.fromhex("b101a18a") + b"user_agent" + bytes.fromhex("85") + b"audit"
+
+    def open_hello(stack, peer):
+        conn = stack.enter_context(socket.create_connection(
+            (address.hostname, address.port), timeout=2, source_address=(peer, 0)))
+        reader = stack.enter_context(conn.makefile("rb"))
+        conn.sendall(handshake)
+        assert reader.read(4) == bytes.fromhex("00000105")
+        conn.sendall(len(hello).to_bytes(2, "big") + hello + b"\x00\x00")
+        size = int.from_bytes(reader.read(2), "big")
+        payload = reader.read(size)
+        assert reader.read(2) == b"\x00\x00"
+        return payload
+
     with GraphDatabase.driver(bolt, auth=(user, token)) as driver, ExitStack() as stack:
         session = stack.enter_context(driver.session(database="payments"))
         tx = stack.enter_context(session.begin_transaction())
         assert tx.run("RETURN 1 AS n").single()["n"] == 1
-        for _ in range(16):
-            conn = stack.enter_context(socket.create_connection((address.hostname, address.port), timeout=2))
-            reader = stack.enter_context(conn.makefile("rb"))
-            conn.sendall(handshake)
-            assert reader.read(4) == bytes.fromhex("00000105")
-            conn.sendall(len(hello).to_bytes(2, "big") + hello + b"\x00\x00")
-            size = int.from_bytes(reader.read(2), "big")
-            assert reader.read(size).startswith(bytes.fromhex("b170"))
-            assert reader.read(2) == b"\x00\x00"
-        # All regular handshakes are stalled. A ready client can authenticate
-        # through the slot with a shorter deadline.
+        for _ in range(8):
+            assert open_hello(stack, "127.0.0.2").startswith(bytes.fromhex("b170"))
+        for _ in range(4):
+            rejected = open_hello(stack, "127.0.0.2")
+            assert rejected.startswith(bytes.fromhex("b17f"))
+            assert b"Neo.TransientError.Request.NoThreadsAvailable" in rejected
         with driver.session(database="payments") as fresh:
             assert fresh.run("RETURN 2 AS n").single()["n"] == 2
+        for _ in range(8):
+            assert open_hello(stack, "127.0.0.3").startswith(bytes.fromhex("b170"))
+        rejected = open_hello(stack, "127.0.0.1")
+        assert rejected.startswith(bytes.fromhex("b17f"))
+        assert b"Neo.TransientError.Request.NoThreadsAvailable" in rejected
         assert tx.run("RETURN 3 AS n").single()["n"] == 3
         tx.rollback()
 

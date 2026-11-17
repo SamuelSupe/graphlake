@@ -6,7 +6,7 @@ mod freshness;
 pub(in crate::admin) use freshness::{RefreshStatus, health, watch};
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -49,24 +49,29 @@ impl ExplorationSnapshot {
     ) -> ApiResult<Self> {
         let cluster = app.cluster.as_ref().ok_or_else(Error::not_found)?;
         let objects = cluster.shared.objects.clone();
-        let manifest = manifest(&objects, model, revision, generation)
-            .await
-            .map_err(|error| {
-                if error.chain().any(|cause| {
-                    matches!(
-                        cause.downcast_ref::<object_store::Error>(),
-                        Some(object_store::Error::NotFound { .. })
-                    )
-                }) {
-                    Error::new(
-                        StatusCode::CONFLICT,
-                        "csr_snapshot_expired",
-                        "原图快照已不可用，请选择当前代次",
-                    )
-                } else {
-                    storage(error)
-                }
-            })?;
+        let prefix = objects.graph(model, revision, generation);
+        // A user can explore a historical generation after GC has removed it.
+        let manifest = async {
+            objects.head(&prefix.clone().join("manifest.json")).await?;
+            manifest(&objects, model, revision, generation).await
+        }
+        .await
+        .map_err(|error| {
+            if error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<object_store::Error>(),
+                    Some(object_store::Error::NotFound { .. })
+                )
+            }) {
+                Error::new(
+                    StatusCode::CONFLICT,
+                    "csr_snapshot_expired",
+                    "原图快照已不可用，请选择当前代次",
+                )
+            } else {
+                storage(error)
+            }
+        })?;
         if manifest.format < 3 {
             return Err(Error::new(
                 StatusCode::CONFLICT,
@@ -75,7 +80,7 @@ impl ExplorationSnapshot {
             ));
         }
         Ok(Self {
-            prefix: objects.graph(model, revision, generation),
+            prefix,
             objects,
             manifest,
         })
@@ -480,9 +485,60 @@ impl Manifest {
     }
 }
 
-type ManifestCell = Arc<tokio::sync::OnceCell<Arc<Manifest>>>;
+type ManifestCell = Arc<tokio::sync::OnceCell<(Arc<Manifest>, u64)>>;
 
-pub(super) type ManifestCache = std::sync::Mutex<std::collections::VecDeque<(Key, ManifestCell)>>;
+const MANIFEST_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+const MANIFEST_CACHE_ENTRIES: usize = 256;
+
+#[derive(Default)]
+pub(super) struct ManifestCache(VecDeque<ManifestEntry>);
+
+struct ManifestEntry {
+    key: Key,
+    model: String,
+    cell: ManifestCell,
+}
+
+impl ManifestCache {
+    fn lookup(&mut self, key: &Key, model: &str) -> ManifestCell {
+        self.0
+            .retain(|entry| entry.cell.initialized() || Arc::strong_count(&entry.cell) > 1);
+        let entry = self
+            .0
+            .iter()
+            .position(|entry| &entry.key == key)
+            .and_then(|index| self.0.remove(index))
+            .unwrap_or_else(|| ManifestEntry {
+                key: key.clone(),
+                model: model.into(),
+                cell: Arc::default(),
+            });
+        let cell = entry.cell.clone();
+        self.0.push_front(entry);
+        cell
+    }
+
+    fn trim(&mut self) {
+        let mut bytes = 0;
+        let mut ready = 0;
+        let mut per_model = HashMap::new();
+        self.0.retain(|entry| {
+            let Some((_, size)) = entry.cell.get() else {
+                // In-flight loads keep their identity even while the cache is full.
+                return Arc::strong_count(&entry.cell) > 1;
+            };
+            let count = per_model.entry(entry.model.clone()).or_insert(0);
+            if *count == 2 || ready == MANIFEST_CACHE_ENTRIES || bytes + size > MANIFEST_CACHE_BYTES
+            {
+                return false;
+            }
+            *count += 1;
+            bytes += size;
+            ready += 1;
+            true
+        });
+    }
+}
 
 async fn manifest(
     objects: &Objects,
@@ -494,18 +550,10 @@ async fn manifest(
         .graph(model, revision, generation)
         .join("manifest.json");
     // Coalesce misses for the same immutable generation without blocking other models.
-    let cell = {
-        let mut cache = objects.csr_manifests.lock().unwrap();
-        let entry = cache
-            .iter()
-            .position(|(cached, _)| *cached == key)
-            .and_then(|index| cache.remove(index))
-            .unwrap_or_else(|| (key.clone(), Arc::default()));
-        let cell = entry.1.clone();
-        cache.push_front(entry);
-        cache.truncate(2);
-        cell
-    };
+    let cell = objects.csr_manifests.lock().unwrap().lookup(&key, model);
+    if let Some((manifest, _)) = cell.get() {
+        return Ok(manifest.clone());
+    }
     let manifest = cell
         .get_or_try_init(|| async {
             let object = objects.get(&key).await?;
@@ -514,6 +562,8 @@ async fn manifest(
                 "CSR manifest is too large"
             );
             let bytes = object.bytes().await?;
+            let size = bytes.len() as u64;
+            ensure!(size <= MANIFEST_LIMIT, "CSR manifest is too large");
             let manifest: Manifest =
                 tokio::task::spawn_blocking(move || serde_json::from_slice(&bytes)).await??;
             ensure!(
@@ -523,10 +573,63 @@ async fn manifest(
                     && (2..=8).contains(&manifest.partitions.len()),
                 "invalid CSR manifest"
             );
-            Ok::<_, anyhow::Error>(Arc::new(manifest))
+            Ok::<_, anyhow::Error>((Arc::new(manifest), size))
         })
         .await?;
-    Ok(manifest.clone())
+    objects.csr_manifests.lock().unwrap().trim();
+    Ok(manifest.0.clone())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn manifests_are_shared_across_models_and_keep_in_flight_loads_when_full() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let objects = Objects::open(root.path().to_str().unwrap(), "manifest-test")?;
+    let generation = Uuid::new_v4();
+    let revision = "reviewed";
+    let mut read = Vec::new();
+    for model in ["one", "two", "three"] {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "format": 5, "generation": generation, "model_revision": revision,
+            "graph_options": GraphOptions::default(), "sources": [], "schemas": {},
+            "edge_types": [], "edge_keys": [], "vertices": 0, "edges": 0, "bytes": 0, "build_ms": 0,
+            "partitions": [{"vertices":[],"arcs":[]},{"vertices":[],"arcs":[]}], "reads": {}
+        }))?;
+        let key = objects
+            .graph(model, revision, generation)
+            .join("manifest.json");
+        objects.put_immutable(&key, bytes).await?;
+        read.push((
+            model,
+            manifest(&objects, model, revision, generation).await?,
+        ));
+    }
+    for (model, cached) in &read {
+        assert!(Arc::ptr_eq(
+            cached,
+            &manifest(&objects, model, revision, generation).await?
+        ));
+    }
+
+    let mut cache = ManifestCache::default();
+    let first_key = Key::from("pending.json");
+    let pending = cache.lookup(&first_key, "pending");
+    for i in 0..5 {
+        let model = format!("model-{i}");
+        let cell = cache.lookup(&Key::from(format!("{model}.json")), &model);
+        assert!(cell.set((read[0].1.clone(), MANIFEST_LIMIT)).is_ok());
+        cache.trim();
+    }
+    assert!(Arc::ptr_eq(&pending, &cache.lookup(&first_key, "pending")));
+    assert_eq!(
+        cache
+            .0
+            .iter()
+            .filter(|entry| entry.cell.initialized())
+            .count(),
+        4
+    );
+    Ok(())
 }
 
 fn encode_schema(schema: &Schema) -> Result<String> {

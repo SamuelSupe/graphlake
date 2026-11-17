@@ -1,34 +1,56 @@
-# GraphLake
+<p align="center">
+  <img src="docs/images/graphlake-logo.png" width="144" height="144" alt="">
+</p>
 
-**Read-only graph analytics across databases and lakehouse tables.**
+<h1 align="center">GraphLake</h1>
 
-Build a labeled graph over existing tables, query it with Cypher, SQL, or Gremlin, and explore the results in a browser. GraphLake runs as an embedded Rust engine, a standalone Linux service, or a Coordinator with distributed Workers.
+<p align="center"><strong>Read-only graph analytics across databases and lakehouse tables</strong></p>
 
-[**Download v1.1.1**](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.1) · [Quickstart](docs/quickstart.md) · [Deployment](docs/deployment.md) · [中文技术参考](docs/reference.zh-CN.md)
+<p align="center">
+  <a href="https://github.com/SamuelSupe/graphlake/releases/latest"><strong>Download for Linux</strong></a> ·
+  <a href="docs/quickstart.md">Quickstart</a> ·
+  <a href="docs/deployment.md">Deployment</a> ·
+  <a href="docs/reference.zh-CN.md">中文技术参考</a>
+</p>
 
-![GraphLake 1.1.0 query workbench showing three accounts and four transfers from the Parquet demo](docs/workbench.jpg)
+Build a graph over existing tables, query it with **Cypher**, **SQL**, or **Gremlin**, and explore nodes and relationships in your browser. Run GraphLake as an embedded Rust engine, a standalone Linux service, or a Coordinator with distributed Workers.
+
+[![English GraphLake Query workbench showing three accounts, four transfers, and the amount on the selected relationship](docs/images/query-workbench-en.jpg)](docs/images/query-workbench-en.jpg)
+
+*The Cypher workbench displays the accounts and transfers from the built-in Parquet demo.*
+
+## Try the Parquet demo
+
+The [quickstart](docs/quickstart.md) creates two small Parquet files and opens the workbench. Run this query in the CLI or browser to find two-hop transfers from account `10`.
+
+```cypher
+MATCH (a:Account)-[:Transfer]->(b:Account)-[t:Transfer]->(c:Account)
+WHERE a.tenant_id = 1 AND a.account_id = 10
+RETURN c.account_id AS account, count(*) AS paths, sum(t.amount) AS amount
+```
+
+The result is account `30`, with two paths and a total amount of `600`.
 
 ## What you can do
 
-| | |
+| Workflow | What GraphLake provides |
 | --- | --- |
-| **Model** | Map nodes and relationships to one or more tables, with composite keys, property mappings, filters, business-time rules, and validation. Publish a draft or roll back to an archived version. |
-| **Query** | Use Cypher, SQL, or Gremlin. Set a timeout, inspect the model and source versions, cancel a query, or export complete results as Arrow IPC. |
-| **Explore** | Inspect node and relationship properties, expand and page through neighbors, search across batches, and continue loading a truncated graph preview. |
+| **Model** | Map tables to node labels and relationship types with composite keys, property mappings, filters, and business-time rules. Validate and publish drafts or roll back to an archived version. |
+| **Query and explore** | Inspect properties and expand neighbors in the graph view. Set query timeouts, inspect model and source versions, and export results as Arrow IPC. |
 | **Analyze** | Run bounded traversals, shortest paths, PageRank, weakly connected components, community detection, and Node2Vec. Reuse persisted CSR indexes for supported workloads. |
-| **Connect AI** | Connect Agents to separate query and modeling MCP services through an in-app guide. Personal AI tokens inherit the owner’s live model permissions and tenant scope; administrators set global capability limits. |
-| **Sync locally** | Load selected source fields into managed Parquet tables, refresh incrementally by key and watermark, and schedule refreshes. |
-| **Operate** | Manage users, service accounts, and model-level roles. Collect audit events, Prometheus metrics, and OTLP signals. Restore an off-site checkpoint and verify a known business query before enabling traffic. |
+| **Connect AI** | Use [separate MCP services for querying and modeling](docs/mcp.md). Personal AI tokens inherit the owner’s current model permissions and tenant scope. |
+| **Sync locally** | Load selected source columns into managed Parquet tables and refresh them incrementally by key and watermark. |
+| **Operate** | Manage users, service accounts, and model-level roles. Collect audit events, Prometheus metrics, and OTLP signals. Restore from an off-site checkpoint. |
 
 The browser console defaults to English and supports Simplified Chinese. Choose an interface language on the sign-in page or in the main navigation. The browser remembers your choice.
 
 ## Local tables and data sync
 
-In GraphLake 1.1.0, open **Local Tables** (本地表) from a graph model to load selected source columns into a managed Parquet copy. Run full or incremental refreshes on demand or on a schedule. Incremental refresh uses a primary key and watermark. The panel shows which copies are ready, when they last refreshed, and when the next run is due. Load history records each run’s outcome and row counts.
+Open **Local tables** from a graph model to load selected source columns into a managed Parquet copy. Run full or incremental refreshes on demand or on a schedule. The panel shows the last refresh, the next scheduled run, and load history.
 
-![GraphLake 1.1.0 local table sync panel showing a successful refresh and a five-minute schedule for transfers_local](docs/local-tables.jpg)
+[![English GraphLake Local tables panel showing a successful four-row sync and a five-minute schedule for transfers_local](docs/images/local-tables-en.jpg)](docs/images/local-tables-en.jpg)
 
-A refresh publishes the new snapshot atomically. If a load fails before publication, the last committed copy stays available. Use a full reload to reflect rows deleted at the source. [Local tables and data sync guide](docs/local-tables.zh-CN.md)
+A refresh publishes the new copy atomically. The last committed copy remains available if a load fails before publication. Use a full reload to reflect rows deleted at the source. [Local tables and data sync guide](docs/local-tables.zh-CN.md)
 
 ## Install on Linux
 
@@ -37,16 +59,6 @@ The GitHub release ships **ARM64 (`aarch64`)** and **AMD64 (`x86_64`)** packages
 1. Run `uname -m` and download the matching `.tar.gz` and `.tar.gz.sha256` from the release page.
 2. Verify the checksum and extract the package. Each archive contains a `BUILD-INFO` file with its commit, source digest, and target architecture.
 3. Use the [standalone deployment guide](docs/deployment.md#standalone-service) for installation, administrator setup, and the first health check.
-
-For local development and a runnable example, follow the [quickstart](docs/quickstart.md). It builds a graph from two small Parquet files and runs this query through the CLI and the browser:
-
-```cypher
-MATCH (a:Account)-[:Transfer]->(b:Account)-[t:Transfer]->(c:Account)
-WHERE a.tenant_id = 1 AND a.account_id = 10
-RETURN c.account_id AS account, count(*) AS paths, sum(t.amount) AS amount
-```
-
-The example returns account `30`, two paths, and a total amount of `600`.
 
 ## Data sources and interfaces
 

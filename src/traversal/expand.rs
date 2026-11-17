@@ -36,7 +36,7 @@ pub(crate) struct Expansion {
     pub starts: Vec<String>,
     pub anchored: bool,
     pub start_variable: Option<String>,
-    pub start_seed: Option<String>,
+    pub start_seed: Option<StartSeed>,
     #[cfg(feature = "admin")]
     pub finishes: BTreeMap<String, Vec<String>>,
 }
@@ -47,7 +47,62 @@ pub(crate) struct MixedExpansion {
     pub starts: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct StartSeed {
+    pub table: String,
+    pub keys: Vec<String>,
+    // Heterogeneous topologies prefix the two typed key regions with a label tag.
+    pub tag: Option<(bool, usize)>,
+}
+
 impl Expansion {
+    pub(crate) fn imported_keys(
+        &self,
+        context: &datafusion::execution::TaskContext,
+    ) -> Result<Option<datafusion::arrow::array::RecordBatch>> {
+        use anyhow::Context;
+        use datafusion::arrow::{
+            array::{Array, BooleanArray, RecordBatch, StructArray},
+            compute::filter,
+        };
+        let (Some(start), Some(variable)) = (&self.start_seed, &self.start_variable) else {
+            return Ok(None);
+        };
+        let Some(seed) = crate::cypher::apply::replay::seed_batch(context, &start.table) else {
+            return Ok(None);
+        };
+        let entity = seed
+            .column_by_name(variable)
+            .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+            .context("missing imported traversal vertex")?;
+        let properties = entity
+            .column_by_name("properties")
+            .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+            .context("missing imported traversal key fields")?;
+        let mut fields = Vec::new();
+        let mut arrays = Vec::new();
+        for key in &start.keys {
+            let index = properties
+                .fields()
+                .find(key)
+                .map(|(i, _)| i)
+                .context("missing imported traversal key")?;
+            fields.push(properties.fields()[index].clone());
+            arrays.push(properties.column(index).clone());
+        }
+        if let Some(nulls) = entity.nulls().filter(|nulls| nulls.null_count() > 0) {
+            let valid = BooleanArray::new(nulls.inner().clone(), None);
+            arrays = arrays
+                .iter()
+                .map(|array| filter(array, &valid))
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(Some(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            arrays,
+        )?))
+    }
+
     pub(crate) async fn register(
         self,
         catalog: &Catalog,

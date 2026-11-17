@@ -170,12 +170,11 @@ impl Managed {
                 ticket,
                 head: head.clone(),
             };
-            // Bumping the state revision in the same transaction as the lease key
-            // makes pin admission conflict with a GC mark or a head change.
+            // The comparison orders pin admission against a head change. A pin
+            // addresses only the current head, which GC always retains.
             let result = self.meta.call("/v3/kv/txn", json!({
                 "compare":[{"key":key,"target":"MOD","result":"EQUAL","mod_revision":rev.to_string()}],
-                "success":[{"request_put":{"key":key,"value":encode(&state)?}},
-                           {"request_put":{"key":self.pin_key(id,ticket),"value":encode(&pin)?,"lease":lease}}]
+                "success":[{"request_put":{"key":self.pin_key(id,ticket),"value":encode(&pin)?,"lease":lease}}]
             })).await?;
             if result["succeeded"].as_bool() == Some(true) {
                 return Ok((state.table, Some(pin)));

@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use datafusion::{
     arrow::{
-        array::{Array, RecordBatch},
+        array::RecordBatch,
         datatypes::{DataType, Field, Schema, SchemaRef},
     },
     common::{DataFusionError, ScalarValue, tree_node::TreeNodeRecursion},
@@ -46,7 +46,7 @@ pub use algorithms::{
 };
 pub(crate) use cache::Cache;
 pub use cache::RefreshReport;
-pub(crate) use expand::{Expansion, MixedExpansion, text_key};
+pub(crate) use expand::{Expansion, MixedExpansion, StartSeed, text_key};
 pub use projected::{
     CommunityOptions, GraphProjection, Node2VecOptions, ProjectionAlgorithm, Route, RouteStrategy,
     VertexKey,
@@ -63,7 +63,7 @@ pub(crate) const PATH: &str = "__graphlake_path";
 pub(crate) const PATH_NODES: &str = "__graphlake_path_nodes";
 const COOPERATIVE_INTERVAL: usize = 2048;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     Outgoing,
@@ -180,15 +180,15 @@ impl Engine {
                     if strategy == TraversalStrategy::Cached
                         || (!time_sensitive
                             && self
-                                .pinned_versions_match(scope, &generation.versions)
+                                .pinned_versions_match(scope, &generation.graph.versions)
                                 .await
                                 .unwrap_or(false)) =>
                 {
                     *scope.csr_generation.lock().expect("CSR metrics") =
-                        Some(generation.generation.clone());
+                        Some(generation.graph.generation.clone());
                     let prepared = Prepared {
                         aggregate: None,
-                        versions: generation.versions.clone(),
+                        versions: generation.graph.versions.clone(),
                         reservations: Vec::new(),
                         postgres: Default::default(),
                     };
@@ -350,8 +350,8 @@ impl TraversalExec {
         let (node_schema, identity) = match &input {
             Input::Live(inputs) => (inputs.nodes.schema(), Arc::clone(&inputs.identity)),
             Input::Cached(generation) => (
-                generation.topology.keys.schema(),
-                generation.topology.identities.schema(),
+                generation.graph.topology.keys.schema(),
+                generation.graph.topology.identities.schema(),
             ),
         };
         let mut fields = match &mode {
@@ -546,7 +546,7 @@ impl ExecutionPlan for TraversalExec {
             let batch_size = context.session_config().batch_size();
             let mut bound_start = None;
             let (topology, starts) = match &input {
-                Input::Cached(generation) => (Arc::clone(&generation.topology), None),
+                Input::Cached(generation) => (Arc::clone(&generation.graph.topology), None),
                 Input::Live(inputs) => {
                     let topology = match (&mode, remote) {
                         (Mode::Single(request), Some(remote)) => remote.load(request, inputs, Arc::clone(&context), &reservation)
@@ -607,11 +607,9 @@ impl ExecutionPlan for TraversalExec {
                     return;
                 }
                 Mode::Expand(expansion) => {
-                    let seed = expansion.start_seed.as_deref().and_then(|seed| {
-                        crate::cypher::apply::replay::seed_batch(&context, seed)
-                    });
-                    let starts = if let (Some(seed), Some(variable)) = (seed, &expansion.start_variable) {
-                        Box::new(imported_starts(&topology, &seed, variable, &reservation)
+                    let starts = if let Some(seed) = expansion.imported_keys(&context).map_err(external)? {
+                        let tag = expansion.start_seed.as_ref().and_then(|start| start.tag);
+                        Box::new(imported_starts(&topology, &seed, tag, &reservation)
                             .map_err(external)?.into_iter()) as Box<dyn Iterator<Item = usize> + Send>
                     } else { match (bound_start, starts) {
                         (Some(key), _) => Box::new(topology.node_id(&key).map_err(external)?.into_iter())
@@ -636,41 +634,33 @@ impl ExecutionPlan for TraversalExec {
 fn imported_starts(
     topology: &Topology,
     seed: &RecordBatch,
-    variable: &str,
+    tag: Option<(bool, usize)>,
     reservation: &MemoryReservation,
 ) -> Result<Vec<usize>> {
-    use datafusion::arrow::array::StructArray;
-    let entity = seed
-        .column_by_name(variable)
-        .and_then(|column| column.as_any().downcast_ref::<StructArray>())
-        .context("missing imported traversal vertex")?;
-    let properties = entity
-        .column_by_name("properties")
-        .and_then(|column| column.as_any().downcast_ref::<StructArray>())
-        .context("missing imported traversal key fields")?;
+    use datafusion::arrow::array::{ArrayRef, Int32Array, new_null_array};
     let schema = topology.keys.schema();
-    let keys = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            properties
-                .column_by_name(field.name())
-                .cloned()
-                .context("missing imported traversal key")
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let keys = if let Some((second, offset)) = tag {
+        let tag = Arc::new(Int32Array::from_value(i32::from(second), seed.num_rows())) as ArrayRef;
+        let mut columns = vec![tag];
+        for (index, field) in schema.fields().iter().enumerate().skip(1) {
+            let key = index
+                .checked_sub(offset)
+                .filter(|&index| index < seed.num_columns());
+            columns.push(match key {
+                Some(index) => seed.column(index).clone(),
+                None => new_null_array(field.data_type(), seed.num_rows()),
+            });
+        }
+        columns
+    } else {
+        seed.columns().to_vec()
+    };
     reservation.try_grow(seed.num_rows().saturating_mul(2 * size_of::<usize>()))?;
     let converter = row_converter(&schema)?;
     let keys = converter.convert_columns(&keys)?;
     let mut starts = keys
         .iter()
-        .enumerate()
-        .filter_map(|(row, key)| {
-            entity
-                .is_valid(row)
-                .then(|| topology.index.get(key.data()).copied())
-                .flatten()
-        })
+        .filter_map(|key| topology.index.get(key.data()).copied())
         .collect::<Vec<_>>();
     // Preserve traversal order and visit each imported vertex once.
     starts.sort_unstable();

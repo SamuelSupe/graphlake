@@ -37,6 +37,7 @@ pub(super) struct Access {
     pub(super) model: String,
     sockets: tokio::sync::Semaphore,
     pending_sockets: Arc<tokio::sync::Semaphore>,
+    expedited_socket: Arc<tokio::sync::Semaphore>,
 }
 
 impl Access {
@@ -49,6 +50,7 @@ impl Access {
             model,
             sockets: tokio::sync::Semaphore::new(16),
             pending_sockets: Arc::new(tokio::sync::Semaphore::new(16)),
+            expedited_socket: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 }

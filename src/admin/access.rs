@@ -97,9 +97,37 @@ pub(super) struct Policy {
     path: PathBuf,
     managed: bool,
     accounts: Mutex<Accounts>,
-    audit: Option<Mutex<AuditFile>>,
-    anonymous_audit: Option<Mutex<AuditFile>>,
+    audit: Option<AuditWriter>,
+    anonymous_audit: Option<AuditWriter>,
     audit_failures: AtomicU64,
+}
+
+struct AuditWriter(std::sync::mpsc::SyncSender<(Vec<u8>, std::sync::mpsc::Sender<Result<()>>)>);
+
+impl AuditWriter {
+    fn open(path: PathBuf) -> Result<Self> {
+        let mut file = AuditFile::open(path)?;
+        let (send, receive) =
+            std::sync::mpsc::sync_channel::<(Vec<u8>, std::sync::mpsc::Sender<Result<()>>)>(16);
+        std::thread::Builder::new()
+            .name("graphlake-audit".into())
+            .spawn(move || {
+                while let Ok((entry, receipt)) = receive.recv() {
+                    let _ = receipt.send(file.append(&entry));
+                }
+            })?;
+        Ok(Self(send))
+    }
+
+    fn append(&self, entry: Vec<u8>) -> Result<()> {
+        // Acknowledge after writing so callers can immediately inspect the log.
+        // Bound the queue and keep the disk writer outside request locks.
+        let (send, receive) = std::sync::mpsc::channel();
+        self.0
+            .send((entry, send))
+            .map_err(|_| anyhow::anyhow!("audit writer stopped"))?;
+        receive.recv().context("audit writer stopped")?
+    }
 }
 
 const AUDIT_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
@@ -192,14 +220,12 @@ impl Policy {
             None
         } else {
             let audit_path = dir.join("audit.jsonl");
-            Some(Mutex::new(AuditFile::open(audit_path)?))
+            Some(AuditWriter::open(audit_path)?)
         };
         let anonymous_audit = if managed {
             None
         } else {
-            Some(Mutex::new(AuditFile::open(
-                dir.join("audit-anonymous.jsonl"),
-            )?))
+            Some(AuditWriter::open(dir.join("audit-anonymous.jsonl"))?)
         };
         Ok(Self {
             path,
@@ -395,7 +421,7 @@ impl Policy {
         if let Some(audit) = audit {
             let mut entry = serde_json::to_vec(&entry).expect("serializable audit event");
             entry.push(b'\n');
-            if let Err(error) = crate::blocking(|| audit.lock().unwrap().append(&entry)) {
+            if let Err(error) = crate::blocking(|| audit.append(entry)) {
                 self.audit_failures.fetch_add(1, Ordering::Relaxed);
                 eprintln!("GraphLake audit write failed: {error}");
             }

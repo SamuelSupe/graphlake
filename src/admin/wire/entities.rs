@@ -139,19 +139,39 @@ pub(super) fn value<'a>(
                     .downcast_ref::<StructArray>()
                     .ok_or_else(invalid)?;
                 let kinds = record.column_by_name("kind").ok_or_else(invalid)?;
-                let mut values = Vec::new();
-                for i in 0..steps.len() {
-                    match text_key(kinds.as_ref(), i).as_deref() {
-                        Some("vertex" | "edge") => {
-                            let node = text_key(kinds.as_ref(), i).as_deref() == Some("vertex");
-                            let id = tagged(catalog, node, record, i)?;
-                            values.push(if let Some(value) = cached(prefetched, &id, budget)? {
-                                value
-                            } else {
-                                hydrate(catalog, result, &id, budget).await?
-                            });
+                if steps.len() > *budget / std::mem::size_of::<BoltValue>() {
+                    return Err(result_limit());
+                }
+                let steps = (0..record.len())
+                    .map(|i| match text_key(kinds.as_ref(), i).as_deref() {
+                        Some(kind @ ("vertex" | "edge")) => {
+                            tagged(catalog, kind == "vertex", record, i).map(Some)
                         }
-                        Some("value") => {
+                        Some("value") => Ok(None),
+                        _ => Err(invalid()),
+                    })
+                    .collect::<ApiResult<Vec<_>>>()?;
+                let missing = steps
+                    .iter()
+                    .flatten()
+                    .filter(|id| !prefetched.contains_key(*id))
+                    .cloned()
+                    .collect();
+                let mut hydration_budget = *budget;
+                let hydrated =
+                    hydrate_many(catalog, result, missing, &mut hydration_budget).await?;
+                let mut values = Vec::with_capacity(steps.len());
+                for (i, step) in steps.iter().enumerate() {
+                    match step {
+                        Some(id) => {
+                            let source = if prefetched.contains_key(id) {
+                                prefetched
+                            } else {
+                                &hydrated
+                            };
+                            values.push(cached(source, id, budget)?.ok_or_else(invalid)?);
+                        }
+                        None => {
                             let keys = list(
                                 record.column_by_name("key").ok_or_else(invalid)?.as_ref(),
                                 i,
@@ -159,7 +179,6 @@ pub(super) fn value<'a>(
                             .ok_or_else(invalid)?;
                             values.push(value_at(&keys, 0, 0, false, budget)?);
                         }
-                        _ => return Err(invalid()),
                     }
                 }
                 // The Gremlin encoder recognizes this only when produced from a Path column.

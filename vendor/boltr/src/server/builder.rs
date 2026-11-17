@@ -255,6 +255,7 @@ impl<B: BoltBackend> BoltServer<B> {
                 Arc::new(SessionSlots {
                     pending: Arc::new(Semaphore::new(pending)),
                     active: Arc::new(Semaphore::new(active)),
+                    expedited: Arc::new(Semaphore::new(1)),
                 })
             });
         let session_manager = Arc::new(SessionManager::new(if slots.is_some() {
@@ -473,16 +474,24 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: BoltBackend,
 {
+    let mut deadline = context.handshake_timeout.map(|t| started + t);
     let capacity = match context.slots {
         Some(slots) => {
-            let Ok(pending) = slots.pending.clone().try_acquire_owned() else {
-                return;
+            let permit = match slots.pending.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let Ok(permit) = slots.expedited.clone().try_acquire_owned() else {
+                        return;
+                    };
+                    let expedited = started + Duration::from_millis(500);
+                    deadline = Some(deadline.map_or(expedited, |current| current.min(expedited)));
+                    permit
+                }
             };
-            Some((slots, pending))
+            Some((slots, permit))
         }
         None => None,
     };
-    let deadline = context.handshake_timeout.map(|t| started + t);
     if let Some(validator) = &context.auth_validator
         && with_deadline(deadline, validator.session_allowed()).await != Some(true)
     {
@@ -521,8 +530,11 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
     );
     conn.set_slots(capacity);
     conn.set_max_unauthenticated_message_size(context.max_unauthenticated_message_size);
-    if let (Some(timeout), Some(deadline)) = (context.handshake_timeout, deadline) {
-        conn.set_auth_deadline(timeout, deadline);
+    if let Some(deadline) = deadline {
+        conn.set_auth_deadline(
+            context.handshake_timeout.unwrap_or(Duration::from_secs(5)),
+            deadline,
+        );
     }
     let mut closed = context.closed;
     if let Err(e) = conn

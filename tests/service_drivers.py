@@ -1,15 +1,17 @@
 """Run against the published payments fixture with neo4j and gremlinpython installed."""
 
+import asyncio
 import os
 import json
 from base64 import b64encode
-from contextlib import ExitStack
+from contextlib import AsyncExitStack, ExitStack
 import socket
 import sys
 from urllib.parse import urlsplit
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from aiohttp import ClientSession
 from gremlin_python.driver.client import Client
 from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection
 from gremlin_python.driver.protocol import GremlinServerError
@@ -42,7 +44,7 @@ def check_bolt_handshake_capacity(bolt, user, token):
         session = stack.enter_context(driver.session(database="payments"))
         tx = stack.enter_context(session.begin_transaction())
         assert tx.run("RETURN 1 AS n").single()["n"] == 1
-        for _ in range(15):
+        for _ in range(16):
             conn = stack.enter_context(socket.create_connection((address.hostname, address.port), timeout=2))
             reader = stack.enter_context(conn.makefile("rb"))
             conn.sendall(handshake)
@@ -51,12 +53,29 @@ def check_bolt_handshake_capacity(bolt, user, token):
             size = int.from_bytes(reader.read(2), "big")
             assert reader.read(size).startswith(bytes.fromhex("b170"))
             assert reader.read(2) == b"\x00\x00"
-        # One authenticated session and 15 stalled LOGONs used to exhaust
-        # the shared pool, including for a client ready to authenticate.
+        # All regular handshakes are stalled. A ready client can authenticate
+        # through the slot with a shorter deadline.
         with driver.session(database="payments") as fresh:
             assert fresh.run("RETURN 2 AS n").single()["n"] == 2
         assert tx.run("RETURN 3 AS n").single()["n"] == 3
         tx.rollback()
+
+
+async def check_gremlin_handshake_capacity(ws, user, token, established):
+    def check_queries():
+        ready = Client(ws, "g", username=user, password=token,
+                       message_serializer=GraphSONSerializersV3d0())
+        try:
+            query = "g.V().hasLabel('Merchant').limit(1).count()"
+            assert ready.submit(query).all().result() == [1]
+            assert established.submit(query).all().result() == [1]
+        finally:
+            ready.close()
+
+    async with ClientSession() as session, AsyncExitStack() as stack:
+        for _ in range(16):
+            await stack.enter_async_context(session.ws_connect(ws))
+        await asyncio.to_thread(check_queries)
 
 
 def main(http, bolt, revision):
@@ -132,6 +151,7 @@ def main(http, bolt, revision):
         result = client.submit("g.V().hasLabel('Merchant').limit(1).count()")
         assert result.all().result() == [1]
         assert result.status_attributes["model_revision"] == revision
+        asyncio.run(check_gremlin_handshake_capacity(ws, user, token, client))
         streamed = client.submit("g.V().hasLabel('CustomerAccount').limit(302).id()")
         values = streamed.all().result()
         assert len(values) == len(set(values)) and values

@@ -27,9 +27,12 @@ pub(super) fn set_generation(tx: &Transaction, id: Uuid) -> Result<()> {
 }
 
 fn cache_path(anchor: &Path) -> Result<PathBuf> {
-    // The index belongs to the active writer. Never put a SQLite WAL on the
-    // shared catalog filesystem used by the HA coordinator.
-    let dir = std::env::temp_dir().join(cache_name());
+    // In HA the anchor belongs to the coordinator's private data workspace.
+    let anchor = std::path::absolute(anchor)?;
+    let dir = anchor
+        .parent()
+        .expect("absolute snapshot path")
+        .join(cache_name());
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -51,7 +54,6 @@ fn cache_path(anchor: &Path) -> Result<PathBuf> {
             "unsafe local key index directory permissions"
         );
     }
-    let anchor = std::path::absolute(anchor)?;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let name = URL_SAFE_NO_PAD.encode(Sha256::digest(anchor.as_os_str().as_encoded_bytes()));
     Ok(dir.join(format!("{name}.sqlite")))

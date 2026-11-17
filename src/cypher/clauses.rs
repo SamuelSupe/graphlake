@@ -1543,7 +1543,6 @@ fn join_match(
     if let Some((imports, false)) = anchor {
         for expansion in &mut plan.expansions[first_expansion..] {
             if expansion.mixed.is_none()
-                && catalog.edges[&expansion.edge].from.node == catalog.edges[&expansion.edge].to.node
                 && expansion.starts.is_empty()
                 && expansion.start_variable.as_ref().is_some_and(|name| {
                     matches!(left.scope.columns.get(name), Some(Value::Entity(binding))
@@ -1551,7 +1550,15 @@ fn join_match(
                         && imports.explicit.is_none_or(|names| names.contains(name))
                 })
             {
-                expansion.start_seed = Some(imports.seed.to_owned());
+                let edge = &catalog.edges[&expansion.edge];
+                let second = expansion.start_node == edge.to.node;
+                expansion.start_seed = Some(crate::traversal::StartSeed {
+                    table: imports.seed.to_owned(),
+                    keys: catalog.nodes[&expansion.start_node].key.clone(),
+                    tag: (edge.from.node != edge.to.node).then(|| {
+                        (second, if second { 1 + catalog.nodes[&edge.from.node].key.len() } else { 1 })
+                    }),
+                });
             }
         }
     }

@@ -26,10 +26,10 @@ use crate::{CancellationToken, Catalog};
 use store::{Config, Mode, Run, Store, Table, View, now};
 
 pub(super) struct LocalTables {
+    workspace: Option<tempfile::TempDir>,
     pub(super) store: Mutex<Store>,
     running: Mutex<BTreeMap<String, CancellationToken>>,
     slots: Arc<Semaphore>,
-    workspace: Option<tempfile::TempDir>,
     cached: Mutex<BTreeMap<Uuid, (Uuid, managed::WorkspaceVersion)>>,
     create_work: tokio::sync::Mutex<()>,
 }
@@ -37,18 +37,31 @@ pub(super) struct LocalTables {
 impl LocalTables {
     pub fn open(root: PathBuf, managed: bool) -> anyhow::Result<Self> {
         let store = Store::open(root)?;
-        let workspace = managed
-            .then(|| {
+        let workspace = if managed {
+            // The store lock excludes other writers using this data directory.
+            // A crash can leave behind uncommitted local copies of S3 snapshots.
+            let prefix = "managed-sync-";
+            for entry in std::fs::read_dir(&store.root)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir()
+                    && entry.file_name().to_string_lossy().starts_with(prefix)
+                {
+                    std::fs::remove_dir_all(entry.path())?;
+                }
+            }
+            Some(
                 tempfile::Builder::new()
-                    .prefix("managed-sync-")
-                    .tempdir_in(&store.root)
-            })
-            .transpose()?;
+                    .prefix(prefix)
+                    .tempdir_in(&store.root)?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
+            workspace,
             store: Mutex::new(store),
             running: Mutex::default(),
             slots: Arc::new(Semaphore::new(2)),
-            workspace,
             cached: Mutex::default(),
             create_work: tokio::sync::Mutex::new(()),
         })

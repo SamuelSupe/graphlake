@@ -126,6 +126,7 @@ impl OpenResults {
 pub(crate) struct SessionSlots {
     pub(crate) pending: Arc<tokio::sync::Semaphore>,
     pub(crate) active: Arc<tokio::sync::Semaphore>,
+    pub(crate) expedited: Arc<tokio::sync::Semaphore>,
 }
 
 /// Handles a single Bolt TCP connection.

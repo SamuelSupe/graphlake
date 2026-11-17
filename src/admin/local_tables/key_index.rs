@@ -8,14 +8,18 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
-use datafusion::arrow::{
-    array::{Array, RecordBatch, RecordBatchReader},
-    datatypes::{DataType, Schema},
-    row::{RowConverter, Rows, SortField},
+use datafusion::{
+    arrow::{
+        array::{Array, BooleanArray, RecordBatch, RecordBatchReader},
+        compute::{cast, filter_record_batch, not},
+        datatypes::{DataType, Schema},
+        row::{RowConverter, Rows, SortField},
+    },
+    execution::memory_pool::MemoryConsumer,
 };
 use parquet::{
     arrow::{
-        ProjectionMask,
+        ArrowWriter, ProjectionMask,
         arrow_reader::{
             ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
             RowSelector,
@@ -32,6 +36,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use super::{
+    load::writer_properties,
     overlay::{self, Prepared},
     store::now,
 };
@@ -40,7 +45,7 @@ use crate::{
     engine::QueryScope,
     source::{
         ReadStats,
-        parquet_snapshot::{IndexedSnapshot, Part, Snapshot},
+        parquet_snapshot::{IndexedSnapshot, Part, Snapshot, row_selection},
     },
 };
 
@@ -136,6 +141,132 @@ pub(super) fn full(
     })?;
     ensure!(written, "could not publish indexed local snapshot");
     Ok(())
+}
+
+pub(super) fn compact(
+    anchor: &Path,
+    previous: Option<&Snapshot>,
+    delta: &NamedTempFile,
+    output: File,
+    keys: &[String],
+    deleted: Option<&str>,
+    scope: &QueryScope,
+) -> Result<u64> {
+    let scratch = tempfile::Builder::new()
+        .prefix(".sync-")
+        .tempfile_in(anchor.parent().context("local table directory")?)?;
+    let mut index = rusqlite::Connection::open(scratch.path())?;
+    let cache_kib = (scope.options.memory_bytes / 8192).clamp(32, 8192);
+    let batch_size = scope.options.batch_size.min(128);
+    index.pragma_update(None, "cache_size", -(cache_kib as i64))?;
+    index.execute_batch(
+        "PRAGMA journal_mode=OFF;
+         CREATE TABLE incoming (key BLOB PRIMARY KEY) WITHOUT ROWID;",
+    )?;
+    let memory = MemoryConsumer::new("local table compaction").register(&scope.runtime.memory_pool);
+    memory.try_grow(cache_kib * 1024)?;
+    let batch_memory = memory.new_empty();
+    let data = counted(delta.reopen()?, scope);
+    let metadata = ArrowReaderMetadata::load(&data, ArrowReaderOptions::new())?;
+    let codec = Codec::new(metadata.schema(), keys)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(data, metadata.clone());
+    let projection = ProjectionMask::roots(builder.parquet_schema(), codec.indices.iter().copied());
+    let reader = builder
+        .with_projection(projection)
+        .with_batch_size(batch_size)
+        .build()?;
+    let key_codec = Codec::new(reader.schema().as_ref(), keys)?;
+    let tx = index.transaction()?;
+    {
+        let mut insert = tx.prepare("INSERT INTO incoming VALUES (?)")?;
+        for batch in reader {
+            scope.check()?;
+            let batch = batch?;
+            batch_memory.try_resize(batch.get_array_memory_size())?;
+            let encoded = key_codec.rows(&batch)?;
+            batch_memory.try_grow(encoded.size())?;
+            for key in encoded.iter() {
+                insert.execute([key.as_ref()])?;
+            }
+        }
+    }
+    tx.commit()?;
+    let mut contains = index.prepare("SELECT 1 FROM incoming WHERE key = ?")?;
+    let mut writer =
+        ArrowWriter::try_new(output, metadata.schema().clone(), Some(writer_properties()))?;
+    let mut total = 0;
+    let mut append = |batch: RecordBatch| -> Result<()> {
+        total += batch.num_rows() as u64;
+        writer.write(&batch)?;
+        if writer.memory_size() > scope.options.memory_bytes / 8 {
+            writer.flush()?;
+        }
+        Ok(())
+    };
+    let mut copy_previous = |file: File, part: Option<&Part>| -> Result<()> {
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(counted(file, scope))?
+            .with_batch_size(batch_size);
+        if let Some(part) = part {
+            ensure!(
+                usize::try_from(reader.metadata().file_metadata().num_rows())? == part.rows,
+                "local snapshot part row count changed"
+            );
+            if let Some(selection) = row_selection(part.rows, &part.deleted) {
+                reader = reader.with_row_selection(selection);
+            }
+        }
+        let reader = reader.build()?;
+        let codec = Codec::new(reader.schema().as_ref(), keys)?;
+        for batch in reader {
+            scope.check()?;
+            let batch = batch?;
+            batch_memory.try_resize(batch.get_array_memory_size().saturating_mul(2))?;
+            let encoded = codec.rows(&batch)?;
+            batch_memory.try_grow(encoded.size())?;
+            let keep = BooleanArray::from(
+                encoded
+                    .iter()
+                    .map(|key| Ok(!contains.exists([key.as_ref()])?))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            append(filter_record_batch(&batch, &keep)?)?;
+        }
+        Ok(())
+    };
+    if let Some(previous) = previous {
+        for part in &previous.parts {
+            copy_previous(File::open(part.path(anchor))?, Some(part))?;
+        }
+    } else {
+        copy_previous(File::open(anchor)?, None)?;
+    }
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+        counted(delta.reopen()?, scope),
+        metadata,
+    )
+    .with_batch_size(batch_size)
+    .build()?;
+    for batch in reader {
+        scope.check()?;
+        let mut batch = batch?;
+        batch_memory.try_resize(batch.get_array_memory_size().saturating_mul(2))?;
+        if let Some(deleted) = deleted {
+            let marks = cast(
+                batch
+                    .column_by_name(deleted)
+                    .context("missing deletion column")?,
+                &DataType::Boolean,
+            )?;
+            let marks = marks
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context("invalid deletion column")?;
+            batch = filter_record_batch(&batch, &not(marks)?)?;
+        }
+        append(batch)?;
+    }
+    writer.close()?;
+    Ok(total)
 }
 
 /// None means the batch cannot be published within the existing overlay bounds.

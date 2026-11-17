@@ -17,6 +17,9 @@ use datafusion::{
     },
     execution::memory_pool::{MemoryConsumer, MemoryReservation},
 };
+#[cfg(unix)]
+use std::sync::{Mutex, Weak};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -35,15 +38,23 @@ pub(crate) struct Cache {
     dir: PathBuf,
     binding: String,
     #[cfg(unix)]
-    recent: Arc<std::sync::Mutex<VecDeque<Recent>>>,
+    recent: Arc<Mutex<Recent>>,
 }
 
 #[derive(Debug)]
 pub(super) struct Loaded {
+    pub(super) graph: Arc<Decoded>,
+    _budget: MemoryReservation,
+    #[cfg(unix)]
+    _flight: Option<Arc<Flight>>,
+}
+
+#[derive(Debug)]
+pub(super) struct Decoded {
     pub(super) topology: Arc<Topology>,
     pub(super) versions: Vec<SourceVersion>,
     pub(super) generation: String,
-    _budget: MemoryReservation,
+    reserved: usize,
 }
 
 #[cfg(unix)]
@@ -65,14 +76,75 @@ fn file_id(file: &File) -> std::io::Result<FileId> {
 }
 
 #[cfg(unix)]
-struct Recent {
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CacheKey {
     path: PathBuf,
     direction: Direction,
     id: FileId,
-    topology: Arc<Topology>,
-    versions: Vec<SourceVersion>,
-    generation: String,
-    reserved: usize,
+}
+
+#[cfg(unix)]
+type Flight = Mutex<Weak<Decoded>>;
+
+#[cfg(unix)]
+#[derive(Default)]
+struct Recent {
+    retained: VecDeque<(CacheKey, Arc<Decoded>)>,
+    active: HashMap<CacheKey, Weak<Flight>>,
+}
+
+#[cfg(unix)]
+impl Recent {
+    fn cached(&mut self, key: &CacheKey) -> Option<Arc<Decoded>> {
+        let index = self.retained.iter().position(|(cached, _)| cached == key)?;
+        let entry = self.retained.remove(index).expect("cached CSR");
+        let graph = entry.1.clone();
+        self.retained.push_front(entry);
+        Some(graph)
+    }
+
+    fn flight(&mut self, key: &CacheKey) -> Arc<Flight> {
+        self.active.retain(|_, entry| entry.strong_count() != 0);
+        if let Some(flight) = self.active.get(key).and_then(Weak::upgrade) {
+            return flight;
+        }
+        let flight = Arc::new(Flight::default());
+        self.active.insert(key.clone(), Arc::downgrade(&flight));
+        flight
+    }
+
+    fn retain(&mut self, key: CacheKey, graph: Arc<Decoded>) {
+        if graph.reserved > MAX_RETAINED_BYTES {
+            return;
+        }
+        self.retained
+            .retain(|(other, _)| other.path != key.path || other.direction != key.direction);
+        while self.retained.len() >= 4
+            || self
+                .retained
+                .iter()
+                .map(|(_, entry)| entry.reserved)
+                .sum::<usize>()
+                + graph.reserved
+                > MAX_RETAINED_BYTES
+        {
+            self.retained.pop_back();
+        }
+        self.retained.push_front((key, graph));
+    }
+}
+
+#[cfg(unix)]
+fn reuse(graph: Arc<Decoded>, scope: &QueryScope, flight: Option<Arc<Flight>>) -> Result<Loaded> {
+    scope.check()?;
+    let budget =
+        MemoryConsumer::new("GraphLake persisted CSR").register(&scope.runtime.memory_pool);
+    budget.try_grow(graph.reserved)?;
+    Ok(Loaded {
+        graph,
+        _budget: budget,
+        _flight: flight,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -234,54 +306,43 @@ impl Cache {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
-            #[cfg(unix)]
-            let mut recent = recent.lock().unwrap();
-            #[cfg(unix)]
-            let (id, file_check) = {
-                let id = file_id(&file)?;
-                if let Some(index) = recent.iter().position(|entry| {
-                    entry.id == id && entry.path == path && entry.direction == direction
-                }) {
-                    let entry = recent.remove(index).expect("cache entry");
-                    recent.push_front(entry);
-                    let entry = &recent[0];
-                    scope.check()?;
-                    let budget = MemoryConsumer::new("GraphLake persisted CSR")
-                        .register(&scope.runtime.memory_pool);
-                    budget.try_grow(entry.reserved)?;
-                    return Ok(Some(Arc::new(Loaded {
-                        topology: Arc::clone(&entry.topology),
-                        versions: entry.versions.clone(),
-                        generation: entry.generation.clone(),
-                        _budget: budget,
-                    })));
-                }
-                (id, file.try_clone()?)
+            let decode = |file| {
+                read(file, &binding, &edge, direction, &scope)
+                    .with_context(|| format!("reading CSR generation {}", path.display()))
             };
-            let loaded = read(file, &binding, &edge, direction, &scope)
-                .with_context(|| format!("reading CSR generation {}", path.display()))?;
             #[cfg(unix)]
-            {
-                let reserved = loaded._budget.size();
-                if reserved <= MAX_RETAINED_BYTES && file_id(&file_check)? == id {
-                    recent.retain(|entry| entry.path != path || entry.direction != direction);
-                    while recent.len() >= 4
-                        || recent.iter().map(|entry| entry.reserved).sum::<usize>() + reserved
-                            > MAX_RETAINED_BYTES
-                    {
-                        recent.pop_back();
+            let loaded = {
+                let key = CacheKey {
+                    path: path.clone(),
+                    direction,
+                    id: file_id(&file)?,
+                };
+                let flight = {
+                    let mut cache = recent.lock().unwrap();
+                    if let Some(graph) = cache.cached(&key) {
+                        return Ok(Some(Arc::new(reuse(graph, &scope, None)?)));
                     }
-                    recent.push_front(Recent {
-                        path,
-                        direction,
-                        id,
-                        topology: Arc::clone(&loaded.topology),
-                        versions: loaded.versions.clone(),
-                        generation: loaded.generation.clone(),
-                        reserved,
-                    });
+                    cache.flight(&key)
+                };
+                // Only callers loading the same inode and direction wait here.
+                // A weak entry also shares uncached topologies between active queries.
+                let mut shared = flight.lock().unwrap();
+                if let Some(graph) = shared.upgrade() {
+                    reuse(graph, &scope, Some(flight.clone()))?
+                } else {
+                    scope.check()?;
+                    let file_check = file.try_clone()?;
+                    let mut loaded = decode(file)?;
+                    if file_id(&file_check)? == key.id {
+                        *shared = Arc::downgrade(&loaded.graph);
+                        loaded._flight = Some(flight.clone());
+                        recent.lock().unwrap().retain(key, loaded.graph.clone());
+                    }
+                    loaded
                 }
-            }
+            };
+            #[cfg(not(unix))]
+            let loaded = decode(file)?;
             Ok(Some(Arc::new(loaded)))
         })
         .await?
@@ -562,8 +623,7 @@ fn read(
             );
         }
     }
-    let generation = hex(&hash);
-    Ok(Loaded {
+    let graph = Arc::new(Decoded {
         topology: Arc::new(Topology {
             keys,
             identities,
@@ -572,8 +632,14 @@ fn read(
             index,
         }),
         versions: manifest.source_versions()?,
-        generation,
+        generation: hex(&hash),
+        reserved: budget.size(),
+    });
+    Ok(Loaded {
+        graph,
         _budget: budget,
+        #[cfg(unix)]
+        _flight: None,
     })
 }
 

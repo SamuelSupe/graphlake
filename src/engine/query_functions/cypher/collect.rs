@@ -318,27 +318,30 @@ impl CollectAccumulator {
                 .collect::<Vec<_>>(),
         ));
         let batch = RecordBatch::try_new(schema, arrays)?;
-        let mut shared = self.store.spill.lock().expect("collect spill file");
-        if shared.is_none() {
-            *shared = Some(
-                self.store
-                    .runtime
-                    .disk_manager
-                    .create_tmp_file("spilling Cypher collect")?,
-            );
-        }
-        let file = shared.as_ref().expect("collect spill file");
-        let offset = file.size().expect("local spill file size");
-        let mut writer = StreamWriter::try_new(file.open_writer()?, &batch.schema())?;
-        writer.write(&batch)?;
-        writer.into_inner()?.finish()?;
-        let length = file.size().expect("local spill file size") - offset;
-        self.store.spilled.fetch_add(length, Ordering::Relaxed);
-        self.files.push(Run {
-            file: file.clone(),
-            offset,
-            length,
-        });
+        let run = crate::blocking(|| {
+            let mut shared = self.store.spill.lock().expect("collect spill file");
+            if shared.is_none() {
+                *shared = Some(
+                    self.store
+                        .runtime
+                        .disk_manager
+                        .create_tmp_file("spilling Cypher collect")?,
+                );
+            }
+            let file = shared.as_ref().expect("collect spill file");
+            let offset = file.size().expect("local spill file size");
+            let mut writer = StreamWriter::try_new(file.open_writer()?, &batch.schema())?;
+            writer.write(&batch)?;
+            writer.into_inner()?.finish()?;
+            let length = file.size().expect("local spill file size") - offset;
+            Ok::<_, datafusion::common::DataFusionError>(Run {
+                file: file.clone(),
+                offset,
+                length,
+            })
+        })?;
+        self.store.spilled.fetch_add(run.length, Ordering::Relaxed);
+        self.files.push(run);
         self.inner = (self.factory)()?;
         if let Some(reservation) = &self.reservation {
             reservation.free();

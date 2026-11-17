@@ -461,13 +461,25 @@ impl PartitionStream for Paths {
                 }
                 if targets.is_empty() { return; }
             }
-            for (label, plan) in starts {
-                let plan = datafusion::physical_plan::execution_plan::reset_plan_states(plan)?;
-                let mut rows = execute_stream(plan, ctx.clone())?;
+            let mut imported = expansion.imported_keys(&ctx).map_err(external)?;
+            let seeded = imported.is_some();
+            let mut starts = if seeded { Vec::new() } else { starts }.into_iter();
+            let mut imported_seen = BTreeSet::new();
+            loop {
+                let (label, mut rows): (_, SendableRecordBatchStream) = if let Some(batch) = imported.take() {
+                    let stream = RecordBatchStreamAdapter::new(batch.schema(), futures::stream::iter([Ok(batch)]));
+                    (Some(expansion.start_node.clone()), Box::pin(stream))
+                } else if let Some((label, plan)) = starts.next() {
+                    let plan = datafusion::physical_plan::execution_plan::reset_plan_states(plan)?;
+                    (label, execute_stream(plan, ctx.clone())?)
+                } else {
+                    break;
+                };
                 while let Some(batch) = rows.try_next().await? {
                     let layout = label.as_ref().map(|label| Layout::Single(label.clone()));
                     for row in 0..batch.num_rows() {
                         let start = layout.as_ref().unwrap_or(&emitter.layout).start(&batch, row, &keys).map_err(external)?;
+                        if seeded && !imported_seen.insert(start) { continue; }
                         let mut paths = walks(&execution, start, &expansion, max, restricted.then_some(&targets), &filters);
                         while let Some(path) = paths.try_next().await.map_err(external)? {
                             if let Some(batch) = emitter.push(&keys, path).await.map_err(external)? { yield batch; }

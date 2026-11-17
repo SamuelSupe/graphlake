@@ -193,7 +193,7 @@ impl Coordinator {
         let permit = if method == Method::HEAD {
             None
         } else {
-            Some(query::download::download_slot(app).await?)
+            Some(query::download::download_slot(app, principal).await?)
         };
         let key = self
             .shared

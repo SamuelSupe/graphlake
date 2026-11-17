@@ -5,6 +5,11 @@ use datafusion::{
     arrow::datatypes::DataType,
     common::{DataFusionError, ScalarValue},
     dataframe::DataFrame,
+    execution::{
+        memory_pool::{FairSpillPool, MemoryConsumer, MemoryReservation},
+        runtime_env::RuntimeEnv,
+        session_state::SessionStateBuilder,
+    },
     prelude::{ParquetReadOptions, SessionContext, col, lit},
 };
 use futures::TryStreamExt;
@@ -372,7 +377,8 @@ async fn load(
         && deleted.is_none()
         && loaded > 0
         && delta_bytes <= overlay::MAX_DELTA_BYTES
-        && let Some(total) = tokio::task::block_in_place(|| {
+    {
+        match tokio::task::block_in_place(|| {
             key_index::incremental(
                 path,
                 snapshot.as_ref(),
@@ -383,9 +389,12 @@ async fn load(
                 run_id,
                 scope,
             )
-        })?
-    {
-        return Ok((loaded, total));
+        }) {
+            Ok(Some(total)) => return Ok((loaded, total)),
+            Ok(None) => {}
+            Err(error) if out_of_memory(&error) => {}
+            Err(error) => return Err(error),
+        }
     }
     let (output, total) = if let Some((_, total)) = checkpoint {
         let same_boundary = if deleted.is_none()
@@ -413,10 +422,18 @@ async fn load(
                 .map(|name| ident(name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let live_delete = any(&context, &format!("SELECT 1 FROM (SELECT {keys} FROM incoming WHERE {mark}) d JOIN previous p USING ({keys}) LIMIT 1")).await?;
-            let visible_change = any(&context, &format!("(SELECT * FROM incoming WHERE NOT ({mark}) EXCEPT SELECT * FROM previous) LIMIT 1")).await?;
-            if !live_delete && !visible_change {
-                return Ok((loaded, total));
+            let changed = async {
+                if any(&context, &format!("SELECT 1 FROM (SELECT {keys} FROM incoming WHERE {mark}) d JOIN previous p USING ({keys}) LIMIT 1")).await? {
+                    return Ok(true);
+                }
+                any(&context, &format!("(SELECT * FROM incoming WHERE NOT ({mark}) EXCEPT SELECT * FROM previous) LIMIT 1")).await
+            }
+            .await;
+            match changed {
+                Ok(false) => return Ok((loaded, total)),
+                Ok(true) => {}
+                Err(error) if out_of_memory(&error) => {}
+                Err(error) => return Err(error),
             }
         }
         let selective = if candidate.is_none()
@@ -461,6 +478,23 @@ async fn load(
         };
         if let Some(result) = selective {
             result
+        } else if key_index::supports(incoming.schema().as_arrow(), &config.key_columns, true) {
+            let output = staging_file(root)?;
+            let total = tokio::task::block_in_place(|| {
+                key_index::compact(
+                    path,
+                    snapshot.as_ref(),
+                    &delta,
+                    output.reopen()?,
+                    &config.key_columns,
+                    config.deleted_column.as_deref(),
+                    scope,
+                )
+            })?;
+            scope
+                .reads
+                .local_parquet_write(output.as_file().metadata()?.len());
+            (output, total)
         } else {
             let keys = config
                 .key_columns
@@ -468,19 +502,13 @@ async fn load(
                 .map(|name| format!("p.{} = i.{}", ident(name), ident(name)))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            // Manifest scans have no exact row statistics. Build the hash
-            // table on the known-small input when compacting the whole base.
-            let join = if snapshot.is_some() && loaded <= scope.options.batch_size as u64 {
-                "incoming i RIGHT ANTI JOIN previous p"
-            } else {
-                "previous p LEFT ANTI JOIN incoming i"
-            };
+            let (compaction, _sort_budget) = compaction_session(&context, scope)?;
             let visible = deleted
                 .as_ref()
                 .map_or(String::new(), |mark| format!(" WHERE NOT ({mark})"));
-            let merged = context
+            let merged = compaction
                 .sql(&format!(
-                    "SELECT p.* FROM {join} ON {keys} UNION ALL SELECT * FROM incoming{visible}"
+                    "SELECT p.* FROM previous p LEFT ANTI JOIN incoming i ON {keys} UNION ALL SELECT * FROM incoming{visible}"
                 ))
                 .await?;
             let output = staging_file(root)?;
@@ -525,6 +553,42 @@ async fn load(
     output.persist(path)?;
     File::open(root)?.sync_all()?;
     Ok((loaded, total))
+}
+
+fn compaction_session(
+    context: &SessionContext,
+    scope: &QueryScope,
+) -> Result<(SessionContext, MemoryReservation)> {
+    // Sorts can spill, but the Parquet readers cannot evict their input pages.
+    // Cap the planner's pool while keeping both pools within the query budget.
+    let sort_bytes = scope.options.memory_bytes / 2;
+    let budget = MemoryConsumer::new("local table compaction").register(&scope.runtime.memory_pool);
+    budget.try_grow(sort_bytes)?;
+    let runtime = Arc::new(RuntimeEnv {
+        memory_pool: Arc::new(FairSpillPool::new(sort_bytes)),
+        disk_manager: scope.runtime.disk_manager.clone(),
+        cache_manager: scope.runtime.cache_manager.clone(),
+        object_store_registry: scope.runtime.object_store_registry.clone(),
+    });
+    let mut state = context.state();
+    let options = state.config_mut().options_mut();
+    options.optimizer.prefer_hash_join = false;
+    options.execution.sort_spill_reservation_bytes = 256 * 1024;
+    options.execution.target_partitions = options.execution.target_partitions.max(2);
+    let state = SessionStateBuilder::new_from_existing(state)
+        .with_runtime_env(runtime)
+        .build();
+    Ok((SessionContext::new_with_state(state), budget))
+}
+
+fn out_of_memory(error: &anyhow::Error) -> bool {
+    error.chain().any(|error| {
+        error
+            .downcast_ref::<DataFusionError>()
+            .is_some_and(|error| {
+                matches!(error.find_root(), DataFusionError::ResourcesExhausted(_))
+            })
+    })
 }
 
 fn lookback(value: &ScalarValue, distance: u64) -> Result<ScalarValue> {
@@ -645,4 +709,106 @@ pub(super) fn writer_properties() -> WriterProperties {
     WriterProperties::builder()
         .set_max_row_group_row_count(Some(8192))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_delta_compaction_preserves_rows_and_tombstones_under_a_small_budget()
+    -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let source = scratch.path().join("input.db");
+        {
+            let db = rusqlite::Connection::open(&source)?;
+            db.execute_batch(
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, ver INTEGER NOT NULL,
+                                    removed INTEGER NOT NULL, body BLOB NOT NULL) STRICT;
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<4800)
+                 INSERT INTO items SELECT i, i=1, 0, randomblob(4096) FROM n;",
+            )?;
+        }
+        let mut table: Table = serde_json::from_value(serde_json::json!({
+            "model": "model", "data_id": uuid::Uuid::new_v4(), "revision": uuid::Uuid::new_v4(),
+            "source": {"type":"sqlite", "path":source},
+            "config": {"name":"items","source_table":"db.items","columns":["id","ver","removed","body"],
+                "key_columns":["id"],"watermark_column":"ver","deleted_column":"removed","mode":"incremental"},
+            "history":[]
+        }))?;
+        let path = scratch.path().join("items.parquet");
+        let admission = Arc::new(Admission::new(crate::EngineLimits::default())?);
+        super::super::prepare_run(&mut table, Some(Mode::Full), false, false)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let (_, before, _, _) = run(
+            &table,
+            &path,
+            Mode::Full,
+            QueryOptions::default(),
+            &admission,
+        )
+        .await?;
+        assert_eq!(before, 4800);
+        rusqlite::Connection::open(source)?.execute_batch(
+            "UPDATE items SET body=randomblob(4096), ver=2 WHERE id BETWEEN 101 AND 4400;
+             UPDATE items SET removed=1, ver=2 WHERE id<=100;
+             INSERT INTO items VALUES (5000, 2, 0, x'0102');",
+        )?;
+        // Simulate the next load with a fresh run identifier and the old watermark intact.
+        table.history[0].id = uuid::Uuid::new_v4();
+        let (_, total, _, committed) = run(
+            &table,
+            &path,
+            Mode::Incremental,
+            QueryOptions {
+                memory_bytes: 24 * 1024 * 1024,
+                batch_size: 128,
+                ..QueryOptions::default()
+            },
+            &admission,
+        )
+        .await?;
+        assert_eq!(total, 4701);
+        assert!(committed.is_some());
+        let next = Snapshot::read(&path)?.expect("indexed local snapshot");
+        assert_eq!(
+            key_index::checkpoint(next.indexed.as_ref().unwrap())?,
+            ScalarValue::Int64(Some(2))
+        );
+        let part = next.parts.first().expect("compacted base");
+        let batches = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            File::open(part.path(&path))?,
+        )?
+        .build()?;
+        let mut items = Vec::new();
+        for batch in batches {
+            use crate::arrow::array::Int64Array;
+            let batch = batch?;
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("id column")?;
+            let versions = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("version column")?;
+            items.extend(
+                keys.values()
+                    .iter()
+                    .copied()
+                    .zip(versions.values().iter().copied()),
+            );
+        }
+        items.sort_unstable();
+        assert_eq!(
+            items,
+            (101..=4800)
+                .chain([5000])
+                .map(|id| (id, if (4401..=4800).contains(&id) { 0 } else { 2 }))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
 }

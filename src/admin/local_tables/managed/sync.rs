@@ -284,11 +284,11 @@ impl Managed {
     ) -> Result<(LoadResult, Option<Head>)> {
         let id = record.table.data_id;
         let path = Self::workspace(app, id);
-        let cached = app.local_tables.cached.lock().unwrap().remove(&id);
         let previous = match &record.head {
             Some(head) => Some(self.snapshot(id, head).await?),
             None => None,
         };
+        let cached = app.local_tables.cached.lock().unwrap().remove(&id);
         let committed = record.head.as_ref().map(|h| h.generation);
         if !cached.is_some_and(|(generation, version)| {
             Some(generation) == committed && Some(version) == WorkspaceVersion::read(&path)

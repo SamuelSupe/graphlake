@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.1.2
+
+- Use the same GraphLake logo on the sign-in page, console navigation, and browser tab.
+- Refresh the English Cypher workbench and local-table sync screenshots in the README.
+
 ## v1.1.1
 
 - Keep both branches of a paged Gremlin traversal on the same input. Allow Gremlin queries to use published CSR snapshots and combine equivalent traversers in eligible count queries without losing multiplicity.

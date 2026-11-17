@@ -83,6 +83,7 @@ small, .small { font-size: 12px; }
 }
 .skip-link { position: fixed; inset: 10px auto auto 10px; z-index: 20; padding: 10px 16px; border-radius: 6px; background: #fff; color: var(--blue); transform: translateY(-200%); }
 .skip-link:focus { transform: none; }
+.brand-logo { display: block; flex: none; }
 .brand-mark { color: var(--blue); transform: rotate(90deg); flex: none; }
 .button {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 38px; padding: 7px 13px;
@@ -196,7 +197,7 @@ thead th { font-weight: 700; white-space: nowrap; }
 .empty .button { margin-left: 12px; }
 .auth-page { min-height: 100dvh; display: grid; place-items: center; padding: var(--gutter); background: radial-gradient(ellipse at 50% 24%, #e8efff, #f5f7fb 64%); }
 .auth-card { display: grid; gap: 18px; width: min(100%, 408px); padding: clamp(20px, 6vw, 32px); background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 12px 36px #19388315; }
-.auth-brand { display: flex; align-items: center; gap: 11px; color: #193883; font-size: 19px; font-weight: 750; }
+.auth-brand { display: flex; align-items: center; gap: 5px; color: #193883; font-size: 19px; font-weight: 750; }
 .auth-card-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
 .language-picker { min-inline-size: 0; }
 .language-picker select { padding-block: 5px; font-size: .8125rem; }

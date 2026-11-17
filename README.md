@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/graphlake-logo.png" width="144" height="144" alt="">
+  <img src="web/src/assets/graphlake-logo.png" width="144" height="144" alt="">
 </p>
 
 <h1 align="center">GraphLake</h1>

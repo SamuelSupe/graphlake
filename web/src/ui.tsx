@@ -3,8 +3,13 @@ import { createContext, useContext, useId, useLayoutEffect, useRef, useState, ty
 import { AlertTriangle, CheckCircle2, CircleMinus, Share2, X } from 'lucide-react';
 import type { Status } from './api';
 import { modelIdPattern } from './model';
+import graphlakeLogo from './assets/graphlake-logo.png';
 
 export const WorkspaceLocked = createContext(false);
+
+export function BrandLogo({ size = 36 }: { size?: number }) {
+  return <img className="brand-logo" src={graphlakeLogo} alt="" width={size} height={size} />;
+}
 
 export function Mark({ size = 25 }: { size?: number }) {
   return <Share2 className="brand-mark" size={size} strokeWidth={2.25} aria-hidden="true" />;

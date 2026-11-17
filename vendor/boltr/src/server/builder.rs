@@ -8,9 +8,13 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::time::Instant;
 
+use crate::chunk::{ChunkReader, ChunkWriter};
 use crate::error::BoltError;
+use crate::message::{
+    ClientMessage, ServerMessage, decode::decode_client_message, encode::encode_server_message,
+};
 use crate::server::auth::AuthValidator;
 use crate::server::backend::BoltBackend;
 use crate::server::connection::{Connection, SessionSlots};
@@ -88,6 +92,7 @@ pub struct BoltServer<B: BoltBackend> {
     idle_timeout: Option<Duration>,
     max_sessions: Option<usize>,
     max_pending_sessions: Option<usize>,
+    max_pending_sessions_per_peer: Option<usize>,
     max_message_size: Option<usize>,
     max_unauthenticated_message_size: usize,
     handshake_timeout: Option<Duration>,
@@ -105,6 +110,7 @@ impl<B: BoltBackend> BoltServer<B> {
             idle_timeout: None,
             max_sessions: None,
             max_pending_sessions: None,
+            max_pending_sessions_per_peer: None,
             max_message_size: None,
             max_unauthenticated_message_size: DEFAULT_MAX_UNAUTHENTICATED_MESSAGE_SIZE,
             handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
@@ -146,6 +152,13 @@ impl<B: BoltBackend> BoltServer<B> {
     /// When set with max_sessions, the latter limits authenticated sessions.
     pub fn max_pending_sessions(mut self, limit: usize) -> Self {
         self.max_pending_sessions = Some(limit);
+        self
+    }
+
+    /// Limit unauthenticated connections from each transport peer IP.
+    /// Applies when both the pending and authenticated limits are configured.
+    pub fn max_pending_sessions_per_peer(mut self, limit: usize) -> Self {
+        self.max_pending_sessions_per_peer = Some(limit);
         self
     }
 
@@ -252,11 +265,11 @@ impl<B: BoltBackend> BoltServer<B> {
             .max_pending_sessions
             .zip(self.max_sessions)
             .map(|(pending, active)| {
-                Arc::new(SessionSlots {
-                    pending: Arc::new(Semaphore::new(pending)),
-                    active: Arc::new(Semaphore::new(active)),
-                    expedited: Arc::new(Semaphore::new(1)),
-                })
+                Arc::new(SessionSlots::new(
+                    pending,
+                    active,
+                    self.max_pending_sessions_per_peer,
+                ))
             });
         let session_manager = Arc::new(SessionManager::new(if slots.is_some() {
             None
@@ -475,22 +488,24 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
     B: BoltBackend,
 {
     let mut deadline = context.handshake_timeout.map(|t| started + t);
-    let capacity = match context.slots {
-        Some(slots) => {
-            let permit = match slots.pending.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    let Ok(permit) = slots.expedited.clone().try_acquire_owned() else {
-                        return;
-                    };
-                    let expedited = started + Duration::from_millis(500);
-                    deadline = Some(deadline.map_or(expedited, |current| current.min(expedited)));
-                    permit
-                }
-            };
-            Some((slots, permit))
+    let mut rejected = None;
+    let capacity = if let Some(slots) = context.slots {
+        match slots.pending(peer_addr) {
+            Ok(permit) => Some((slots, permit)),
+            Err(error) => {
+                let Ok(permit) = slots.rejecting.clone().try_acquire_owned() else {
+                    return;
+                };
+                let rejection_deadline = started + Duration::from_millis(500);
+                deadline = Some(
+                    deadline.map_or(rejection_deadline, |limit| limit.min(rejection_deadline)),
+                );
+                rejected = Some((permit, error));
+                None
+            }
         }
-        None => None,
+    } else {
+        None
     };
     if let Some(validator) = &context.auth_validator
         && with_deadline(deadline, validator.session_allowed()).await != Some(true)
@@ -509,6 +524,13 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
         }
     };
     tracing::debug!(%peer_addr, ?version, "Bolt handshake complete");
+    if let Some((_permit, error)) = rejected {
+        let limit = context
+            .max_unauthenticated_message_size
+            .min(context.max_message_size.unwrap_or(usize::MAX));
+        let _ = with_deadline(deadline, reject_hello(&mut stream, limit, error)).await;
+        return;
+    }
 
     let (mut read_half, write_half) = tokio::io::split(stream);
     // Read ahead within a bounded buffer so a peer closing during RUN/PULL
@@ -552,4 +574,31 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
         tracing::debug!(%peer_addr, error = %e, "Bolt connection closed");
     }
     pump.abort();
+}
+
+async fn reject_hello<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    limit: usize,
+    error: BoltError,
+) -> Result<(), BoltError> {
+    let mut reader = ChunkReader::new(&mut *stream);
+    reader.set_max_message_size(limit);
+    loop {
+        let bytes = reader.read_message().await?;
+        if !bytes.is_empty() {
+            if matches!(decode_client_message(&bytes)?, ClientMessage::Hello { .. }) {
+                let mut encoded = bytes::BytesMut::new();
+                encode_server_message(
+                    &mut encoded,
+                    &ServerMessage::Failure {
+                        metadata: error.to_failure_metadata(),
+                    },
+                );
+                let mut writer = ChunkWriter::new(stream);
+                writer.write_message(&encoded).await?;
+                writer.flush().await?;
+            }
+            return Ok(());
+        }
+    }
 }

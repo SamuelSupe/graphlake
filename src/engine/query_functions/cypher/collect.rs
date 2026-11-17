@@ -461,15 +461,24 @@ impl Accumulator for CollectAccumulator {
         let mut merged = (self.factory)()?;
         let budget = MemoryConsumer::new("materializing a Cypher collect result")
             .register(&self.store.runtime.memory_pool);
-        for file in &self.files {
-            let reader = file.reader()?;
-            for batch in reader {
-                let batch = batch?;
-                budget.try_grow(ipc_batch_bytes(&batch))?;
-                merged.merge_batch(batch.columns())?;
-                budget.try_resize(merged.size())?;
+        crate::blocking(|| {
+            for file in &self.files {
+                let reader = file.reader()?;
+                for batch in reader {
+                    if self.store.cancellation.is_cancelled() {
+                        return exec_err!("query cancelled");
+                    }
+                    if tokio::time::Instant::now() >= self.store.deadline {
+                        return exec_err!("query deadline exceeded");
+                    }
+                    let batch = batch?;
+                    budget.try_grow(ipc_batch_bytes(&batch))?;
+                    merged.merge_batch(batch.columns())?;
+                    budget.try_resize(merged.size())?;
+                }
             }
-        }
+            Ok(())
+        })?;
         if self.dirty {
             let tail = self
                 .inner

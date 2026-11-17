@@ -1450,6 +1450,40 @@ async fn cypher_collect_distinct_merges_ordered_spills_within_memory_budget() ->
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cypher_grouped_collect_keeps_duplicates_and_order_when_spilling() -> Result<()> {
+    let (_files, engine) = local_fixture("key: [tenant, id]")?;
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "UNWIND range(0,65535) AS i WITH i % 2 AS group_id, i / 4 AS value ORDER BY i DESC
+         RETURN group_id, collect(value) AS values ORDER BY group_id",
+            QueryOptions {
+                memory_bytes: 64 * 1024 * 1024,
+                spill_bytes: 128 * 1024 * 1024,
+                batch_size: 128,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let rows = rows(&mut result).await?;
+    assert_eq!(rows.len(), 2);
+    for (group, row) in rows.iter().enumerate() {
+        assert_eq!(row["group_id"], json!(group));
+        let values = row["values"].as_array().unwrap();
+        assert_eq!(values.len(), 32768);
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(
+                value.as_i64(),
+                Some(16383 - index as i64 / 2),
+                "group {group}, row {index}"
+            );
+        }
+    }
+    assert!(result.metrics().spilled_bytes > 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn cypher_undirected_and_shortest_paths_keep_parallel_edge_identity() -> Result<()> {
     let (_files, engine) = local_fixture("key: [tenant, id]")?;

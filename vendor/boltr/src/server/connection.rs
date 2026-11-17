@@ -1,6 +1,6 @@
 //! Per-TCP-connection Bolt handler.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,14 +124,92 @@ impl OpenResults {
 }
 
 pub(crate) struct SessionSlots {
-    pub(crate) pending: Arc<tokio::sync::Semaphore>,
-    pub(crate) active: Arc<tokio::sync::Semaphore>,
-    pub(crate) expedited: Arc<tokio::sync::Semaphore>,
+    pending: Arc<tokio::sync::Semaphore>,
+    active: Arc<tokio::sync::Semaphore>,
+    pub(crate) rejecting: Arc<tokio::sync::Semaphore>,
+    per_peer: Option<usize>,
+    pending_by_ip: std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
+}
+
+pub(crate) struct SessionPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    peer: Option<(Arc<SessionSlots>, std::net::IpAddr)>,
+}
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        if let Some((slots, ip)) = &self.peer {
+            let mut pending = slots.pending_by_ip.lock().unwrap();
+            let count = pending.get_mut(ip).expect("pending Bolt peer");
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(ip);
+            }
+        }
+    }
+}
+
+impl SessionSlots {
+    pub(crate) fn new(pending: usize, active: usize, per_peer: Option<usize>) -> Self {
+        Self {
+            pending: Arc::new(tokio::sync::Semaphore::new(pending)),
+            active: Arc::new(tokio::sync::Semaphore::new(active)),
+            rejecting: Arc::new(tokio::sync::Semaphore::new(4)),
+            per_peer,
+            pending_by_ip: Default::default(),
+        }
+    }
+
+    pub(crate) fn pending(
+        self: &Arc<Self>,
+        address: SocketAddr,
+    ) -> Result<SessionPermit, BoltError> {
+        let ip = address.ip().to_canonical();
+        let mut peers = self.pending_by_ip.lock().unwrap();
+        if self
+            .per_peer
+            .is_some_and(|limit| peers.get(&ip).copied().unwrap_or(0) >= limit)
+        {
+            return Err(connection_capacity());
+        }
+        let permit = self
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| connection_capacity())?;
+        let peer = self.per_peer.map(|_| {
+            *peers.entry(ip).or_default() += 1;
+            (self.clone(), ip)
+        });
+        Ok(SessionPermit {
+            _permit: permit,
+            peer,
+        })
+    }
+
+    fn active(&self) -> Result<SessionPermit, BoltError> {
+        let permit = self
+            .active
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| connection_capacity())?;
+        Ok(SessionPermit {
+            _permit: permit,
+            peer: None,
+        })
+    }
+}
+
+fn connection_capacity() -> BoltError {
+    BoltError::Query {
+        code: "Neo.TransientError.Request.NoThreadsAvailable".into(),
+        message: "Bolt connection capacity reached".into(),
+    }
 }
 
 /// Handles a single Bolt TCP connection.
 pub struct Connection<R, W, B: BoltBackend> {
-    capacity: Option<(Arc<SessionSlots>, tokio::sync::OwnedSemaphorePermit)>,
+    capacity: Option<(Arc<SessionSlots>, SessionPermit)>,
     reader: ChunkReader<R>,
     writer: ChunkWriter<W>,
     backend: Arc<B>,
@@ -204,30 +282,8 @@ where
 
     /// Sets the message size limit that applies before authentication
     /// (capped by the general maximum message size).
-    pub(crate) fn set_slots(
-        &mut self,
-        capacity: Option<(Arc<SessionSlots>, tokio::sync::OwnedSemaphorePermit)>,
-    ) {
+    pub(crate) fn set_slots(&mut self, capacity: Option<(Arc<SessionSlots>, SessionPermit)>) {
         self.capacity = capacity;
-    }
-
-    fn next_slot(
-        &self,
-        active: bool,
-    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, BoltError> {
-        self.capacity
-            .as_ref()
-            .map(|(slots, _)| {
-                let pool = if active {
-                    &slots.active
-                } else {
-                    &slots.pending
-                };
-                pool.clone().try_acquire_owned().map_err(|_| {
-                    BoltError::ResourceExhausted("Bolt connection capacity reached".into())
-                })
-            })
-            .transpose()
     }
 
     pub(crate) fn set_max_unauthenticated_message_size(&mut self, bytes: usize) {
@@ -604,7 +660,11 @@ where
             None
         };
 
-        let active = self.next_slot(true)?;
+        let active = self
+            .capacity
+            .as_ref()
+            .map(|(slots, _)| slots.active())
+            .transpose()?;
         let credentials_expired = auth_info
             .as_ref()
             .is_some_and(|info| info.credentials_expired);
@@ -633,7 +693,11 @@ where
     }
 
     async fn handle_logoff(&mut self) -> Result<(), BoltError> {
-        let pending = self.next_slot(false)?;
+        let pending = self
+            .capacity
+            .as_ref()
+            .map(|(slots, _)| slots.pending(self.peer_addr))
+            .transpose()?;
         // Clear any in-flight state: abort pending transaction, discard results.
         if let (Some(session), Some(tx)) = (&self.session, self.transaction.take()) {
             let _ = self.backend.rollback(session, &tx).await;

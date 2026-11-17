@@ -11,8 +11,7 @@ use super::*;
 const SNAPSHOTS_PER_OWNER: usize = 4;
 const PREVIEW_INLINE_BYTES: usize = 1024 * 1024;
 const SNAPSHOTS_TOTAL: usize = 32;
-const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const DOWNLOAD_MAX_DURATION: Duration = Duration::from_secs(15 * 60);
+pub(in crate::admin) const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SNAPSHOT_BUDGET: u64 = 1024 * 1024 * 1024;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30 * 60);
 const TICKET_TTL: Duration = Duration::from_secs(60);
@@ -495,23 +494,20 @@ where
     let Some(permit) = permit else {
         return Body::empty();
     };
-    download_stream(stream, permit, DOWNLOAD_IDLE_TIMEOUT, DOWNLOAD_MAX_DURATION)
+    download_stream(stream, permit, DOWNLOAD_IDLE_TIMEOUT)
 }
 
 fn download_stream<E>(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
     permit: impl Send + 'static,
     idle: Duration,
-    maximum: Duration,
 ) -> Body
 where
     E: Into<axum::BoxError> + Send + 'static,
 {
     use futures::StreamExt;
     use tokio::{sync::watch, time::Instant};
-    let start = Instant::now();
-    let end = start + maximum;
-    let (progress, mut deadline) = watch::channel((start + idle).min(end));
+    let (progress, mut deadline) = watch::channel(Instant::now() + idle);
     let expired = tokio_util::sync::CancellationToken::new();
     let watchdog = expired.clone();
     tokio::spawn(async move {
@@ -520,10 +516,6 @@ where
             let next = *deadline.borrow_and_update();
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(end) => {
-                    watchdog.cancel();
-                    return;
-                }
                 changed = deadline.changed() => {
                     if changed.is_err() {
                         return;
@@ -544,14 +536,14 @@ where
             let chunk = tokio::select! {
                 biased;
                 _ = expired.cancelled() => Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut, "Arrow download deadline exceeded"
+                    std::io::ErrorKind::TimedOut, "Arrow download stalled"
                 ).into())),
                 chunk = stream.next() => chunk.map(|chunk| chunk.map_err(Into::into)),
             };
             match chunk {
                 Some(Ok(chunk)) => {
                     if !chunk.is_empty() {
-                        progress.send_replace((Instant::now() + idle).min(end));
+                        progress.send_replace(Instant::now() + idle);
                     }
                     yield Ok::<_, axum::BoxError>(chunk);
                 }
@@ -646,53 +638,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_download_making_progress_still_releases_its_slot_at_the_total_deadline() {
-        let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = slots.clone().acquire_owned().await.unwrap();
-        let chunks = futures::stream::repeat_with(|| {
-            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"a"))
-        })
-        .then(|chunk| async {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            chunk
-        });
-        let mut stream = download_stream(
-            chunks,
-            permit,
-            Duration::from_secs(5),
-            Duration::from_millis(40),
-        )
-        .into_data_stream();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(chunk) = stream.next().await {
-                if chunk.is_err() {
-                    assert!(slots.acquire().await.is_ok());
-                    return;
-                }
-            }
-            panic!("download ended without a timeout");
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
     async fn download_progress_extends_deadline_and_unpolled_body_releases_permit()
     -> Result<(), axum::Error> {
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = slots.clone().acquire_owned().await.unwrap();
-        let chunks = futures::stream::iter(0..4).then(|_| async {
+        let chunks = futures::stream::iter(0..8).then(|_| async {
             tokio::time::sleep(Duration::from_millis(120)).await;
             Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"a"))
         });
-        let mut stream = download_stream(
-            chunks,
-            permit,
-            Duration::from_millis(350),
-            Duration::from_secs(3),
-        )
-        .into_data_stream();
-        for _ in 0..4 {
+        let mut stream =
+            download_stream(chunks, permit, Duration::from_millis(350)).into_data_stream();
+        for _ in 0..8 {
             assert_eq!(
                 stream.next().await.unwrap()?,
                 bytes::Bytes::from_static(b"a")
@@ -704,13 +660,8 @@ mod tests {
         let permit = slots.clone().acquire_owned().await.unwrap();
         let blocked =
             futures::stream::pending::<std::result::Result<bytes::Bytes, std::io::Error>>();
-        let mut stream = download_stream(
-            blocked,
-            permit,
-            Duration::from_millis(25),
-            Duration::from_secs(3),
-        )
-        .into_data_stream();
+        let mut stream =
+            download_stream(blocked, permit, Duration::from_millis(25)).into_data_stream();
         let released = tokio::time::timeout(Duration::from_secs(2), slots.acquire())
             .await
             .unwrap()

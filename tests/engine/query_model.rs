@@ -33,6 +33,10 @@ async fn expanding_scalars_reserve_memory_before_allocation() -> Result<()> {
         ),
         (
             Language::Sql,
+            "SELECT array_length(array_resize([[1]], 1048576, [2, 3])) AS n",
+        ),
+        (
+            Language::Sql,
             r#"SELECT length(repeat(status, 16777216)) AS n FROM "Account""#,
         ),
         (Language::Cypher, "RETURN size(range(1, 1000000)) AS n"),
@@ -56,6 +60,20 @@ async fn expanding_scalars_reserve_memory_before_allocation() -> Result<()> {
         .await?;
     assert_eq!(rows(&mut small).await?, [json!({"s":"λλλ", "a":[4,4]})]);
     assert!(small.metrics().peak_reserved_bytes > 0);
+    // A one-element list per row shares a batch buffer. Resizing these lists
+    // to the same length must fit even when the input is a single large batch.
+    let mut lists = engine
+        .query(
+            Language::Sql,
+            "SELECT sum(array_length(array_resize([i], 1))) AS n FROM generate_series(1, 2048) t(i)",
+            QueryOptions {
+                memory_bytes: 16 * 1024 * 1024,
+                batch_size: 1024,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(rows(&mut lists).await?, [json!({"n":2048})]);
     Ok(())
 }
 

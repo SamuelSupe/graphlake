@@ -12,6 +12,7 @@ pub(crate) struct Read {
     pub(super) columns: Option<BTreeSet<String>>,
     pub(super) native: Option<(String, Pushdown)>,
     pub(super) single: Option<String>,
+    pub(super) limited: bool,
 }
 
 #[derive(Clone)]
@@ -122,6 +123,7 @@ pub(super) fn hint(statement: &Statement, catalog: &Catalog) -> Option<Read> {
         columns,
         native,
         single,
+        limited: query.limit_clause.is_some(),
     })
 }
 
@@ -216,6 +218,7 @@ pub(super) fn graph_hint(statement: &Statement, catalog: &Catalog) -> Option<Rea
             columns: None,
             native: operation.map(|operation| (label.clone(), Pushdown { operation, filters })),
             single: Some(label),
+            limited: limit.is_some(),
         });
     }
 }

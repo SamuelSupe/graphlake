@@ -5,7 +5,7 @@ use std::{
 
 use datafusion::{
     arrow::{
-        array::{Array, AsArray},
+        array::{Array, ArrayRef, AsArray},
         datatypes::{DataType, FieldRef, Int64Type, IntervalMonthDayNanoType},
     },
     common::{Result, ScalarValue, exec_err},
@@ -170,16 +170,69 @@ fn integer(value: &ColumnarValue, row: usize) -> Option<i64> {
     }
 }
 
-fn value_bytes(value: &ColumnarValue, row: usize) -> usize {
+// List slices share their child buffers. Follow the offsets before estimating
+// the bytes copied into an output, including nested lists and structs.
+fn slice_bytes(array: &dyn Array) -> Result<usize> {
+    if let Some(width) = array.data_type().primitive_width() {
+        return Ok(array.len().saturating_mul(width));
+    }
+    let nested = |value: &dyn Fn(usize) -> ArrayRef| -> Result<usize> {
+        let mut bytes = array.len().saturating_mul(16);
+        for row in 0..array.len() {
+            if array.is_valid(row) {
+                bytes = bytes.saturating_add(slice_bytes(value(row).as_ref())?);
+            }
+        }
+        Ok(bytes)
+    };
+    let total = match array.data_type() {
+        DataType::List(_) => nested(&|i| array.as_list::<i32>().value(i))?,
+        DataType::LargeList(_) => nested(&|i| array.as_list::<i64>().value(i))?,
+        DataType::FixedSizeList(_, _) => nested(&|i| array.as_fixed_size_list().value(i))?,
+        DataType::ListView(_) => nested(&|i| array.as_list_view::<i32>().value(i))?,
+        DataType::LargeListView(_) => nested(&|i| array.as_list_view::<i64>().value(i))?,
+        DataType::Map(_, _) => nested(&|i| Arc::new(array.as_map().value(i)))?,
+        DataType::Struct(_) => {
+            let mut bytes = array.len();
+            for column in array.as_struct().columns() {
+                bytes = bytes.saturating_add(slice_bytes(column.as_ref())?);
+            }
+            bytes
+        }
+        DataType::Utf8View => array
+            .as_string_view()
+            .iter()
+            .flatten()
+            .fold(16usize.saturating_mul(array.len()), |n, s| {
+                n.saturating_add(s.len())
+            }),
+        DataType::BinaryView => array
+            .as_binary_view()
+            .iter()
+            .flatten()
+            .fold(16usize.saturating_mul(array.len()), |n, s| {
+                n.saturating_add(s.len())
+            }),
+        _ => array.to_data().get_slice_memory_size()?,
+    };
+    Ok(total)
+}
+
+fn value_bytes(value: &ColumnarValue, row: usize) -> Result<usize> {
     if let Some(value) = text(value, row) {
-        return value.len().saturating_add(16);
+        return Ok(value.len().saturating_add(16));
     }
     match value {
-        ColumnarValue::Scalar(value) => value.size(),
-        ColumnarValue::Array(array) => array
-            .data_type()
-            .primitive_width()
-            .unwrap_or_else(|| array.get_buffer_memory_size()),
+        ColumnarValue::Scalar(ScalarValue::List(array)) => slice_bytes(array.as_ref()),
+        ColumnarValue::Scalar(ScalarValue::LargeList(array)) => slice_bytes(array.as_ref()),
+        ColumnarValue::Scalar(ScalarValue::FixedSizeList(array)) => slice_bytes(array.as_ref()),
+        ColumnarValue::Scalar(value) => Ok(value.size()),
+        ColumnarValue::Array(array) => {
+            if let Some(width) = array.data_type().primitive_width() {
+                return Ok(width);
+            }
+            slice_bytes(array.slice(row, 1).as_ref())
+        }
     }
 }
 
@@ -307,12 +360,14 @@ fn row_bytes(name: &str, args: &[ColumnarValue], row: usize) -> Result<usize> {
                 total.saturating_add(len(i)).saturating_add(separator)
             })
         }
-        "array_repeat" => count().saturating_mul(value_bytes(&args[0], row).saturating_add(8)),
+        "array_repeat" => count().saturating_mul(value_bytes(&args[0], row)?.saturating_add(8)),
         "array_resize" => {
             let fill = args
                 .get(2)
-                .map_or(8, |value| value_bytes(value, row).saturating_add(8));
-            value_bytes(&args[0], row).saturating_add(count().saturating_mul(fill))
+                .map(|value| value_bytes(value, row).map(|bytes| bytes.saturating_add(8)))
+                .transpose()?
+                .unwrap_or(8);
+            value_bytes(&args[0], row)?.saturating_add(count().saturating_mul(fill))
         }
         "range" | "generate_series" | "__graphlake_cypher_range" => {
             range_bytes(args, row, name != "range")?

@@ -95,7 +95,14 @@ pub(super) async fn prepare<'a, 'q>(
         let watermark = read.watermark;
         #[cfg(not(feature = "admin"))]
         let watermark = None;
-        let mut parquet_versions = None;
+        let text_mode = if read.explain_only {
+            source::text::ReadMode::Probe
+        } else if read.stream_raw || stream && read.sql.is_some_and(|sql| sql.limited) {
+            source::text::ReadMode::Stream
+        } else {
+            source::text::ReadMode::Snapshot
+        };
+        let mut file_versions = None;
         let table: Arc<dyn TableProvider> = match source {
             Source::Duckdb { .. }
             | Source::SqlserverNative { .. }
@@ -225,7 +232,7 @@ pub(super) async fn prepare<'a, 'q>(
                             Arc::clone(&scope.runtime.memory_pool),
                             &scope.runtime.disk_manager,
                             Arc::clone(&scope.reads),
-                            read.explain_only,
+                            text_mode,
                             Some(storage),
                         )
                         .await?;
@@ -240,14 +247,12 @@ pub(super) async fn prepare<'a, 'q>(
                         object
                     })
                     .collect::<Vec<_>>();
-                if matches!(format, crate::ObjectFormat::Parquet) {
-                    parquet_versions = Some(
-                        objects
-                            .iter()
-                            .map(|object| (object.source.clone(), object.version.clone()))
-                            .collect(),
-                    );
-                }
+                file_versions = Some(
+                    objects
+                        .iter()
+                        .map(|object| (object.source.clone(), object.version.clone()))
+                        .collect(),
+                );
                 for object in objects {
                     if let Some(previous) = versions.get(&object.source) {
                         ensure!(
@@ -678,11 +683,17 @@ pub(super) async fn prepare<'a, 'q>(
                     Arc::clone(&scope.runtime.memory_pool),
                     &scope.runtime.disk_manager,
                     Arc::clone(&scope.reads),
-                    read.explain_only,
+                    text_mode,
                     None,
                 )
                 .await
                 .with_context(|| crate::catalog::MappedTable(reference.to_owned()))?;
+                file_versions = Some(
+                    objects
+                        .iter()
+                        .map(|object| (object.source.clone(), object.version.clone()))
+                        .collect(),
+                );
                 for object in objects {
                     if let Some(previous) = versions.get(&object.source) {
                         ensure!(
@@ -717,7 +728,7 @@ pub(super) async fn prepare<'a, 'q>(
                 } else {
                     table
                 };
-                parquet_versions = Some(
+                file_versions = Some(
                     objects
                         .iter()
                         .map(|object| (object.source.clone(), object.version.clone()))
@@ -752,7 +763,7 @@ pub(super) async fn prepare<'a, 'q>(
             Raw {
                 alias,
                 schema,
-                parquet_versions,
+                file_versions,
             },
         );
     }

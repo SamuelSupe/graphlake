@@ -327,36 +327,65 @@ pub(super) async fn partition_step(
                 let mut rows = Vec::new();
                 let identities = graph.budget.new_empty();
                 let mut roots = BTreeMap::new();
-                let mut blocks = (0..graph.manifest.partitions.len())
-                    .map(|_| None)
-                    .collect::<Vec<_>>();
-                for (vertex, score) in state {
-                    let identity = vertex_text(graph, &mut blocks, vertex).await?;
-                    let component = if matches!(algorithm, Algorithm::Components) {
-                        if let Some(value) = roots.get(&score.aux) {
-                            Some(Arc::<str>::clone(value))
-                        } else {
-                            let root: Arc<str> =
-                                Arc::from(vertex_text(graph, &mut blocks, score.aux).await?);
-                            if roots.len() >= 256 {
-                                roots.clear();
+                let root_memory = graph.budget.new_empty();
+                let mut scores = state.into_iter();
+                let prefix = graph.prefix.clone().join(format!("v-{shard}"));
+                for (index, block) in graph.manifest.partitions[shard].vertices.iter().enumerate() {
+                    let memory = graph.budget.new_empty();
+                    memory.try_grow(block.decoded_size())?;
+                    let bytes = read_block(
+                        graph.objects,
+                        &prefix.clone().join(index.to_string()),
+                        block,
+                        graph.scope,
+                    )
+                    .await?;
+                    // Both the identity blocks and the saved scores are ordered by vertex ID.
+                    for (vertex, data) in records(&bytes) {
+                        let (id, score) = scores.next().context("missing CSR vertex score")?;
+                        ensure!(id == vertex, "CSR vertex identity and score disagree");
+                        let identity = std::str::from_utf8(vertex_record(data)?.0)?;
+                        let component = if matches!(algorithm, Algorithm::Components) {
+                            if vertex == score.aux {
+                                Some(Arc::from(identity))
+                            } else if let Some(value) = roots.get(&score.aux) {
+                                Some(Arc::<str>::clone(value))
+                            } else {
+                                let shard = partition(score.aux, graph.manifest.partitions.len());
+                                let record = graph
+                                    .record(
+                                        &graph.manifest.partitions[shard].vertices,
+                                        &format!("v-{shard}"),
+                                        score.aux,
+                                    )
+                                    .await?;
+                                let root: Arc<str> =
+                                    Arc::from(std::str::from_utf8(vertex_record(&record)?.0)?);
+                                if roots.len() >= 256 {
+                                    roots.clear();
+                                    root_memory.free();
+                                }
+                                if root_memory.try_grow(root.len() + 64).is_ok() {
+                                    roots.insert(score.aux, root.clone());
+                                }
+                                Some(root)
                             }
-                            roots.insert(score.aux, root.clone());
-                            Some(root)
+                        } else {
+                            None
+                        };
+                        identities.try_grow(
+                            identity.len() + component.as_ref().map_or(0, |s| s.len()) + 96,
+                        )?;
+                        rows.push((identity.to_owned(), score, component));
+                        if rows.len() == 128 {
+                            graph.scope.check()?;
+                            writer.write(&batch(schema.clone(), *algorithm, &rows)?)?;
+                            rows.clear();
+                            identities.free();
                         }
-                    } else {
-                        None
-                    };
-                    identities.try_grow(
-                        identity.len() + component.as_ref().map_or(0, |s| s.len()) + 96,
-                    )?;
-                    rows.push((identity, score, component));
-                    if rows.len() == 128 {
-                        writer.write(&batch(schema.clone(), *algorithm, &rows)?)?;
-                        rows.clear();
-                        identities.free();
                     }
                 }
+                ensure!(scores.next().is_none(), "missing CSR vertex identity");
                 if !rows.is_empty() {
                     writer.write(&batch(schema.clone(), *algorithm, &rows)?)?;
                 }
@@ -432,44 +461,6 @@ fn batch(
         )),
     };
     Ok(RecordBatch::try_new(schema, vec![vertices, values])?)
-}
-
-async fn vertex_text(
-    graph: &Graph<'_>,
-    cache: &mut [Option<(usize, CachedBlock)>],
-    id: Vertex,
-) -> Result<String> {
-    let shard = partition(id, cache.len());
-    let blocks = &graph.manifest.partitions[shard].vertices;
-    let index = blocks.partition_point(|b| b.last < id);
-    let block = blocks
-        .get(index)
-        .filter(|b| b.first <= id)
-        .context("missing CSR identity block")?;
-    if cache[shard].as_ref().is_none_or(|(i, _)| *i != index) {
-        cache[shard] = None;
-        let path = graph
-            .prefix
-            .clone()
-            .join(format!("v-{shard}"))
-            .join(index.to_string());
-        let memory = graph.budget.new_empty();
-        memory.try_grow(block.decoded_size())?;
-        let bytes = read_block(graph.objects, &path, block, graph.scope).await?;
-        cache[shard] = Some((
-            index,
-            CachedBlock {
-                bytes,
-                _memory: memory,
-                compress_spill: false,
-            },
-        ));
-    }
-    let data = records(&cache[shard].as_ref().unwrap().1.bytes)
-        .find(|(key, _)| *key == id)
-        .map(|(_, value)| value)
-        .context("missing CSR identity")?;
-    Ok(std::str::from_utf8(vertex_record(data)?.0)?.to_owned())
 }
 
 pub(super) async fn run(

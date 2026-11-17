@@ -7,7 +7,7 @@ pub(super) use cypher::register_tables;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -291,8 +291,45 @@ impl BlockCacheState {
 
 struct CachedBlock {
     bytes: bytes::Bytes,
+    record_offsets: OnceLock<Vec<(u64, usize)>>,
     _memory: MemoryReservation,
     compress_spill: bool,
+}
+
+impl CachedBlock {
+    fn record(&self, id: u64) -> Option<&[u8]> {
+        // WCC representatives can be interleaved across the whole block.
+        // Index large identity blocks on demand, keeping offsets with the cached bytes.
+        const STRIDE: usize = 4096;
+        let offsets = self.record_offsets.get_or_init(|| {
+            let capacity = self.bytes.len() / STRIDE;
+            if capacity == 0
+                || self
+                    ._memory
+                    .try_grow(capacity * size_of::<(u64, usize)>())
+                    .is_err()
+            {
+                return Vec::new();
+            }
+            let mut index = Vec::with_capacity(capacity);
+            let mut offset = 0;
+            let mut last = 0;
+            for (key, value) in records(&self.bytes) {
+                if offset - last >= STRIDE {
+                    index.push((key, offset));
+                    last = offset;
+                }
+                offset += 12 + value.len();
+            }
+            index
+        });
+        let end = offsets.partition_point(|(key, _)| *key <= id);
+        let start = offsets[..end].last().map_or(0, |(_, offset)| *offset);
+        records(&self.bytes[start..])
+            .find(|(key, _)| *key >= id)
+            .filter(|(key, _)| *key == id)
+            .map(|(_, value)| value)
+    }
 }
 
 impl BlockCache {
@@ -371,6 +408,7 @@ impl BlockCache {
         };
         let value = Arc::new(CachedBlock {
             bytes,
+            record_offsets: OnceLock::new(),
             _memory: memory,
             compress_spill: block.decoded_bytes.is_some() || block.ids.is_some(),
         });
@@ -454,13 +492,8 @@ impl Graph<'_> {
                 .identity_cache
                 .read(self.objects, key, &blocks[index], self.scope)
                 .await?;
-            for (key, value) in records(&block.bytes) {
-                if key == id {
-                    return Ok(value.to_vec());
-                }
-                if key > id {
-                    break;
-                }
+            if let Some(value) = block.record(id) {
+                return Ok(value.to_vec());
             }
         }
         anyhow::bail!("vertex or edge not found in the CSR generation")

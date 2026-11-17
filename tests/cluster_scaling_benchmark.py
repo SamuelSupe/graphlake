@@ -229,6 +229,16 @@ distributed_min_rows: {min_rows}
             samples = []
             for i in range(repeats + 1):
                 rows, entry = sample(base, model, revisions[model], statement, procs)
+                if i == 0 and name in ('pagerank', 'wcc'):
+                    values = {int(json.loads(vertex)['key'][0]): value for vertex, value in rows}
+                    assert len(rows) == 128 and set(values) == set(range(128)), name
+                    if name == 'pagerank':
+                        assert all(math.isclose(float(v), 1 / 128) for v in values.values())
+                    else:
+                        # Each 64-vertex ring has exactly one representative inside the ring.
+                        for first in (0, 64):
+                            representatives = {int(json.loads(values[k])['key'][0]) for k in range(first, first + 64)}
+                            assert len(representatives) == 1 and first <= representatives.pop() < first + 64
                 assert rows == expected.setdefault(name, rows), (count, name)
                 if i:
                     samples.append(entry)

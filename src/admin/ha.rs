@@ -30,6 +30,7 @@ use crate::CancellationToken;
 
 pub(super) struct Ha {
     pub leader: Arc<Leadership>,
+    source: SourceProbe,
     pub catalog: tokio::sync::Mutex<(String, i64)>,
     probe_generation: std::sync::RwLock<String>,
     pub recovery_configured: bool,
@@ -37,29 +38,58 @@ pub(super) struct Ha {
     pub recovery_check: tokio::sync::Mutex<()>,
 }
 
-pub(super) async fn source_available(path: PathBuf) -> bool {
-    tokio::time::timeout(
-        Duration::from_millis(850),
-        tokio::task::spawn_blocking(move || {
-            #[cfg(unix)]
-            {
-                use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
-                let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-                    return false;
-                };
-                let mut stat = MaybeUninit::<libc::statvfs>::uninit();
-                // statvfs checks the mounted filesystem itself, independently of a cached directory entry.
-                unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) == 0 }
-            }
-            #[cfg(not(unix))]
-            path.is_dir()
-        }),
-    )
-    .await
-    .is_ok_and(|task| matches!(task, Ok(true)))
+#[derive(Clone)]
+pub(super) struct SourceProbe {
+    path: PathBuf,
+    slot: Arc<tokio::sync::Mutex<()>>,
 }
 
-pub(super) fn watch_source(path: PathBuf, stop: CancellationToken) {
+impl SourceProbe {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            slot: Arc::default(),
+        }
+    }
+
+    pub(super) async fn available(&self) -> bool {
+        self.check(source_available).await
+    }
+
+    async fn check(&self, probe: impl FnOnce(&Path) -> bool + Send + 'static) -> bool {
+        tokio::time::timeout(Duration::from_millis(850), async {
+            let slot = self.slot.clone().lock_owned().await;
+            let path = self.path.clone();
+            tokio::task::spawn_blocking(move || {
+                // A blocked syscall outlives its waiter. Hold the slot on the
+                // blocking thread so retries cannot start a second probe.
+                let _slot = slot;
+                probe(&path)
+            })
+            .await
+            .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
+fn source_available(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+        // Check the mounted filesystem itself, independently of a cached directory entry.
+        unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) == 0 }
+    }
+    #[cfg(not(unix))]
+    path.is_dir()
+}
+
+pub(super) fn watch_source(probe: SourceProbe, stop: CancellationToken) {
     tokio::spawn(async move {
         let mut failures = 0;
         loop {
@@ -67,7 +97,7 @@ pub(super) fn watch_source(path: PathBuf, stop: CancellationToken) {
                 _ = stop.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(450)) => {}
             }
-            if source_available(path.clone()).await {
+            if probe.available().await {
                 failures = 0;
                 continue;
             }
@@ -90,7 +120,7 @@ impl Ha {
         self.recovery_pending.load(Ordering::Acquire)
     }
 
-    pub async fn open(leader: Arc<Leadership>, original: &Path, local: &Path) -> Result<Self> {
+    pub async fn open(leader: Arc<Leadership>, source: SourceProbe, local: &Path) -> Result<Self> {
         let recovery = leader
             .get::<super::recovery::Gate>("recovery")
             .await
@@ -120,7 +150,7 @@ impl Ha {
         {
             Some(pointer) => pointer,
             None => {
-                let original_path = original.to_owned();
+                let original_path = source.path.clone();
                 let original = original_path.clone();
                 let state = tokio::time::timeout(
                     Duration::from_secs(4),
@@ -160,6 +190,7 @@ impl Ha {
         restore(local, &state).map_err(|e| anyhow::anyhow!(e.message))?;
         Ok(Self {
             leader,
+            source,
             probe_generation: std::sync::RwLock::new(generation.clone()),
             recovery_configured: recovery.is_some(),
             recovery_pending: AtomicBool::new(recovery.is_some_and(|(gate, _)| !gate.approved)),
@@ -397,7 +428,7 @@ async fn mutate_inner(
     options.timeout = options.timeout.min(Duration::from_secs(8));
     let activating = matches!(mutation, Mutation::Publish(_) | Mutation::Rollback(_));
     let prepared = async {
-        if activating && !source_available(sources.clone()).await {
+        if activating && !ha.source.available().await {
             return Err(control::timeout());
         }
         models.apply_ha(id, mutation, &options, app).await
@@ -679,4 +710,31 @@ pub(super) async fn change_policy(
     })
     .await
     .map_err(|_| Error::storage())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timed_out_storage_probe_keeps_its_slot_until_the_syscall_returns() {
+        let directory = tempfile::tempdir().unwrap();
+        let probe = SourceProbe::new(directory.path().to_owned());
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, hold) = std::sync::mpsc::channel();
+        let first = probe.clone();
+        let waiter = tokio::spawn(async move {
+            first
+                .check(move |_| {
+                    let _ = started.send(());
+                    hold.recv().is_ok()
+                })
+                .await
+        });
+        entered.await.unwrap();
+        assert!(!waiter.await.unwrap());
+        assert!(!probe.check(|_| true).await);
+        release.send(()).unwrap();
+        assert!(probe.available().await);
+    }
 }

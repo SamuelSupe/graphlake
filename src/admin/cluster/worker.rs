@@ -18,6 +18,13 @@ use crate::{
     admin::{ops::Metrics, telemetry},
 };
 
+#[derive(Debug, PartialEq, Eq)]
+enum Publication {
+    Committed,
+    Rejected,
+    Unknown,
+}
+
 pub(super) struct Worker {
     pub(super) id: Uuid,
     pub(super) shared: Shared,
@@ -361,9 +368,29 @@ impl Worker {
             Ok(state) => (state, true),
             Err(error) => (failure(&error), false),
         };
-        let published = self.publish_result(id, &job, &state).await;
+        self.finish_result(id, &job, &state, written, slot).await;
+    }
+
+    async fn finish_result(
+        &self,
+        id: Uuid,
+        job: &Job,
+        state: &JobState,
+        written: bool,
+        slot: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let mut publication = self.publish_result(id, job, state).await;
         drop(slot);
-        if !published || !written {
+        while publication == Publication::Unknown {
+            // The Coordinator may need the original request to retry this attempt.
+            // Leave both artifacts available until etcd resolves the outcome.
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+            publication = self.publish_result(id, job, state).await;
+        }
+        if publication == Publication::Rejected || !written {
             self.shared.objects.clean_results(id, job.attempt).await;
         } else {
             if self.partitions > 0 {
@@ -377,11 +404,8 @@ impl Worker {
         }
     }
 
-    async fn publish_result(&self, id: Uuid, job: &Job, state: &JobState) -> bool {
+    async fn publish_result(&self, id: Uuid, job: &Job, state: &JobState) -> Publication {
         let metadata = &self.shared.metadata;
-        let mut ambiguous = false;
-        // Leave time for a transient read/write failure even if computation
-        // consumed the query deadline. A competing attempt still wins its CAS.
         let deadline = Instant::now() + Duration::from_secs(5);
         tokio::time::timeout_at(deadline, async {
             loop {
@@ -391,30 +415,30 @@ impl Worker {
                             && saved.job.worker == Some(self.id) =>
                     {
                         if !matches!(saved.job.state, JobState::Running) {
-                            return ambiguous
-                                && matches!(
-                                    saved.job.state,
-                                    JobState::Done { .. } | JobState::Downloaded
-                                );
+                            return if matches!(
+                                saved.job.state,
+                                JobState::Done { .. } | JobState::Downloaded
+                            ) && matches!(state, JobState::Done { .. })
+                            {
+                                Publication::Committed
+                            } else {
+                                Publication::Rejected
+                            };
                         }
                         let mut current = saved.job;
                         current.state = state.clone();
-                        match metadata.replace(id, saved.revision, &current).await {
-                            Ok(true) => return true,
-                            Ok(false) => {}
-                            Err(_) => ambiguous = true,
+                        if let Ok(true) = metadata.replace(id, saved.revision, &current).await {
+                            return Publication::Committed;
                         }
                     }
-                    Ok(_) => return false,
+                    Ok(_) => return Publication::Rejected,
                     Err(_) => {}
                 }
                 tokio::time::sleep(WAIT).await;
             }
         })
         .await
-        // If the CAS response was lost, retention may own a committed result.
-        // Preserve objects until metadata can resolve the outcome.
-        .unwrap_or(true)
+        .unwrap_or(Publication::Unknown)
     }
 
     async fn maintain_lease(&self, id: Uuid, job: &Job, token: &CancellationToken) {
@@ -614,10 +638,11 @@ mod tests {
     use super::*;
     use axum::routing::post;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
-    async fn terminal_result_survives_a_transient_metadata_read_failure() -> anyhow::Result<()> {
+    async fn terminal_result_keeps_recovery_artifacts_until_metadata_returns() -> anyhow::Result<()>
+    {
         let worker_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();
         let job = Job {
@@ -636,14 +661,14 @@ mod tests {
             deadline_ms: now_ms() + 1000,
             state: JobState::Running,
         };
-        let reads = Arc::new(AtomicUsize::new(0));
+        let unavailable = Arc::new(AtomicBool::new(true));
         let saved = Arc::new(std::sync::Mutex::new(None));
         let router = Router::new()
             .route("/v3/kv/range", post({
-                let reads = reads.clone();
+                let unavailable = unavailable.clone();
                 let record = STANDARD.encode(serde_json::to_vec(&job)?);
                 move || async move {
-                    if reads.fetch_add(1, Ordering::Relaxed) == 0 {
+                    if unavailable.load(Ordering::Acquire) {
                         StatusCode::SERVICE_UNAVAILABLE.into_response()
                     } else {
                         Json(serde_json::json!({ "kvs": [{ "value": record, "mod_revision": "7" }] })).into_response()
@@ -695,15 +720,38 @@ mod tests {
             graph_pages: 0,
             completed_ms: now_ms(),
         };
-        assert!(worker.publish_result(job_id, &job, &terminal).await);
+        let worker = Arc::new(worker);
+        let objects = &worker.shared.objects;
+        let request = objects.artifact(job_id, job.attempt, "request.json");
+        let result = objects.artifact(job_id, job.attempt, "result.arrow");
+        for key in [&request, &result] {
+            objects.put_bytes(key, b"fixture".to_vec()).await?;
+        }
+        let attempt = job.attempt;
+        let slot = worker.slots.clone().acquire_owned().await?;
+        let publish = {
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                worker
+                    .finish_result(job_id, &job, &terminal, true, slot)
+                    .await;
+            })
+        };
+        let _slot = tokio::time::timeout(Duration::from_secs(10), worker.slots.acquire()).await??;
+        assert!(saved.lock().unwrap().is_none());
+        assert!(objects.exists(&request).await?);
+        assert!(objects.exists(&result).await?);
+        unavailable.store(false, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(10), publish).await??;
+        assert!(!objects.exists(&request).await?);
+        assert!(objects.exists(&result).await?);
         server.abort();
         let persisted = saved.lock().unwrap().take().expect("terminal CAS");
-        assert_eq!(persisted.attempt, job.attempt);
+        assert_eq!(persisted.attempt, attempt);
         assert!(matches!(
             persisted.state,
             JobState::Done { arrow: true, .. }
         ));
-        assert_eq!(reads.load(Ordering::Relaxed), 2);
         Ok(())
     }
 }

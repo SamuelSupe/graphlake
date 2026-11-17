@@ -143,7 +143,7 @@ impl Managed {
         let record = Record {
             table,
             head: None,
-            retired: Vec::new(),
+            retired: Default::default(),
             pending: None,
         };
         if self.save(&record, 0, leader(app)?).await.map_err(error)? {
@@ -183,6 +183,7 @@ impl Managed {
         let _serial = app.local_tables.create_work.lock().await;
         let leader = leader(app)?;
         let lease = leader.confirm().await?;
+        self.migrate_retirements(id, leader).await.map_err(error)?;
         let owner = owner(leader);
         let permit = app
             .local_tables
@@ -374,12 +375,13 @@ impl Managed {
             {
                 return Ok(false);
             }
+            let mut retired = None;
             let result = match outcome {
                 Ok((result, head)) => {
                     if let Some(head) = head.clone()
                         && let Some(old) = record.head.replace(head)
                     {
-                        record.retired.push(Historical {
+                        retired = Some(Historical {
                             head: old,
                             retired_ms: now(),
                             marked_ms: None,
@@ -391,9 +393,10 @@ impl Managed {
             };
             record_result(&mut record.table, result, cancelled);
             record.pending = None;
-            // The same transaction changes the head and its successful history
-            // and compares both the previous record revision and etcd ownership.
-            if self.save(&record, rev, leader).await? {
+            if self
+                .save_retiring(&record, rev, leader, retired.as_ref())
+                .await?
+            {
                 return Ok(true);
             }
             leader.confirm().await.map_err(api_error)?;
@@ -472,7 +475,7 @@ mod tests {
         let mut record = Record {
             table,
             head: Some(head.clone()),
-            retired: Vec::new(),
+            retired: Default::default(),
             pending: Some(Pending {
                 run: run.id,
                 owner: "leader".into(),

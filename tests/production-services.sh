@@ -63,6 +63,7 @@ run_fixture lib source::warehouse::clickhouse::tests::single_scan_yields_before_
 run_fixture lib source::warehouse::clickhouse::tests::preview_schema_excludes_ephemeral_columns
 run_fixture lib admin::cluster::control::tests::stale_leadership_cannot_replace_committed_state
 run_fixture lib admin::local_tables::managed::gc::tests::newly_retired_generation_does_not_delay_sweeping_an_old_one
+run_fixture lib admin::local_tables::managed::gc::tests::full_legacy_history_migrates_and_can_be_marked
 GRAPHLAKE_TEST_RETENTION_STORAGE="s3://$GRAPHLAKE_TEST_BUCKET" \
   run_fixture lib admin::cluster::retention::tests::sweep_keeps_current_state_jobs_and_leased_receipts
 run_fixture admin local_tables::local_tables_postgres_upsert_and_cancel

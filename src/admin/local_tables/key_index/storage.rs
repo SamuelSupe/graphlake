@@ -67,8 +67,13 @@ fn cache_name() -> String {
     }
 }
 
-pub(super) fn open(anchor: &Path, scope: &QueryScope) -> Result<Connection> {
-    let path = cache_path(anchor)?;
+pub(super) fn open(anchor: &Path, managed: bool, scope: &QueryScope) -> Result<Connection> {
+    // Managed anchors live inside a TempDir owned by the Coordinator.
+    let path = if managed {
+        anchor.with_extension("keys.sqlite")
+    } else {
+        cache_path(anchor)?
+    };
     match open_database(&path, scope) {
         Err(error)
             if error

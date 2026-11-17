@@ -1,3 +1,5 @@
+use crate::source::SourceConsistency;
+
 mod bigquery;
 pub(crate) mod clickhouse;
 pub(crate) mod databricks;
@@ -115,7 +117,7 @@ impl Snapshot {
                         role: role.clone(),
                         timeout,
                     }),
-                    "Snowflake time travel",
+                    SourceConsistency::Snowflake.label(),
                     as_of.as_deref(),
                 )
             }
@@ -142,7 +144,7 @@ impl Snapshot {
                         maximum_bytes_billed: *maximum_bytes_billed,
                         timeout,
                     }),
-                    "BigQuery time travel",
+                    SourceConsistency::Bigquery.label(),
                     as_of.as_deref(),
                 )
             }

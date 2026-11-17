@@ -179,7 +179,7 @@ pub(super) async fn partition_step(
         Step::Initialize { algorithm } => {
             let mut state = State::new();
             graph
-                .vertices(shard, |id, bytes| {
+                .vertices(shard, None, |id, bytes| {
                     budget.try_grow(64)?;
                     let value = match algorithm {
                         Algorithm::Rank => Value {

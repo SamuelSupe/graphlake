@@ -25,6 +25,26 @@ pub(super) struct Historical {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(super) enum Retirements {
+    Inline(Vec<Historical>),
+    // An object makes old Coordinators fail closed instead of sweeping objects
+    // referenced by retirement keys they do not understand.
+    Separate {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        remaining: Vec<Historical>,
+    },
+}
+
+impl Default for Retirements {
+    fn default() -> Self {
+        Self::Separate {
+            remaining: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Pending {
     pub run: Uuid,
     pub owner: String,
@@ -35,7 +55,7 @@ pub(super) struct Record {
     pub table: Table,
     pub head: Option<Head>,
     #[serde(default)]
-    pub retired: Vec<Historical>,
+    pub retired: Retirements,
     pub pending: Option<Pending>,
 }
 
@@ -68,9 +88,40 @@ fn encode(value: &impl Serialize) -> Result<String> {
     Ok(B64.encode(json))
 }
 
+// Leave room for rewriting an old state record in the same etcd transaction.
+fn retirement_batch(changes: impl Iterator<Item = Result<Value>>) -> Result<Vec<Value>> {
+    const MAX_BYTES: usize = 96 * 1024;
+    let mut bytes = 0usize;
+    let mut batch = Vec::new();
+    for change in changes.take(64) {
+        let change = change?;
+        bytes += change.to_string().len();
+        if bytes > MAX_BYTES && !batch.is_empty() {
+            break;
+        }
+        batch.push(change);
+    }
+    Ok(batch)
+}
+
 impl Managed {
     fn table_key(&self, table: Uuid) -> String {
         B64.encode(format!("{}/local-table/state/{table}", self.meta.prefix))
+    }
+
+    fn retired_prefix(&self, table: Uuid) -> String {
+        format!("{}/local-table/retired/{table}/", self.meta.prefix)
+    }
+
+    fn retired_key(&self, table: Uuid, generation: Uuid) -> String {
+        B64.encode(format!("{}{generation}", self.retired_prefix(table)))
+    }
+
+    fn retired_put(&self, table: Uuid, item: &Historical) -> Result<Value> {
+        Ok(json!({"request_put":{
+            "key": self.retired_key(table, item.head.generation),
+            "value": encode(item)?
+        }}))
     }
 
     fn pins_prefix(&self, table: Uuid) -> String {
@@ -83,18 +134,42 @@ impl Managed {
 
     async fn list(&self, prefix: &str) -> Result<Vec<Value>> {
         let mut end = prefix.as_bytes().to_vec();
-        // Both prefixes are ASCII and end in a slash.
+        // All prefixes are ASCII and end in a slash.
         *end.last_mut().unwrap() += 1;
-        let result = self
-            .meta
-            .call(
-                "/v3/kv/range",
-                json!({
-                    "key":B64.encode(prefix), "range_end":B64.encode(end)
-                }),
-            )
-            .await?;
-        Ok(result["kvs"].as_array().cloned().unwrap_or_default())
+        let end = B64.encode(end);
+        let mut key = B64.encode(prefix);
+        let mut at_revision = None;
+        let mut entries = Vec::new();
+        loop {
+            let result = self
+                .meta
+                .call(
+                    "/v3/kv/range",
+                    json!({
+                        "key":key, "range_end":end, "limit":"128",
+                        "sort_order":"ASCEND", "revision":at_revision.as_deref().unwrap_or("0")
+                    }),
+                )
+                .await?;
+            let page = result["kvs"].as_array();
+            entries.extend(page.into_iter().flatten().cloned());
+            if result["more"].as_bool() != Some(true) {
+                return Ok(entries);
+            }
+            let last = entries.last().context("empty managed metadata page")?;
+            let mut after = B64.decode(last["key"].as_str().context("missing metadata key")?)?;
+            after.push(0);
+            key = B64.encode(after);
+            if at_revision.is_none() {
+                at_revision = Some(
+                    result["header"]["revision"]
+                        .as_str()
+                        .context("missing metadata list revision")?
+                        .parse::<i64>()?
+                        .to_string(),
+                );
+            }
+        }
     }
 
     async fn read(&self, key: String) -> Result<Option<Value>> {
@@ -123,13 +198,118 @@ impl Managed {
         rev: i64,
         leader: &Leadership,
     ) -> Result<bool> {
+        self.save_retiring(record, rev, leader, None).await
+    }
+
+    pub(super) async fn save_retiring(
+        &self,
+        record: &Record,
+        rev: i64,
+        leader: &Leadership,
+        retired: Option<&Historical>,
+    ) -> Result<bool> {
+        ensure!(
+            retired.is_none() || matches!(record.retired, Retirements::Separate { .. }),
+            "migrate inline snapshot history before retiring a generation"
+        );
+        let changes = retired
+            .map(|item| self.retired_put(record.table.data_id, item))
+            .transpose()?
+            .into_iter()
+            .collect();
+        self.save_record(record, rev, leader, changes).await
+    }
+
+    async fn save_record(
+        &self,
+        record: &Record,
+        rev: i64,
+        leader: &Leadership,
+        mut changes: Vec<Value>,
+    ) -> Result<bool> {
         leader.admission().map_err(super::api_error)?;
         let key = self.table_key(record.table.data_id);
+        changes.push(json!({"request_put":{"key":key,"value":encode(record)?}}));
         let result = self.meta.call("/v3/kv/txn", json!({
             "compare":[leader.owner(),{"key":key,"target":"MOD","result":"EQUAL","mod_revision":rev.to_string()}],
-            "success":[{"request_put":{"key":key,"value":encode(record)?}}]
+            "success":changes
         })).await?;
         Ok(result["succeeded"].as_bool() == Some(true))
+    }
+
+    pub(super) async fn migrate_retirements(&self, table: Uuid, leader: &Leadership) -> Result<()> {
+        let mut conflicts = 0;
+        while let Some((mut state, rev)) = self.record(table).await? {
+            let mut remaining = match std::mem::take(&mut state.retired) {
+                Retirements::Separate { remaining } if remaining.is_empty() => return Ok(()),
+                Retirements::Inline(items) | Retirements::Separate { remaining: items } => items,
+            };
+            let changes = retirement_batch(
+                remaining
+                    .iter()
+                    .rev()
+                    .map(|item| self.retired_put(table, item)),
+            )?;
+            remaining.truncate(remaining.len() - changes.len());
+            state.retired = Retirements::Separate { remaining };
+            if self.save_record(&state, rev, leader, changes).await? {
+                conflicts = 0;
+            } else {
+                conflicts += 1;
+                ensure!(
+                    conflicts < 8,
+                    "managed table changed too often to migrate snapshot history"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn retirements(&self, table: Uuid) -> Result<Vec<Historical>> {
+        self.list(&self.retired_prefix(table))
+            .await?
+            .iter()
+            .map(|entry| decode(&entry["value"]))
+            .collect()
+    }
+
+    pub(super) async fn update_retirements(
+        &self,
+        table: Uuid,
+        leader: &Leadership,
+        items: &[Historical],
+        mark: Option<u64>,
+    ) -> Result<()> {
+        let mut offset = 0;
+        while offset < items.len() {
+            let changes = retirement_batch(items[offset..].iter().map(|item| {
+                if let Some(now) = mark {
+                    let mut item = item.clone();
+                    item.marked_ms = Some(now);
+                    self.retired_put(table, &item)
+                } else {
+                    Ok(json!({"request_delete_range":{
+                        "key":self.retired_key(table, item.head.generation)
+                    }}))
+                }
+            }))?;
+            offset += changes.len();
+            leader.admission().map_err(super::api_error)?;
+            let result = self
+                .meta
+                .call(
+                    "/v3/kv/txn",
+                    json!({
+                        "compare":[leader.owner()], "success":changes
+                    }),
+                )
+                .await?;
+            ensure!(
+                result["succeeded"].as_bool() == Some(true),
+                "lost leadership during snapshot GC"
+            );
+        }
+        Ok(())
     }
 
     pub(super) async fn grant(&self, ttl: u64) -> Result<String> {

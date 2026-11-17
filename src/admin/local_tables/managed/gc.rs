@@ -8,12 +8,14 @@ use crate::admin::{App, cluster::control::Leadership, local_tables::store::now, 
 
 impl Managed {
     async fn collect(&self, table: Uuid, leader: &Leadership, metrics: &Metrics) -> Result<()> {
+        self.migrate_retirements(table, leader).await?;
         // Take the object listing first. Any pre-existing object a later publisher
         // can reference is either in a retained manifest or in its pending upload.
         let listing = self.objects.local_objects(table).await?;
-        let Some((mut state, revision)) = self.record(table).await? else {
+        let Some((state, _)) = self.record(table).await? else {
             return Ok(());
         };
+        let retired = self.retirements(table).await?;
         let pinned = self.active_pins(table).await?;
         let now = now();
         let due = |item: &super::metadata::Historical| {
@@ -23,8 +25,7 @@ impl Managed {
         };
         let mut keep = BTreeSet::new();
         for head in state.head.iter().chain(
-            state
-                .retired
+            retired
                 .iter()
                 .filter(|item| !due(item))
                 .map(|item| &item.head),
@@ -53,46 +54,22 @@ impl Managed {
             self.objects.delete_local(&object.location).await?;
             metrics.gc_deleted();
         }
-        // A sync may have advanced the head during the object scan. Apply only
-        // decisions about retired generations from the original view.
-        let reclaimed = state
-            .retired
-            .iter()
-            .filter(|item| due(item))
-            .map(|item| item.head.generation)
-            .collect::<BTreeSet<_>>();
-        let mark = state
-            .retired
-            .iter()
-            .filter(|item| {
-                item.marked_ms.is_none()
-                    && !pinned.contains(&item.head.generation)
-                    && item.retired_ms.saturating_add(self.retention_ms) <= now
-            })
-            .map(|item| item.head.generation)
-            .collect::<BTreeSet<_>>();
-        let mut revision = revision;
-        for _ in 0..8 {
-            let before = state.retired.len();
-            state
-                .retired
-                .retain(|item| !reclaimed.contains(&item.head.generation));
-            let mut changed = state.retired.len() != before;
-            for item in &mut state.retired {
-                if item.marked_ms.is_none() && mark.contains(&item.head.generation) {
-                    item.marked_ms = Some(now);
-                    changed = true;
-                }
+        let mut reclaimed = Vec::new();
+        let mut mark = Vec::new();
+        for item in retired {
+            if due(&item) {
+                reclaimed.push(item);
+            } else if item.marked_ms.is_none()
+                && !pinned.contains(&item.head.generation)
+                && item.retired_ms.saturating_add(self.retention_ms) <= now
+            {
+                mark.push(item);
             }
-            if !changed || self.save(&state, revision, leader).await? {
-                return Ok(());
-            }
-            let Some(latest) = self.record(table).await? else {
-                return Ok(());
-            };
-            (state, revision) = latest;
         }
-        anyhow::bail!("managed table changed too often to commit GC")
+        self.update_retirements(table, leader, &reclaimed, None)
+            .await?;
+        self.update_retirements(table, leader, &mark, Some(now))
+            .await
     }
 
     async fn collect_all(&self, leader: &Leadership, app: &App) -> Result<()> {
@@ -144,10 +121,102 @@ mod tests {
             control::Control,
             store::{Metadata, Objects},
         },
-        local_tables::managed::metadata::{Historical, Record},
+        local_tables::managed::metadata::{Historical, Record, Retirements},
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
+
+    #[tokio::test]
+    #[ignore = "requires disposable etcd"]
+    async fn full_legacy_history_migrates_and_can_be_marked() -> Result<()> {
+        let endpoint = std::env::var("GRAPHLAKE_TEST_ETCD")?.parse()?;
+        let directory = tempfile::tempdir()?;
+        let name = format!("managed-history-{}", Uuid::new_v4());
+        let meta = Metadata::new(reqwest::Client::new(), vec![endpoint], &name);
+        let objects = Objects::open(directory.path().to_str().unwrap(), &name)?;
+        let leader = Control::new(meta.clone(), objects.clone())
+            .acquire(&crate::CancellationToken::new())
+            .await?;
+        let managed = Managed::new(meta, objects, 1, 1);
+        let table = Uuid::new_v4();
+        let head = super::super::metadata::Head {
+            generation: Uuid::new_v4(),
+            upload: Uuid::new_v4(),
+            sha256: "0".repeat(64),
+            watermark: Some(json!(123_456_789)),
+        };
+        let at = now();
+        let mut record = Record {
+            table: serde_json::from_value(json!({
+                "model":"model", "data_id":table, "revision":Uuid::new_v4(), "managed":true,
+                "source":{"type":"sqlite","path":"unused"},
+                "config":{"name":"test","source_table":"db.rows","columns":["id"],"mode":"full"},
+                "history":[]
+            }))?,
+            head: Some(head.clone()),
+            retired: Retirements::Inline(Vec::new()),
+            pending: None,
+        };
+        let template = Historical {
+            head,
+            retired_ms: at,
+            marked_ms: None,
+        };
+        let limit = 768 * 1024;
+        let base = serde_json::to_vec(&record)?.len();
+        let entry = serde_json::to_vec(&template)?.len() + 1;
+        let count = (limit - base) / entry;
+        let items: Vec<_> = (0..count)
+            .map(|_| {
+                let mut item = template.clone();
+                item.head.generation = Uuid::new_v4();
+                item
+            })
+            .collect();
+        record.retired = Retirements::Inline(items);
+        assert!(managed.save(&record, 0, &leader).await?);
+        if let Retirements::Inline(items) = &mut record.retired {
+            for item in items {
+                item.marked_ms = Some(at);
+            }
+        }
+        assert!(serde_json::to_vec(&record)?.len() > limit);
+
+        managed.migrate_retirements(table, &leader).await?;
+        let (mut current, revision) = managed.record(table).await?.unwrap();
+        assert!(serde_json::to_vec(&current)?.len() < 1024);
+        let mut replacement = template.clone();
+        replacement.head.generation = Uuid::new_v4();
+        current.head = Some(replacement.head);
+        assert!(
+            managed
+                .save_retiring(&current, revision, &leader, Some(&template))
+                .await?
+        );
+
+        let retired = managed.retirements(table).await?;
+        assert_eq!(retired.len(), count + 1);
+        managed
+            .update_retirements(table, &leader, &retired, Some(at))
+            .await?;
+        let marked = managed.retirements(table).await?;
+        assert!(marked.iter().all(|item| item.marked_ms == Some(at)));
+        managed
+            .update_retirements(table, &leader, &marked, None)
+            .await?;
+        assert!(managed.retirements(table).await?.is_empty());
+
+        let empty = Uuid::new_v4();
+        current.table.data_id = empty;
+        current.retired = Retirements::Inline(Vec::new());
+        assert!(managed.save(&current, 0, &leader).await?);
+        managed.migrate_retirements(empty, &leader).await?;
+        let (migrated, _) = managed.record(empty).await?.unwrap();
+        assert!(
+            matches!(migrated.retired, Retirements::Separate { remaining } if remaining.is_empty())
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires disposable etcd and S3 fixtures"]
@@ -185,7 +254,7 @@ mod tests {
                 "history":[]
             }))?,
             head: Some(live.clone()),
-            retired: vec![
+            retired: Retirements::Inline(vec![
                 Historical {
                     head: old.clone(),
                     retired_ms,
@@ -196,7 +265,7 @@ mod tests {
                     retired_ms,
                     marked_ms: None,
                 },
-            ],
+            ]),
             pending: None,
         };
         meta.call(
@@ -207,6 +276,7 @@ mod tests {
             }),
         )
         .await?;
+        managed.migrate_retirements(table, &leader).await?;
         let (_, revision) = managed.record(table).await?.unwrap();
         let lease = managed.grant(10).await?;
         let (_, pin) = managed.pin_current(table, Uuid::new_v4(), &lease).await?;
@@ -215,10 +285,10 @@ mod tests {
         // The object store timestamps uploads with second-level precision.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         managed.collect(table, &leader, &Metrics::new(1)).await?;
-        let (next, _) = managed.record(table).await?.unwrap();
-        assert_eq!(next.retired.len(), 1);
-        assert_eq!(next.retired[0].head, fresh);
-        assert!(next.retired[0].marked_ms.is_some());
+        let history = managed.retirements(table).await?;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].head, fresh);
+        assert!(history[0].marked_ms.is_some());
         assert!(!objects.exists(&managed.manifest_key(table, &old)).await?);
         assert!(objects.exists(&managed.manifest_key(table, &fresh)).await?);
         assert!(objects.exists(&managed.manifest_key(table, &live)).await?);

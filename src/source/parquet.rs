@@ -1,3 +1,5 @@
+use crate::source::SourceConsistency;
+
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
@@ -63,7 +65,7 @@ fn snapshot_version(location: &str, snapshot: &Snapshot) -> SourceVersion {
     SourceVersion {
         source: location.to_owned(),
         version: snapshot.generation.to_string(),
-        consistency: "pinned object",
+        consistency: SourceConsistency::PinnedObject.label(),
     }
 }
 
@@ -89,7 +91,7 @@ impl PinnedFile {
                 .clone()
                 .or_else(|| self.meta.e_tag.clone())
                 .unwrap_or_default(),
-            consistency: "pinned object",
+            consistency: SourceConsistency::PinnedObject.label(),
         }
     }
 
@@ -629,7 +631,7 @@ impl ParquetTable {
                 versions.push(SourceVersion {
                     source: location.clone(),
                     version: frozen.generation.to_string(),
-                    consistency: "pinned object",
+                    consistency: SourceConsistency::PinnedObject.label(),
                 });
                 if let Some(snapshot) = &frozen.snapshot {
                     for part in &snapshot.parts {

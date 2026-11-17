@@ -19,6 +19,7 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 }
 .dialog-heading > div { min-inline-size: 0; }
 .dialog-heading h2 { font-size: 1.125rem; overflow-wrap: anywhere; }
+.dialog-heading h2[tabindex="-1"]:focus-visible { outline: none; }
 .dialog-heading p { margin-block-start: 7px; color: var(--muted); font-size: .8125rem; line-height: 1.6; }
 .dialog-heading .icon-button { min-inline-size: 34px; min-block-size: 34px; margin-block-start: -5px; }
 .dialog-content, .panel-layout { display: flex; flex: 1; flex-direction: column; min-inline-size: 0; min-block-size: 0; }

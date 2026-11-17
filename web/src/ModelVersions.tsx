@@ -86,10 +86,10 @@ export function Versions({ id, yaml, busy, close, rollback, offline, archiveErro
                   <span className="version-choice-action">{t('查看并对照')}{history.active_revision === entry.revision && history.versions.findIndex(version => version.revision === entry.revision) === i && <span className="tag">{t('生效中')}</span>}</span>
                 </button>
                 {history.active_revision !== entry.revision && rollback && <button className="text-button" aria-label={t('回退至 {0}', entry.revision.slice(0, 14))} disabled={busy}
-                  onClick={() => rollback(entry.revision)}>{t('回退至此版本')}</button>}
+                  onClick={() => rollback(entry.revision)}>{t('预览回退')}</button>}
               </li>)}
             </ol>}
-            {rollback && <p className="muted small">{t('回退前会校验当前来源；工作草稿会保留。')}</p>}
+            {rollback && <p className="muted small">{t('回退前可预览固定场景，确认时会重新校验。工作草稿会保留。')}</p>}
             {offline && <details className="version-management"><summary>{t('生效版本操作')}</summary>
               <div className="form-fields">
                 <button className="button compact" disabled={probing || busy} onClick={() => void probe()}>{t('检查生效版本数据源')}</button>

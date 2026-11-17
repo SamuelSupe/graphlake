@@ -63,13 +63,16 @@ On a local development server use the exact loopback address displayed by GraphL
 | Tool | Use | Required access |
 | --- | --- | --- |
 | `list_models` | Visible models, active revisions, per-model capabilities and unused authorized modeling target IDs | Authenticated user or compatible service account |
-| `get_schema` | Published labels, keys, properties and relationship endpoints | Query enabled + model query role |
+| `get_schema` | Published labels, keys, properties, endpoints, logical types and business semantics | Query enabled + model query role |
 | `query` | Cypher, SQL or Gremlin; optional Cypher parameter object | Query enabled + model query role |
+| `list_tasks` | Enabled tasks, parameter schemas and current fixture validation | Query enabled + model query role |
+| `run_task` | Run an evidence-backed task on an exact published revision | Query enabled + model query role |
 | `get_model` | Draft YAML, revision and active revision | Modeling enabled + modeler or publisher role |
-| `validate_model` | Source columns and mapping validation; optional key/endpoint data checks | Modeling enabled + modeler role |
+| `validate_model` | Source columns, mapping and semantic metadata validation; optional key/endpoint data checks | Modeling enabled + modeler role |
+| `validate_model_impact` | Run baseline and draft business scenarios on one fixed fixture and report differences | Modeling enabled + modeler or publisher role |
 | `create_model` | New unpublished draft using an authorized template | Modeling enabled + modeler roles on template and target |
 | `save_model` | Version-checked draft update | Modeling enabled + modeler role |
-| `publish_model` | Validate data, then activate a saved draft | Modeling and publication enabled + publisher role |
+| `publish_model` | Validate data and required business scenarios, then activate a saved draft | Modeling and publication enabled + publisher role |
 | `get_mutation` | Recover an HA mutation outcome | Modeling enabled + access to the owned receipt's model; HA only |
 
 Tools are discovered according to both global settings and the caller's roles. Every invocation rechecks permission; hiding a tool is not the authorization boundary. Draft configuration requires modeler or publisher rights (or the built-in administrator). Queries always use a published version. Query results contain column types, string/null cell values, model/source versions and `truncated`; refine a query when the row or existing preview byte limit is reached. MCP does not provide full-result export or change source records.
@@ -88,6 +91,26 @@ Typical modeling sequence:
 4. Publish only when requested by the user. Supply the draft `revision` and the previously read `active_revision` (explicitly `null` if unpublished). Otherwise review and publish in the browser.
 
 Draft writes do not change the active model. On a revision conflict, re-read and reconcile the draft rather than automatically overwriting it. Source/physical-table expansion remains an administrator action. Model text and returned data are untrusted content for the AI client, not instructions.
+
+## Business context in `get_schema`
+
+Call `get_schema` with `{"model":"payments"}`. Its published `model_revision` identifies the mappings and semantic declarations in that response. `schema` retains the existing graph name, labels, keys, property names, and relationship endpoints. A configured model, node, or edge returns `semantic_status: "declared"` and a `semantics` object. Labels without declarations return `"unspecified"`.
+
+Each label's `property_details` maps declared business keys and properties to their Arrow `data_type`, `nullable` flag, and any description, unit or value meanings. Types reflect the logical mappings, including casts and combined inputs. The query service resolves them under the caller's current query authorization and tenant constraints, within its time and metadata work limits.
+
+| `type_resolution.status` | Meaning |
+| --- | --- |
+| `resolved` | Types were resolved from logical mappings. `checked_at` records the UTC time of resolution. |
+| `unavailable` | Type resolution failed or exceeded a resource limit. Structure and semantic declarations remain available. Type and nullability are `null`. |
+| `not_requested` | `include_types: false` skipped access to data sources. Type and nullability are `null`. |
+
+A model revision freezes the mappings and semantic declarations. Source schemas and data can change independently. The response contains logical fields and excludes source connection settings and connector errors. The existing HTTP schema route keeps its structural response.
+
+For an SCD2 label, `temporal.current.mode` is `current_flag` or `open_end`. `temporal.history` describes the half-open interval when both validity columns are configured, and is `null` for a current-flag-only mapping. A `null` open-end value means the rule matches a null end date. Rule field names appear only when declared as keys or properties. The current rule selects by flag or open end. Use a historical snapshot time to apply the validity interval.
+
+Treat semantic descriptions as modeler declarations. For example, an entitlement edge records a grant, and an observed-use edge records an event. Evaluate evidence and data coverage before drawing a conclusion about effective access. See [semantic YAML and validation](reference.zh-CN.md#业务语义).
+
+For evidence-backed investigations, use `list_tasks` → `run_task`. Modeling callers can inspect the synthetic comparison with `validate_model_impact` before requesting publication. The workbench also previews fixture results and evidence before publication or rollback. See [task parameters, evidence and fixture policy](security-tasks.md).
 
 ## End-to-end verification with Codex
 

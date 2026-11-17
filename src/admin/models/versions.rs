@@ -1,8 +1,9 @@
 use super::*;
+use crate::admin::tasks::{self, ImpactInput, ImpactStamp};
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Action {
+pub(in crate::admin) enum Action {
     Adopt,
     Publish,
     Rollback,
@@ -13,6 +14,8 @@ struct Entry {
     revision: String,
     action: Action,
     at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    impact: Option<ImpactStamp>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -24,9 +27,18 @@ pub(super) struct VersionState {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Activation {
     revision: String,
     active_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preview: Option<ImpactPreview>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::admin) struct ImpactPreview {
+    pub(in crate::admin) report_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -152,20 +164,145 @@ impl Models {
         Ok(())
     }
 
-    pub(super) fn adopt(&self, id: &str, model: &Model) -> ApiResult<()> {
+    pub(in crate::admin) fn adopt(&self, id: &str, model: &Model) -> ApiResult<()> {
         if self.version_state(id)?.is_none() {
-            self.archive(id, model)?;
             let mut state = VersionState::default();
-            state.activate(&model.revision, Action::Adopt);
+            if !self.requires_task_publish(id, &model.yaml)? {
+                self.archive(id, model)?;
+                state.activate(&model.revision, Action::Adopt, None);
+            }
             self.write_state(id, &state)?;
         }
         Ok(())
     }
 
-    fn activate(&self, model: Model, request: Activation, action: Action) -> ApiResult<Model> {
+    pub(in crate::admin) fn requires_task_publish(&self, id: &str, yaml: &str) -> ApiResult<bool> {
+        Ok(
+            metadata(&tasks::managed_suite_path(self.directory(), id))?.is_some()
+                || metadata(&tasks::suite_path(self.source_directory(), id))?.is_some()
+                || parse(yaml, &self.source_path(id)?)
+                    .is_ok_and(|catalog| !catalog.tasks.is_empty()),
+        )
+    }
+
+    pub(in crate::admin) fn has_task_history(&self, id: &str) -> ApiResult<bool> {
+        Ok(self
+            .version_state(id)?
+            .is_some_and(|state| state.history.iter().any(|entry| entry.impact.is_some())))
+    }
+
+    fn recorded_impact(&self, id: &str, revision: &str) -> ApiResult<Option<ImpactStamp>> {
+        let state = self.version_state(id)?.ok_or_else(unpublished)?;
+        if state.active.as_deref() != Some(revision) {
+            return Err(active_conflict());
+        }
+        Ok(state
+            .history
+            .iter()
+            .rev()
+            .find(|entry| entry.revision == revision)
+            .and_then(|entry| entry.impact.clone()))
+    }
+
+    pub(in crate::admin) fn task_stamp(
+        &self,
+        id: &str,
+        revision: &str,
+    ) -> ApiResult<Option<ImpactStamp>> {
+        let stamp = self.recorded_impact(id, revision)?;
+        if let Some(stamp) = stamp
+            && stamp.current(tasks::suite_revision(self, id)?.as_deref())
+        {
+            return Ok(Some(stamp));
+        }
+        Ok(None)
+    }
+
+    pub(in crate::admin) fn check_activation_policy(
+        &self,
+        id: &str,
+        revision: &str,
+    ) -> ApiResult<()> {
+        self.check_impact_policy(id, self.recorded_impact(id, revision)?.as_ref())
+    }
+
+    fn check_impact_policy(&self, id: &str, stamp: Option<&ImpactStamp>) -> ApiResult<()> {
+        let suite = tasks::suite_revision(self, id)?;
+        if stamp.map_or(suite.is_none(), |stamp| {
+            stamp.matches_suite(suite.as_deref())
+        }) {
+            return Ok(());
+        }
+        Err(Error::new(
+            StatusCode::CONFLICT,
+            "task_policy_changed",
+            "固定业务场景已变化，请重新预览后再试",
+        ))
+    }
+
+    pub(in crate::admin) fn draft_impact(
+        &self,
+        id: &str,
+        request: &Activation,
+    ) -> ApiResult<(Model, ImpactInput)> {
+        let model = self.get(id)?;
+        if model.revision != request.revision {
+            return Err(conflict());
+        }
         if model.active_revision != request.active_revision {
             return Err(active_conflict());
         }
+        let impact = ImpactInput::new(
+            self,
+            id,
+            &model.revision,
+            model.active_revision.clone(),
+            model.yaml.clone(),
+            Action::Publish,
+        )?;
+        Ok((model, impact))
+    }
+
+    pub(in crate::admin) fn rollback_impact(
+        &self,
+        id: &str,
+        request: &Activation,
+    ) -> ApiResult<(String, ImpactInput)> {
+        let model = self.get(id)?;
+        if model.active_revision != request.active_revision {
+            return Err(active_conflict());
+        }
+        let state = self.version_state(id)?.ok_or_else(Error::not_found)?;
+        if !state
+            .history
+            .iter()
+            .any(|entry| entry.revision == request.revision)
+        {
+            return Err(Error::not_found());
+        }
+        let yaml = self.archived(id, &request.revision)?;
+        let impact = ImpactInput::new(
+            self,
+            id,
+            &request.revision,
+            request.active_revision.clone(),
+            yaml.clone(),
+            Action::Rollback,
+        )?;
+        Ok((yaml, impact))
+    }
+
+    fn activate(
+        &self,
+        model: Model,
+        request: Activation,
+        action: Action,
+        impact: Option<ImpactStamp>,
+    ) -> ApiResult<Model> {
+        if model.active_revision != request.active_revision {
+            return Err(active_conflict());
+        }
+        self.check_impact_policy(&model.id, impact.as_ref())?;
         self.adopt(&model.id, &model)?;
         let mut state = self.version_state(&model.id)?.ok_or_else(Error::storage)?;
         match action {
@@ -188,7 +325,12 @@ impl Models {
             Action::Adopt => unreachable!(),
         }
         if state.active.as_deref() != Some(request.revision.as_str()) {
-            state.activate(&request.revision, action);
+            state.activate(&request.revision, action, impact);
+            self.write_state(&model.id, &state)?;
+        } else if let Some(last) = state.history.last_mut()
+            && last.impact != impact
+        {
+            last.impact = impact;
             self.write_state(&model.id, &state)?;
         }
         self.get(&model.id)
@@ -200,13 +342,14 @@ impl VersionState {
         self.offline_at_ms.is_some()
     }
 
-    fn activate(&mut self, revision: &str, action: Action) {
+    fn activate(&mut self, revision: &str, action: Action, impact: Option<ImpactStamp>) {
         self.active = Some(revision.to_owned());
         self.offline_at_ms = None;
         self.history.push(Entry {
             revision: revision.to_owned(),
             action,
             at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+            impact,
         });
     }
 }
@@ -224,6 +367,7 @@ pub(crate) async fn history(
             revision: model.revision,
             action: Action::Adopt,
             at_ms: 0,
+            impact: None,
         }],
     });
     state.history.reverse();
@@ -328,29 +472,35 @@ pub(crate) async fn publish(
         .await;
     }
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let (model, path) = {
+    let (model, path, impact) = {
         let models = app.models.lock().unwrap();
-        (models.get(&id)?, models.source_path(&id)?)
+        let (model, impact) = models.draft_impact(&id, &request)?;
+        (model, models.source_path(&id)?, impact)
     };
-    if model.revision != request.revision {
-        return Err(conflict());
+    let validation = async {
+        inspect(&model.yaml, &path, &app.options, true, &app, &id).await?;
+        impact
+            .run(app.options.clone())
+            .await?
+            .require_pass(request.preview.as_ref())
     }
-    if model.active_revision != request.active_revision {
-        return Err(active_conflict());
-    }
-    if let Err(error) = inspect(&model.yaml, &path, &app.options, true, &app, &id).await {
-        app.models
-            .lock()
-            .unwrap()
-            .checks
-            .insert(id, (model.revision, Status::Failed));
-        return Err(error);
-    }
+    .await;
+    let impact = match validation {
+        Ok(impact) => impact,
+        Err(error) => {
+            app.models
+                .lock()
+                .unwrap()
+                .checks
+                .insert(id, (model.revision, Status::Failed));
+            return Err(error);
+        }
+    };
     let _policy = app.users.writes.lock().await;
     super::super::users::check(&app, &principal, &id, super::super::users::Role::Publisher)?;
     let mut models = app.models.lock().unwrap();
     let model = models.get(&id)?;
-    let published = models.activate(model, request, Action::Publish)?;
+    let published = models.activate(model, request, Action::Publish, impact)?;
     models
         .checks
         .insert(id, (published.revision.clone(), Status::Passed));
@@ -380,31 +530,21 @@ pub(crate) async fn rollback(
         .await;
     }
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let (yaml, path) = {
+    let (yaml, path, impact) = {
         let models = app.models.lock().unwrap();
-        let model = models.get(&id)?;
-        if model.active_revision != request.active_revision {
-            return Err(active_conflict());
-        }
-        let state = models.version_state(&id)?.ok_or_else(Error::not_found)?;
-        if !state
-            .history
-            .iter()
-            .any(|entry| entry.revision == request.revision)
-        {
-            return Err(Error::not_found());
-        }
-        (
-            models.archived(&id, &request.revision)?,
-            models.source_path(&id)?,
-        )
+        let (yaml, impact) = models.rollback_impact(&id, &request)?;
+        (yaml, models.source_path(&id)?, impact)
     };
     inspect(&yaml, &path, &app.options, true, &app, &id).await?;
+    let impact = impact
+        .run(app.options.clone())
+        .await?
+        .require_pass(request.preview.as_ref())?;
     let _policy = app.users.writes.lock().await;
     super::super::users::check(&app, &principal, &id, super::super::users::Role::Publisher)?;
     let models = app.models.lock().unwrap();
     let model = models.get(&id)?;
-    Ok(Json(models.activate(model, request, Action::Rollback)?).into_response())
+    Ok(Json(models.activate(model, request, Action::Rollback, impact)?).into_response())
 }
 
 pub(crate) async fn unpublish(
@@ -465,31 +605,30 @@ impl Models {
             }
             Mutation::Save { yaml, expected } => self.save(id, yaml, Some(&expected))?,
             Mutation::Publish(request) => {
-                let model = self.get(id)?;
-                if model.revision != request.revision {
-                    return Err(conflict());
-                }
-                if model.active_revision != request.active_revision {
-                    return Err(active_conflict());
-                }
+                let (model, impact) = self.draft_impact(id, &request)?;
                 inspect(&model.yaml, &self.source_path(id)?, options, true, app, id).await?;
-                let mut model = self.activate(model, request, Action::Publish)?;
+                let impact = impact
+                    .run(options.clone())
+                    .await?
+                    .require_pass(request.preview.as_ref())?;
+                let mut model = self.activate(model, request, Action::Publish, impact)?;
                 model.status = Status::Passed;
                 self.checks
                     .insert(id.into(), (model.revision.clone(), Status::Passed));
                 model
             }
             Mutation::Rollback(request) => {
-                let model = self.get(id)?;
-                if model.active_revision != request.active_revision {
-                    return Err(active_conflict());
-                }
-                let yaml = self.archived(id, &request.revision)?;
+                let (yaml, impact) = self.rollback_impact(id, &request)?;
                 inspect(&yaml, &self.source_path(id)?, options, true, app, id).await?;
-                self.activate(model, request, Action::Rollback)?
+                let impact = impact
+                    .run(options.clone())
+                    .await?
+                    .require_pass(request.preview.as_ref())?;
+                self.activate(self.get(id)?, request, Action::Rollback, impact)?
             }
             Mutation::Unpublish(request) => self.deactivate(id, request)?,
             Mutation::Restore { revision, yaml } => self.restore(id, &revision, &yaml)?,
+            Mutation::SaveTaskSuite(request) => tasks::save_suite(self, id, request)?,
         };
         Ok((StatusCode::OK, model))
     }

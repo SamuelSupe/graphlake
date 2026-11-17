@@ -18,6 +18,28 @@ export type ValidationSite = { kind: 'table'; table: string; column: string | nu
   | { kind: 'field'; label: string; field: string; index: number | null }
   | { kind: 'input_column'; label: string; input: number; column: string };
 export type Validation = { status: Status; check_data: boolean; labels: Record<string, Column[]>; error?: string; location?: ValidationSite };
+export type BusinessStatus = { required: boolean; suite_revision: string | null; active: 'passed' | 'stale' | null };
+export type TaskSuite = { revision: string | null; source: 'deployment' | 'console' | null; content: string | null };
+export type Evidence = {
+  label: string; tenant_id: string; source_system: string | null; record_id: string | null;
+  observed_at_ms: number | null; source_version?: string;
+};
+export type Finding = { kind: string; values: Record<string, string | null>; evidence: Evidence[] };
+export type ImpactCase = {
+  id: string; task: string; tenant_id: string; parameters: Record<string, unknown>;
+  status: 'passed' | 'failed' | 'inconclusive' | 'not_covered';
+  baseline_matches: boolean | null; candidate_matches: boolean | null;
+  baseline_subject: string | null; candidate_subject: string | null;
+  baseline_findings: number | null; candidate_findings: number | null;
+  baseline_anchor: Evidence | null; candidate_anchor: Evidence | null;
+  added: Finding[]; removed: Finding[]; changed: [Finding, Finding][]; issue?: string;
+  expected_on_mismatch?: { subject: string; anchor: Evidence | null; findings: Finding[] };
+};
+export type ImpactReport = {
+  status: 'not_required' | 'passed' | 'failed' | 'inconclusive';
+  revision: string; active_revision: string | null; suite_revision: string | null; report_id?: string;
+  cases: ImpactCase[]; mapping_changes: Record<string, string[]>;
+};
 export type VersionHistory = { active_revision: string | null; offline_at_ms: number | null; versions: {
   revision: string; action: 'adopt' | 'publish' | 'rollback'; at_ms: number;
 }[] };

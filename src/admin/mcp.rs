@@ -305,7 +305,8 @@ pub(super) async fn handle(
             if let Some(receipt) = receipt {
                 value["mutation_id"] = json!(receipt);
             }
-            let failed = !status.is_success() || value["status"] == "failed";
+            let failed = !status.is_success()
+                || matches!(value["status"].as_str(), Some("failed" | "inconclusive"));
             app.access.record(
                 Some(&principal),
                 "mcp",

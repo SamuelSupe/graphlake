@@ -6,6 +6,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+pub mod semantics;
+pub mod tasks;
+use semantics::{LabelSemantics, ModelSemantics};
+
 pub(crate) const ROW_ID: &str = "__graphlake_edge_id";
 
 #[derive(Clone, Debug, Serialize)]
@@ -73,6 +77,10 @@ impl std::fmt::Display for ValidationSite {
 #[serde(deny_unknown_fields)]
 pub struct Catalog {
     pub graph: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<ModelSemantics>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub tasks: BTreeSet<tasks::BusinessTask>,
     pub sources: BTreeMap<String, Source>,
     pub nodes: BTreeMap<String, Node>,
     #[serde(default)]
@@ -392,6 +400,8 @@ fn default_tls() -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<LabelSemantics>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -410,6 +420,8 @@ pub struct Node {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Edge {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics: Option<LabelSemantics>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -565,6 +577,15 @@ impl Catalog {
             }
             validate_columns_at(&node.key, name, "key")?;
             validate_columns_at(&node.properties, name, "properties")?;
+            if let Some(semantics) = &node.semantics {
+                semantics.validate(
+                    name,
+                    &node.key,
+                    &node.properties,
+                    node.scd2.is_some(),
+                    false,
+                )?;
+            }
         }
         for (name, edge) in &self.edges {
             validate_name(name)?;
@@ -578,6 +599,9 @@ impl Catalog {
             .map_err(|error| ValidationSite::for_mapping(error, name))?;
             validate_columns_at(&edge.key, name, "key")?;
             validate_columns_at(&edge.properties, name, "properties")?;
+            if let Some(semantics) = &edge.semantics {
+                semantics.validate(name, &edge.key, &edge.properties, edge.scd2.is_some(), true)?;
+            }
             for input in &edge.inputs {
                 ensure!(
                     input
@@ -606,7 +630,7 @@ impl Catalog {
                 validate_columns_at(&endpoint.columns, name, side)?;
             }
         }
-        Ok(())
+        self.validate_tasks()
     }
 
     pub(crate) fn mapping(&self, name: &str) -> Mapping<'_> {

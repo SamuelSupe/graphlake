@@ -35,6 +35,30 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .field-help { color: var(--muted); font-size: .75rem; font-weight: 400; }
 .panel-section-heading { display: grid; gap: 6px; margin-block-end: 16px; }
 .panel-section-heading > code { color: var(--muted); font-size: .75rem; overflow-wrap: anywhere; }
+.business-status { display: flex; gap: 6px 16px; flex-wrap: wrap; padding-block: 4px; }
+.business-task-choice label { display: inline-flex; align-items: center; gap: 8px; }
+.business-task-choice p { margin: 4px 0 0 24px; }
+.business-suite-fields { padding: 0; margin: 0; border: 0; min-inline-size: 0; }
+.business-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+.business-actions > label { min-inline-size: 0; }
+.business-actions input[type="file"] { max-inline-size: 100%; }
+.business-json { inline-size: 100%; min-inline-size: 0; resize: vertical; white-space: pre; }
+.business-preview :is(dl, dd, ol, ul, h3, h4, p) { margin: 0; }
+.business-versions { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.business-versions dd { overflow-wrap: anywhere; }
+.business-preview summary { overflow-wrap: anywhere; }
+.business-case-status { margin-inline-start: 12px; font-size: .8rem; color: var(--muted); }
+.business-case-status.passed { color: #19713b; }
+.business-case-status:is(.failed, .inconclusive, .not_covered) { color: #9a4d08; }
+.business-case-fields { margin-block-start: 12px; }
+.business-comparison { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: 12px; }
+.business-outcome, .business-findings > li { padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; overflow-wrap: anywhere; }
+.business-outcome h4 { margin-block-end: 6px; }
+.business-findings { display: grid; gap: 8px; padding-inline-start: 1.25rem; }
+.business-preview .business-evidence { margin-block-start: 8px; padding-inline-start: 8px; border-inline-start: 2px solid var(--line); font-size: .8rem; }
+.business-preview :is(.business-evidence, .business-findings dl) > div { display: flex; flex-wrap: wrap; gap: 2px 8px; }
+.business-preview dt { color: var(--muted); }
+.business-parameters { overflow: auto; white-space: pre-wrap; }
 .panel-placeholder { display: grid; align-content: center; justify-items: center; gap: 10px; min-block-size: 200px; padding: 24px 12px; color: var(--muted); text-align: center; }
 .panel-placeholder h3 { color: #34445e; }
 .source-browser-grid { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr); gap: 28px; }

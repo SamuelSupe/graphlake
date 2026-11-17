@@ -5,7 +5,7 @@ import { documentOf, record } from './model.ts';
 export type ModelChange = { kind: 'added' | 'removed' | 'changed'; section: string; name: string; fields: string[] };
 const fieldNames: Record<string, string> = {
   source: t('来源表'), inputs: t('来源映射'), key: t('业务键'), properties: t('属性'), from: t('起点'), to: t('终点'),
-  scd2: t('时态规则'), logical_partition: t('逻辑分区'), type: t('连接器'), tables: t('来源表'), dsn_env: t('连接环境变量'),
+  semantics: t('业务语义'), tasks: t('业务任务'), scd2: t('时态规则'), logical_partition: t('逻辑分区'), type: t('连接器'), tables: t('来源表'), dsn_env: t('连接环境变量'),
 };
 const canonical = (value: unknown) => stringify(value, { sortMapEntries: true });
 
@@ -27,7 +27,7 @@ export function modelChanges(before: string, after: string): ModelChange[] {
   for (const key of new Set([...Object.keys(old), ...Object.keys(next)])) {
     if (['sources', 'nodes', 'edges'].includes(key) || canonical(old[key]) === canonical(next[key])) continue;
     changes.push({ kind: !Object.hasOwn(old, key) ? 'added' : !Object.hasOwn(next, key) ? 'removed' : 'changed',
-      section: t('模型'), name: key === 'graph' ? t('名称') : key, fields: [] });
+      section: t('模型'), name: key === 'graph' ? t('名称') : fieldNames[key] ?? key, fields: [] });
   }
   return changes;
 }

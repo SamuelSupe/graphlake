@@ -13,6 +13,7 @@ mod models;
 mod ops;
 mod query;
 mod recovery;
+mod tasks;
 mod telemetry;
 mod users;
 mod wire;
@@ -492,6 +493,9 @@ pub async fn serve_clustered_with_status(
             "/v1/models/{id}/history/{revision}",
             get(models::archived_yaml).put(models::restore_archive),
         )
+        .route("/v1/models/{id}/impact", get(tasks::http_business_status).post(tasks::http_impact))
+        .route("/v1/models/{id}/impact/rollback", post(tasks::http_rollback_impact))
+        .route("/v1/models/{id}/task-suite", get(tasks::http_read_suite).put(tasks::http_save_suite))
         .route("/v1/models/{id}/publish", post(models::publish))
         .route("/v1/models/{id}/rollback", post(models::rollback))
         .route("/v1/models/{id}/unpublish", post(models::unpublish))

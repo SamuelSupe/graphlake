@@ -678,6 +678,12 @@ pub(super) fn operation(method: &axum::http::Method, path: &str) -> Operation {
                 (&Method::POST, ["explore"]) => ("explore", true),
                 (&Method::POST, ["export"]) => ("export", true),
                 (&Method::POST, ["browse"]) => ("browse", false),
+                (&Method::GET | &Method::HEAD | &Method::POST, ["impact"]) => {
+                    ("validate_model_impact", false)
+                }
+                (&Method::POST, ["impact", "rollback"]) => ("preview_rollback_impact", false),
+                (&Method::GET | &Method::HEAD, ["task-suite"]) => ("read_task_suite", false),
+                (&Method::PUT, ["task-suite"]) => ("save_task_suite", false),
                 (&Method::POST, ["publish"]) => ("publish", false),
                 (&Method::POST, ["rollback"]) => ("rollback", false),
                 (&Method::PUT, ["history", _]) => ("restore_archive", false),
@@ -763,12 +769,18 @@ pub(super) fn permits_operation(app: &super::App, principal: &Principal, op: &Op
                         .iter()
                         .any(|role| roles.contains(role)),
                     "save_model" => roles.contains(&Role::Modeler),
+                    "validate_model_impact" => {
+                        roles.contains(&Role::Modeler) || roles.contains(&Role::Publisher)
+                    }
                     "export" | "result_download" => {
                         roles.contains(&Role::Query) && roles.contains(&Role::Export)
                     }
-                    "publish" | "rollback" | "unpublish" | "restore_archive" | "refresh_csr" => {
-                        roles.contains(&Role::Publisher)
-                    }
+                    "publish"
+                    | "rollback"
+                    | "preview_rollback_impact"
+                    | "unpublish"
+                    | "restore_archive"
+                    | "refresh_csr" => roles.contains(&Role::Publisher),
                     "model_readiness" => !roles.is_empty(),
                     _ => op.service && roles.contains(&Role::Query),
                 }

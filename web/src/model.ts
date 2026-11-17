@@ -5,7 +5,7 @@ import type { ValidationSite } from './api';
 export type Section = 'sources' | 'nodes' | 'edges';
 export type Selection = { section: Section; name: string };
 export type ModelMap = Record<string, Record<string, unknown>>;
-export type Model = { graph: string; sources: ModelMap; nodes: ModelMap; edges: ModelMap };
+export type Model = { graph: string; sources: ModelMap; nodes: ModelMap; edges: ModelMap; tasks: string[] };
 export type Endpoint = { node: string; columns: string[] };
 export type YamlDocument = ReturnType<typeof parseDocument>;
 export type ValidationTarget = { selection: Selection; control: string; caption: string };
@@ -35,7 +35,7 @@ export function modelOf(yaml: string): Model {
       return [name, item];
     }));
   };
-  return { graph: text(value.graph), sources: section('sources'), nodes: section('nodes'), edges: section('edges') };
+  return { graph: text(value.graph), sources: section('sources'), nodes: section('nodes'), edges: section('edges'), tasks: strings(value.tasks) };
 }
 
 export function emptyModel(name: string) {
@@ -173,6 +173,7 @@ export function validationTargets(model: Model, location: ValidationSite): Valid
         }
         else if (field) add(field.title, field.key);
         else if (location.field === 'scd2') add(t('时态建模'), 'scd2');
+        else if (location.field === 'semantics') add(t('业务语义'), 'semantics');
         else add(t('数据映射'), 'mapping');
         continue;
       }

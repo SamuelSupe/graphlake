@@ -2,7 +2,20 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setupIssue } from '../src/modelWorkflow.ts';
 import { modelChanges } from '../src/modelChanges.ts';
+import { joinSuite, splitSuite } from '../src/taskSuite.ts';
 import { addEdgeType, appendMappingInput, documentOf, modelIdPattern, modelOf, removeGraphType, rename, validationTargets } from '../src/model.ts';
+
+test('editing one business scenario preserves exact JSON in untouched fixture tables and cases', () => {
+  const raw = '{"tables":{"security.alert":{"rows":[{"big":9223372036854775807,"score":-0.0}]}},"cases":[{"id":"first"},{"id":"second","expected":{"observed_at_ms":9007199254740993}}]}';
+  const suite = splitSuite(raw);
+  suite.cases[0] = '{"id":"renamed"}';
+  const joined = joinSuite(suite);
+  assert.match(joined, /"big":9223372036854775807,"score":-0\.0/);
+  assert.match(joined, /"id":"second","expected":\{"observed_at_ms":9007199254740993\}/);
+  assert.deepEqual(JSON.parse(joined).cases.map(item => item.id), ['renamed', 'second']);
+  suite.cases[0] = '{"id":';
+  assert.throws(() => joinSuite(suite), SyntaxError);
+});
 
 test('model ID pattern works with the HTML pattern Unicode sets flag', () => {
   const pattern = new RegExp('^(?:' + modelIdPattern + ')$', 'v');

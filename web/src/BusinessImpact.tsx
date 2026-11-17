@@ -1,7 +1,7 @@
 import { diagnosticText, t } from './locale';
 import { useEffect, useState } from 'react';
 import { api, ApiError, errorText, type Evidence, type Finding, type ImpactCase, type ImpactReport } from './api';
-import { taskName } from './taskSuite';
+import { findingName, subjects, taskName } from './taskSuite';
 import { Modal } from './ui';
 
 export type ImpactTarget = { action: 'check' | 'publish' | 'rollback'; revision: string; active_revision: string | null };
@@ -93,8 +93,6 @@ export function BusinessImpact({ id, target, busy, onReport, confirm, reloadMode
   </Modal>;
 }
 
-const subjects: Record<string, string> = { found: t('找到主体'), not_found: t('未找到主体'), no_departure_at_as_of: t('指定时点尚未离职') };
-
 function Case({ result }: { result: ImpactCase }) {
   const same = !result.added.length && !result.removed.length && !result.changed.length
     && JSON.stringify(result.baseline_anchor) === JSON.stringify(result.candidate_anchor)
@@ -149,7 +147,7 @@ function Findings({ label, findings }: { label: string; findings: Finding[] }) {
     <h4>{t('{0}（{1}）', label, findings.length)}</h4>
     <ol className="business-findings">
       {findings.map((finding, index) => <li key={index}>
-        <code>{finding.kind}</code>
+        <strong>{findingName(finding.kind)}</strong>
         <dl>{Object.entries(finding.values).map(([name, value]) => <div key={name}><dt>{name}</dt><dd>{value ?? '—'}</dd></div>)}</dl>
         {finding.evidence.map((evidence, position) => <EvidenceDetails key={position} evidence={evidence} />)}
       </li>)}

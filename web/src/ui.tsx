@@ -21,8 +21,8 @@ export function StatusLabel({ status, text }: { status: Status; text?: string })
   return <span className={'status ' + status}><Icon size={16} aria-hidden="true" />{text ?? label}</span>;
 }
 
-export function Modal({ title, description, close, children, layout = 'drawer', size = 'standard' }: {
-  title: string; description?: string; close: () => void; children: ReactNode;
+export function Modal({ title, description, close, beforeClose, children, layout = 'drawer', size = 'standard' }: {
+  title: string; description?: string; close: () => void; beforeClose?: () => boolean; children: ReactNode;
   layout?: 'drawer' | 'center'; size?: 'standard' | 'medium' | 'wide';
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -35,9 +35,12 @@ export function Modal({ title, description, close, children, layout = 'drawer', 
     element?.showModal();
     return () => element?.close();
   }, [locked]);
-  return <dialog ref={dialog} className={'dialog-' + layout + ' dialog-' + size} aria-labelledby={heading} onClose={event => { if (!event.currentTarget.open && !locked) close(); }}>
+  return <dialog ref={dialog} className={'dialog-' + layout + ' dialog-' + size} aria-labelledby={heading}
+    onCancel={event => { if (beforeClose && !beforeClose()) event.preventDefault(); }}
+    onClose={event => { if (!event.currentTarget.open && !locked) close(); }}>
     <header className="dialog-heading"><div><h2 id={heading} tabIndex={-1}>{title}</h2>{description && <p>{description}</p>}</div>
-      <form method="dialog"><button className="icon-button" aria-label={t('关闭')}><X size={18} /></button></form></header>
+      <form method="dialog" onSubmit={event => { if (beforeClose && !beforeClose()) event.preventDefault(); }}>
+        <button className="icon-button" aria-label={t('关闭')}><X size={18} /></button></form></header>
     <div className="dialog-content">{children}</div>
   </dialog>;
 }

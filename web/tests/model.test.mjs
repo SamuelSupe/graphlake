@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setupIssue } from '../src/modelWorkflow.ts';
 import { modelChanges } from '../src/modelChanges.ts';
-import { joinSuite, splitSuite } from '../src/taskSuite.ts';
+import { editScenarioField, joinSuite, scenarioDocument, splitSuite } from '../src/taskSuite.ts';
 import { addEdgeType, appendMappingInput, documentOf, modelIdPattern, modelOf, removeGraphType, rename, validationTargets } from '../src/model.ts';
 
 test('editing one business scenario preserves exact JSON in untouched fixture tables and cases', () => {
@@ -15,6 +15,19 @@ test('editing one business scenario preserves exact JSON in untouched fixture ta
   assert.deepEqual(JSON.parse(joined).cases.map(item => item.id), ['renamed', 'second']);
   suite.cases[0] = '{"id":';
   assert.throws(() => joinSuite(suite), SyntaxError);
+});
+
+test('structured scenario editing preserves the exact evidence payload and existing parameter values', () => {
+  const raw = '{ "id":"alert", "parameters":{"alert_id":"existing"}, "expected":{"subject":"found","anchor":{"observed_at_ms":9223372036854775807},"findings":[{"value":-0.0}]} }';
+  const doc = scenarioDocument(raw);
+  assert.ok(doc);
+  const renamed = editScenarioField(raw, doc, ['parameters', 'alert_id'], 'alert-"2"');
+  assert.equal(JSON.parse(renamed).parameters.alert_id, 'alert-"2"');
+  const changed = editScenarioField(renamed, scenarioDocument(renamed), ['parameters', 'window_start'], '2026-02-01T00:00:00Z');
+  assert.deepEqual(JSON.parse(changed).parameters, { alert_id: 'alert-"2"', window_start: '2026-02-01T00:00:00Z' });
+  const expected = scenarioDocument(changed).get('expected');
+  assert.equal(expected.getIn(['anchor', 'observed_at_ms']), 9223372036854775807n);
+  assert.equal(changed.slice(changed.indexOf('"expected"')), raw.slice(raw.indexOf('"expected"')));
 });
 
 test('model ID pattern works with the HTML pattern Unicode sets flag', () => {

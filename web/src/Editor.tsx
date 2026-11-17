@@ -20,6 +20,7 @@ import { ModelYamlEditor } from './ModelYamlEditor';
 import { useModelDraft } from './useModelDraft';
 import { setupIssue } from './modelWorkflow';
 import { Modal, NameDialog, StatusLabel } from './ui';
+import { WorkspaceTools } from './WorkspaceTools';
 
 export type Workspace = 'graph' | 'catalogs' | 'query';
 const GraphCanvas = lazy(() => import('./GraphCanvas'));
@@ -287,7 +288,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   useEffect(() => {
     if (!connecting) return;
     function cancel(event: KeyboardEvent) {
-      if (event.key !== 'Escape' || document.querySelector('dialog[open]')) return;
+      if (event.key !== 'Escape' || document.querySelector('dialog[open]')
+        || CSS.supports('selector(:popover-open)') && document.querySelector(':popover-open')) return;
       event.preventDefault();
       setConnection(undefined);
     }
@@ -437,12 +439,12 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         <button className="button compact" disabled={!dirty || busy || !!incomplete} title={incomplete?.message} onClick={() => void save()}>{saving ? t('保存中…') : t('保存草稿')}</button>
         <button className="button primary compact" disabled={!canPublish} onClick={() => saved.revision && void activate(saved.revision, 'publish')}>{t('校验并发布')}</button>
         {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span role="status"><StatusLabel status={status} text={statusText} /></span>}
-        <details className="workspace-tools"><summary>{t('更多工具')}</summary><div>
-          <button className="button compact" disabled={busy} onClick={() => void validate()}>{checking ? t('正在校验…') : t('校验结构')}</button>
-          <button className="button compact" disabled={busy} onClick={() => void validate(true)}>{t('校验数据')}</button>
-          <button className="button compact" onClick={openYaml}><Braces size={15} />{t('查看 YAML')}</button>
-          <button className="button compact" disabled={busy || !saved.revision} onClick={refresh}><RefreshCw size={15} />{t('重新加载')}</button>
-        </div></details>
+        <WorkspaceTools>
+          <button type="button" className="tool-button" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>
+          <button type="button" className="tool-button" disabled={busy} onClick={() => void validate(true)}><ShieldCheck size={16} aria-hidden="true" />{t('校验数据')}</button>
+          <button type="button" className="tool-button" onClick={openYaml}><Braces size={16} aria-hidden="true" />{t('查看 YAML')}</button>
+          <button type="button" className="tool-button" disabled={busy || !saved.revision} onClick={refresh}><RefreshCw size={16} aria-hidden="true" />{t('重新加载')}</button>
+        </WorkspaceTools>
       </div>
       <Catalogs model={model} selected={catalogSelection} configure={name => {
         inspectorInvoker.current = document.activeElement as HTMLElement;
@@ -478,14 +480,14 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
               <Upload size={16} aria-hidden="true" />{activating ? t('正在切换…') : t('校验并发布')}
             </button>}
             {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span className="draft-status graph-status" role="status"><StatusLabel status={status} text={statusText} /></span>}
-            <details className="workspace-tools"><summary>{t('更多工具')}</summary><div>
-              {!showingYaml && allow.configure && <button className="button compact" onClick={() => initial ? openSource() : goTo('catalogs')}>
-                <Database size={16} />{initial ? t('添加数据源') : t('数据源')}
+            <WorkspaceTools key={showingYaml ? 'yaml' : 'canvas'}>
+              {!showingYaml && allow.configure && <button type="button" className="tool-button" onClick={() => initial ? openSource() : goTo('catalogs')}>
+                <Database size={16} aria-hidden="true" />{initial ? t('添加数据源') : t('数据源')}
               </button>}
-              {!showingYaml && allow.edit && <button className="button compact" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} />{checking ? t('正在校验…') : t('校验结构')}</button>}
-              {allow.edit && <button className="button compact" disabled={busy || !!yamlError} onClick={() => void validate(true)}><ShieldCheck size={16} />{t('校验数据')}</button>}
-              <button className="button compact" disabled={!saved.revision || activating} onClick={() => setModal('versions')}><History size={16} />{t('版本历史')}</button>
-            </div></details>
+              {!showingYaml && allow.edit && <button type="button" className="tool-button" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>}
+              {allow.edit && <button type="button" className="tool-button" disabled={busy || !!yamlError} onClick={() => void validate(true)}><ShieldCheck size={16} aria-hidden="true" />{t('校验数据')}</button>}
+              <button type="button" className="tool-button" disabled={!saved.revision || activating} onClick={() => setModal('versions')}><History size={16} aria-hidden="true" />{t('版本历史')}</button>
+            </WorkspaceTools>
           </div>
         </div>
         {!showingYaml && model && !saved.active_revision && allow.edit && <ModelSetup configure={allow.configure} publishAllowed={allow.publish} model={model} issue={incomplete} dirty={dirty} busy={!!busy} canPublish={canPublish}

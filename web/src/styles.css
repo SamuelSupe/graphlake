@@ -375,7 +375,6 @@ thead th { font-weight: 700; white-space: nowrap; }
 }
 .graph-command-bar { justify-content: space-between; gap: 8px 16px; }
 .graph-draft-actions { flex: 1; justify-content: flex-end; }
-.graph-draft-actions .workspace-tools > div { justify-content: flex-end; }
 .graph-toolbar {
   grid-column: 1 / -1; gap: 4px; padding: 5px 10px;
   border-block-end: 1px solid var(--line); background: var(--surface);
@@ -393,7 +392,7 @@ thead th { font-weight: 700; white-space: nowrap; }
 .model-view-switch .tool-button { min-height: 32px; padding-inline: 10px; }
 .model-view-switch .tool-button[aria-pressed="true"] { color: var(--blue-dark); background: var(--tint); border-color: #c9d7ff; }
 @media (pointer: coarse) {
-  :is(.graph-command-bar, .graph-toolbar) :is(.tool-button, summary) { min-block-size: 44px; }
+  :is(.graph-command-bar, .graph-toolbar) .tool-button { min-block-size: 44px; }
 }
 .tool-primary { padding-inline: 12px; background: var(--blue); color: #fff; margin-right: 4px; }
 .tool-primary:not(:disabled):hover { color: #fff; background: var(--blue-dark); }
@@ -422,8 +421,6 @@ thead th { font-weight: 700; white-space: nowrap; }
 @container model-editor (inline-size < 36rem) {
   .graph-draft-actions { flex-basis: 100%; justify-content: flex-start; gap: 4px; }
   .graph-draft-actions .tool-primary { margin-inline-end: 0; }
-  .graph-draft-actions .workspace-tools > summary { padding-inline: 4px; }
-  .graph-draft-actions .workspace-tools > div { justify-content: flex-start; }
   .graph-label-actions { margin-inline-start: 0; }
 }
 .canvas-panel { position: relative; min-width: 0; min-height: 0; width: 100%; overflow: hidden; }
@@ -749,18 +746,45 @@ button.graph-edge:hover, .graph-edge[aria-pressed="true"] { color: var(--blue); 
 .form-fields { display: grid; gap: 10px; min-inline-size: 0; }
 .form-fields > .button { justify-self: start; }
 .form-disclosure { min-inline-size: 0; }
-.form-disclosure > summary, .workspace-tools > summary { cursor: pointer; font-weight: 650; color: #405171; }
+.form-disclosure > summary { cursor: pointer; font-weight: 650; color: #405171; }
 .form-disclosure > summary { padding-block: 8px; }
 .form-disclosure > summary small { margin-inline-start: 8px; color: var(--muted); font-weight: 500; }
 .form-disclosure > :is(.form-fields, fieldset) { margin-block-start: 6px; }
 .source-table { padding: 10px; border: 1px solid var(--line); border-radius: 6px; }
 .mapping-options { margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 6px; }
 .mapping-options legend { padding-inline: 4px; font-weight: 650; }
-.workspace-tools { align-self: center; align-content: center; font-size: .8125rem; min-height: 36px; }
-.workspace-tools > summary { padding: 8px; border-radius: 6px; }
-.workspace-tools > summary:hover { background: var(--tint); }
-.workspace-tools[open] { flex-basis: 100%; }
-.workspace-tools > div { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 8px 6px; }
+.workspace-tools { flex: none; }
+.workspace-tools-trigger { cursor: pointer; }
+.workspace-tools-trigger::-webkit-details-marker { display: none; }
+.workspace-tools-trigger svg { width: 14px; height: 14px; }
+.workspace-tools:is([open], :has(> :popover-open)) > .workspace-tools-trigger {
+  background: var(--tint); border-color: #c9d7ff; color: var(--blue-dark);
+}
+.workspace-tools-panel {
+  position: fixed; inset: calc(var(--header-height) + 6px) var(--gutter) auto auto; margin: 0;
+  inline-size: min(14rem, calc(100vi - 2 * var(--gutter))); max-block-size: min(22rem, calc(100dvb - 24px));
+  padding: 5px; overflow: auto; overscroll-behavior: contain; z-index: 6;
+  border: 1px solid var(--line); border-radius: 9px; background: var(--surface);
+  color: inherit; box-shadow: 0 8px 24px #17223b24;
+}
+.workspace-tools-panel > .tool-button {
+  display: flex; inline-size: 100%; justify-content: flex-start; text-align: start;
+  padding-inline: 9px; gap: 10px; border-color: transparent; background: transparent; white-space: normal;
+}
+.workspace-tools-panel svg { flex: none; }
+@supports (position-area: block-end span-inline-start) {
+  .workspace-tools-panel[popover] {
+    inset: auto; margin-block: 6px; position-area: block-end span-inline-start;
+    position-try-fallbacks: flip-inline, flip-block, flip-block flip-inline, --workspace-tools-centered;
+  }
+  @position-try --workspace-tools-centered {
+    position-area: block-end span-all;
+    justify-self: center;
+  }
+}
+@media (pointer: coarse) {
+  :is(.workspace-tools-trigger, .workspace-tools-panel > .tool-button) { min-block-size: 44px; }
+}
 .scope-button { align-self: flex-start; }
 .scope-rule { display: grid; grid-template-columns: minmax(0, 1fr) 5rem minmax(0, 1fr) auto; align-items: end; gap: 8px; }
 .scope-rule .icon-button { grid-column: -2; }

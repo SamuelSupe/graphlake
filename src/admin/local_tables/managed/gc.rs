@@ -4,10 +4,10 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use super::{Managed, api_error, backend};
-use crate::admin::{App, cluster::control::Leadership, local_tables::store::now};
+use crate::admin::{App, cluster::control::Leadership, local_tables::store::now, ops::Metrics};
 
 impl Managed {
-    async fn collect(&self, table: Uuid, leader: &Leadership, app: &App) -> Result<()> {
+    async fn collect(&self, table: Uuid, leader: &Leadership, metrics: &Metrics) -> Result<()> {
         // Take the object listing first. Any pre-existing object a later publisher
         // can reference is either in a retained manifest or in its pending upload.
         let listing = self.objects.local_objects(table).await?;
@@ -16,20 +16,6 @@ impl Managed {
         };
         let pinned = self.active_pins(table).await?;
         let now = now();
-        let mut changed = false;
-        for item in &mut state.retired {
-            if !pinned.contains(&item.head.generation)
-                && item.marked_ms.is_none()
-                && item.retired_ms.saturating_add(self.retention_ms) <= now
-            {
-                item.marked_ms = Some(now);
-                changed = true;
-            }
-        }
-        if changed {
-            self.save(&state, revision, leader).await?;
-            return Ok(());
-        }
         let due = |item: &super::metadata::Historical| {
             item.marked_ms
                 .is_some_and(|marked| marked.saturating_add(self.grace_ms) <= now)
@@ -65,20 +51,63 @@ impl Managed {
             // deleting through a loss of metadata access or coordinator ownership.
             leader.confirm().await.map_err(api_error)?;
             self.objects.delete_local(&object.location).await?;
-            app.metrics.gc_deleted();
+            metrics.gc_deleted();
         }
-        if state.retired.iter().any(due) {
-            state.retired.retain(|item| !due(item));
-            self.save(&state, revision, leader).await?;
+        // A sync may have advanced the head during the object scan. Apply only
+        // decisions about retired generations from the original view.
+        let reclaimed = state
+            .retired
+            .iter()
+            .filter(|item| due(item))
+            .map(|item| item.head.generation)
+            .collect::<BTreeSet<_>>();
+        let mark = state
+            .retired
+            .iter()
+            .filter(|item| {
+                item.marked_ms.is_none()
+                    && !pinned.contains(&item.head.generation)
+                    && item.retired_ms.saturating_add(self.retention_ms) <= now
+            })
+            .map(|item| item.head.generation)
+            .collect::<BTreeSet<_>>();
+        let mut revision = revision;
+        for _ in 0..8 {
+            let before = state.retired.len();
+            state
+                .retired
+                .retain(|item| !reclaimed.contains(&item.head.generation));
+            let mut changed = state.retired.len() != before;
+            for item in &mut state.retired {
+                if item.marked_ms.is_none() && mark.contains(&item.head.generation) {
+                    item.marked_ms = Some(now);
+                    changed = true;
+                }
+            }
+            if !changed || self.save(&state, revision, leader).await? {
+                return Ok(());
+            }
+            let Some(latest) = self.record(table).await? else {
+                return Ok(());
+            };
+            (state, revision) = latest;
         }
-        Ok(())
+        anyhow::bail!("managed table changed too often to commit GC")
     }
 
     async fn collect_all(&self, leader: &Leadership, app: &App) -> Result<()> {
+        let mut result = Ok(());
         for (record, _) in self.records().await? {
-            self.collect(record.table.data_id, leader, app).await?;
+            leader.admission().map_err(api_error)?;
+            if let Err(error) = self
+                .collect(record.table.data_id, leader, &app.metrics)
+                .await
+            {
+                result =
+                    Err(error.context(format!("collecting local table {}", record.table.data_id)));
+            }
         }
-        Ok(())
+        result
     }
 }
 
@@ -104,5 +133,97 @@ pub(in crate::admin) async fn watch(app: Weak<App>) {
         }
         drop(app);
         tokio::time::sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::{
+        cluster::{
+            control::Control,
+            store::{Metadata, Objects},
+        },
+        local_tables::managed::metadata::{Historical, Record},
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde_json::json;
+
+    #[tokio::test]
+    #[ignore = "requires disposable etcd and S3 fixtures"]
+    async fn newly_retired_generation_does_not_delay_sweeping_an_old_one() -> Result<()> {
+        let endpoint = std::env::var("GRAPHLAKE_TEST_ETCD")?.parse()?;
+        let bucket = std::env::var("GRAPHLAKE_TEST_BUCKET")?;
+        let name = format!("managed-gc-{}", Uuid::new_v4());
+        let meta = Metadata::new(reqwest::Client::new(), vec![endpoint], &name);
+        let objects = Objects::open(&format!("s3://{bucket}"), &name)?;
+        let leader = Control::new(meta.clone(), objects.clone())
+            .acquire(&crate::CancellationToken::new())
+            .await?;
+        let managed = Managed::new(meta.clone(), objects.clone(), 1, 1);
+        let scratch = tempfile::NamedTempFile::new()?;
+        std::fs::write(scratch.path(), b"test payload")?;
+        let table = Uuid::new_v4();
+        let old = managed
+            .upload(table, Uuid::new_v4(), scratch.path(), None, None)
+            .await?
+            .unwrap();
+        let fresh = managed
+            .upload(table, Uuid::new_v4(), scratch.path(), None, None)
+            .await?
+            .unwrap();
+        let live = managed
+            .upload(table, Uuid::new_v4(), scratch.path(), None, None)
+            .await?
+            .unwrap();
+        let retired_ms = now().saturating_sub(2_000);
+        let record = Record {
+            table: serde_json::from_value(json!({
+                "model":"model", "data_id":table, "revision":Uuid::new_v4(), "managed":true,
+                "source":{"type":"sqlite","path":"unused"},
+                "config":{"name":"test", "source_table":"db.rows", "columns":["id"], "mode":"full"},
+                "history":[]
+            }))?,
+            head: Some(live.clone()),
+            retired: vec![
+                Historical {
+                    head: old.clone(),
+                    retired_ms,
+                    marked_ms: Some(retired_ms),
+                },
+                Historical {
+                    head: fresh.clone(),
+                    retired_ms,
+                    marked_ms: None,
+                },
+            ],
+            pending: None,
+        };
+        meta.call(
+            "/v3/kv/put",
+            json!({
+                "key": STANDARD.encode(format!("{}/local-table/state/{table}", meta.prefix)),
+                "value": STANDARD.encode(serde_json::to_vec(&record)?),
+            }),
+        )
+        .await?;
+        let (_, revision) = managed.record(table).await?.unwrap();
+        let lease = managed.grant(10).await?;
+        let (_, pin) = managed.pin_current(table, Uuid::new_v4(), &lease).await?;
+        assert_eq!(pin.unwrap().head, live);
+        assert_eq!(managed.record(table).await?.unwrap().1, revision);
+        // The object store timestamps uploads with second-level precision.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        managed.collect(table, &leader, &Metrics::new(1)).await?;
+        let (next, _) = managed.record(table).await?.unwrap();
+        assert_eq!(next.retired.len(), 1);
+        assert_eq!(next.retired[0].head, fresh);
+        assert!(next.retired[0].marked_ms.is_some());
+        assert!(!objects.exists(&managed.manifest_key(table, &old)).await?);
+        assert!(objects.exists(&managed.manifest_key(table, &fresh)).await?);
+        assert!(objects.exists(&managed.manifest_key(table, &live)).await?);
+        managed.release(&lease).await;
+        leader.release().await;
+        Ok(())
     }
 }

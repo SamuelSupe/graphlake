@@ -396,6 +396,11 @@ pub(super) fn bind_pattern(
                     filters,
                     starts,
                     anchored,
+                    start_variable: left_node
+                        .variable
+                        .as_ref()
+                        .map(|variable| variable.0.clone()),
+                    start_seed: None,
                     #[cfg(feature = "admin")]
                     finishes,
                 });

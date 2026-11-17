@@ -89,7 +89,7 @@ impl CypherCsr {
             worker,
             job: job.clone(),
             id,
-            generation: Arc::new(generation),
+            generation,
             stats: Default::default(),
             cache: Default::default(),
         })
@@ -461,13 +461,25 @@ impl PartitionStream for Paths {
                 }
                 if targets.is_empty() { return; }
             }
-            for (label, plan) in starts {
-                let plan = datafusion::physical_plan::execution_plan::reset_plan_states(plan)?;
-                let mut rows = execute_stream(plan, ctx.clone())?;
+            let mut imported = expansion.imported_keys(&ctx, false).map_err(external)?;
+            let seeded = imported.is_some();
+            let mut starts = if seeded { Vec::new() } else { starts }.into_iter();
+            let mut imported_seen = BTreeSet::new();
+            loop {
+                let (label, mut rows): (_, SendableRecordBatchStream) = if let Some(batch) = imported.take() {
+                    let stream = RecordBatchStreamAdapter::new(batch.schema(), futures::stream::iter([Ok(batch)]));
+                    (Some(expansion.start_node.clone()), Box::pin(stream))
+                } else if let Some((label, plan)) = starts.next() {
+                    let plan = datafusion::physical_plan::execution_plan::reset_plan_states(plan)?;
+                    (label, execute_stream(plan, ctx.clone())?)
+                } else {
+                    break;
+                };
                 while let Some(batch) = rows.try_next().await? {
                     let layout = label.as_ref().map(|label| Layout::Single(label.clone()));
                     for row in 0..batch.num_rows() {
                         let start = layout.as_ref().unwrap_or(&emitter.layout).start(&batch, row, &keys).map_err(external)?;
+                        if seeded && !imported_seen.insert(start) { continue; }
                         let mut paths = walks(&execution, start, &expansion, max, restricted.then_some(&targets), &filters);
                         while let Some(path) = paths.try_next().await.map_err(external)? {
                             if let Some(batch) = emitter.push(&keys, path).await.map_err(external)? { yield batch; }
@@ -1002,7 +1014,7 @@ fn walks<'a>(
                 if depth == max || remaining == Some(0) { break; }
                 let mut next = Vec::new();
                 let final_targets = if depth+1 == max { targets } else { None };
-                for mut batch in frontier.chunks(128).map(|chunk| adjacency(execution, chunk, final_targets, filters)) {
+                for mut batch in frontier.chunks(128).map(|chunk| adjacency(execution, chunk, final_targets, filters, false)) {
                     while let Some((to,from,edge)) = batch.try_next().await? {
                         if depth+1 == max && targets.is_some_and(|targets| !targets.contains(&to)) {
                             continue;
@@ -1080,7 +1092,7 @@ impl WalkAdjacency {
                 for &link in links.iter() { yield link; }
                 return;
             }
-            let mut stream = adjacency(execution, &[vertex], targets, filters);
+            let mut stream = adjacency(execution, &[vertex], targets, filters, true);
             let mut saved = Some(Vec::new());
             let temp = self.budget.new_empty();
             while let Some(link) = stream.try_next().await? {
@@ -1111,6 +1123,7 @@ fn adjacency<'a>(
     vertices: &[Vertex],
     targets: Option<&'a BTreeSet<Vertex>>,
     filters: &'a [(u32, Vec<String>)],
+    local: bool,
 ) -> futures::stream::BoxStream<'a, Result<Link>> {
     let mut groups = BTreeMap::<usize, BTreeSet<Vertex>>::new();
     for &vertex in vertices {
@@ -1128,8 +1141,9 @@ fn adjacency<'a>(
             for group in candidates.chunk_by(|a,b| *a+1==*b) {
                 for chunk in group.chunks(2) {
                     let remote_targets = targets.filter(|ids| ids.len() <= 256).cloned();
-                    let round = execution.round(vec![(shard, Step::Arcs { frontier: ids.clone(), start_block: chunk[0],
-                        end_block: chunk.last().unwrap()+1, targets: remote_targets, filters: filters.to_vec() })]).await?;
+                    // Dispatching a single vertex costs more than scanning its blocks locally.
+                    let round = execution.run_round(vec![(shard, Step::Arcs { frontier: ids.clone(), start_block: chunk[0],
+                        end_block: chunk.last().unwrap()+1, targets: remote_targets, filters: filters.to_vec() })], local).await?;
                     for output in round.outputs {
                         for link in output.links { yield link; }
                     }

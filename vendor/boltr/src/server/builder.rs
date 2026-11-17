@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::Instant;
+use tokio::{sync::Semaphore, time::Instant};
 
 use crate::error::BoltError;
 use crate::server::auth::AuthValidator;
 use crate::server::backend::BoltBackend;
-use crate::server::connection::Connection;
+use crate::server::connection::{Connection, SessionSlots};
 use crate::server::handshake::server_handshake;
 use crate::server::session_manager::SessionManager;
 
@@ -87,6 +87,7 @@ pub struct BoltServer<B: BoltBackend> {
     auth_validator: Option<Arc<dyn AuthValidator>>,
     idle_timeout: Option<Duration>,
     max_sessions: Option<usize>,
+    max_pending_sessions: Option<usize>,
     max_message_size: Option<usize>,
     max_unauthenticated_message_size: usize,
     handshake_timeout: Option<Duration>,
@@ -103,6 +104,7 @@ impl<B: BoltBackend> BoltServer<B> {
             auth_validator: None,
             idle_timeout: None,
             max_sessions: None,
+            max_pending_sessions: None,
             max_message_size: None,
             max_unauthenticated_message_size: DEFAULT_MAX_UNAUTHENTICATED_MESSAGE_SIZE,
             handshake_timeout: Some(DEFAULT_HANDSHAKE_TIMEOUT),
@@ -137,6 +139,13 @@ impl<B: BoltBackend> BoltServer<B> {
     /// Sets the maximum number of concurrent sessions.
     pub fn max_sessions(mut self, limit: usize) -> Self {
         self.max_sessions = Some(limit);
+        self
+    }
+
+    /// Reserve a separate limit for TCP handshakes and sessions awaiting LOGON.
+    /// When set with max_sessions, the latter limits authenticated sessions.
+    pub fn max_pending_sessions(mut self, limit: usize) -> Self {
+        self.max_pending_sessions = Some(limit);
         self
     }
 
@@ -239,7 +248,21 @@ impl<B: BoltBackend> BoltServer<B> {
     ) -> Result<(), BoltError> {
         let addr = listener.local_addr()?;
         let backend = Arc::new(self.backend);
-        let session_manager = Arc::new(SessionManager::new(self.max_sessions));
+        let slots = self
+            .max_pending_sessions
+            .zip(self.max_sessions)
+            .map(|(pending, active)| {
+                Arc::new(SessionSlots {
+                    pending: Arc::new(Semaphore::new(pending)),
+                    active: Arc::new(Semaphore::new(active)),
+                    expedited: Arc::new(Semaphore::new(1)),
+                })
+            });
+        let session_manager = Arc::new(SessionManager::new(if slots.is_some() {
+            None
+        } else {
+            self.max_sessions
+        }));
         let (closing, closed) = tokio::sync::watch::channel(());
         let context = ConnectionContext {
             backend: Arc::clone(&backend),
@@ -249,6 +272,7 @@ impl<B: BoltBackend> BoltServer<B> {
             max_unauthenticated_message_size: self.max_unauthenticated_message_size,
             handshake_timeout: self.handshake_timeout,
             closed: Some(closed),
+            slots,
         };
 
         #[cfg(feature = "tls")]
@@ -329,6 +353,7 @@ pub(crate) struct ConnectionContext<B: BoltBackend> {
     pub(crate) max_unauthenticated_message_size: usize,
     pub(crate) handshake_timeout: Option<Duration>,
     pub(crate) closed: Option<tokio::sync::watch::Receiver<()>>,
+    pub(crate) slots: Option<Arc<SessionSlots>>,
 }
 
 impl<B: BoltBackend> Clone for ConnectionContext<B> {
@@ -341,6 +366,7 @@ impl<B: BoltBackend> Clone for ConnectionContext<B> {
             max_unauthenticated_message_size: self.max_unauthenticated_message_size,
             handshake_timeout: self.handshake_timeout,
             closed: self.closed.clone(),
+            slots: self.slots.clone(),
         }
     }
 }
@@ -448,7 +474,24 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: BoltBackend,
 {
-    let deadline = context.handshake_timeout.map(|t| started + t);
+    let mut deadline = context.handshake_timeout.map(|t| started + t);
+    let capacity = match context.slots {
+        Some(slots) => {
+            let permit = match slots.pending.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let Ok(permit) = slots.expedited.clone().try_acquire_owned() else {
+                        return;
+                    };
+                    let expedited = started + Duration::from_millis(500);
+                    deadline = Some(deadline.map_or(expedited, |current| current.min(expedited)));
+                    permit
+                }
+            };
+            Some((slots, permit))
+        }
+        None => None,
+    };
     if let Some(validator) = &context.auth_validator
         && with_deadline(deadline, validator.session_allowed()).await != Some(true)
     {
@@ -485,9 +528,13 @@ pub(crate) async fn run_handshake_and_connection<S, B>(
         peer_addr,
         context.max_message_size,
     );
+    conn.set_slots(capacity);
     conn.set_max_unauthenticated_message_size(context.max_unauthenticated_message_size);
-    if let (Some(timeout), Some(deadline)) = (context.handshake_timeout, deadline) {
-        conn.set_auth_deadline(timeout, deadline);
+    if let Some(deadline) = deadline {
+        conn.set_auth_deadline(
+            context.handshake_timeout.unwrap_or(Duration::from_secs(5)),
+            deadline,
+        );
     }
     let mut closed = context.closed;
     if let Err(e) = conn

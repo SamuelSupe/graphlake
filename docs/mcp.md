@@ -96,13 +96,13 @@ Draft writes do not change the active model. On a revision conflict, re-read and
 
 Call `get_schema` with `{"model":"payments"}`. Its published `model_revision` identifies the mappings and semantic declarations in that response. `schema` retains the existing graph name, labels, keys, property names, and relationship endpoints. A configured model, node, or edge returns `semantic_status: "declared"` and a `semantics` object. Labels without declarations return `"unspecified"`.
 
-Each label's `property_details` maps declared business keys and properties to their Arrow `data_type`, `nullable` flag, and any description, unit or value meanings. Types reflect the logical mappings, including casts and combined inputs. The query service resolves them under the caller's current query authorization and tenant constraints, within its time and metadata work limits.
+Each label's `property_details` maps declared business keys and properties to their Arrow `data_type`, `nullable` flag, and any description, unit or value meanings. Types reflect the logical mappings, including casts and combined inputs. By default, the call does not contact the data sources. Pass `{"model":"payments","include_types":true}` to resolve types under the caller's authorization and tenant constraints. Type resolution has its own concurrency limit.
 
 | `type_resolution.status` | Meaning |
 | --- | --- |
 | `resolved` | Types were resolved from logical mappings. `checked_at` records the UTC time of resolution. |
 | `unavailable` | Type resolution failed or exceeded a resource limit. Structure and semantic declarations remain available. Type and nullability are `null`. |
-| `not_requested` | `include_types: false` skipped access to data sources. Type and nullability are `null`. |
+| `not_requested` | Omitting `include_types` or passing `false` skipped access to data sources. Type and nullability are `null`. |
 
 A model revision freezes the mappings and semantic declarations. Source schemas and data can change independently. The response contains logical fields and excludes source connection settings and connector errors. The existing HTTP schema route keeps its structural response.
 

@@ -1,11 +1,15 @@
 use anyhow::{Result, ensure};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use super::{Node2VecOptions, cooperate, graph::Graph};
+use super::{Node2VecOptions, graph::Graph};
 use crate::engine::QueryScope;
 
 impl Node2VecOptions {
     pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.dimensions <= 1024,
+            "Node2Vec supports at most 1024 dimensions"
+        );
         ensure!(
             self.dimensions > 0
                 && self.walk_length > 1
@@ -29,11 +33,17 @@ impl Node2VecOptions {
     }
 }
 
-pub(super) async fn train(
+pub(super) fn train(
     graph: &Graph,
     options: Node2VecOptions,
     scope: &QueryScope,
+    stop: &crate::CancellationToken,
 ) -> Result<Vec<f32>> {
+    let check = || {
+        ensure!(!stop.is_cancelled(), "query cancelled");
+        scope.check()
+    };
+    check()?;
     let vertices = graph.vertices.len();
     let size = vertices
         .checked_mul(options.dimensions)
@@ -43,7 +53,9 @@ pub(super) async fn train(
     let mut input = Vec::with_capacity(size);
     for index in 0..size {
         input.push(rng.random_range(-initial..initial));
-        cooperate(scope, index).await?;
+        if index % 1024 == 0 {
+            check()?;
+        }
     }
     let mut output = vec![0.0_f32; size];
     if vertices == 0 {
@@ -56,7 +68,9 @@ pub(super) async fn train(
     for (index, row) in graph.adjacency.iter().enumerate() {
         total += (row.len() as f64).powf(0.75);
         negative.push(total);
-        cooperate(scope, index).await?;
+        if index % 1024 == 0 {
+            check()?;
+        }
     }
     let mut walk = Vec::with_capacity(options.walk_length);
     let mut steps = 0_usize;
@@ -64,16 +78,15 @@ pub(super) async fn train(
         let learning_rate =
             (options.learning_rate * (1.0 - epoch as f64 / options.epochs as f64)) as f32;
         for start in 0..vertices {
-            scope.check()?;
+            check()?;
             for _ in 0..options.walks_per_node {
                 walk.clear();
                 walk.push(start);
                 while walk.len() < options.walk_length {
-                    cooperate(scope, walk.len()).await?;
+                    check()?;
                     let previous = walk.len().checked_sub(2).map(|index| walk[index]);
                     let current = *walk.last().expect("walk start");
-                    let Some(next) =
-                        step(graph, previous, current, &options, &mut rng, scope).await?
+                    let Some(next) = step(graph, previous, current, &options, &mut rng, &check)?
                     else {
                         break;
                     };
@@ -117,11 +130,13 @@ pub(super) async fn train(
                                 );
                             }
                             steps += 1;
-                            cooperate(scope, steps).await?;
+                            if steps % 128 == 0 {
+                                check()?;
+                            }
                         }
                     }
                 }
-                tokio::task::yield_now().await;
+                check()?;
             }
         }
     }
@@ -144,13 +159,13 @@ pub(super) fn workspace(vertices: usize, options: Node2VecOptions) -> usize {
         )
 }
 
-async fn step(
+fn step(
     graph: &Graph,
     previous: Option<usize>,
     current: usize,
     options: &Node2VecOptions,
     rng: &mut SmallRng,
-    scope: &QueryScope,
+    check: &impl Fn() -> Result<()>,
 ) -> Result<Option<usize>> {
     // Weighted reservoir sampling needs one pass and no per-node alias tables.
     let mut total = 0.0;
@@ -176,7 +191,9 @@ async fn step(
         if weight > 0.0 && rng.random::<f64>() * total < weight {
             selected = Some(neighbor.vertex);
         }
-        cooperate(scope, i + 1).await?;
+        if i % 1024 == 0 {
+            check()?;
+        }
     }
     Ok(selected)
 }

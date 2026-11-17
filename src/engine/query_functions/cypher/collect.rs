@@ -6,6 +6,7 @@ use std::{
     fmt,
     fs::File,
     hash::{Hash, Hasher},
+    io::{Read, Seek, SeekFrom},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -24,7 +25,7 @@ use datafusion::{
     execution::{
         memory_pool::{MemoryConsumer, MemoryReservation},
         runtime_env::RuntimeEnv,
-        spill_file::{SpillFile, SpillWriter},
+        spill_file::SpillFile,
     },
     functions_aggregate::array_agg::array_agg_udaf,
     logical_expr::{
@@ -35,7 +36,28 @@ use datafusion::{
     prelude::SessionContext,
 };
 
-type Files = Vec<Arc<dyn SpillFile>>;
+type Files = Vec<Run>;
+
+#[derive(Clone)]
+struct Run {
+    file: Arc<dyn SpillFile>,
+    offset: u64,
+    length: u64,
+}
+
+impl Run {
+    fn reader(&self) -> Result<StreamReader<std::io::BufReader<std::io::Take<File>>>> {
+        let Some(path) = self.file.path() else {
+            return exec_err!("collect spill has no local path");
+        };
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        Ok(StreamReader::try_new_buffered(
+            file.take(self.length),
+            None,
+        )?)
+    }
+}
 type Factory = Box<dyn Fn() -> Result<Box<dyn Accumulator>> + Send + Sync>;
 
 pub(in crate::engine) fn register(
@@ -51,6 +73,7 @@ pub(in crate::engine) fn register(
         flush_bytes: (memory_bytes / 16).clamp(1, 4 * 1024 * 1024),
         next: AtomicU64::new(0),
         tokens: Mutex::new(HashMap::new()),
+        spill: Mutex::new(None),
         spilled,
         cancellation,
         deadline,
@@ -70,6 +93,7 @@ struct Store {
     flush_bytes: usize,
     next: AtomicU64,
     tokens: Mutex<HashMap<u64, Files>>,
+    spill: Mutex<Option<Arc<dyn SpillFile>>>,
     spilled: Arc<AtomicU64>,
     cancellation: tokio_util::sync::CancellationToken,
     deadline: tokio::time::Instant,
@@ -199,7 +223,6 @@ impl AggregateUDFImpl for Collect {
             store: Arc::clone(&self.store),
             inner: factory()?,
             factory,
-            writer: Mutex::new(None),
             files: Vec::new(),
             dirty: false,
             distinct_type,
@@ -243,16 +266,10 @@ impl Collect {
     }
 }
 
-struct Writer {
-    file: Arc<dyn SpillFile>,
-    stream: StreamWriter<Box<dyn SpillWriter>>,
-}
-
 struct CollectAccumulator {
     store: Arc<Store>,
     inner: Box<dyn Accumulator>,
     factory: Factory,
-    writer: Mutex<Option<Writer>>,
     files: Files,
     dirty: bool,
     distinct_type: Option<DataType>,
@@ -301,39 +318,35 @@ impl CollectAccumulator {
                 .collect::<Vec<_>>(),
         ));
         let batch = RecordBatch::try_new(schema, arrays)?;
-        let writer = self.writer.get_mut().expect("collect spill writer");
-        if writer.is_none() {
-            let file = self
-                .store
-                .runtime
-                .disk_manager
-                .create_tmp_file("spilling Cypher collect")?;
-            let stream = StreamWriter::try_new(file.open_writer()?, &batch.schema())?;
-            *writer = Some(Writer { file, stream });
-        }
-        writer
-            .as_mut()
-            .expect("collect spill writer")
-            .stream
-            .write(&batch)?;
+        let run = crate::blocking(|| {
+            let mut shared = self.store.spill.lock().expect("collect spill file");
+            if shared.is_none() {
+                *shared = Some(
+                    self.store
+                        .runtime
+                        .disk_manager
+                        .create_tmp_file("spilling Cypher collect")?,
+                );
+            }
+            let file = shared.as_ref().expect("collect spill file");
+            let offset = file.size().expect("local spill file size");
+            let mut writer = StreamWriter::try_new(file.open_writer()?, &batch.schema())?;
+            writer.write(&batch)?;
+            writer.into_inner()?.finish()?;
+            let length = file.size().expect("local spill file size") - offset;
+            Ok::<_, datafusion::common::DataFusionError>(Run {
+                file: file.clone(),
+                offset,
+                length,
+            })
+        })?;
+        self.store.spilled.fetch_add(run.length, Ordering::Relaxed);
+        self.files.push(run);
         self.inner = (self.factory)()?;
         if let Some(reservation) = &self.reservation {
             reservation.free();
         }
         self.dirty = false;
-        Ok(())
-    }
-
-    fn finish_writer(&mut self) -> Result<()> {
-        if let Some(Writer { file, stream }) =
-            self.writer.get_mut().expect("collect spill writer").take()
-        {
-            stream.into_inner()?.finish()?;
-            self.store
-                .spilled
-                .fetch_add(file.size().unwrap_or_default(), Ordering::Relaxed);
-            self.files.push(file);
-        }
         Ok(())
     }
 
@@ -398,7 +411,6 @@ impl Accumulator for CollectAccumulator {
         for (row, token) in tokens.iter().enumerate() {
             if let Some(token) = token {
                 self.flush()?;
-                self.finish_writer()?;
                 let files = self
                     .store
                     .tokens
@@ -421,19 +433,12 @@ impl Accumulator for CollectAccumulator {
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        if self.files.is_empty()
-            && self
-                .writer
-                .get_mut()
-                .expect("collect spill writer")
-                .is_none()
-        {
+        if self.files.is_empty() {
             let mut state = self.inner.state()?;
             state.push(ScalarValue::UInt64(None));
             return Ok(state);
         }
         self.flush()?;
-        self.finish_writer()?;
         let mut state = self.inner.state()?;
         let token = self.store.next.fetch_add(1, Ordering::Relaxed);
         self.store
@@ -446,23 +451,18 @@ impl Accumulator for CollectAccumulator {
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        self.finish_writer()?;
         if self.files.is_empty() {
             return self.inner.evaluate();
         }
         if let Some(ty) = self.distinct_type.clone() {
             self.flush()?;
-            self.finish_writer()?;
-            return spill::finish(&self.store, std::mem::take(&mut self.files), &ty);
+            return spill::finish(self.store.clone(), std::mem::take(&mut self.files), &ty);
         }
         let mut merged = (self.factory)()?;
         let budget = MemoryConsumer::new("materializing a Cypher collect result")
             .register(&self.store.runtime.memory_pool);
         for file in &self.files {
-            let Some(path) = file.path() else {
-                return exec_err!("collect spill has no local path");
-            };
-            let reader = StreamReader::try_new_buffered(File::open(path)?, None)?;
+            let reader = file.reader()?;
             for batch in reader {
                 let batch = batch?;
                 budget.try_grow(ipc_batch_bytes(&batch))?;
@@ -495,6 +495,6 @@ impl Accumulator for CollectAccumulator {
         } else {
             0
         };
-        size_of::<Self>() + inner + self.files.capacity() * size_of::<Arc<dyn SpillFile>>()
+        size_of::<Self>() + inner + self.files.capacity() * size_of::<Run>()
     }
 }

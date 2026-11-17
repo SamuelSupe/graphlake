@@ -1,4 +1,4 @@
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, Write};
 
 use axum::{body::Body, http::header};
 use tokio::sync::OwnedSemaphorePermit;
@@ -9,8 +9,10 @@ use crate::arrow::ipc::writer::StreamWriter;
 use super::*;
 
 const SNAPSHOTS_PER_OWNER: usize = 4;
+const PREVIEW_INLINE_BYTES: usize = 1024 * 1024;
 const SNAPSHOTS_TOTAL: usize = 32;
 const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_MAX_DURATION: Duration = Duration::from_secs(15 * 60);
 const SNAPSHOT_BUDGET: u64 = 1024 * 1024 * 1024;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30 * 60);
 const TICKET_TTL: Duration = Duration::from_secs(60);
@@ -20,54 +22,86 @@ pub(in crate::admin) struct ResultSnapshot {
     model: String,
     revision: String,
     owner: Principal,
-    file: Option<tempfile::NamedTempFile>,
+    arrow: Option<Captured>,
     length: u64,
     created: std::time::Instant,
     graph: Option<(Vec<Arc<graph::Fragment>>, bool)>,
 }
 
 pub(super) struct Capture {
-    file: tempfile::NamedTempFile,
     ipc: StreamWriter<Bounded>,
 }
 
-pub(in crate::admin) struct Captured {
-    pub file: tempfile::NamedTempFile,
-    pub length: u64,
+pub(in crate::admin) enum Captured {
+    Memory(bytes::Bytes),
+    File {
+        file: tempfile::NamedTempFile,
+        length: u64,
+    },
+}
+
+impl Captured {
+    pub(in crate::admin) fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::File { length, .. } => *length,
+        }
+    }
+
+    fn body(&self) -> ApiResult<DownloadSource> {
+        Ok(match self {
+            Self::Memory(bytes) => DownloadSource::Memory(bytes.clone()),
+            Self::File { file, .. } => {
+                DownloadSource::File(file.reopen().map_err(|_| write_error())?)
+            }
+        })
+    }
+}
+
+enum CaptureSink {
+    Memory(Vec<u8>),
+    File(BufWriter<tempfile::NamedTempFile>),
 }
 
 impl Capture {
     pub(super) fn new(schema: &crate::arrow::datatypes::Schema, budget: u64) -> ApiResult<Self> {
         let file = tempfile::NamedTempFile::new().map_err(|_| write_error())?;
+        Self::open(schema, budget, CaptureSink::File(BufWriter::new(file)))
+    }
+
+    pub(super) fn preview(schema: &crate::arrow::datatypes::Schema) -> ApiResult<Self> {
+        Self::open(schema, 16 * 1024 * 1024, CaptureSink::Memory(Vec::new()))
+    }
+
+    fn open(
+        schema: &crate::arrow::datatypes::Schema,
+        budget: u64,
+        sink: CaptureSink,
+    ) -> ApiResult<Self> {
         let writer = Bounded {
-            file: BufWriter::new(file.reopen().map_err(|_| write_error())?),
+            sink,
             remaining: budget.min(SNAPSHOT_BUDGET),
         };
         let ipc = StreamWriter::try_new(writer, schema).map_err(|_| write_error())?;
-        Ok(Self { file, ipc })
+        Ok(Self { ipc })
     }
 
     pub(super) fn write(&mut self, batch: &crate::arrow::array::RecordBatch) -> ApiResult<()> {
-        tokio::task::block_in_place(|| self.ipc.write(batch)).map_err(|_| write_error())
+        crate::blocking(|| self.ipc.write(batch)).map_err(|_| write_error())
     }
 
     pub(super) fn finish(self) -> ApiResult<Captured> {
-        tokio::task::block_in_place(|| {
-            self.ipc
-                .into_inner()
-                .map_err(|_| write_error())?
-                .flush()
-                .map_err(|_| write_error())?;
-            let length = self
-                .file
-                .as_file()
-                .metadata()
-                .map_err(|_| write_error())?
-                .len();
-            Ok(Captured {
-                file: self.file,
-                length,
-            })
+        crate::blocking(|| {
+            let sink = self.ipc.into_inner().map_err(|_| write_error())?.sink;
+            match sink {
+                CaptureSink::Memory(bytes) => Ok(Captured::Memory(bytes.into())),
+                CaptureSink::File(writer) => {
+                    let mut file = writer.into_inner().map_err(|_| write_error())?;
+                    let length = file.as_file().metadata().map_err(|_| write_error())?.len();
+                    file.as_file_mut().rewind().map_err(|_| write_error())?;
+                    Ok(Captured::File { file, length })
+                }
+            }
         })
     }
 }
@@ -81,13 +115,13 @@ pub(super) fn save_snapshot(
     arrow: Option<Captured>,
     graph: Option<(Vec<graph::Fragment>, bool)>,
 ) {
-    let length = arrow.as_ref().map_or(0, |arrow| arrow.length);
+    let length = arrow.as_ref().map_or(0, Captured::len);
     let snapshot = ResultSnapshot {
         id,
         model,
         revision,
         owner,
-        file: arrow.map(|arrow| arrow.file),
+        arrow,
         length,
         created: std::time::Instant::now(),
         graph: graph
@@ -117,13 +151,24 @@ pub(super) fn save_snapshot(
         results.remove(index);
     }
     results.push_back(snapshot);
-    let app = Arc::downgrade(app);
-    tokio::spawn(async move {
-        tokio::time::sleep(SNAPSHOT_TTL).await;
-        if let Some(app) = app.upgrade() {
-            app.results.lock().unwrap().retain(|saved| saved.id != id);
+}
+
+pub(in crate::admin) async fn expire_results(app: std::sync::Weak<App>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let Some(app) = app.upgrade() else { return };
+        if app.shutdown.is_cancelled() {
+            return;
         }
-    });
+        app.results
+            .lock()
+            .unwrap()
+            .retain(|saved| saved.created.elapsed() < SNAPSHOT_TTL);
+        app.downloads
+            .lock()
+            .unwrap()
+            .retain(|download| download.created.elapsed() < TICKET_TTL);
+    }
 }
 
 pub(in crate::admin) async fn snapshot(
@@ -145,7 +190,7 @@ pub(in crate::admin) async fn snapshot(
             .find(|saved| {
                 saved.id == id
                     && saved.model == model
-                    && saved.file.is_some()
+                    && saved.arrow.is_some()
                     && access::owns_query(&principal, &saved.owner)
             })
             .ok_or_else(|| {
@@ -156,12 +201,7 @@ pub(in crate::admin) async fn snapshot(
                 )
             })?;
         (
-            saved
-                .file
-                .as_ref()
-                .expect("Arrow result")
-                .reopen()
-                .map_err(|_| write_error())?,
+            saved.arrow.as_ref().expect("Arrow result").body()?,
             saved.length,
             saved.revision.clone(),
         )
@@ -169,7 +209,7 @@ pub(in crate::admin) async fn snapshot(
     let permit = if method == axum::http::Method::HEAD {
         None
     } else {
-        Some(download_slot(&app).await?)
+        Some(download_slot(&app, &principal).await?)
     };
     Ok(attachment(
         file,
@@ -260,8 +300,10 @@ pub(in crate::admin) async fn export(
     if active.token.is_cancelled() {
         return Err(Error::new(StatusCode::CONFLICT, "cancelled", "查询已取消"));
     }
-    let length = captured.length;
-    let file = captured.file.into_file();
+    let Captured::File { file, length } = captured else {
+        unreachable!("exports always use a file");
+    };
+    let file = file.into_file();
     drop(active);
     let ticket = Uuid::new_v4();
     {
@@ -294,13 +336,6 @@ pub(in crate::admin) async fn export(
             created: std::time::Instant::now(),
         });
     }
-    let app = Arc::downgrade(&app);
-    tokio::spawn(async move {
-        tokio::time::sleep(TICKET_TTL).await;
-        if let Some(app) = app.upgrade() {
-            app.downloads.lock().unwrap().retain(|d| d.ticket != ticket);
-        }
-    });
     Ok(Json(serde_json::json!({ "ticket": ticket.to_string() })).into_response())
 }
 
@@ -323,7 +358,7 @@ pub(in crate::admin) async fn download(
     if !app.downloads.lock().unwrap().iter().any(&matching) {
         return Err(Error::not_found());
     }
-    let permit = download_slot(&app).await?;
+    let permit = download_slot(&app, &principal).await?;
     let download = {
         let mut downloads = app.downloads.lock().unwrap();
         let index = downloads
@@ -333,7 +368,7 @@ pub(in crate::admin) async fn download(
         downloads.remove(index).expect("matching download")
     };
     let mut response = attachment(
-        download.file,
+        DownloadSource::File(download.file),
         download.length,
         download.filename,
         download.model_revision,
@@ -343,15 +378,52 @@ pub(in crate::admin) async fn download(
     Ok(response)
 }
 
-pub(in crate::admin) async fn download_slot(app: &App) -> ApiResult<OwnedSemaphorePermit> {
-    acquire(
+pub(in crate::admin) struct DownloadPermit {
+    _slot: OwnedSemaphorePermit,
+    _owner: DownloadOwner,
+}
+
+struct DownloadOwner {
+    owner: Principal,
+    owners: Arc<std::sync::Mutex<Vec<Principal>>>,
+}
+
+impl Drop for DownloadOwner {
+    fn drop(&mut self) {
+        self.owners
+            .lock()
+            .unwrap()
+            .retain(|owner| owner != &self.owner);
+    }
+}
+
+pub(in crate::admin) async fn download_slot(
+    app: &App,
+    principal: &Principal,
+) -> ApiResult<DownloadPermit> {
+    let owner = {
+        let mut owners = app.download_owners.lock().unwrap();
+        if owners.contains(principal) {
+            return Err(Error::busy());
+        }
+        owners.push(principal.clone());
+        DownloadOwner {
+            owner: principal.clone(),
+            owners: app.download_owners.clone(),
+        }
+    };
+    let slot = acquire(
         app,
         &app.download_work,
         &app.download_waiters,
         app.options.timeout,
         &app.shutdown,
     )
-    .await
+    .await?;
+    Ok(DownloadPermit {
+        _slot: slot,
+        _owner: owner,
+    })
 }
 
 pub(in crate::admin) async fn capture_all(
@@ -371,14 +443,27 @@ pub(in crate::admin) async fn capture_all(
     capture.finish()
 }
 
+enum DownloadSource {
+    Memory(bytes::Bytes),
+    File(std::fs::File),
+}
+
 fn attachment(
-    file: std::fs::File,
+    source: DownloadSource,
     length: u64,
     filename: String,
     revision: String,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<DownloadPermit>,
 ) -> Response {
-    let stream = ReaderStream::new(tokio::fs::File::from_std(file));
+    let body = match source {
+        DownloadSource::Memory(bytes) => download_body(
+            futures::stream::once(async move { Ok::<_, std::io::Error>(bytes) }),
+            permit,
+        ),
+        DownloadSource::File(file) => {
+            download_body(ReaderStream::new(tokio::fs::File::from_std(file)), permit)
+        }
+    };
     (
         [
             (
@@ -395,14 +480,14 @@ fn attachment(
                 revision,
             ),
         ],
-        download_body(stream, permit),
+        body,
     )
         .into_response()
 }
 
 pub(in crate::admin) fn download_body<E>(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<DownloadPermit>,
 ) -> Body
 where
     E: Into<axum::BoxError> + Send + 'static,
@@ -410,20 +495,23 @@ where
     let Some(permit) = permit else {
         return Body::empty();
     };
-    download_stream(stream, permit, DOWNLOAD_IDLE_TIMEOUT)
+    download_stream(stream, permit, DOWNLOAD_IDLE_TIMEOUT, DOWNLOAD_MAX_DURATION)
 }
 
 fn download_stream<E>(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
-    permit: OwnedSemaphorePermit,
+    permit: impl Send + 'static,
     idle: Duration,
+    maximum: Duration,
 ) -> Body
 where
     E: Into<axum::BoxError> + Send + 'static,
 {
     use futures::StreamExt;
     use tokio::{sync::watch, time::Instant};
-    let (progress, mut deadline) = watch::channel(Instant::now() + idle);
+    let start = Instant::now();
+    let end = start + maximum;
+    let (progress, mut deadline) = watch::channel((start + idle).min(end));
     let expired = tokio_util::sync::CancellationToken::new();
     let watchdog = expired.clone();
     tokio::spawn(async move {
@@ -432,6 +520,10 @@ where
             let next = *deadline.borrow_and_update();
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep_until(end) => {
+                    watchdog.cancel();
+                    return;
+                }
                 changed = deadline.changed() => {
                     if changed.is_err() {
                         return;
@@ -452,14 +544,14 @@ where
             let chunk = tokio::select! {
                 biased;
                 _ = expired.cancelled() => Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut, "Arrow download made no progress"
+                    std::io::ErrorKind::TimedOut, "Arrow download deadline exceeded"
                 ).into())),
                 chunk = stream.next() => chunk.map(|chunk| chunk.map_err(Into::into)),
             };
             match chunk {
                 Some(Ok(chunk)) => {
                     if !chunk.is_empty() {
-                        progress.send_replace(Instant::now() + idle);
+                        progress.send_replace((Instant::now() + idle).min(end));
                     }
                     yield Ok::<_, axum::BoxError>(chunk);
                 }
@@ -482,7 +574,7 @@ fn write_error() -> Error {
 }
 
 struct Bounded {
-    file: BufWriter<std::fs::File>,
+    sink: CaptureSink,
     remaining: u64,
 }
 
@@ -491,13 +583,26 @@ impl Write for Bounded {
         if bytes.len() as u64 > self.remaining {
             return Err(std::io::Error::other("export exceeds disk budget"));
         }
-        let n = self.file.write(bytes)?;
-        self.remaining -= n as u64;
-        Ok(n)
+        if let CaptureSink::Memory(buffer) = &mut self.sink
+            && buffer.len().saturating_add(bytes.len()) > PREVIEW_INLINE_BYTES
+        {
+            let mut file = BufWriter::new(tempfile::NamedTempFile::new()?);
+            file.write_all(buffer)?;
+            self.sink = CaptureSink::File(file);
+        }
+        match &mut self.sink {
+            CaptureSink::Memory(buffer) => buffer.extend_from_slice(bytes),
+            CaptureSink::File(file) => file.write_all(bytes)?,
+        }
+        self.remaining -= bytes.len() as u64;
+        Ok(bytes.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
+        match &mut self.sink {
+            CaptureSink::Memory(_) => Ok(()),
+            CaptureSink::File(file) => file.flush(),
+        }
     }
 }
 
@@ -505,6 +610,71 @@ impl Write for Bounded {
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    #[test]
+    fn preview_capture_retains_small_arrow_and_spills_large_arrow() -> anyhow::Result<()> {
+        use crate::arrow::{
+            array::{BinaryArray, RecordBatch},
+            ipc::reader::StreamReader,
+        };
+        for size in [16, PREVIEW_INLINE_BYTES + 128] {
+            let payload = vec![42; size];
+            let batch = RecordBatch::try_from_iter([(
+                "payload",
+                Arc::new(BinaryArray::from_vec(vec![payload.as_slice()]))
+                    as crate::arrow::array::ArrayRef,
+            )])
+            .unwrap();
+            let into_error = |error: Error| anyhow::anyhow!(error.message);
+            let mut capture = Capture::preview(&batch.schema()).map_err(into_error)?;
+            capture.write(&batch).map_err(into_error)?;
+            let captured = capture.finish().map_err(into_error)?;
+            let len = captured.len();
+            let mut body: Box<dyn std::io::Read> = match (size, captured) {
+                (16, Captured::Memory(bytes)) => Box::new(std::io::Cursor::new(bytes)),
+                (_, Captured::File { file, .. }) if size > PREVIEW_INLINE_BYTES => {
+                    assert_eq!(file.as_file().metadata().unwrap().len(), len);
+                    Box::new(file.reopen().unwrap())
+                }
+                _ => panic!("preview used the wrong storage"),
+            };
+            let mut reader = StreamReader::try_new(&mut body, None).unwrap();
+            assert_eq!(reader.next().unwrap().unwrap(), batch);
+            assert!(reader.next().is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_download_making_progress_still_releases_its_slot_at_the_total_deadline() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let chunks = futures::stream::repeat_with(|| {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"a"))
+        })
+        .then(|chunk| async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            chunk
+        });
+        let mut stream = download_stream(
+            chunks,
+            permit,
+            Duration::from_secs(5),
+            Duration::from_millis(40),
+        )
+        .into_data_stream();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = stream.next().await {
+                if chunk.is_err() {
+                    assert!(slots.acquire().await.is_ok());
+                    return;
+                }
+            }
+            panic!("download ended without a timeout");
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn download_progress_extends_deadline_and_unpolled_body_releases_permit()
@@ -515,8 +685,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(120)).await;
             Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"a"))
         });
-        let mut stream =
-            download_stream(chunks, permit, Duration::from_millis(350)).into_data_stream();
+        let mut stream = download_stream(
+            chunks,
+            permit,
+            Duration::from_millis(350),
+            Duration::from_secs(3),
+        )
+        .into_data_stream();
         for _ in 0..4 {
             assert_eq!(
                 stream.next().await.unwrap()?,
@@ -529,8 +704,13 @@ mod tests {
         let permit = slots.clone().acquire_owned().await.unwrap();
         let blocked =
             futures::stream::pending::<std::result::Result<bytes::Bytes, std::io::Error>>();
-        let mut stream =
-            download_stream(blocked, permit, Duration::from_millis(25)).into_data_stream();
+        let mut stream = download_stream(
+            blocked,
+            permit,
+            Duration::from_millis(25),
+            Duration::from_secs(3),
+        )
+        .into_data_stream();
         let released = tokio::time::timeout(Duration::from_secs(2), slots.acquire())
             .await
             .unwrap()

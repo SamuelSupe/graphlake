@@ -33,6 +33,7 @@ pub(in crate::admin) async fn serve(app: Arc<App>, listener: TcpListener) -> Res
     BoltServer::builder(backend.clone())
         .auth(backend)
         .max_sessions(16)
+        .max_pending_sessions(16)
         .max_unauthenticated_message_size(4096)
         .max_message_size(256 * 1024)
         .handshake_timeout(Duration::from_secs(5))
@@ -122,7 +123,7 @@ fn mode(extra: &BoltDict) -> Result<(), BoltError> {
 impl AuthValidator for Backend {
     async fn session_allowed(&self) -> bool {
         match &self.app.ha {
-            Some(ha) => !ha.recovery_pending() && ha.leader.confirm().await.is_ok(),
+            Some(ha) => !ha.recovery_pending() && ha.leader.eligible(),
             None => !self.app.shutdown.is_cancelled(),
         }
     }
@@ -133,7 +134,7 @@ impl AuthValidator for Backend {
 
     async fn validate(&self, input: &AuthCredentials) -> Result<AuthInfo, BoltError> {
         if let Some(ha) = &self.app.ha {
-            ha.leader.confirm().await.map_err(query_error)?;
+            ha.leader.admission().map_err(query_error)?;
         }
         let name = input.principal.as_deref().unwrap_or_default();
         let credential = (input.scheme == "basic")

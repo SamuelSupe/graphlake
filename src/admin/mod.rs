@@ -72,9 +72,11 @@ struct App {
     explore_recovery: Arc<Semaphore>,
     explorations: Mutex<query::Sessions>,
     metadata_work: Semaphore,
+    schema_work: Semaphore,
     model_probes: Semaphore,
     export_work: Arc<Semaphore>,
     download_work: Arc<Semaphore>,
+    download_owners: Arc<Mutex<Vec<access::Principal>>>,
     download_waiters: Semaphore,
     downloads: Mutex<VecDeque<query::Download>>,
     results: Mutex<VecDeque<query::ResultSnapshot>>,
@@ -422,9 +424,11 @@ pub async fn serve_clustered_with_status(
         explore_recovery: Arc::new(Semaphore::new(2)),
         explorations: Mutex::new(explorations),
         metadata_work: Semaphore::new(4),
+        schema_work: Semaphore::new(1),
         model_probes: Semaphore::new(2),
         export_work: Arc::new(Semaphore::new(1)),
-        download_work: Arc::new(Semaphore::new(1)),
+        download_work: Arc::new(Semaphore::new(2)),
+        download_owners: Arc::default(),
         download_waiters: Semaphore::new(4),
         downloads: Mutex::default(),
         results: Mutex::default(),
@@ -462,6 +466,7 @@ pub async fn serve_clustered_with_status(
     tokio::spawn(local_tables::watch(Arc::downgrade(&app)));
     tokio::spawn(local_tables::managed::watch(Arc::downgrade(&app)));
     tokio::spawn(cluster::csr::watch(Arc::downgrade(&app)));
+    tokio::spawn(query::download::expire_results(Arc::downgrade(&app)));
     let api = Router::new()
         .route("/v1/models/{id}/local-tables", get(local_tables::list).post(local_tables::create))
         .route("/v1/models/{id}/local-tables/{name}", axum::routing::put(local_tables::schedule))

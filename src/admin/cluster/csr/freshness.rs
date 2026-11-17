@@ -21,6 +21,10 @@ pub(in crate::admin) struct RefreshStatus {
     attempted_at_ms: u64,
     status: &'static str,
     error: Option<&'static str>,
+    #[serde(skip)]
+    revision: String,
+    #[serde(skip)]
+    failures: u32,
 }
 
 pub(super) async fn refresh_model(
@@ -36,26 +40,40 @@ pub(super) async fn refresh_model(
         .ok_or_else(Error::not_found)?;
     let _slot = cluster.csr_work.try_acquire().map_err(|_| Error::busy())?;
     let attempted_at_ms = now();
-    cluster.csr_refresh.lock().unwrap().insert(
-        model.into(),
-        RefreshStatus {
-            attempted_at_ms,
-            status: "building",
-            error: None,
-        },
-    );
+    let revision = request.model_revision.clone();
+    let failures = {
+        let mut status = cluster.csr_refresh.lock().unwrap();
+        let previous = status
+            .get(model)
+            .filter(|s| s.revision == revision)
+            .map_or(0, |s| s.failures);
+        status.insert(
+            model.into(),
+            RefreshStatus {
+                attempted_at_ms,
+                status: "building",
+                error: None,
+                revision: revision.clone(),
+                failures: previous,
+            },
+        );
+        previous
+    };
     let result = build_and_publish(app, model, principal, request).await;
-    let status = match &result {
-        Ok(_) => RefreshStatus {
-            attempted_at_ms,
-            status: "succeeded",
-            error: None,
+    let (status, error, failures) = match &result {
+        Ok(_) => ("succeeded", None, 0),
+        Err(error) => ("failed", Some(error.code), failures.saturating_add(1)),
+    };
+    let status = RefreshStatus {
+        attempted_at_ms: if error.is_some() {
+            now()
+        } else {
+            attempted_at_ms
         },
-        Err(error) => RefreshStatus {
-            attempted_at_ms: now(),
-            status: "failed",
-            error: Some(error.code),
-        },
+        status,
+        error,
+        revision,
+        failures,
     };
     cluster
         .csr_refresh
@@ -65,7 +83,7 @@ pub(super) async fn refresh_model(
     result
 }
 
-async fn current(app: &App, model: &str, revision: &str) -> ApiResult<Option<Manifest>> {
+async fn current(app: &App, model: &str, revision: &str) -> ApiResult<Option<Arc<Manifest>>> {
     let Some(cluster) = app.cluster.as_ref().filter(|c| c.graph_partitions > 0) else {
         return Ok(None);
     };
@@ -159,7 +177,10 @@ pub(in crate::admin) async fn watch(app: Weak<App>) {
                 .unwrap()
                 .get(&model)
                 .is_some_and(|s| {
-                    s.status == "failed" && now().saturating_sub(s.attempted_at_ms) < 30_000
+                    s.revision == revision
+                        && s.status == "failed"
+                        && now().saturating_sub(s.attempted_at_ms)
+                            < 30_000 * (1 << s.failures.saturating_sub(1).min(5))
                 })
             {
                 continue;

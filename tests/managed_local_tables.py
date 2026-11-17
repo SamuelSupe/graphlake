@@ -44,13 +44,16 @@ class Hold:
 
 
 @contextmanager
-def proxy(upstream, rules, *, offline=None):
+def proxy(upstream, rules, *, offline=None, reject=None):
     dest = urlsplit(upstream)
 
     class Handler(BaseHTTPRequestHandler):
         def handle_request(self):
             if offline is not None and offline.is_set():
                 self.close_connection = True
+                return
+            if reject is not None and reject(self.command, self.path):
+                self.send_error(403)
                 return
             data = self.rfile.read(int(self.headers.get('Content-Length', 0)))
             held = next((rule for rule in rules if rule.take(self.command, self.path, data)), None)
@@ -179,8 +182,17 @@ def exercise(args, root, dsn, relation):
     export_hold = []
     writes = []
     s3 = os.environ['AWS_ENDPOINT']
+    failure = {'write_prefix': None, 'read_paths': set()}
+
+    def reject_sync(method, path):
+        path = urlsplit(path).path
+        return ((method == 'PUT' and failure['write_prefix'] is not None
+                 and path.startswith(failure['write_prefix']))
+                or (method == 'GET' and path in failure['read_paths']))
+
     with Site(args, root / 'origin', dsn) as original, Site(args, root / 'standby', dsn) as standby, \
-         proxy(args.etcd, writes) as old_etcd, proxy(s3, worker_hold) as worker_s3, proxy(s3, export_hold) as export_s3:
+         proxy(args.etcd, writes) as old_etcd, proxy(s3, worker_hold) as worker_s3, \
+         proxy(s3, export_hold) as export_s3, proxy(s3, [], reject=reject_sync) as sync_s3:
         config = original.config.read_text()
         cluster = config.splitlines()[0].split(': ')[1]
         storage = urlsplit(config.splitlines()[2].split(': ', 1)[1]).path.strip('/')
@@ -206,7 +218,7 @@ edges:
   Grant: {{source: input.public.{relation}, key: [id], from: {{node: Account, columns: [id]}}, to: {{node: Account, columns: [target]}}}}
 '''
         (original.root / 'accounts.yaml').write_text(yaml)
-        old_coordinator = original.coordinator('original')
+        old_coordinator = original.coordinator('original', AWS_ENDPOINT=sync_s3)
         original.login()
         draft = ok(original.call(MODEL))
         local = ok(original.call(MODEL + '/local-tables', {
@@ -223,6 +235,25 @@ edges:
         assert before['generation'] == first
         prefix = objectroot + '/' + table + '/'
         old_parts = data_keys(args, prefix + before['upload'])
+        failure['write_prefix'] = '/' + args.bucket + '/' + prefix
+        try:
+            failed = original.load('full', wait=False)
+
+            def finished_failure():
+                last = original.table()['history'][0]
+                return last if last['id'] == failed['id'] and last['status'] != 'running' else None
+
+            assert until(finished_failure)['status'] == 'failed'
+        finally:
+            failure['write_prefix'] = None
+        assert value(lookup(args, state_key)[0])['head'] == before
+        failure['read_paths'] = {'/' + args.bucket + '/' + key for key in old_parts}
+        try:
+            assert original.load()['total_rows'] == 3
+        finally:
+            failure['read_paths'] = set()
+        assert value(lookup(args, state_key)[0])['head'] == before
+        print(json.dumps({'failed_upload_retried_without_downloading_committed_parts': True}), flush=True)
         original_yaml = yaml.replace('nodes:', f"  replica: {{type: parquet, tables: {{accounts: ['{location}']}}}}\nnodes:")
         original_yaml = original_yaml.replace('source: input.public.' + relation, 'source: replica.accounts')
         version = ok(original.call(MODEL, {'yaml': original_yaml}, method='PUT', match=draft['revision']))

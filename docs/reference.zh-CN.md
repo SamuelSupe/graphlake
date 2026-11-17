@@ -562,7 +562,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml \
 - 投影版 PageRank 按出边权重分配质量，弱连通分量忽略方向和权重。两者分别输出 `__graphlake_rank` 和 `__graphlake_component`。
 - `analyze --edge Transfer --direction undirected label-propagation` 按投影方向和边权传播社区标签，支持 `--max-iterations`，输出 `__graphlake_community`。
 - Louvain 和 Leiden 按无向图优化加权模块度，零权边不参与优化。支持 `--resolution`、`--max-iterations` 和 `--seed`，输出 `__graphlake_community`。社区编号是当前投影中的标识。社区计算在迭代、局部移动、细化和聚合时检查取消和超时。仓库保留 `leiden-rs` 0.8.1 的源码与许可证，提供协作取消入口。
-- Node2Vec 采用由 `--return-bias` 和 `--explore-bias` 控制的二阶随机游走，并用负采样训练 Skip-gram。输出定长 Float32 向量 `__graphlake_embedding`，种子和训练参数可配置。无训练上下文的节点保留种子初始化的向量。
+- Node2Vec 采用由 `--return-bias` 和 `--explore-bias` 控制的二阶随机游走，并用负采样训练 Skip-gram。输出定长 Float32 向量 `__graphlake_embedding`，种子和训练参数可配置，维度上限为 1024。无训练上下文的节点保留种子初始化的向量。
 
 `--weight` 指定所有选中边标签共享的映射字段，须为非空、有限数值，省略时为单位权重。负权只用于 Bellman–Ford、Johnson 和 DAG 最长路。PageRank、社区检测和 Node2Vec 使用 Float64 权重。方向可设为 `outgoing`、`incoming` 或 `undirected`。多标签和加权算法在查询内按内存预算构建拓扑。路径查询保留用于输出的边文本键。弱连通分量和社区检测直接使用边端点和权重。普通单表标签只投影业务键、端点、权重和过滤所需的列，多表和 SCD2 标签保留判定冲突所需的属性。
 

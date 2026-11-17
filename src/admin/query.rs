@@ -500,7 +500,7 @@ pub(super) async fn preview(
             options.spill_bytes,
         )?)
     } else {
-        download::Capture::new(&result.batches.schema(), 16 * 1024 * 1024).ok()
+        download::Capture::preview(&result.batches.schema()).ok()
     };
     let mut page = ResultPage {
         model_revision: request.model_revision.clone(),

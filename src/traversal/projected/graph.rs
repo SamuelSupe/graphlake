@@ -41,6 +41,7 @@ pub(super) struct Link {
     pub(super) weight: f64,
 }
 
+#[derive(Default)]
 pub(super) struct Graph {
     pub(super) vertices: Vec<Identity>,
     pub(super) links: Vec<Link>,

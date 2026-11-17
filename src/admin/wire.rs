@@ -37,6 +37,7 @@ pub(super) struct Access {
     pub(super) model: String,
     sockets: tokio::sync::Semaphore,
     pending_sockets: Arc<tokio::sync::Semaphore>,
+    expedited_socket: Arc<tokio::sync::Semaphore>,
 }
 
 impl Access {
@@ -49,6 +50,7 @@ impl Access {
             model,
             sockets: tokio::sync::Semaphore::new(16),
             pending_sockets: Arc::new(tokio::sync::Semaphore::new(16)),
+            expedited_socket: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 }
@@ -107,6 +109,7 @@ struct Rows {
     _managed: Option<Arc<super::local_tables::managed::Selection>>,
     batch: Option<RecordBatch>,
     offset: usize,
+    prefetched_paths: entities::Hydrated,
     finished: bool,
     columns: Vec<String>,
     revision: String,
@@ -309,6 +312,7 @@ async fn execute_inner(
         _managed: managed,
         batch: None,
         offset: 0,
+        prefetched_paths: Default::default(),
         finished: false,
         columns,
         revision,
@@ -388,6 +392,22 @@ impl Rows {
             }
         }
         let batch = self.batch.as_ref().unwrap();
+        const PATH_BATCH: usize = 16;
+        if self.offset % PATH_BATCH == 0 {
+            self.prefetched_paths.clear();
+            let end = (self.offset + PATH_BATCH).min(batch.num_rows());
+            if end - self.offset > 1 {
+                // Large or malformed paths still get the usual per-row limit/diagnostic.
+                self.prefetched_paths = entities::prefetch_paths(
+                    &self.engine.catalog,
+                    &mut self.result,
+                    batch,
+                    self.offset..end,
+                )
+                .await
+                .unwrap_or_default();
+            }
+        }
         let mut budget = ROW_BYTES;
         let values = if let Some((label, node)) = self.result.graph_output.row_entity.clone() {
             vec![
@@ -416,6 +436,7 @@ impl Rows {
                         shape.as_ref(),
                         variant,
                         &mut budget,
+                        &self.prefetched_paths,
                     )
                     .await?,
                 );

@@ -294,19 +294,6 @@ impl Records {
         }
     }
 
-    async fn record(
-        &mut self,
-        objects: &Objects,
-        prefix: &Key,
-        id: u64,
-        value: &[u8],
-    ) -> Result<()> {
-        if self.should_flush(value.len(), BLOCK_BYTES) {
-            self.flush(objects, prefix).await?;
-        }
-        self.append(id, value)
-    }
-
     fn should_flush(&self, size: usize, limit: usize) -> bool {
         !self.pending.is_empty() && self.pending.len() + size + 12 > limit
     }
@@ -359,6 +346,27 @@ impl Records {
             )
             .await?,
         );
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        objects: &Objects,
+        prefix: &Key,
+        blocks: Vec<(u64, u64, Vec<u8>)>,
+    ) -> Result<()> {
+        use futures::{StreamExt, TryStreamExt};
+        let offset = self.blocks.len();
+        let mut writes = futures::stream::iter(blocks.into_iter().enumerate().map(
+            |(i, (first, last, bytes))| {
+                let key = prefix.clone().join((offset + i).to_string());
+                async move { write_block_data(objects, &key, first, last, bytes, true).await }
+            },
+        ))
+        .buffered(2);
+        while let Some(block) = writes.try_next().await? {
+            self.blocks.push(block);
+        }
         Ok(())
     }
 
@@ -564,6 +572,7 @@ pub(super) async fn build(
         .await?;
     let mut previous = None;
     while let Some(batch) = rows.try_next().await? {
+        scope.check()?;
         let ids = batch
             .column(0)
             .as_any()
@@ -574,6 +583,8 @@ pub(super) async fn build(
             .as_any()
             .downcast_ref::<datafusion::arrow::array::BinaryArray>()
             .context("invalid CSR vertex values")?;
+        let mut ready = vec![Vec::new(); partitions];
+        let block_budget = reservation.new_empty();
         for (row, id) in ids.values().iter().copied().enumerate() {
             ensure!(
                 !ids.is_null(row) && previous != Some(id),
@@ -581,24 +592,37 @@ pub(super) async fn build(
             );
             previous = Some(id);
             let shard = partition(id, partitions);
-            vertex_files[shard]
-                .record(
-                    objects,
-                    &prefix.clone().join(format!("v-{shard}")),
-                    id,
-                    values.value(row),
-                )
-                .await?;
+            if let Some(block) = vertex_files[shard].queue(id, values.value(row), BLOCK_BYTES)? {
+                block_budget.try_grow(block.2.len())?;
+                ready[shard].push(block);
+            }
             manifest.vertices += 1;
         }
+        futures::stream::iter(vertex_files.iter_mut().zip(ready).enumerate().filter_map(
+            |(id, (file, blocks))| (!blocks.is_empty()).then_some(Ok((id, file, blocks))),
+        ))
+        .try_for_each_concurrent(2, |(id, file, blocks)| async move {
+            file.write_batch(objects, &prefix.clone().join(format!("v-{id}")), blocks)
+                .await
+        })
+        .await?;
     }
     drop(rows);
     drop(reservation);
-    for (id, mut file) in vertex_files.into_iter().enumerate() {
+    futures::stream::iter(
+        vertex_files
+            .into_iter()
+            .zip(&mut manifest.partitions)
+            .enumerate()
+            .map(Ok),
+    )
+    .try_for_each_concurrent(2, |(id, (mut file, partition))| async move {
         file.flush(objects, &prefix.clone().join(format!("v-{id}")))
             .await?;
-        manifest.partitions[id].vertices = file.blocks;
-    }
+        partition.vertices = file.blocks;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?;
 
     let mut adjacency = (0..partitions)
         .map(|_| ArcRuns::new(scope))
@@ -726,7 +750,7 @@ pub(super) async fn build(
                     if let Some(block) = edges.queue(id, &record, BLOCK_BYTES)? {
                         ready.push(block);
                     }
-                    if let Some(block) = identities.queue(id, key.data(), 32 * 1024)? {
+                    if let Some(block) = identities.queue(id, key.data(), BLOCK_BYTES)? {
                         identity_blocks.push(block);
                     }
                     adjacency[partition(from, partitions)].push(
@@ -752,14 +776,10 @@ pub(super) async fn build(
                 }
                 (ready, identity_blocks)
             };
-            for (first, last, bytes) in ready {
-                edges.write(objects, &edge_path, first, last, bytes).await?;
-            }
-            for (first, last, bytes) in identity_blocks {
-                identities
-                    .write(objects, &identity_path, first, last, bytes)
-                    .await?;
-            }
+            tokio::try_join!(
+                edges.write_batch(objects, &edge_path, ready),
+                identities.write_batch(objects, &identity_path, identity_blocks),
+            )?;
         }
         identities.flush(objects, &identity_path).await?;
         manifest
@@ -771,15 +791,21 @@ pub(super) async fn build(
     }
     edges.flush(objects, &edge_path).await?;
     manifest.edge_keys = edges.blocks;
-    for (shard, runs) in adjacency.into_iter().enumerate() {
-        runs.publish(
-            scope,
-            objects,
-            prefix,
-            shard,
-            &mut manifest.partitions[shard],
-        )
-        .await?;
+    {
+        use futures::{StreamExt, TryStreamExt};
+        let shards = adjacency
+            .into_iter()
+            .zip(std::mem::take(&mut manifest.partitions))
+            .enumerate();
+        manifest.partitions =
+            futures::stream::iter(shards.map(|(shard, (runs, mut partition))| async move {
+                runs.publish(scope, objects, prefix, shard, &mut partition)
+                    .await?;
+                Ok::<_, anyhow::Error>(partition)
+            }))
+            .buffered(2)
+            .try_collect()
+            .await?;
     }
     manifest.bytes = manifest
         .edge_keys
@@ -930,6 +956,7 @@ struct SnapshotWriter {
     schema: Arc<Schema>,
     writer: StreamWriter<Vec<u8>>,
     blocks: Vec<Block>,
+    uploads: futures::stream::FuturesOrdered<futures::future::BoxFuture<'static, Result<Block>>>,
     first: u64,
     end: u64,
     ids: Option<[String; 2]>,
@@ -978,6 +1005,7 @@ impl SnapshotWriter {
             writer: Self::writer(&schema)?,
             schema,
             blocks: Vec::new(),
+            uploads: Default::default(),
             first,
             end: first,
             ids: None,
@@ -1078,16 +1106,8 @@ impl SnapshotWriter {
                 bytes.len() <= 2 * BLOCK_BYTES,
                 "CSR property batch exceeds block size"
             );
-            let mut block = write_block(
-                objects,
-                &self.prefix.clone().join(self.blocks.len().to_string()),
-                self.first,
-                self.end - 1,
-                bytes,
-            )
-            .await?;
-            block.ids = Some(ids);
-            block.numbers = bounds::finish(&mut self.numbers);
+            let numbers = bounds::finish(&mut self.numbers);
+            let mut columns = Vec::new();
             if let Some((_, file)) = &mut self.filter_file {
                 let first = self
                     .column_batches
@@ -1106,7 +1126,7 @@ impl SnapshotWriter {
                     let bytes = writer.into_inner()?;
                     use std::io::Write;
                     file.write_all(&bytes)?;
-                    block.columns.push(ColumnPage {
+                    columns.push(ColumnPage {
                         bytes: bytes.len().try_into()?,
                         sha256: Sha256::digest(&bytes).into(),
                     });
@@ -1114,7 +1134,26 @@ impl SnapshotWriter {
                 self.column_batches.clear();
             }
             self.column_memory.free();
-            self.blocks.push(block);
+            let queued = self.column_memory.new_empty();
+            queued.try_grow(bytes.len())?;
+            let key = self
+                .prefix
+                .clone()
+                .join((self.blocks.len() + self.uploads.len()).to_string());
+            let (first, last) = (self.first, self.end - 1);
+            let objects = objects.clone();
+            self.uploads.push_back(Box::pin(async move {
+                let _queued = queued;
+                let mut block = write_block(&objects, &key, first, last, bytes).await?;
+                block.ids = Some(ids);
+                block.numbers = numbers;
+                block.columns = columns;
+                Ok(block)
+            }));
+            if self.uploads.len() >= 2 {
+                self.blocks
+                    .push(self.uploads.try_next().await?.expect("queued CSR block"));
+            }
             self.first = self.end;
         }
         Ok(())
@@ -1122,6 +1161,9 @@ impl SnapshotWriter {
 
     async fn finish(mut self, objects: &Objects, scope: &QueryScope) -> Result<Vec<Block>> {
         self.flush(objects).await?;
+        while let Some(block) = self.uploads.try_next().await? {
+            self.blocks.push(block);
+        }
         if let Some((file, mut writer)) = self.filter_file {
             writer.finish()?;
             let size = file.size().context("CSR filter column file size")?;

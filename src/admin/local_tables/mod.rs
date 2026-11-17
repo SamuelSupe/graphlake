@@ -26,21 +26,42 @@ use crate::{CancellationToken, Catalog};
 use store::{Config, Mode, Run, Store, Table, View, now};
 
 pub(super) struct LocalTables {
+    workspace: Option<tempfile::TempDir>,
     pub(super) store: Mutex<Store>,
     running: Mutex<BTreeMap<String, CancellationToken>>,
     slots: Arc<Semaphore>,
-    workspace: Option<tempfile::TempDir>,
-    cached: Mutex<BTreeMap<Uuid, Uuid>>,
+    cached: Mutex<BTreeMap<Uuid, (Uuid, managed::WorkspaceVersion)>>,
     create_work: tokio::sync::Mutex<()>,
 }
 
 impl LocalTables {
     pub fn open(root: PathBuf, managed: bool) -> anyhow::Result<Self> {
+        let store = Store::open(root)?;
+        let workspace = if managed {
+            // The store lock excludes other writers using this data directory.
+            // A crash can leave behind uncommitted local copies of S3 snapshots.
+            let prefix = "managed-sync-";
+            for entry in std::fs::read_dir(&store.root)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir()
+                    && entry.file_name().to_string_lossy().starts_with(prefix)
+                {
+                    std::fs::remove_dir_all(entry.path())?;
+                }
+            }
+            Some(
+                tempfile::Builder::new()
+                    .prefix(prefix)
+                    .tempdir_in(&store.root)?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
-            store: Mutex::new(Store::open(root)?),
+            workspace,
+            store: Mutex::new(store),
             running: Mutex::default(),
             slots: Arc::new(Semaphore::new(2)),
-            workspace: managed.then(tempfile::tempdir).transpose()?,
             cached: Mutex::default(),
             create_work: tokio::sync::Mutex::new(()),
         })
@@ -352,6 +373,9 @@ fn start(app: &Arc<App>, key: String, mode: Option<Mode>, scheduled: bool) -> Ap
             ..app.options.clone()
         };
         let result = load::run(&table, &path, mode, options, &app.admission).await;
+        if result.is_ok() {
+            crate::blocking(|| load::clean_parts(&path));
+        }
         let mut store = app.local_tables.store.lock().unwrap();
         if let Some(mut current) = store.tables.get(&key).cloned() {
             record_result(&mut current, result, cancel.is_cancelled());

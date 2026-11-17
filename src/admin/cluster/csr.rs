@@ -77,7 +77,7 @@ impl ExplorationSnapshot {
         Ok(Self {
             prefix: objects.graph(model, revision, generation),
             objects,
-            manifest: Arc::new(manifest),
+            manifest,
         })
     }
 
@@ -174,7 +174,7 @@ struct Version {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Manifest {
+pub(super) struct Manifest {
     format: u32,
     generation: Uuid,
     model_revision: String,
@@ -480,24 +480,53 @@ impl Manifest {
     }
 }
 
+type ManifestCell = Arc<tokio::sync::OnceCell<Arc<Manifest>>>;
+
+pub(super) type ManifestCache = std::sync::Mutex<std::collections::VecDeque<(Key, ManifestCell)>>;
+
 async fn manifest(
     objects: &Objects,
     model: &str,
     revision: &str,
     generation: Uuid,
-) -> Result<Manifest> {
-    let prefix = objects.graph(model, revision, generation);
-    let manifest: Manifest = objects
-        .get_json(&prefix.join("manifest.json"), MANIFEST_LIMIT)
+) -> Result<Arc<Manifest>> {
+    let key = objects
+        .graph(model, revision, generation)
+        .join("manifest.json");
+    // Coalesce misses for the same immutable generation without blocking other models.
+    let cell = {
+        let mut cache = objects.csr_manifests.lock().unwrap();
+        let entry = cache
+            .iter()
+            .position(|(cached, _)| *cached == key)
+            .and_then(|index| cache.remove(index))
+            .unwrap_or_else(|| (key.clone(), Arc::default()));
+        let cell = entry.1.clone();
+        cache.push_front(entry);
+        cache.truncate(2);
+        cell
+    };
+    let manifest = cell
+        .get_or_try_init(|| async {
+            let object = objects.get(&key).await?;
+            ensure!(
+                object.meta.size <= MANIFEST_LIMIT,
+                "CSR manifest is too large"
+            );
+            let bytes = object.bytes().await?;
+            let manifest: Manifest =
+                tokio::task::spawn_blocking(move || serde_json::from_slice(&bytes)).await??;
+            ensure!(
+                matches!(manifest.format, 2..=5)
+                    && manifest.generation == generation
+                    && manifest.model_revision == revision
+                    && (2..=8).contains(&manifest.partitions.len()),
+                "invalid CSR manifest"
+            );
+            Ok::<_, anyhow::Error>(Arc::new(manifest))
+        })
         .await?;
-    ensure!(
-        matches!(manifest.format, 2..=5)
-            && manifest.generation == generation
-            && manifest.model_revision == revision
-            && (2..=8).contains(&manifest.partitions.len()),
-        "invalid CSR manifest"
-    );
-    Ok(manifest)
+    Ok(manifest.clone())
 }
 
 fn encode_schema(schema: &Schema) -> Result<String> {

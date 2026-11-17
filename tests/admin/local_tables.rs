@@ -1335,6 +1335,30 @@ async fn local_tables_indexed_keys_compact_keep_pinned_readers_and_recover() -> 
         assert!(redundant["committed_generation"].is_null());
         assert_eq!(fs::read(path)?, before);
 
+        if name == "uuid" {
+            db.execute(
+                "UPDATE accounts SET name='wide-delta' WHERE version BETWEEN 1000 AND 2200",
+                [],
+            )?;
+            db.execute(
+                "UPDATE accounts SET version=version+5000 WHERE name='wide-delta'",
+                [],
+            )?;
+            let loaded = load(&server, name, "incremental").await?;
+            assert_eq!(loaded["status"], "succeeded", "{loaded}");
+            assert!(loaded["loaded_rows"].as_u64().unwrap() > 1024);
+            let manifest: Value = serde_json::from_slice(&fs::read(path)?[6..])?;
+            assert_eq!(manifest["parts"][0]["id"], base_id);
+            // Leave the remainder of this test on a fresh checkpoint.
+            db.execute(
+                "UPDATE accounts SET version=version-5000 WHERE name='wide-delta'",
+                [],
+            )?;
+            load(&server, name, "full").await?;
+        }
+        let snapshot: Value = serde_json::from_slice(&fs::read(path)?[6..])?;
+        let base_id = snapshot["parts"][0]["id"].clone();
+
         let mapping = root.path().join(format!("{name}-replica.yaml"));
         fs::write(
             &mapping,

@@ -414,6 +414,7 @@ pub(in crate::admin) struct Objects {
     remote: bool,
     bucket: Option<String>,
     pub(super) prefix: Key,
+    pub(super) csr_manifests: Arc<super::csr::ManifestCache>,
 }
 
 impl Objects {
@@ -455,6 +456,7 @@ impl Objects {
                 .and_then(|uri| uri.split('/').next())
                 .map(str::to_owned),
             prefix: prefix.join("graphlake-v1").join(cluster),
+            csr_manifests: Default::default(),
         })
     }
 
@@ -644,7 +646,13 @@ impl Objects {
     }
 
     pub async fn put_arrow(&self, key: &Key, arrow: Captured) -> Result<()> {
-        self.put_file(key, arrow.file.path(), arrow.length).await
+        match arrow {
+            Captured::Memory(bytes) => {
+                self.store.put(key, bytes.into()).await?;
+                Ok(())
+            }
+            Captured::File { file, length } => self.put_file(key, file.path(), length).await,
+        }
     }
 
     pub async fn put_file(&self, key: &Key, path: &Path, length: u64) -> Result<()> {

@@ -1,7 +1,7 @@
 mod batch;
 pub(crate) use batch::{Batch, SINGLE_KEY_PAGE};
 mod lookup;
-mod replay;
+pub(crate) mod replay;
 pub(crate) use lookup::Lookup;
 pub(super) use lookup::scalar_projection;
 
@@ -236,7 +236,8 @@ impl Apply {
                         let _nested_budget;
                         let mut inner = if replay {
                             if replay_plan.is_none() {
-                                replay_plan = Some(replay::Plan::new(context, &inner).await?);
+                                replay_plan =
+                                    Some(replay::Plan::new(context, &inner, seed.clone()).await?);
                             }
                             replay_plan.as_ref().unwrap().execute(input)?
                         } else {

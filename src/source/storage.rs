@@ -9,22 +9,28 @@ use object_store::{
     ObjectStore,
     aws::{AmazonS3Builder, AmazonS3ConfigKey},
     azure::MicrosoftAzureBuilder,
-    gcp::GoogleCloudStorageBuilder,
+    gcp::{GoogleCloudStorageBuilder, GoogleConfigKey},
     path::Path,
 };
 
 use crate::StorageConfig;
 use sha2::{Digest, Sha256};
 
-type S3Connection = (String, [u8; 32], Instant, Arc<dyn ObjectStore>);
+type Connection = ([u8; 32], Instant, Arc<dyn ObjectStore>);
 
-pub(super) fn s3_from_env(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
-    static CONNECTIONS: OnceLock<Mutex<VecDeque<S3Connection>>> = OnceLock::new();
+fn cached(
+    config: &[u8],
+    include_env: impl Fn(&std::ffi::OsStr) -> bool,
+    connect: impl FnOnce() -> Result<Arc<dyn ObjectStore>>,
+) -> Result<Arc<dyn ObjectStore>> {
+    static CONNECTIONS: OnceLock<Mutex<VecDeque<Connection>>> = OnceLock::new();
     let mut settings = std::env::vars_os()
-        .filter(|(key, _)| key.as_encoded_bytes().starts_with(b"AWS_"))
+        .filter(|(key, _)| include_env(key))
         .collect::<Vec<_>>();
     settings.sort_unstable();
     let mut fingerprint = Sha256::new();
+    fingerprint.update(config.len().to_le_bytes());
+    fingerprint.update(config);
     for (key, value) in settings {
         for part in [key.as_encoded_bytes(), value.as_encoded_bytes()] {
             fingerprint.update(part.len().to_le_bytes());
@@ -33,26 +39,36 @@ pub(super) fn s3_from_env(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     }
     let fingerprint: [u8; 32] = fingerprint.finalize().into();
     let mut connections = CONNECTIONS.get_or_init(Mutex::default).lock().unwrap();
-    connections.retain(|(_, _, opened, _)| opened.elapsed() < Duration::from_secs(300));
+    connections.retain(|(_, opened, _)| opened.elapsed() < Duration::from_secs(300));
     if let Some(index) = connections
         .iter()
-        .position(|(name, env, _, _)| name == bucket && env == &fingerprint)
+        .position(|(key, _, _)| key == &fingerprint)
     {
         let entry = connections.remove(index).expect("located S3 connection");
-        let store = entry.3.clone();
+        let store = entry.2.clone();
         connections.push_back(entry);
         return Ok(store);
     }
-    let store: Arc<dyn ObjectStore> = Arc::new(
-        AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .build()?,
-    );
+    let store = connect()?;
     if connections.len() == 32 {
         connections.pop_front();
     }
-    connections.push_back((bucket.into(), fingerprint, Instant::now(), store.clone()));
+    connections.push_back((fingerprint, Instant::now(), store.clone()));
     Ok(store)
+}
+
+pub(super) fn s3_from_env(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+    cached(
+        bucket.as_bytes(),
+        |key| key.as_encoded_bytes().starts_with(b"AWS_"),
+        || {
+            Ok(Arc::new(
+                AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .build()?,
+            ))
+        },
+    )
 }
 
 pub(crate) fn validate(config: &StorageConfig) -> Result<()> {
@@ -138,6 +154,71 @@ fn secret(name: &str) -> Result<String> {
 
 pub(crate) fn open(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
     validate(config)?;
+    let credentials = [
+        &config.access_key_env,
+        &config.secret_key_env,
+        &config.session_token_env,
+        &config.account_key_env,
+        &config.service_account_env,
+    ];
+    let file_credentials = if config.provider == "gcs" && config.service_account_env.is_none() {
+        let builder = GoogleCloudStorageBuilder::from_env();
+        match builder.get_config_value(&GoogleConfigKey::ServiceAccountKey) {
+            Some(_) => None,
+            None => {
+                let file = builder
+                    .get_config_value(&GoogleConfigKey::ServiceAccount)
+                    .or_else(|| builder.get_config_value(&GoogleConfigKey::ApplicationCredentials))
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        let (env, file) = if cfg!(windows) {
+                            ("APPDATA", "gcloud/application_default_credentials.json")
+                        } else {
+                            (
+                                "HOME",
+                                ".config/gcloud/application_default_credentials.json",
+                            )
+                        };
+                        std::env::var_os(env).map(|home| std::path::PathBuf::from(home).join(file))
+                    });
+                file.as_deref()
+                    .map(credential_digest)
+                    .transpose()?
+                    .flatten()
+            }
+        }
+    } else {
+        None
+    };
+    let settings = serde_json::to_vec(&(config, file_credentials))?;
+    cached(
+        &settings,
+        |key| {
+            let key_bytes = key.as_encoded_bytes();
+            [b"AWS_".as_slice(), b"AZURE_", b"GOOGLE_"]
+                .iter()
+                .any(|prefix| key_bytes.starts_with(prefix))
+                || (config.provider == "gcs" && key == "SERVICE_ACCOUNT")
+                || credentials
+                    .iter()
+                    .filter_map(|name| name.as_deref())
+                    .any(|name| key == name)
+        },
+        || connect(config),
+    )
+}
+
+fn credential_digest(path: &std::path::Path) -> Result<Option<[u8; 32]>> {
+    // GCS loads a credential file once when building a client. Rotating at the
+    // same path must change the key even if the old client has a live token.
+    match std::fs::read(path) {
+        Ok(contents) => Ok(Some(Sha256::digest(&contents).into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn connect(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
     Ok(match config.provider.as_str() {
         "azure" => {
             let mut builder = if config.account_key_env.is_some() {
@@ -215,4 +296,29 @@ pub(crate) fn open(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
             Arc::new(builder.build()?)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_file_rotation_replaces_the_cached_client() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let open = || {
+            let key =
+                serde_json::to_vec(&("credential_file_fixture", credential_digest(file.path())?))?;
+            cached(
+                &key,
+                |_| false,
+                || Ok(Arc::new(object_store::memory::InMemory::new())),
+            )
+        };
+        std::fs::write(file.path(), b"first")?;
+        let old = open()?;
+        assert!(Arc::ptr_eq(&old, &open()?));
+        std::fs::write(file.path(), b"other")?;
+        assert!(!Arc::ptr_eq(&old, &open()?));
+        Ok(())
+    }
 }

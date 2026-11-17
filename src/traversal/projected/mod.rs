@@ -285,8 +285,9 @@ pub(crate) async fn projection_table(
         return Buffer::new(&scope.runtime.memory_pool, None).finish_schema(schema);
     }
     let batch_size = scope.options.batch_size;
-    let graph_budget =
-        MemoryConsumer::new("GraphLake projected topology").register(&scope.runtime.memory_pool);
+    let graph_budget = Arc::new(
+        MemoryConsumer::new("GraphLake projected topology").register(&scope.runtime.memory_pool),
+    );
     let mut graph = Graph::read(
         catalog,
         projection,
@@ -302,7 +303,7 @@ pub(crate) async fn projection_table(
         },
     )
     .await?;
-    let working = graph_budget.new_empty();
+    let working = Arc::new(graph_budget.new_empty());
     let projection_ready_ms = scope.elapsed_ms();
     let (scores, mut metrics) = algorithm
         .run(&mut graph, scope, &working, &graph_budget)
@@ -485,8 +486,8 @@ impl ProjectionAlgorithm {
         self,
         graph: &mut Graph,
         scope: &Arc<QueryScope>,
-        budget: &MemoryReservation,
-        projected: &MemoryReservation,
+        budget: &Arc<MemoryReservation>,
+        projected: &Arc<MemoryReservation>,
     ) -> Result<(Scores, GraphAlgorithmMetrics)> {
         let name = match self {
             Self::PageRank { .. } => "pagerank",
@@ -584,7 +585,18 @@ impl ProjectionAlgorithm {
             Self::Node2Vec(options) => {
                 stats.workspace_bytes = Some(embedding::workspace(stats.vertices, options));
                 reserve_workspace(budget, scope, stats.workspace_bytes.unwrap(), &stats)?;
-                let values = embedding::train(graph, options, scope).await?;
+                let input = std::mem::take(graph);
+                let worker_scope = scope.clone();
+                let worker_memory = (projected.clone(), budget.clone());
+                let stop = crate::CancellationToken::new();
+                let _cancel_worker = stop.clone().drop_guard();
+                let (input, values) = tokio::task::spawn_blocking(move || {
+                    let _memory = worker_memory;
+                    let values = embedding::train(&input, options, &worker_scope, &stop)?;
+                    Ok::<_, anyhow::Error>((input, values))
+                })
+                .await??;
+                *graph = input;
                 stats.iterations = Some(options.epochs);
                 Scores::Embedding {
                     values,

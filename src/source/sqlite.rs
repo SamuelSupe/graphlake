@@ -246,14 +246,15 @@ impl Scan {
             let row = rows.next()?;
             let done = row.is_none();
             if let Some(row) = row {
+                let mut needed = self.schema.fields().len().saturating_mul(32);
+                for index in 0..self.schema.fields().len() {
+                    if let ValueRef::Text(bytes) | ValueRef::Blob(bytes) = row.get_ref(index)? {
+                        needed = needed.saturating_add(bytes.len().saturating_mul(2));
+                    }
+                }
+                raw.try_grow(needed)?;
                 for (index, field) in self.schema.fields().iter().enumerate() {
-                    let value = row.get_ref(index)?;
-                    let bytes = match value {
-                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
-                        _ => 0,
-                    };
-                    raw.try_grow(bytes.saturating_mul(2).saturating_add(32))?;
-                    columns[index].push(value, field)?;
+                    columns[index].push(row.get_ref(index)?, field)?;
                 }
                 count += 1;
             }

@@ -34,16 +34,21 @@ pub(in crate::admin) async fn upgrade(
     if headers.contains_key(header::ORIGIN) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Ok(pending) = Arc::clone(&access.pending_sockets).try_acquire_owned() else {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    let (pending, auth_time) = match access.pending_sockets.clone().try_acquire_owned() {
+        Ok(permit) => (permit, Duration::from_secs(5)),
+        Err(_) => match access.expedited_socket.clone().try_acquire_owned() {
+            Ok(permit) => (permit, Duration::from_millis(500)),
+            Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        },
     };
+    let auth_deadline = tokio::time::Instant::now() + auth_time;
     socket
         .max_message_size(256 * 1024)
         .max_frame_size(256 * 1024)
         .on_upgrade(move |socket| async move {
             tokio::select! {
                 _ = app.shutdown.cancelled() => {},
-                _ = serve(&app, socket, pending) => {},
+                _ = serve(&app, socket, pending, auth_deadline) => {},
             }
         })
 }
@@ -96,14 +101,18 @@ async fn receive(socket: &mut Input, wait: Duration) -> Option<Request> {
     .flatten()
 }
 
-async fn serve(app: &Arc<App>, socket: WebSocket, pending: tokio::sync::OwnedSemaphorePermit) {
+async fn serve(
+    app: &Arc<App>,
+    socket: WebSocket,
+    pending: tokio::sync::OwnedSemaphorePermit,
+    auth_deadline: tokio::time::Instant,
+) {
     use futures::StreamExt;
     let (mut output, mut input) = socket.split();
     let mut credential: Option<super::super::access::Credential> = None;
     let mut queued = std::collections::VecDeque::new();
     let mut pending = Some(pending);
     let mut _authenticated_slot = None;
-    let auth_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let request = if let Some(request) = queued.pop_front() {
             request
@@ -111,27 +120,37 @@ async fn serve(app: &Arc<App>, socket: WebSocket, pending: tokio::sync::OwnedSem
             let mut live = credential
                 .as_ref()
                 .map(|credential| credential.live.clone());
+            let wait = if credential.is_some() {
+                Duration::from_secs(60)
+            } else {
+                auth_deadline.saturating_duration_since(tokio::time::Instant::now())
+            };
             let Some(request) = (tokio::select! {
                 biased;
                 () = super::super::access::revoked(&mut live) => return,
-                request = receive(&mut input, Duration::from_secs(if credential.is_some() { 60 } else { 5 })) => request,
+                request = receive(&mut input, wait) => request,
             }) else {
                 return;
             };
             request
         };
         if credential.is_none() {
-            if !send(
-                &mut output,
-                request.id,
-                407,
-                "SASL PLAIN authentication required",
-                Vec::new(),
-                json!({}),
-                request.binary,
-            )
-            .await
-            {
+            if !matches!(
+                tokio::time::timeout_at(
+                    auth_deadline,
+                    send(
+                        &mut output,
+                        request.id,
+                        407,
+                        "SASL PLAIN authentication required",
+                        Vec::new(),
+                        json!({}),
+                        request.binary,
+                    )
+                )
+                .await,
+                Ok(true)
+            ) {
                 return;
             }
             credential = receive(
@@ -165,14 +184,17 @@ async fn serve(app: &Arc<App>, socket: WebSocket, pending: tokio::sync::OwnedSem
                 if credential.is_some() { 200 } else { 401 },
             );
             if credential.is_none() {
-                send(
-                    &mut output,
-                    request.id,
-                    401,
-                    "Invalid driver credentials",
-                    Vec::new(),
-                    json!({}),
-                    request.binary,
+                let _ = tokio::time::timeout_at(
+                    auth_deadline,
+                    send(
+                        &mut output,
+                        request.id,
+                        401,
+                        "Invalid driver credentials",
+                        Vec::new(),
+                        json!({}),
+                        request.binary,
+                    ),
                 )
                 .await;
                 return;
@@ -187,7 +209,7 @@ async fn serve(app: &Arc<App>, socket: WebSocket, pending: tokio::sync::OwnedSem
             _authenticated_slot = Some(slot);
         }
         if let Some(ha) = &app.ha
-            && ha.leader.confirm().await.is_err()
+            && (ha.recovery_pending() || !ha.leader.eligible())
         {
             return;
         }

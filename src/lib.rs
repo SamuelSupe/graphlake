@@ -35,3 +35,12 @@ pub use traversal::{
     GraphAlgorithmMetrics, GraphProjection, Node2VecOptions, ProjectionAlgorithm, RefreshReport,
     Route, RouteStrategy, Traversal, TraversalKind, TraversalStrategy, VertexKey,
 };
+
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}

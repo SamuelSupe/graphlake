@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use super::{Head, Managed};
+use crate::admin::local_tables::load::staging_file;
 use crate::source::parquet_snapshot::{self, RemoteFile, RemoteSnapshot, Snapshot};
 
 fn hex(hash: impl AsRef<[u8]>) -> String {
@@ -30,6 +31,35 @@ async fn hash(path: &Path) -> Result<(u64, String)> {
         hash.update(&bytes[..count]);
     }
     Ok((size, hex(hash.finalize())))
+}
+
+async fn verified_local(path: &Path, expected: &RemoteFile) -> Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_file() && meta.len() == expected.size => {
+            let (size, digest) = hash(path).await?;
+            Ok(size == expected.size && digest == expected.sha256)
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) async fn preserve_parquet_anchor(path: &Path) -> Result<()> {
+    let committed = path.with_extension("committed");
+    match tokio::fs::remove_file(&committed).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match tokio::fs::hard_link(path, &committed).await {
+        Ok(()) => {}
+        Err(error) if super::super::overlay::links_unavailable(&error) => {
+            tokio::fs::copy(path, &committed).await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 impl Managed {
@@ -175,15 +205,32 @@ impl Managed {
         tokio::fs::create_dir_all(directory).await?;
         if let Some(index) = &snapshot.snapshot {
             tokio::fs::create_dir_all(parquet_snapshot::parts_dir(path)).await?;
-            tokio::fs::File::create(parquet_snapshot::reader_lock(path)).await?;
-            for part in &index.parts {
-                self.download_file(table, &snapshot.files[&part.id], &part.path(path))
-                    .await?;
-            }
-            tokio::fs::write(path, index.encode()?).await?;
-        } else {
-            self.download_file(table, &snapshot.files[&Uuid::nil()], path)
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(parquet_snapshot::reader_lock(path))
                 .await?;
+            for part in &index.parts {
+                let path = part.path(path);
+                let expected = &snapshot.files[&part.id];
+                if !verified_local(&path, expected).await? {
+                    self.download_file(table, expected, &path).await?;
+                }
+            }
+            let staged = staging_file(directory)?;
+            tokio::fs::write(staged.path(), index.encode()?).await?;
+            staged.persist(path)?;
+        } else {
+            let expected = &snapshot.files[&Uuid::nil()];
+            if !verified_local(path, expected).await? {
+                let committed = path.with_extension("committed");
+                if verified_local(&committed, expected).await? {
+                    tokio::fs::rename(committed, path).await?;
+                } else {
+                    self.download_file(table, expected, path).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -198,7 +245,8 @@ impl Managed {
             "managed snapshot file version changed"
         );
         let mut stream = result.into_stream();
-        let mut out = tokio::fs::File::create(path).await?;
+        let staged = staging_file(path.parent().context("missing managed table directory")?)?;
+        let mut out = tokio::fs::File::from_std(staged.reopen()?);
         let mut sum = Sha256::new();
         let mut size = 0;
         while let Some(chunk) = stream.next().await {
@@ -216,6 +264,8 @@ impl Managed {
             "managed snapshot file checksum mismatch"
         );
         out.sync_all().await?;
+        drop(out);
+        staged.persist(path)?;
         Ok(())
     }
 }

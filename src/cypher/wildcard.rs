@@ -451,6 +451,11 @@ fn ranged(
         filters: Vec::new(),
         starts: Vec::new(),
         anchored: false,
+        start_variable: start.patterns[0]
+            .variable
+            .as_ref()
+            .map(|name| name.0.clone()),
+        start_seed: None,
         #[cfg(feature = "admin")]
         finishes,
     });

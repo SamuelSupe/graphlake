@@ -1,13 +1,14 @@
 import { t } from './locale.ts';
-import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { Box, Minus, Move, Plus, RotateCcw, Waypoints, X } from 'lucide-react';
 import { CanvasVertex } from './CanvasVertex';
 import { endpoint, type Model, type Selection } from './model';
-import { edgeCurve, pinOf, placeNodes, pointOf, pointOn, type CanvasLayout, type Curve, type Point } from './modelCanvasGeometry';
+import { canvasColumns, connectedNodeOrder, edgeCurve, pinOf, placeNodes, pointOf, pointOn, type CanvasLayout, type Curve, type Point } from './modelCanvasGeometry';
 import './modelCanvas.css';
 
 export type GraphSelection = Selection & { section: 'nodes' | 'edges' };
 export type CanvasConnection = { from?: string };
+export type CanvasView = { layout: CanvasLayout; zoom: number };
 type Editing = {
   enabled: boolean;
   positions: ReadonlyMap<string, Point>;
@@ -39,17 +40,18 @@ function drawCurve(context: CanvasRenderingContext2D, points: Curve, color: stri
   context.fill();
 }
 
-export default function GraphCanvas({ model, selected, select, editing }: {
+export default function GraphCanvas({ model, selected, select, editing, viewState }: {
   model: Pick<Model, 'nodes' | 'edges'>;
   selected?: Selection;
   select?: (selection: GraphSelection) => void;
   editing?: Editing;
+  viewState?: RefObject<CanvasView | undefined>;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const stage = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const [layout, setLayout] = useState<CanvasLayout>('spread');
-  const [zoom, setZoom] = useState(1);
+  const [layout, setLayout] = useState<CanvasLayout>(() => viewState?.current?.layout ?? 'spread');
+  const [zoom, setZoom] = useState(() => viewState?.current?.zoom ?? 1);
   const [size, setSize] = useState({ width: 600, height: 600 });
   const [moving, setMoving] = useState<{ name: string; point: Point }>();
   const [placeNode, setPlaceNode] = useState<string>();
@@ -62,10 +64,17 @@ export default function GraphCanvas({ model, selected, select, editing }: {
   const connection = enabled ? editing?.connection : undefined;
   const placing = enabled && !connection && placeNode && Object.hasOwn(model.nodes, placeNode) ? placeNode : undefined;
 
+  useLayoutEffect(() => {
+    if (viewState) viewState.current = { layout, zoom };
+  }, [viewState, layout, zoom]);
+
   useEffect(() => {
     const element = viewport.current;
     if (!element) return;
-    const observer = new ResizeObserver(() => setSize({ width: element.clientWidth, height: element.clientHeight }));
+    const observer = new ResizeObserver(() => {
+      const { clientWidth: width, clientHeight: height } = element;
+      setSize(previous => previous.width === width && previous.height === height ? previous : { width, height });
+    });
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
@@ -82,37 +91,52 @@ export default function GraphCanvas({ model, selected, select, editing }: {
     return () => cancelAnimationFrame(pointerFrame.current);
   }, [enabled, connection]);
 
-  const names = Object.keys(model.nodes);
+  const names = useMemo(() => Object.keys(model.nodes), [model.nodes]);
+  const links = useMemo(() => Object.entries(model.edges).map(([name, edge]) => ({
+    name, from: endpoint(edge.from).node, to: endpoint(edge.to).node,
+  })), [model.edges]);
+  const order = useMemo(() => layout === 'spread' ? connectedNodeOrder(names, links) : names, [names, links, layout]);
   const width = Math.max(264, size.width);
-  const columns = Math.max(2, Math.min(7, Math.floor(width / 145)));
+  const columns = canvasColumns(width);
   const height = Math.max(280, Math.ceil(names.length / columns) * 124 + 95, size.height);
-  const points = placeNodes(names, width, height, columns, layout);
-  for (const [name, pin] of editing?.positions ?? []) {
-    if (points.has(name)) points.set(name, pointOf(pin, width, height));
-  }
-  if (moving && enabled && !connection && points.has(moving.name)) points.set(moving.name, moving.point);
+  const positions = editing?.positions;
+  const movePreview = enabled && !connection ? moving : undefined;
+  const points = useMemo(() => {
+    const result = placeNodes(order, width, height, columns, layout);
+    for (const [name, pin] of positions ?? []) {
+      if (result.has(name)) result.set(name, pointOf(pin, width, height));
+    }
+    if (movePreview && result.has(movePreview.name)) result.set(movePreview.name, movePreview.point);
+    return result;
+  }, [order, width, height, columns, layout, positions, movePreview]);
 
-  const lanes = new Map<string, number>();
-  const curves: { name: string; points: Curve; labelBelow: boolean }[] = [];
-  for (const [name, edge] of Object.entries(model.edges)) {
-    const from = endpoint(edge.from).node;
-    const to = endpoint(edge.to).node;
-    const a = points.get(from);
-    const b = points.get(to);
-    if (!a || !b) continue;
-    const pair = JSON.stringify([from, to].sort());
-    const lane = lanes.get(pair) ?? 0;
-    lanes.set(pair, lane + 1);
-    const loop = from === to;
-    curves.push({ name, points: edgeCurve(a, b, height, lane, loop, from > to), labelBelow: loop && a[1] <= height / 2 });
-  }
+  const { lanes, curves } = useMemo(() => {
+    const lanes = new Map<string, number>();
+    const curves: { name: string; points: Curve; labelBelow: boolean; style: { left: number; top: number } }[] = [];
+    for (const { name, from, to } of links) {
+      const a = points.get(from);
+      const b = points.get(to);
+      if (!a || !b) continue;
+      const pair = JSON.stringify([from, to].sort());
+      const lane = lanes.get(pair) ?? 0;
+      lanes.set(pair, lane + 1);
+      const loop = from === to;
+      const curve = edgeCurve(a, b, height, lane, loop, from > to);
+      const labelBelow = loop && a[1] <= height / 2;
+      const [x, y] = pointOn(curve, .47);
+      curves.push({ name, points: curve, labelBelow, style: { left: x, top: labelBelow ? y + 5 : y - 5 } });
+    }
+    return { lanes, curves };
+  }, [links, points, height]);
   const from = connection?.from;
   const origin = from === undefined ? undefined : points.get(from);
   const target = previewTarget === undefined ? undefined : points.get(previewTarget);
   const destination = target ?? cursor;
-  const preview = origin && destination ? edgeCurve(origin, destination, height,
+  const preview = useMemo(() => origin && destination ? edgeCurve(origin, destination, height,
     target ? lanes.get(JSON.stringify([from, previewTarget].sort())) ?? 0 : 0,
-    from === previewTarget, !!previewTarget && from! > previewTarget, target ? undefined : 0) : undefined;
+    from === previewTarget, !!previewTarget && from! > previewTarget, target ? undefined : 0) : undefined,
+  [origin, destination, height, lanes, from, previewTarget, target]);
+  const selectedEdge = selected?.section === 'edges' ? selected.name : undefined;
 
   useLayoutEffect(() => {
     const surface = canvas.current;
@@ -126,11 +150,11 @@ export default function GraphCanvas({ model, selected, select, editing }: {
     context.setTransform(scale, 0, 0, scale, 0, 0);
     context.clearRect(0, 0, width, height);
     for (const curve of curves) {
-      const current = selected?.section === 'edges' && selected.name === curve.name;
+      const current = selectedEdge === curve.name;
       drawCurve(context, curve.points, current ? '#2457d7' : '#93a9ca', current ? 2.3 : 1.6);
     }
     if (preview) drawCurve(context, preview, '#2457d7', 2, true);
-  });
+  }, [width, height, curves, selectedEdge, preview]);
 
   function stagePoint(x: number, y: number): Point {
     const rect = stage.current?.getBoundingClientRect();
@@ -167,7 +191,7 @@ export default function GraphCanvas({ model, selected, select, editing }: {
     </div>}
     <span id={hint} className="sr-only">{t('可拖动，或按方向键移动节点。')}</span>
     <span className="sr-only" role="status">{moveMessage}</span>
-    <div className="canvas-frame"><div className="canvas-viewport" ref={viewport}>
+    <div className="canvas-frame"><div className="canvas-viewport" ref={viewport} tabIndex={0} role="region" aria-label={t('画布滚动区')}>
       {names.length ? <div ref={stage} className="graph-stage" style={{ width, height, zoom }} data-placing={!!placing || undefined} data-linking={!!connection || undefined}
         onClick={event => {
           if (!placing || event.target !== event.currentTarget) return;
@@ -186,16 +210,12 @@ export default function GraphCanvas({ model, selected, select, editing }: {
           setPreviewTarget(undefined);
         }}>
         <canvas ref={canvas} aria-hidden="true" style={{ width, height }} />
-        {curves.map(curve => {
-          const [x, y] = pointOn(curve.points, .47);
-          const style = { left: x, top: curve.labelBelow ? y + 5 : y - 5 };
-          return select ? <button type="button" key={curve.name} className="graph-edge" style={style}
+        {curves.map(curve => select ? <button type="button" key={curve.name} className="graph-edge" style={curve.style}
             data-label-below={curve.labelBelow || undefined}
             disabled={!!connection || !!placing}
-            aria-pressed={selected?.section === 'edges' && selected.name === curve.name}
+            aria-pressed={selectedEdge === curve.name}
             onClick={() => select({ section: 'edges', name: curve.name })}>{curve.name}</button>
-            : <span key={curve.name} className="graph-edge" style={style} data-label-below={curve.labelBelow || undefined}>{curve.name}</span>;
-        })}
+            : <span key={curve.name} className="graph-edge" style={curve.style} data-label-below={curve.labelBelow || undefined}>{curve.name}</span>)}
         {names.map((name, index) => <CanvasVertex key={name} name={name} point={points.get(name)!} tone={tones[index % tones.length]}
           selected={selected?.section === 'nodes' && selected.name === name}
           linking={!!connection} source={from === name} target={!!from && previewTarget === name} incoming={!!from} moving={moving?.name === name}
@@ -215,7 +235,7 @@ export default function GraphCanvas({ model, selected, select, editing }: {
     </div></div>
     {names.length > 0 && <div className="canvas-controls">
       <label>{t('布局')}<select aria-label={t('画布布局')} value={layout} onChange={event => arrange(event.target.value as CanvasLayout)}>
-        <option value="spread">{t('展开')}</option><option value="grid">{t('网格')}</option>
+        <option value="spread">{t('自动布局')}</option><option value="grid">{t('网格')}</option>
       </select></label>
       {editing && <button type="button" className="icon-button" aria-label={t('自动排列节点')} title={t('自动排列节点')} onClick={() => arrange(layout)}>
         <RotateCcw size={15} aria-hidden="true" />

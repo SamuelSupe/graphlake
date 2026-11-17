@@ -1,6 +1,33 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { edgeCurve, edgeLanes, packPaths, positions, scene } from '../src/graphLayout.ts';
+import { canvasColumns, connectedNodeOrder, placeNodes } from '../src/modelCanvasGeometry.ts';
+
+test('model auto layout places connected node types together in the presence of cycles and isolated types', () => {
+  const names = ['Account', 'Product', 'Invoice', 'Supplier', 'Region'];
+  const links = [
+    { from: 'Invoice', to: 'Account' }, { from: 'Account', to: 'Invoice' },
+    { from: 'Product', to: 'Supplier' }, { from: 'Product', to: 'NotConfigured' },
+  ];
+  assert.deepEqual(connectedNodeOrder(names, links), ['Account', 'Invoice', 'Product', 'Supplier', 'Region']);
+});
+
+test('model canvas has room for long labels at phone, split pane, and desktop widths', () => {
+  const names = Array.from({ length: 7 }, (_, index) => 'LongNodeTypeName' + index);
+  for (const width of [264, 360, 500, 1000]) {
+    const columns = canvasColumns(width);
+    const height = Math.max(280, Math.ceil(names.length / columns) * 124 + 95);
+    for (const layout of ['spread', 'grid']) {
+      const points = [...placeNodes(names, width, height, columns, layout).values()];
+      points.forEach(([x, y], index) => {
+        assert.ok(x >= 74 && x <= width - 74);
+        for (const [previousX, previousY] of points.slice(0, index)) {
+          assert.ok(Math.abs(x - previousX) >= 148 || Math.abs(y - previousY) >= 64);
+        }
+      });
+    }
+  }
+});
 import { focusNeighborhood, graphLabel, maxElements, mergePage, removeElement, visibleGraphElements } from '../src/graphExploration.ts';
 
 test('path-only steps connect vertices and yield to a returned edge', () => {

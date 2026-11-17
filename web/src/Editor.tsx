@@ -2,20 +2,22 @@ import { diagnosticText, t } from './locale.ts';
 import type { useMutations } from './Mutations';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, Waypoints, X } from 'lucide-react';
-import { api, ApiError, downloadText, errorText, type Column, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
+import { api, ApiError, errorText, type Column, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
 import { newConnector } from './connectors';
 import { AddSource } from './AddSource';
 import { Catalogs } from './Catalogs';
 import type { LocalTable } from './LocalTables';
 import { SourceBrowser, type TableSelection } from './SourceBrowser';
-import type { CanvasConnection } from './GraphCanvas';
+import type { CanvasConnection, CanvasView } from './GraphCanvas';
 import { EdgeDraftDialog, type EdgeEnds } from './EdgeDraftDialog';
 import type { Point } from './modelCanvasGeometry';
 import { Inspector, type Edit } from './Inspector';
-import { addEdgeType, documentOf, incidentEdgeTypes, modelOf, removeGraphType, sourceLabel, sourceSignature, text, validationTargets, type Section, type Selection, type ValidationTarget } from './model';
+import { addEdgeType, documentOf, incidentEdgeTypes, removeGraphType, sourceLabel, sourceSignature, text, validationTargets, type Section, type Selection, type ValidationTarget } from './model';
 import { Query } from './Query';
 import { Versions } from './ModelVersions';
 import { ModelSetup } from './ModelSetup';
+import { ModelYamlEditor } from './ModelYamlEditor';
+import { useModelDraft } from './useModelDraft';
 import { setupIssue } from './modelWorkflow';
 import { Modal, NameDialog, StatusLabel } from './ui';
 
@@ -42,7 +44,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   canvasLayouts: Map<string, Map<string, Point>>;
 }) {
   const [saved, setSaved] = useState(initial);
-  const [yaml, setYaml] = useState(initial?.yaml ?? '');
+  const { yaml, current, preview, setYaml, editText, inspectCurrent } = useModelDraft(initial?.yaml ?? '');
+  const [yamlMode, setYamlMode] = useState(false);
   const [selection, setSelection] = useState<Selection>();
   const [positions, setPositions] = useState(() => canvasLayouts.get(id) ?? new Map<string, Point>());
   const [connection, setConnection] = useState<CanvasConnection>();
@@ -64,6 +67,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const inspectorPanel = useRef<HTMLElement>(null);
   const inspectorInvoker = useRef<HTMLElement | null>(null);
   const addNodeButton = useRef<HTMLButtonElement>(null);
+  const canvasView = useRef<CanvasView>(undefined);
 
   useEffect(() => {
     if (positions.size) canvasLayouts.set(id, positions);
@@ -99,15 +103,11 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   // Apply only when a previously interrupted write is resolved.
   }, [recovered]);
 
-  const draft = useMemo(() => {
-    try {
-      return { model: modelOf(yaml), error: '' };
-    } catch (cause) {
-      return { model: undefined, error: errorText(cause) };
-    }
-  }, [yaml]);
-  const model = draft.model;
-  const incomplete = model && setupIssue(model);
+  const model = current?.model;
+  const yamlError = current?.error;
+  const modelName = preview.model?.graph || saved?.id || id;
+  const showingYaml = workspace === 'graph' && (yamlMode || !model);
+  const incomplete = useMemo(() => model && setupIssue(model), [model]);
   function getColumns(table: string) {
     const cached = tableColumns.get(table);
     return model && cached && cached.signature === sourceSignature(model, table) ? cached.columns : undefined;
@@ -133,15 +133,27 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
 
   const selected = model && selection && Object.hasOwn(model[selection.section], selection.name) ? selection : undefined;
 
-  function changeYaml(value: string) {
-    setYaml(value);
+  function changeYaml(value: string, fromText = false) {
+    if (value === yaml) return;
+    if (fromText) editText(value);
+    else setYaml(value);
     setNotice(undefined);
     setChecked(undefined);
     setLocating(undefined);
   }
 
+  function openYaml() {
+    if (workspace === 'graph') setYamlMode(true);
+    else setModal('yaml');
+  }
+
+  function changeText(value: string) {
+    if (workspace === 'graph') setYamlMode(true);
+    changeYaml(value, true);
+  }
+
   const edit: Edit = change => {
-    if (!allow.edit) return;
+    if (!allow.edit || !model) return;
     try {
       const doc = documentOf(yaml);
       change(doc);
@@ -174,8 +186,11 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   }
 
   async function save() {
-    if (!saved || saving || !allow.edit) return;
-    if (incomplete) { setNotice({ text: incomplete.message, error: true, yaml }); return; }
+    if (!saved || busy || !allow.edit) return;
+    const latest = inspectCurrent().model;
+    if (!latest) return;
+    const issue = current ? incomplete : setupIssue(latest);
+    if (issue) { setNotice({ text: issue.message, error: true, yaml }); return; }
     setSaving(true);
     setNotice(undefined);
     try {
@@ -197,7 +212,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   }
 
   async function validate(checkData = false) {
-    if (checking || !allow.edit) return;
+    if (busy || !allow.edit || !inspectCurrent().model) return;
     setChecking(true);
     setNotice(undefined);
     try {
@@ -262,7 +277,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const title = { graph: t('图模型'), catalogs: t('数据源'), query: t('查询') }[workspace];
   const busy = mutations.pending || saving || checking || activating;
   const nodeNames = Object.keys(model?.nodes ?? {});
-  const canConnect = active && allow.edit && !busy && workspace === 'graph' && !modal && !!nodeNames.length;
+  const canConnect = active && allow.edit && !busy && workspace === 'graph' && !showingYaml && !modal && !!nodeNames.length;
   const connecting = canConnect ? connection : undefined;
   useEffect(() => {
     if (!canConnect || connection?.from !== undefined && !Object.hasOwn(model?.nodes ?? {}, connection.from)) {
@@ -314,7 +329,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       return next;
     });
   }
-  const canPublish = allow.publish && Boolean(saved?.revision && !dirty && !busy && saved.revision !== saved.active_revision);
+  const canPublish = allow.publish && Boolean(model && saved?.revision && !dirty && !busy && saved.revision !== saved.active_revision);
   const inspectorSelection: Selection | undefined = workspace === 'catalogs'
     ? model && catalogSelection && Object.hasOwn(model.sources, catalogSelection) ? { section: 'sources', name: catalogSelection } : undefined
     : selected;
@@ -346,6 +361,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     && target.selection.name === inspectorSelection.name).map(target => target.control));
   function locate(target: ValidationTarget) {
     inspectorInvoker.current = document.activeElement as HTMLElement;
+    setYamlMode(false);
     setSelection(target.selection);
     setLocating(target);
     if (workspace !== 'graph') goTo('graph');
@@ -362,7 +378,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       <div className="validation-actions">
         {targets.map(target => <button className="text-button" key={target.selection.name + target.control}
           onClick={() => locate(target)}>{t('定位 {0}', target.caption)}</button>)}
-        {!targets.length && <button className="text-button" onClick={() => setModal('yaml')}>{t('查看 YAML')}</button>}
+        {!targets.length && !showingYaml && <button className="text-button" onClick={openYaml}>{t('查看 YAML')}</button>}
       </div>
     </div>}
   </>;
@@ -379,7 +395,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
             if (next.section === 'nodes' && inspectorSelection.section === 'nodes') removeNodePosition(inspectorSelection.name, next.name);
             setSelection(next);
           }
-        }} id={id} yaml={yaml} openYaml={() => setModal('yaml')}
+        }} id={id} yaml={yaml} openYaml={openYaml}
         getColumns={getColumns} rememberColumns={rememberColumns}
         invalid={invalid} onRemove={() => setRemoving(inspectorSelection)}
         columns={inspectorSelection.section !== 'sources' ? validation?.labels[inspectorSelection.name] : undefined} />
@@ -400,13 +416,14 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         {workspace !== 'query' && dirty && <span className="dirty"><i />{t('未保存')}</span>}
         {saved?.revision && <label className="model-switch"><span className="sr-only">{t('切换图模型')}</span>
           <select value={id} onChange={event => changeModel(event.target.value)}>
-            <option value={id}>{model?.graph || id}</option>
+            <option value={id}>{modelName}</option>
             {models.filter(other => other.id !== id && (workspace !== 'query' || other.active_revision && !other.archive_error)).map(other =>
               <option value={other.id} key={other.id}>{other.name} · {other.id}</option>)}
           </select>
         </label>}
-        {!saved?.revision && model?.graph && <strong className="draft-name">{model.graph}</strong>}
-        {workspace === 'graph' && model && allow.edit && <button className="icon-button" aria-label={t('编辑模型名称')} onClick={() => setModal('title')}><Pencil size={15} /></button>}
+        {!saved?.revision && preview.model?.graph && <strong className="draft-name">{modelName}</strong>}
+        {workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" aria-label={t('编辑模型名称')}
+          disabled={busy || !!yamlError} onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} /></button>}
         {saved && (workspace !== 'query' || !saved.active_revision || saved.archive_error) && <code className="version-chip" title={saved.active_revision ?? undefined}>{saved.archive_error ? t('版本存储异常') : saved.active_revision ? t('生效 {0}', saved.active_revision.slice(0, 10)) : t('未发布')}</code>}
       </div>
     </header>
@@ -423,7 +440,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         <details className="workspace-tools"><summary>{t('更多工具')}</summary><div>
           <button className="button compact" disabled={busy} onClick={() => void validate()}>{checking ? t('正在校验…') : t('校验结构')}</button>
           <button className="button compact" disabled={busy} onClick={() => void validate(true)}>{t('校验数据')}</button>
-          <button className="button compact" onClick={() => setModal('yaml')}><Braces size={15} />{t('查看 YAML')}</button>
+          <button className="button compact" onClick={openYaml}><Braces size={15} />{t('查看 YAML')}</button>
           <button className="button compact" disabled={busy || !saved.revision} onClick={refresh}><RefreshCw size={15} />{t('重新加载')}</button>
         </div></details>
       </div>
@@ -440,44 +457,58 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       <p>{t('发布模型后即可查询。')}</p><button className="button" onClick={() => goTo('graph')}>{t('返回图模型')}</button>
     </div>}
     {loading ? <p className="empty" role="status">{t('正在读取配置…')}</p>
-      : model && saved && workspace === 'graph' ? <div className="graph-workspace">
-        {!saved.active_revision && allow.edit && <ModelSetup configure={allow.configure} publishAllowed={allow.publish} model={model} issue={incomplete} dirty={dirty} busy={!!busy} canPublish={canPublish}
-          add={section => section === 'sources' ? openSource() : setModal(section)} select={setSelection} save={() => void save()} publish={() => void activate(saved.revision, 'publish')} />}
-        {saved.active_revision && incomplete && <p className="notice">{incomplete.message}</p>}
-        <div className="graph-command-bar">
-          <div className="graph-toolbar" role="group" aria-label={t('建模工具栏')}>
-            {allow.publish && (saved.active_revision || !allow.edit) && <button className="tool-button tool-primary" disabled={!canPublish} onClick={() => void activate(saved.revision, 'publish')}>
-              <Upload size={20} aria-hidden="true" />{activating ? t('正在切换…') : t('校验并发布')}
+      : saved && workspace === 'graph' ? <div className="graph-workspace">
+        <div className="graph-command-bar" role="group" aria-label={t('建模工具栏')}>
+          <div className="model-view-switch" role="group" aria-label={t('模型编辑视图')}>
+            <button type="button" className="tool-button" aria-pressed={!showingYaml} disabled={!!yamlError}
+              onClick={() => { if (inspectCurrent().model) setYamlMode(false); }}>
+              <Waypoints size={16} aria-hidden="true" />{t('画布')}
+            </button>
+            <button type="button" className="tool-button" aria-pressed={showingYaml} onClick={openYaml}>
+              <Braces size={16} aria-hidden="true" />YAML
+            </button>
+          </div>
+          <div className="graph-draft-actions">
+            {allow.edit && (showingYaml || saved.active_revision) &&
+              <button className="tool-button" disabled={!!yamlError || !dirty || busy || !!incomplete} title={incomplete?.message || yamlError}
+                onClick={() => void save()}><Save size={16} aria-hidden="true" />{saving ? t('保存中…') : t('保存草稿')}</button>}
+            {showingYaml && allow.edit && <button className="tool-button" disabled={busy || !!yamlError}
+              onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>}
+            {allow.publish && (showingYaml || saved.active_revision || !allow.edit) && <button className="tool-button tool-primary" disabled={!canPublish} onClick={() => void activate(saved.revision, 'publish')}>
+              <Upload size={16} aria-hidden="true" />{activating ? t('正在切换…') : t('校验并发布')}
             </button>}
-            {allow.edit && saved.active_revision && <div className="tool-group">
-              <button className="tool-button" disabled={!dirty || busy || !!incomplete} title={incomplete?.message} onClick={() => void save()}><Save size={20} />{saving ? t('保存中…') : t('保存草稿')}</button>
-            </div>}
-            {allow.edit && <div className="tool-group">
-              <button ref={addNodeButton} className="tool-button" disabled={busy} onClick={() => setModal('nodes')}><Plus size={20} />{t('添加节点')}</button>
-              <button type="button" className="tool-button" disabled={!canConnect} aria-pressed={!!connecting}
-                onClick={() => setConnection(connecting ? undefined : {})}><Waypoints size={20} aria-hidden="true" />{t('连线建边')}</button>
-            </div>}
-            <div className="tool-group">
-              {allow.configure && <button className="tool-button" disabled={!saved.revision} onClick={() => setLocalTables(true)}><Database size={20} />{t('本地表')}</button>}
-              <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={20} />{t('节点 ')}<span className="tool-count">{Object.keys(model.nodes).length}</span></button>
-              <button className="tool-button" onClick={() => setModal('edges-list')}><List size={20} />{t('边 ')}<span className="tool-count">{Object.keys(model.edges).length}</span></button>
-            </div>
+            {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span className="draft-status graph-status" role="status"><StatusLabel status={status} text={statusText} /></span>}
             <details className="workspace-tools"><summary>{t('更多工具')}</summary><div>
-              {allow.configure && <button className="button compact" onClick={() => initial ? openSource() : goTo('catalogs')}>
+              {!showingYaml && allow.configure && <button className="button compact" onClick={() => initial ? openSource() : goTo('catalogs')}>
                 <Database size={16} />{initial ? t('添加数据源') : t('数据源')}
               </button>}
-              {allow.edit && <button className="button compact" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} />{checking ? t('正在校验…') : t('校验结构')}</button>}
-              {allow.edit && <button className="button compact" disabled={busy} onClick={() => void validate(true)}><ShieldCheck size={16} />{t('校验数据')}</button>}
+              {!showingYaml && allow.edit && <button className="button compact" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} />{checking ? t('正在校验…') : t('校验结构')}</button>}
+              {allow.edit && <button className="button compact" disabled={busy || !!yamlError} onClick={() => void validate(true)}><ShieldCheck size={16} />{t('校验数据')}</button>}
               <button className="button compact" disabled={!saved.revision || activating} onClick={() => setModal('versions')}><History size={16} />{t('版本历史')}</button>
-              <button className="button compact" onClick={() => setModal('yaml')}><Braces size={16} />{t('查看 YAML')}</button>
             </div></details>
           </div>
-          {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span className="draft-status graph-status" role="status"><StatusLabel status={status} text={statusText} /></span>}
         </div>
+        {!showingYaml && model && !saved.active_revision && allow.edit && <ModelSetup configure={allow.configure} publishAllowed={allow.publish} model={model} issue={incomplete} dirty={dirty} busy={!!busy} canPublish={canPublish}
+          add={section => section === 'sources' ? openSource() : setModal(section)} select={setSelection} save={() => void save()} publish={() => void activate(saved.revision, 'publish')} />}
+        {(showingYaml || saved.active_revision) && incomplete && <p className="notice">{incomplete.message}</p>}
         {notices}
-        <div className="graph-body">
+        {showingYaml ? <ModelYamlEditor id={id} yaml={yaml} error={yamlError} errorLine={current?.line} editable={allow.edit} busy={busy}
+          change={changeText} />
+        : model && <div className="graph-body">
+          <div className="graph-toolbar" role="group" aria-label={t('画布工具')}>
+            {allow.edit && <>
+              <button ref={addNodeButton} className="tool-button" disabled={busy} onClick={() => setModal('nodes')}><Plus size={16} aria-hidden="true" />{t('添加节点')}</button>
+              <button type="button" className="tool-button" disabled={!canConnect} aria-pressed={!!connecting}
+                onClick={() => setConnection(connecting ? undefined : {})}><Waypoints size={16} aria-hidden="true" />{t('连线建边')}</button>
+            </>}
+            <div className="graph-label-actions">
+              <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={16} aria-hidden="true" />{t('节点 ')}<span className="tool-count">{nodeNames.length}</span></button>
+              <button className="tool-button" onClick={() => setModal('edges-list')}><List size={16} aria-hidden="true" />{t('边 ')}<span className="tool-count">{Object.keys(model.edges).length}</span></button>
+              {allow.configure && <button className="tool-button" disabled={!saved.revision} onClick={() => setLocalTables(true)}><Database size={16} aria-hidden="true" />{t('本地表')}</button>}
+            </div>
+          </div>
           <Suspense fallback={<div className="canvas-panel"><p className="empty" role="status">{t('正在打开画布…')}</p></div>}>
-          <GraphCanvas model={model} selected={selected} select={next => {
+          <GraphCanvas model={model} selected={selected} viewState={canvasView} select={next => {
             inspectorInvoker.current = document.activeElement as HTMLElement;
             setSelection(next);
           }} editing={allow.edit ? {
@@ -492,10 +523,10 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
           } : undefined} />
           </Suspense>
           {inspector}
-        </div>
+        </div>}
       </div> : !saved ? <div className="empty" role="alert">{workspace === 'graph' && notice?.text}<button className="button" onClick={refresh}>{t('重试读取配置')}</button></div>
-      : !model && workspace !== 'query' && <div className="empty" role="alert">{draft.error}<button className="button" onClick={() => setModal('yaml')}>{t('编辑 YAML')}</button></div>}
-    {active && <>{workspace === 'catalogs' && inspectorSelection && <Modal title={t('配置数据源')} size="medium" close={() => setCatalogSelection(undefined)}>
+      : yamlError && workspace !== 'query' && <div className="empty" role="alert">{yamlError}<button className="button" onClick={openYaml}>{allow.edit ? t('编辑 YAML') : t('查看 YAML')}</button></div>}
+    {active && <>{workspace === 'catalogs' && inspectorSelection && modal !== 'yaml' && <Modal title={t('配置数据源')} size="medium" close={() => setCatalogSelection(undefined)}>
       <div className="panel-layout source-settings">
         <div className="panel-body form-fields">{inspector}{notices}</div>
         <footer className="panel-footer">
@@ -561,26 +592,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         </div>
       </div>
     </Modal>}
-    {modal === 'yaml'  && <Modal title={t('模型 YAML')} size="wide" description={allow.edit ? t('编辑内容保留在当前草稿中，完成后可保存、校验并发布。') : t('查看当前模型配置。')} close={() => setModal(undefined)}>
-      <div className="panel-layout yaml-editor"><div className="panel-body">
-        <label><span className="sr-only">{t('YAML 配置')}</span><textarea value={yaml} readOnly={!allow.edit} onChange={event => changeYaml(event.target.value)}
-          spellCheck={false} className="mono" rows={22} data-initial-focus /></label>
-        {draft.error && <p className="inline-error" role="alert">{draft.error}</p>}
-        </div><footer className="panel-footer">
-          {allow.edit && <label className="button">{t('导入 YAML 到草稿')}<input className="sr-only" type="file" accept=".yaml,.yml" disabled={busy} onChange={async event => {
-            const file = event.target.files?.[0]; event.target.value = '';
-            if (!file) return;
-            try {
-              if (file.size > 1024 * 1024) throw new Error(t('YAML 文件超过 1 MiB'));
-              const next = await file.text();
-              modelOf(next);
-              if (yaml !== next && window.confirm(t('将当前编辑内容替换为导入的 YAML？'))) changeYaml(next);
-            } catch (cause) { setNotice({ text: errorText(cause), error: true }); setModal(undefined); }
-          }} /></label>}
-          <button className="button" onClick={() => downloadText(yaml, id + '.yaml')}>{t('下载草稿 YAML')}</button>
-          <button className="button primary" onClick={() => setModal(undefined)}>{t('完成')}</button>
-        </footer>
-      </div>
+    {modal === 'yaml' && <Modal title={t('模型 YAML')} size="wide" description={allow.edit ? t('编辑内容保留在当前草稿中，完成后可保存、校验并发布。') : t('查看当前模型配置。')} close={() => setModal(undefined)}>
+      <ModelYamlEditor id={id} yaml={yaml} error={yamlError} errorLine={current?.line} editable={allow.edit} busy={busy} change={changeText} close={() => setModal(undefined)} />
     </Modal>}
     {modal === 'title' && <NameDialog title={t('编辑模型名称')} initial={text(model?.graph)} close={() => setModal(undefined)}
       submit={name => edit(doc => doc.set('graph', name))} />}

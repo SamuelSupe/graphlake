@@ -13,8 +13,9 @@ export type ValidationTarget = { selection: Selection; control: string; caption:
 export const modelIdPattern = '[A-Za-z0-9][A-Za-z0-9_\\-]{0,63}';
 export const text = (value: unknown) => typeof value === 'string' ? value : '';
 export const strings = (value: unknown): string[] => Array.isArray(value) ? value.map(text) : [];
-export const record = (value: unknown): Record<string, unknown> =>
-  value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+export const record = (value: unknown): Record<string, unknown> => isRecord(value) ? value : {};
 
 export function documentOf(yaml: string) {
   const doc = parseDocument(yaml, { intAsBigInt: true });
@@ -25,9 +26,15 @@ export function documentOf(yaml: string) {
 
 export function modelOf(yaml: string): Model {
   const value = record(documentOf(yaml).toJS({ maxAliasCount: 50 }));
-  const section = (key: Section) => Object.fromEntries(
-    Object.entries(record(value[key])).map(([name, item]) => [name, record(item)]),
-  );
+  const section = (key: Section) => {
+    const mapping = value[key];
+    if (mapping === undefined) return {};
+    if (!isRecord(mapping)) throw new Error(t('{0} 必须为 YAML 映射', key));
+    return Object.fromEntries(Object.entries(mapping).map(([name, item]) => {
+      if (!isRecord(item)) throw new Error(t('{0} 必须为 YAML 映射', key + '.' + name));
+      return [name, item];
+    }));
+  };
   return { graph: text(value.graph), sources: section('sources'), nodes: section('nodes'), edges: section('edges') };
 }
 

@@ -13,6 +13,7 @@ test('model ID pattern works with the HTML pattern Unicode sets flag', () => {
 test('visual edits preserve advanced YAML and update both edge endpoints', () => {
   const yaml = [
     'graph: finance',
+    'freshness: {auto_refresh_csr: true} # Keep the YAML-only setting',
     'sources:',
     '  ledger: { type: postgres, dsn_env: GRAPHLAKE_POSTGRES_DSN }',
     '  big: { type: bigquery, billing_project: finance, location: US, token_env: BIGQUERY_TOKEN, maximum_bytes_billed: 9007199254740995 }',
@@ -37,7 +38,10 @@ test('visual edits preserve advanced YAML and update both edge endpoints', () =>
   const before = modelOf(yaml);
   doc.setIn(['nodes', 'Account', 'properties'], ['name', 'status']);
   rename(doc, before, 'nodes', 'Account', 'CustomerAccount');
-  const after = modelOf(doc.toString());
+  const updated = doc.toString();
+  const after = modelOf(updated);
+  assert.deepEqual(documentOf(updated).getIn(['freshness', 'auto_refresh_csr']), true);
+  assert.match(updated, /# Keep the YAML-only setting/);
   assert.deepEqual(after.nodes.CustomerAccount.inputs, before.nodes.Account.inputs);
   assert.deepEqual(after.nodes.CustomerAccount.scd2, before.nodes.Account.scd2);
   assert.equal(after.sources.ledger.dsn_env, 'GRAPHLAKE_POSTGRES_DSN');
@@ -45,6 +49,12 @@ test('visual edits preserve advanced YAML and update both edge endpoints', () =>
   assert.deepEqual(after.nodes.CustomerAccount.properties, ['name', 'status']);
   assert.deepEqual(after.edges.Transfer.from, { node: 'CustomerAccount', columns: ['tenant', 'src'] });
   assert.deepEqual(after.edges.Transfer.to, { node: 'CustomerAccount', columns: ['tenant', 'dst'] });
+});
+
+test('invalid mapping shapes cannot be mistaken for an empty or incomplete canvas', () => {
+  assert.throws(() => modelOf('nodes: []'), /nodes must be a YAML mapping/);
+  assert.throws(() => modelOf('edges: {Transfer: true}'), /edges\.Transfer must be a YAML mapping/);
+  assert.deepEqual(modelOf('nodes: {Account: {}}').edges, {});
 });
 
 test('creating an edge from the canvas keeps its direction and leaves source fields for mapping', () => {

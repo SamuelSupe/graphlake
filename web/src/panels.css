@@ -38,36 +38,55 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .business-status { display: flex; gap: 6px 16px; flex-wrap: wrap; padding-block: 4px; }
 .business-config { container-type: inline-size; }
 .business-config :is(h3, h4, h5, p, dl, dd) { margin: 0; }
-.business-task-options { border: 0; padding: 0; margin: 0; min-inline-size: 0; }
-.business-task-options legend { padding: 0; margin-block-end: 10px; font-weight: 650; }
-.business-task-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: 10px; }
+.workspace-tabs.business-tabs { flex: none; padding-inline: 24px; }
+.business-task-options { border: 0; padding: 0; margin: 0; min-inline-size: 0; max-inline-size: 48rem; }
+.business-task-grid { display: grid; gap: 10px; }
 .business-task-grid .business-task-choice {
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 12px;
-  padding: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel);
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px;
+  padding: 15px 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
 }
 .business-task-options:not(:disabled) .business-task-choice { cursor: pointer; }
-.business-task-choice:has(input:checked) { border-color: #9bb0da; background: var(--tint); }
+.business-task-options:not(:disabled) .business-task-choice:hover { background: var(--panel); }
 .business-task-choice strong { display: block; font-size: .875rem; }
 .business-task-choice .field-help { display: block; margin-block-start: 4px; }
-.business-task-icon { display: grid; place-items: center; inline-size: 34px; block-size: 34px; color: var(--blue); background: var(--surface); border-radius: 7px; }
-.business-task-choice input { margin-block-start: 3px; }
-.business-suite { border-block-start: 1px solid var(--line); padding-block-start: 18px; }
+.business-task-icon { display: grid; place-items: center; inline-size: 36px; block-size: 36px; color: var(--blue); background: var(--tint); border-radius: 7px; }
+.business-task-choice input { margin: 0; }
 .business-suite-fields { padding: 0; margin: 0; border: 0; min-inline-size: 0; }
-.business-actions, .scenario-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
-.scenario-heading { justify-content: space-between; }
-.scenario-heading .field-help { margin-block-start: 5px; }
-.scenario-layout { display: grid; grid-template-columns: minmax(11rem, 1fr) minmax(0, 2.3fr); gap: 16px; align-items: start; }
-.scenario-list { display: grid; gap: 12px; min-inline-size: 0; }
-.scenario-add { padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); }
-.scenario-add button, .scenario-remove { justify-self: start; }
-.versions-choices.scenario-choices { max-block-size: 24rem; padding: 3px; margin: -3px; }
+.suite-toolbar, .scenario-list-heading, .scenario-editor-heading {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;
+}
+.suite-toolbar { padding-block-end: 12px; border-block-end: 1px solid var(--line); }
+.suite-summary { display: grid; gap: 3px; }
+.suite-summary strong, .scenario-list-heading strong { font-size: .875rem; }
+.scenario-layout { display: grid; grid-template-columns: minmax(12rem, 1fr) minmax(0, 2.8fr); gap: 16px; align-items: start; }
+.scenario-list { display: grid; gap: 8px; min-inline-size: 0; }
+.scenario-list-heading { min-block-size: 36px; }
+.scenario-select { display: none; }
+.scenario-choices {
+  display: grid; gap: 4px; list-style: none; margin: 0; padding: 3px;
+  max-block-size: 27rem; overflow: auto; overscroll-behavior: contain;
+}
+.scenario-choices button {
+  display: grid; gap: 3px; inline-size: 100%; padding: 9px 10px; text-align: start;
+  border: 1px solid transparent; border-radius: 6px; background: transparent; overflow-wrap: anywhere;
+}
+.scenario-choices small { color: var(--muted); }
+.scenario-choices button:hover { background: var(--panel); }
+.scenario-choices button[aria-pressed="true"] { background: var(--tint); border-color: #c9d7ff; color: var(--blue-dark); }
 .scenario-editor { min-inline-size: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); }
+.scenario-editor.scenario-with-tabs { padding: 0; }
+.scenario-editor-heading { align-items: start; flex-wrap: nowrap; padding: 16px 16px 8px; overflow-wrap: anywhere; }
+.scenario-editor-heading .field-help { margin-block-start: 4px; }
+.scenario-editor-heading .scenario-remove { flex: none; }
+.scenario-editor .business-tabs { padding-inline: 7px; }
+.scenario-editor .business-tabs button { min-block-size: 40px; }
+.scenario-content { padding: 16px; min-inline-size: 0; }
+.scenario-content > label { max-inline-size: 100%; }
 .scenario-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12.5rem), 1fr)); gap: 10px; }
 .scenario-fields :is(label, input) { min-inline-size: 0; }
 .scenario-parameters { padding: 0; margin: 0; border: 0; min-inline-size: 0; }
 .scenario-parameters legend { padding: 0; margin-block-end: 8px; font-size: .875rem; font-weight: 650; }
-.scenario-expectations { padding-block-start: 12px; border-block-start: 1px solid var(--line); }
-.scenario-expectations > label { max-inline-size: 22rem; }
+.scenario-empty { background: var(--panel); border: 1px dashed var(--line); border-radius: var(--radius); }
 .scenario-findings { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .scenario-findings summary { overflow-wrap: anywhere; }
 .scenario-findings summary .small { display: inline-block; margin-inline-start: 6px; font-weight: 400; white-space: nowrap; }
@@ -77,9 +96,11 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .scenario-evidence dt { color: var(--muted); }
 @container (max-width: 37rem) {
   .scenario-layout { grid-template-columns: minmax(0, 1fr); }
-  .versions-choices.scenario-choices { display: flex; overflow-x: auto; overscroll-behavior: auto; }
-  .scenario-choices > li { flex: 0 0 min(13rem, 80%); }
-  .scenario-choices button { block-size: 100%; }
+  .scenario-list { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+  .scenario-list-heading { grid-column: 2; grid-row: 1; }
+  .scenario-list-heading > strong, .scenario-list .scenario-choices { display: none; }
+  .scenario-list .scenario-select { display: grid; grid-column: 1; grid-row: 1; min-inline-size: 0; }
+  .scenario-select select { inline-size: 100%; min-inline-size: 0; }
 }
 .business-json { inline-size: 100%; min-inline-size: 0; resize: vertical; white-space: pre; }
 .business-preview :is(dl, dd, ol, ul, h3, h4, p) { margin: 0; }

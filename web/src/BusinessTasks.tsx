@@ -1,15 +1,21 @@
 import { t } from './locale';
 import { useEffect, useId, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
-import { FlaskConical, Plus, Radar, RefreshCw, Upload, UserMinus } from 'lucide-react';
+import { ArrowLeft, Database, FlaskConical, Radar, RefreshCw, Upload, UserMinus } from 'lucide-react';
 import exampleSuite from '../../examples/security-tasks/fixture.json?raw';
 import { api, errorText, type TaskSuite } from './api';
 import { BusinessScenario } from './BusinessScenario';
+import { BusinessTabs } from './BusinessTabs';
 import { caseSummary, emptySuite, joinSuite, splitSuite, taskName, tasks, type SuiteDraft } from './taskSuite';
 import { Modal } from './ui';
+import { WorkspaceTools } from './WorkspaceTools';
 
 const suiteLimit = 1024 * 1024;
 const maxScenarios = 16;
 const title = t('业务任务与固定场景');
+const taskViews = [
+  { id: 'tasks', label: t('内置任务') },
+  { id: 'scenarios', label: t('固定场景') },
+] as const;
 
 export function BusinessTasks({ id, selected, toggle, saveSuite, close }: {
   id: string;
@@ -20,7 +26,7 @@ export function BusinessTasks({ id, selected, toggle, saveSuite, close }: {
 }) {
   const taskDescriptionId = useId();
   const options = <fieldset className="form-fields business-task-options" disabled={!toggle}>
-    <legend>{t('内置任务')}</legend>
+    <legend className="sr-only">{t('内置任务')}</legend>
     <div className="business-task-grid">
       {tasks.map((task, index) => {
         const Icon = index === 0 ? UserMinus : Radar;
@@ -56,7 +62,9 @@ function FixedSuite({ id, save, close, children }: {
   const [suite, setSuite] = useState<TaskSuite>();
   const [draft, setDraft] = useState<SuiteDraft>(emptySuite);
   const [index, setIndex] = useState(0);
-  const [task, setTask] = useState<string>(tasks[0].id);
+  const [view, setView] = useState<typeof taskViews[number]['id']>('tasks');
+  const [showTables, setShowTables] = useState(false);
+  const tabsId = useId();
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -65,6 +73,7 @@ function FixedSuite({ id, save, close, children }: {
   const fileInput = useRef<HTMLInputElement>(null);
   const path = '/models/' + id + '/task-suite';
   const scenarios = draft.cases.map(caseSummary);
+  const editingSuite = view === 'scenarios';
 
   function loaded(value: TaskSuite, position = 0) {
     setSuite(value);
@@ -144,16 +153,14 @@ function FixedSuite({ id, save, close, children }: {
     finally { setLoading(false); }
   }
 
-  function addCase() {
+  function addCase(definition: typeof tasks[number]) {
     const base = 'case-' + (draft.cases.length + 1);
     const taken = new Set(scenarios.map(scenario => scenario.name));
     let id = base;
     for (let suffix = 2; taken.has(id); suffix++) id = base + '-' + suffix;
-    const definition = tasks.find(item => item.id === task);
-    if (!definition) return;
     const parameters = Object.fromEntries(definition.parameters.map(parameter => [parameter.key, '']));
     const raw = JSON.stringify({
-      id, task, tenant_id: '', parameters,
+      id, task: definition.id, tenant_id: '', parameters,
       expected: { subject: 'found', anchor: null, findings: [] },
     }, null, 2);
     update({ ...draft, cases: [...draft.cases, raw] });
@@ -166,69 +173,78 @@ function FixedSuite({ id, save, close, children }: {
 
   return <Modal title={title} size="wide" close={close} beforeClose={discardChanges}>
     <div className="panel-layout">
-      <div className="panel-body form-fields business-config">
-        {children}
-        <section className="form-fields business-suite" aria-label={t('固定回归场景')}>
-          <header className="scenario-heading">
-            <div><h3>{t('固定回归场景')}</h3>
-              <p className="field-help">{suite?.source === 'deployment'
-                ? t('当前使用部署文件。保存后，由控制台管理的套件优先。')
-                : suite?.source === 'console' ? t('当前由控制台管理。') : t('使用合成数据配置固定场景和预期证据。')}</p>
-            </div>
-            {draft.cases.length > 0 && <span className="muted small">{t('{0} / {1} 个场景', draft.cases.length, maxScenarios)}</span>}
-          </header>
-          {loading && <p role="status">{t('正在读取固定场景…')}</p>}
-          <fieldset disabled={loading || saving} className="form-fields business-suite-fields">
-            <div className="business-actions">
-              <button type="button" className="button compact" onClick={() => replace(exampleSuite)}><FlaskConical size={15} aria-hidden="true" />{t('载入合成示例')}</button>
-              <button type="button" className="button compact" onClick={() => fileInput.current?.click()}><Upload size={15} aria-hidden="true" />{t('导入固定场景 JSON')}</button>
-              <input hidden ref={fileInput} type="file" accept=".json,application/json" onChange={event => void importFile(event)} />
-              <button type="button" className="button compact" onClick={() => void reloadSuite()}><RefreshCw size={15} aria-hidden="true" />{t('重新读取套件')}</button>
-            </div>
-            <div className="scenario-layout">
-              <div className="scenario-list">
-                <div className="form-fields scenario-add">
-                  <label>{t('新增场景的任务')}<select value={task} onChange={event => setTask(event.target.value)}>
-                    {tasks.map(option => <option key={option.id} value={option.id}>{option.name}</option>)}
-                  </select></label>
-                  <button type="button" className="button compact" disabled={draft.cases.length >= maxScenarios} onClick={addCase}><Plus size={15} aria-hidden="true" />{t('添加场景')}</button>
-                </div>
-                {scenarios.length > 0 && <ul className="versions-choices scenario-choices" aria-label={t('选择场景')}>
+      <BusinessTabs id={tabsId} label={title} selected={view} choices={taskViews} change={setView} />
+      <div className="panel-body form-fields business-config" id={tabsId + '-panel'} role="tabpanel" aria-labelledby={tabsId + '-' + view}>
+        {!editingSuite ? children : <fieldset disabled={loading || saving} className="form-fields business-suite-fields">
+          <div className="suite-toolbar">
+            {showTables
+              ? <button type="button" className="button compact" onClick={() => setShowTables(false)}>
+                <ArrowLeft size={16} aria-hidden="true" />{t('返回场景')}
+              </button>
+              : <div className="suite-summary">
+                <strong>{t('{0} / {1} 个场景', draft.cases.length, maxScenarios)}</strong>
+                <span className="field-help">{loading ? t('正在读取固定场景…') : suite?.source === 'deployment'
+                  ? t('当前使用部署文件。保存后，由控制台管理的套件优先。')
+                  : suite?.source === 'console' ? t('当前由控制台管理。') : t('使用合成数据配置固定场景和预期证据。')}</span>
+              </div>}
+            {!showTables && !loading && !saving && <WorkspaceTools label={t('套件操作')}>
+              <button type="button" className="tool-button" onClick={() => replace(exampleSuite)}><FlaskConical size={15} aria-hidden="true" />{t('载入合成示例')}</button>
+              <button type="button" className="tool-button" onClick={() => fileInput.current?.click()}><Upload size={15} aria-hidden="true" />{t('导入固定场景 JSON')}</button>
+              <button type="button" className="tool-button" onClick={() => setShowTables(true)}><Database size={15} aria-hidden="true" />{t('固定表数据')}</button>
+              <button type="button" className="tool-button" onClick={() => void reloadSuite()}><RefreshCw size={15} aria-hidden="true" />{t('重新读取套件')}</button>
+            </WorkspaceTools>}
+            <input hidden ref={fileInput} type="file" accept=".json,application/json" onChange={event => void importFile(event)} />
+          </div>
+          {showTables ? <section className="form-fields scenario-editor">
+            <h3>{t('固定表数据')}</h3>
+            <label>{t('表结构与记录（JSON）')}<textarea className="mono business-json" rows={18} spellCheck={false} value={draft.tables}
+              onChange={event => update({ ...draft, tables: event.target.value })} /></label>
+          </section> : !loading && <div className="scenario-layout">
+            <div className="scenario-list">
+              <div className="scenario-list-heading">
+                <strong>{t('场景列表')}</strong>
+                {draft.cases.length < maxScenarios && !saving && <WorkspaceTools label={t('添加场景')}>
+                  {tasks.map(task => <button type="button" className="tool-button" key={task.id} onClick={() => addCase(task)}>{task.name}</button>)}
+                </WorkspaceTools>}
+              </div>
+              {scenarios.length > 0 && <>
+                <label className="scenario-select"><span className="sr-only">{t('选择场景')}</span>
+                  <select value={index} onChange={event => setIndex(Number(event.target.value))}>
+                    {scenarios.map((scenario, position) => <option key={position} value={position}>{scenario.name}</option>)}
+                  </select>
+                </label>
+                <ul className="scenario-choices" aria-label={t('选择场景')}>
                   {scenarios.map((scenario, position) => <li key={position}>
-                    <button type="button" className="version-choice" aria-pressed={position === index} onClick={() => setIndex(position)}>
+                    <button type="button" aria-pressed={position === index} onClick={() => setIndex(position)}>
                       <code>{scenario.name}</code>
                       <small>{taskName(scenario.task) || t('任务未配置')}</small>
                     </button>
                   </li>)}
-                </ul>}
-              </div>
-              {draft.cases[index] === undefined ? <div className="panel-placeholder">
-                <FlaskConical size={26} aria-hidden="true" />
-                <h4>{t('尚未配置固定场景')}</h4>
-                <p className="field-help">{t('可载入合成示例，也可以导入 JSON 或手动添加场景。')}</p>
-              </div> : <BusinessScenario key={index} raw={draft.cases[index]}
-                change={raw => update({ ...draft, cases: draft.cases.map((value, position) => position === index ? raw : value) })}
-                remove={() => {
-                  update({ ...draft, cases: draft.cases.filter((_, position) => position !== index) });
-                  setIndex(Math.max(0, Math.min(index, draft.cases.length - 2)));
-                }} />}
+                </ul>
+              </>}
             </div>
-            <details className="form-disclosure">
-              <summary>{t('固定表数据')}</summary>
-              <label>{t('表结构与记录（JSON）')}<textarea className="mono business-json" rows={9} spellCheck={false} value={draft.tables}
-                onChange={event => update({ ...draft, tables: event.target.value })} /></label>
-            </details>
-          </fieldset>
-        </section>
+            {draft.cases[index] === undefined ? <div className="panel-placeholder scenario-empty">
+              <FlaskConical size={26} aria-hidden="true" />
+              <h4>{t('尚未配置固定场景')}</h4>
+              <button type="button" className="button compact" onClick={() => replace(exampleSuite)}>{t('载入合成示例')}</button>
+            </div> : <BusinessScenario key={index} name={scenarios[index].name} raw={draft.cases[index]}
+              change={raw => update({ ...draft, cases: draft.cases.map((value, position) => position === index ? raw : value) })}
+              remove={() => {
+                update({ ...draft, cases: draft.cases.filter((_, position) => position !== index) });
+                setIndex(Math.max(0, Math.min(index, draft.cases.length - 2)));
+              }} />}
+          </div>}
+        </fieldset>}
       </div>
       <footer className="panel-footer">
         <p className={'panel-footer-context' + (error ? ' inline-error' : '')} role={error ? 'alert' : 'status'}>
           {error || message || (dirty ? t('有未保存的场景修改') : '')}
         </p>
-        <button type="button" className="button" disabled={saving} onClick={() => { if (discardChanges()) close(); }}>{t('完成')}</button>
-        <button type="button" className="button primary" disabled={!suite || !dirty || saving || loading} onClick={() => void submit()}>
+        <button type="button" className={'button' + (editingSuite ? '' : ' primary')} disabled={saving}
+          onClick={() => { if (discardChanges()) close(); }}>{t('完成')}</button>
+        {editingSuite && <button type="button" className="button primary" disabled={!suite || !dirty || saving || loading} onClick={() => void submit()}>
           {saving ? t('正在保存…') : t('保存固定场景')}
-        </button>
+        </button>}
       </footer>
     </div>
   </Modal>;

@@ -2080,11 +2080,11 @@ async fn business_tasks_return_evidence_and_gate_model_publication() -> Result<(
             .status(),
         StatusCode::FORBIDDEN
     );
+    // The role guard rejects these requests before reading a body.
     assert_eq!(
         server
             .guest(Method::PUT, suite_endpoint)
             .header("Cookie", modeler_cookie)
-            .json(&json!({"revision":null,"content":suite}))
             .send()
             .await?
             .status(),
@@ -2094,7 +2094,6 @@ async fn business_tasks_return_evidence_and_gate_model_publication() -> Result<(
         server
             .guest(Method::POST, "models/security/impact/rollback")
             .header("Cookie", modeler_cookie)
-            .json(&http_activation)
             .send()
             .await?
             .status(),

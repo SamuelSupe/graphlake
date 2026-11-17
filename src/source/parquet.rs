@@ -784,6 +784,10 @@ impl OpenedParquet {
                 let pool = Arc::clone(pool);
                 let stats = Arc::clone(stats);
                 async move {
+                    let location = match &expected {
+                        Some(file) => file.url()?.into(),
+                        None => location,
+                    };
                     let mut file = PinnedFile::open_storage(&location, store, pool, stats).await?;
                     if let Some(expected) = &expected {
                         ensure!(

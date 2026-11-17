@@ -43,6 +43,8 @@ The service listens on loopback. For remote browser access, use an SSH tunnel (`
 
 Run Workers on private endpoints and configure the Coordinator with the cluster YAML. All nodes should use the same GraphLake build and have access to the data referenced by the published model.
 
+For shared S3 storage, set `GRAPHLAKE_CLUSTER_S3_BACKEND=opendal` in the environment of Coordinators, Workers, and backup and restore commands to opt in to OpenDAL. The default is `object_store`. To switch back, remove the variable or set it to `object_store` and restart those processes against the same bucket, prefix, and etcd cluster. [S3 backend settings](../deploy/cluster.md)
+
 For Coordinator failover, provision an etcd quorum and S3-compatible shared control storage. Use a TLS ingress that probes the elected Coordinator and the configured client protocols. The [cluster reference](../deploy/cluster.md#coordinator-故障接管) documents the startup flags, ingress configuration, and maintenance order.
 
 ## Monitoring and recovery

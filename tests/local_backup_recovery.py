@@ -86,9 +86,11 @@ class Site:
         (root / 'assets/index.html').write_text('<title>GraphLake recovery</title>')
         init_credentials(args.cli, root, self.password)
         self.config = root.with_suffix('.cluster.yaml')
+        prefix = getattr(args, 's3_prefix', None)
+        namespace = f'{prefix}/' if prefix else ''
         self.config.write_text(f'''name: s6-{uuid4().hex}
 metadata: {etcd}
-storage: s3://{args.bucket}/s6-{uuid4().hex}
+storage: s3://{args.bucket}/{namespace}s6-{uuid4().hex}
 token_env: S6_WORKER_TOKEN
 workers: ['http://127.0.0.1:{self.worker_port}']
 distributed_partitions: 2

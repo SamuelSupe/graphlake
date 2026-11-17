@@ -86,6 +86,24 @@ pub(crate) struct RemoteFile {
     pub sha256: String,
 }
 
+impl RemoteFile {
+    pub(crate) fn url(&self) -> Result<url::Url> {
+        // Manifests store the literal S3 key following the bucket. Encode it
+        // for the query engine and distributed plans, which parse normal URLs.
+        let (bucket, key) = self
+            .location
+            .strip_prefix("s3://")
+            .and_then(|location| location.split_once('/'))
+            .context("invalid managed Parquet location")?;
+        let key = object_store::path::Path::parse(key)?;
+        let mut url = url::Url::parse(&format!("s3://{bucket}"))?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid managed Parquet bucket"))?
+            .extend(key.as_ref().split('/'));
+        Ok(url)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteSnapshot {
     pub generation: Uuid,

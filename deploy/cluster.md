@@ -23,6 +23,10 @@ workers:
 
 将配置保存为 `cluster.yaml`。启动可用的 etcd v3 HTTP/JSON 网关，创建私有存储目录，向各进程注入同一个随机集群令牌。跨主机时将 `storage` 改为 `s3://bucket/prefix`，通过各主机环境配置 AWS 凭据与区域。S3 的 `graphlake-v1/<name>/results/` 前缀应配置对象保留策略和未完成分段上传回收。应用每五分钟清理过期结果对象。归档模型位于独立的 `models/` 前缀，按模型保留策略管理。
 
+集群 S3 默认使用 `object_store`。部署试点可在 Coordinator、Worker 和备份恢复命令共用的环境文件中设置 `GRAPHLAKE_CLUSTER_S3_BACKEND=opendal`。启动事件 `cluster_s3_backend` 记录选用的后端。两种后端使用同一 bucket、prefix 和 etcd 状态，切回时移除该变量或设为 `object_store`，然后重启相关进程。查询源和 S3 导出由各自的数据源或导出配置管理。
+
+OpenDAL 使用 `AWS_ENDPOINT_URL_S3` 或通用的 `AWS_ENDPOINT` / `AWS_ENDPOINT_URL`，区域缺省为 `us-east-1`。HTTP 端点需要 `AWS_ALLOW_HTTP=true`。静态密钥可附带 `AWS_SESSION_TOKEN`，自动凭据由 OpenDAL 的 AWS 凭据链加载。使用自定义 STS 或 IMDS 地址、SSE-C、S3 Express 或 `AWS_*` HTTP 客户端覆盖项的部署应使用默认后端。 [S3 后端设计与验收](../docs/design/opendal-s3.md)
+
 生产环境在 `metadata` 配置同一 etcd 集群的最多三个成员入口，例如 `metadata: [https://etcd-a.example:2379, https://etcd-b.example:2379, https://etcd-c.example:2379]`。每个节点使用同一份成员清单，地址不可跨独立集群混用。读取、申请空租约及续租在可用入口间切换，每个入口的响应预算为 210 毫秒。绑定主权和业务状态写入只在建连失败时换入口重试，可能已提交的写入使用原操作回执确认。原单地址配置继续可用。
 
 通过 [OpenTelemetry 配置](README.md#opentelemetry-上报) 为每台 Coordinator 和 Worker 指定 Collector 和实例标识。请求 Trace 可从 Coordinator 延续到执行 Worker。备份单元加载相同的环境文件，可将 `backup_exported` 事件接入备份新鲜度告警。

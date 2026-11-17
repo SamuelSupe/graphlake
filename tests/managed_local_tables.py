@@ -237,7 +237,7 @@ edges:
         state_key = keyroot + '/state/' + table
         first = original.load('full')['committed_generation']
         assert list(coordinator_tmp.glob('graphlake-managed-sync-*/**/*.parquet'))
-        assert list(coordinator_tmp.glob('graphlake-local-keys-*/*.sqlite'))
+        assert list(coordinator_tmp.glob('graphlake-managed-sync-*/**/*.keys.sqlite'))
         assert not list((original.root / '.graphlake-local').glob('managed-sync-*'))
         assert not list((original.root / '.graphlake-local').rglob('*.sqlite'))
         before = value(lookup(args, state_key)[0])['head']
@@ -324,7 +324,8 @@ edges:
         writes.append(frozen)
         running = original.load(wait=False)
         assert frozen.seen.wait(12), 'expected old coordinator to finish uploading'
-        candidate = next(value(op['request_put'])['head'] for op in json.loads(frozen.request)['success'])
+        candidate = next(value(put)['head'] for op in json.loads(frozen.request)['success']
+                         if (put := op.get('request_put', {})).get('key') == b64(state_key))
         assert manifest_exists(args, prefix + candidate['upload'])
         orphan_parts = {key for key in data_keys(args, prefix + candidate['upload'])
                         if '/' + candidate['upload'] + '/' in key}
@@ -339,6 +340,7 @@ edges:
         assert not json.loads(frozen.result).get('succeeded'), frozen.result
         assert lookup(args, state_key)[0]['mod_revision'] == before_revision
         old_coordinator.wait(timeout=15)
+        assert not list(coordinator_tmp.glob('graphlake-managed-sync-*'))
         start = time.monotonic()
         standby.coordinator('promoted')
         standby.login()

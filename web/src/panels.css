@@ -60,7 +60,7 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .scenario-list { display: grid; gap: 12px; min-inline-size: 0; }
 .scenario-add { padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); }
 .scenario-add button, .scenario-remove { justify-self: start; }
-.scenario-choices { max-block-size: 24rem; padding: 3px; margin: -3px; }
+.versions-choices.scenario-choices { max-block-size: 24rem; padding: 3px; margin: -3px; }
 .scenario-editor { min-inline-size: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); }
 .scenario-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12.5rem), 1fr)); gap: 10px; }
 .scenario-fields :is(label, input) { min-inline-size: 0; }
@@ -70,14 +70,14 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .scenario-expectations > label { max-inline-size: 22rem; }
 .scenario-findings { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .scenario-findings summary { overflow-wrap: anywhere; }
-.scenario-findings summary .small { margin-inline-start: 6px; font-weight: 400; }
+.scenario-findings summary .small { display: inline-block; margin-inline-start: 6px; font-weight: 400; white-space: nowrap; }
 .scenario-evidence { display: grid; gap: 4px 14px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 7rem), 1fr)); font-size: .75rem; overflow-wrap: anywhere; }
 .scenario-evidence + .scenario-evidence { border-block-start: 1px solid var(--line); padding-block-start: 6px; }
 .scenario-findings .scenario-evidence { margin-block-start: 8px; }
 .scenario-evidence dt { color: var(--muted); }
 @container (max-width: 37rem) {
   .scenario-layout { grid-template-columns: minmax(0, 1fr); }
-  .scenario-choices { display: flex; overflow-x: auto; overscroll-behavior: auto; }
+  .versions-choices.scenario-choices { display: flex; overflow-x: auto; overscroll-behavior: auto; }
   .scenario-choices > li { flex: 0 0 min(13rem, 80%); }
   .scenario-choices button { block-size: 100%; }
 }

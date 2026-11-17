@@ -2,9 +2,10 @@ export type Point = [number, number];
 export type Curve = [Point, Point, Point, Point];
 export type CanvasLayout = 'spread' | 'grid';
 
-const horizontalInset = 68;
+const horizontalInset = 84;
 const verticalInset = 62;
 const nodeRadius = 22;
+const columnPitch = 176;
 const clampUnit = (value: number) => Math.min(1, Math.max(0, value));
 
 export function pinOf([x, y]: Point, width: number, height: number): Point {
@@ -21,24 +22,64 @@ export function pointOf([x, y]: Point, width: number, height: number): Point {
   ];
 }
 
+export function canvasColumns(width: number) {
+  return Math.max(1, Math.min(7, 1 + Math.floor((width - 2 * horizontalInset) / columnPitch)));
+}
+
+export function connectedNodeOrder(names: string[], links: readonly { from: string; to: string }[]) {
+  const neighbors = new Map(names.map(name => [name, [] as string[]]));
+  for (const { from, to } of links) {
+    const source = neighbors.get(from);
+    const target = neighbors.get(to);
+    if (!source || !target || from === to) continue;
+    source.push(to);
+    target.push(from);
+  }
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const name of names) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const start = ordered.length;
+    ordered.push(name);
+    for (let index = start; index < ordered.length; index++) {
+      for (const neighbor of neighbors.get(ordered[index])!) {
+        if (seen.has(neighbor)) continue;
+        seen.add(neighbor);
+        ordered.push(neighbor);
+      }
+    }
+  }
+  return ordered;
+}
+
 export function placeNodes(names: string[], width: number, height: number, columns: number, layout: CanvasLayout) {
   const rows = Math.ceil(names.length / columns);
-  const spanX = Math.min(width - 120, 380);
-  const spanY = Math.min(height - 144, 190);
-  return new Map(names.map((name, index): [string, Point] => {
-    if (layout === 'spread' && names.length <= 2) {
+  if (layout === 'spread' && names.length <= 2) {
+    const spanX = Math.min(width - 2 * horizontalInset, 380);
+    const spanY = Math.min(height - 2 * verticalInset, 190);
+    return new Map(names.map((name, index): [string, Point] => {
       const side = names.length === 1 ? 0 : index === 0 ? 0.5 : -0.5;
       return [name, [width / 2 + spanX * side, height / 2 - spanY * side]];
-    }
-    if (layout === 'spread' && names.length <= 10) {
+    }));
+  }
+  if (layout === 'spread' && names.length <= 10) {
+    const radial = names.map((_, index): Point => {
       const angle = index * 2 * Math.PI / names.length - Math.PI / 2;
       const x = Math.min(width / 2 - horizontalInset, Math.max(145, names.length * 31));
       const y = Math.min(height / 2 - verticalInset, Math.max(118, names.length * 24));
-      return [name, [width / 2 + x * Math.cos(angle), height / 2 + y * Math.sin(angle)]];
+      return [width / 2 + x * Math.cos(angle), height / 2 + y * Math.sin(angle)];
+    });
+    // Reserve space for the label and the node beneath it before choosing a ring.
+    if (radial.every(([x, y], index) => radial.slice(0, index)
+      .every(([otherX, otherY]) => Math.abs(x - otherX) >= 156 || Math.abs(y - otherY) >= 68))) {
+      return new Map(names.map((name, index) => [name, radial[index]]));
     }
+  }
+  return new Map(names.map((name, index): [string, Point] => {
     const row = Math.floor(index / columns);
     const count = Math.min(columns, names.length - row * columns);
-    const x = width / 2 + (index % columns - (count - 1) / 2) * Math.min(176, (width - 96) / columns);
+    const x = width / 2 + (index % columns - (count - 1) / 2) * columnPitch;
     return [name, [x, height / 2 + (row - (rows - 1) / 2) * 124]];
   }));
 }

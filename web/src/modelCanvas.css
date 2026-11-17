@@ -1,5 +1,6 @@
 .canvas-panel:has(> .canvas-frame) { display: flex; flex-direction: column; }
 .canvas-frame { position: relative; flex: 1; min-block-size: 0; }
+.canvas-viewport:focus-visible { outline-offset: -2px; }
 .canvas-instructions {
   display: flex;
   flex: none;
@@ -51,5 +52,6 @@
 .graph-stage[data-linking] .graph-node { cursor: crosshair; }
 .graph-toolbar .tool-button[aria-pressed="true"] { color: var(--blue-dark); background: var(--tint); border-color: #c9d7ff; }
 @media (pointer: coarse) {
+  .canvas-controls :is(button, select) { min-block-size: 44px; min-inline-size: 44px; }
   .graph-port { inset-inline-start: 24px; inline-size: 44px; block-size: 44px; }
 }

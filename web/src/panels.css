@@ -65,7 +65,26 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .version-repair { padding: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
 .yaml-editor .panel-body { display: flex; flex-direction: column; gap: 12px; }
 .yaml-editor .panel-body > label { display: flex; flex: 1; min-block-size: 200px; }
-.yaml-editor textarea { flex: 1; inline-size: 100%; min-block-size: 200px; resize: none; font-size: .8125rem; padding: 14px; background: var(--panel); }
+.yaml-editor textarea { flex: 1; inline-size: 100%; min-block-size: 200px; font-size: .875rem; padding: 14px; background: var(--panel); }
+.yaml-editor textarea[aria-invalid="true"] { border-color: #a1322c; }
+.yaml-editor .inline-error { white-space: pre-wrap; overflow-wrap: anywhere; }
+.yaml-diagnostic:empty { position: absolute; }
+.yaml-locate { align-self: flex-start; }
+.graph-workspace > .yaml-editor {
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow);
+}
+.yaml-file-actions {
+  display: flex; flex-wrap: wrap; flex: none; justify-content: flex-end; gap: 6px;
+  padding: 8px 10px; border-block-end: 1px solid var(--line);
+}
+.graph-workspace > .yaml-editor > .panel-body { overflow: visible; padding: 10px; }
+.graph-workspace > .yaml-editor textarea { min-block-size: clamp(220px, 50dvh, 460px); }
+@container model-editor (inline-size < 36rem) {
+  .yaml-file-actions { justify-content: flex-start; }
+}
+@media (pointer: coarse) {
+  .yaml-file-actions .button { min-block-size: 44px; }
+}
 .scope-section { display: grid; gap: 16px; }
 .edge-draft-name { display: grid; gap: 6px; }
 .edge-draft-name input[aria-invalid="true"] { border-color: #a1322c; }

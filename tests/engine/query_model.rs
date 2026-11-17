@@ -11,6 +11,55 @@ use serde_json::json;
 use super::{local_fixture, parquet, rows, transfers};
 
 #[tokio::test]
+async fn expanding_scalars_reserve_memory_before_allocation() -> Result<()> {
+    let (_files, engine) = local_fixture("key: [tenant, id]")?;
+    let options = QueryOptions {
+        memory_bytes: 1024 * 1024,
+        spill_bytes: 0,
+        ..Default::default()
+    };
+    for (language, query) in [
+        (
+            Language::Sql,
+            "SELECT length(repeat('x', 64 * 1024 * 1024)) AS n",
+        ),
+        (
+            Language::Sql,
+            "SELECT length(rpad('x', 8388608, '多')) AS n",
+        ),
+        (
+            Language::Sql,
+            "SELECT array_length(list_repeat(1, 8388608)) AS n",
+        ),
+        (
+            Language::Sql,
+            r#"SELECT length(repeat(status, 16777216)) AS n FROM "Account""#,
+        ),
+        (Language::Cypher, "RETURN size(range(1, 1000000)) AS n"),
+    ] {
+        let error = match engine.query(language, query, options.clone()).await {
+            Ok(mut result) => rows(&mut result).await.err(),
+            Err(error) => Some(error),
+        }
+        .context("an over-budget scalar expansion succeeded")?;
+        assert!(
+            format!("{error:#}").contains("scalar allocation"),
+            "{query}: {error:#}"
+        );
+    }
+    let mut small = engine
+        .query(
+            Language::Sql,
+            "SELECT repeat('λ', 3) AS s, list_repeat(4, 2) AS a",
+            options,
+        )
+        .await?;
+    assert_eq!(rows(&mut small).await?, [json!({"s":"λλλ", "a":[4,4]})]);
+    assert!(small.metrics().peak_reserved_bytes > 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cypher_aggregated_order_only_uses_projected_values() -> Result<()> {
     let (_dir, engine) = local_fixture("key: [tenant, id]")?;
     let error = engine

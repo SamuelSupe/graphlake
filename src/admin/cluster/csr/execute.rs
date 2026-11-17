@@ -393,6 +393,12 @@ impl BlockCache {
     }
 }
 
+fn identity_block(blocks: &[Block], id: u64) -> Option<usize> {
+    let index = blocks.partition_point(|block| block.last < id);
+    blocks.get(index).filter(|block| block.first <= id)?;
+    Some(index)
+}
+
 struct Graph<'a> {
     objects: &'a Objects,
     manifest: Arc<Manifest>,
@@ -402,6 +408,7 @@ struct Graph<'a> {
     types: BTreeSet<u32>,
     direction: Direction,
     arc_cache: &'a ArcBlocks,
+    identity_cache: BlockCache,
 }
 
 impl Graph<'_> {
@@ -441,13 +448,13 @@ impl Graph<'_> {
     }
 
     async fn record(&self, blocks: &[Block], path: &str, id: u64) -> Result<Vec<u8>> {
-        let index = blocks.partition_point(|block| block.last < id);
-        if let Some(block) = blocks.get(index).filter(|b| b.first <= id) {
+        if let Some(index) = identity_block(blocks, id) {
             let key = self.prefix.clone().join(path).join(index.to_string());
-            let memory = self.budget.new_empty();
-            memory.try_grow(block.decoded_size())?;
-            let bytes = read_block(self.objects, &key, block, self.scope).await?;
-            for (key, value) in records(&bytes) {
+            let block = self
+                .identity_cache
+                .read(self.objects, key, &blocks[index], self.scope)
+                .await?;
+            for (key, value) in records(&block.bytes) {
                 if key == id {
                     return Ok(value.to_vec());
                 }
@@ -462,20 +469,30 @@ impl Graph<'_> {
     async fn vertices(
         &self,
         shard: usize,
+        indices: Option<&[usize]>,
         mut visit: impl FnMut(Vertex, &[u8]) -> Result<()>,
     ) -> Result<()> {
         let prefix = self.prefix.clone().join(format!("v-{shard}"));
-        for (index, block) in self.manifest.partitions[shard].vertices.iter().enumerate() {
+        let blocks = &self.manifest.partitions[shard].vertices;
+        for offset in 0..indices.map_or(blocks.len(), <[usize]>::len) {
+            let index = indices.map_or(offset, |selected| selected[offset]);
+            let block = &blocks[index];
+            let key = prefix.clone().join(index.to_string());
             let memory = self.budget.new_empty();
-            memory.try_grow(block.decoded_size())?;
-            let data = read_block(
-                self.objects,
-                &prefix.clone().join(index.to_string()),
-                block,
-                self.scope,
-            )
-            .await?;
-            for (id, bytes) in records(&data) {
+            let cached;
+            let data;
+            let bytes = if indices.is_some() {
+                cached = self
+                    .identity_cache
+                    .read(self.objects, key, block, self.scope)
+                    .await?;
+                &cached.bytes
+            } else {
+                memory.try_grow(block.decoded_size())?;
+                data = read_block(self.objects, &key, block, self.scope).await?;
+                &data
+            };
+            for (id, bytes) in records(bytes) {
                 visit(id, bytes)?;
             }
         }
@@ -667,6 +684,7 @@ pub(in crate::admin::cluster) async fn run_task(
             direction: task.direction,
             types: task.types,
             arc_cache: &worker.arc_cache,
+            identity_cache: BlockCache::default(),
         };
         ensure!(
             task.shard < graph.manifest.partitions.len(),
@@ -803,6 +821,7 @@ impl<'a> Execution<'a> {
                 types,
                 direction,
                 arc_cache: &worker.arc_cache,
+                identity_cache: BlockCache::default(),
                 budget: MemoryConsumer::new("GraphLake CSR execution")
                     .register(&scope.runtime.memory_pool),
             },
@@ -893,8 +912,14 @@ impl<'a> Execution<'a> {
             }
             let endpoint = &peers[index];
             let output = Uuid::new_v4();
-            let remaining = self.graph.scope.remaining()?;
-            let millis = remaining.as_millis().max(1);
+            // Reserve an equal share of the remaining time for each alternative,
+            // including local execution when all peers fail.
+            let attempts = u32::try_from(peers.len() - offset + 1).unwrap_or(u32::MAX);
+            let attempt = self.graph.scope.remaining()? / attempts;
+            let millis = attempt.as_millis();
+            if millis == 0 {
+                break;
+            }
             let response = self
                 .worker
                 .shared
@@ -902,7 +927,7 @@ impl<'a> Execution<'a> {
                 .post(endpoint.join("/internal/v1/csr")?)
                 .headers(crate::admin::telemetry::trace_headers())
                 .bearer_auth(&self.worker.shared.token)
-                .timeout(remaining)
+                .timeout(attempt)
                 .header(WORK_BUDGET_HEADER, millis.to_string())
                 .json(&Task {
                     id: self.id,
@@ -945,7 +970,9 @@ impl<'a> Execution<'a> {
                     self.unavailable.lock().unwrap().insert(index);
                 }
                 continue;
-            } else if response.as_ref().is_err_and(|error| error.is_connect())
+            } else if response
+                .as_ref()
+                .is_err_and(|error| error.is_connect() || error.is_timeout())
                 || response
                     .as_ref()
                     .is_ok_and(|r| r.status() == StatusCode::BAD_GATEWAY)

@@ -1,3 +1,5 @@
+mod allocation;
+
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -454,7 +456,9 @@ impl QueryScope {
         let config = SessionConfig::new()
             .with_target_partitions(self.options.partitions)
             .with_batch_size(self.options.batch_size);
-        SessionContext::new_with_config_rt(config, Arc::clone(&self.runtime))
+        let context = SessionContext::new_with_config_rt(config, Arc::clone(&self.runtime));
+        allocation::register(&context, self, allocation::BUILT_INS);
+        context
     }
 
     #[cfg(feature = "admin")]
@@ -502,6 +506,7 @@ impl QueryScope {
                 .build(),
         );
         super::query_functions::register(&context);
+        allocation::register(&context, self, &["__graphlake_cypher_range"]);
         super::query_functions::cypher::reduce::register(&context, self);
         super::query_functions::cypher::collect::register(
             &context,

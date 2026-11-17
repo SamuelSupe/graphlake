@@ -24,6 +24,57 @@ pub struct SourceVersion {
     pub consistency: &'static str,
 }
 
+// Preserve SourceVersion's public string interface and the on-disk labels.
+macro_rules! source_consistency {
+    ($($variant:ident => $label:literal),+ $(,)?) => {
+        pub(crate) enum SourceConsistency {
+            $($variant,)+
+        }
+
+        impl SourceConsistency {
+            pub(crate) const fn label(self) -> &'static str {
+                match self { $(Self::$variant => $label,)+ }
+            }
+
+            pub(crate) fn persisted_label(label: &str) -> Option<&'static str> {
+                match label { $($label => Some($label),)+ _ => None }
+            }
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn source_consistency_round_trips() {
+            $(
+                let saved = serde_json::to_string(SourceConsistency::$variant.label()).unwrap();
+                let restored: String = serde_json::from_str(&saved).unwrap();
+                assert_eq!(SourceConsistency::persisted_label(&restored), Some($label));
+            )+
+        }
+    };
+}
+
+source_consistency! {
+    PinnedObject => "pinned object",
+    PostgresRepeatableRead => "PostgreSQL repeatable read",
+    PostgresContent => "PostgreSQL relation content",
+    MysqlRepeatableRead => "MySQL InnoDB repeatable read",
+    MysqlStatement => "MySQL-compatible statement",
+    Sqlite => "SQLite read transaction",
+    Duckdb => "DuckDB read transaction",
+    Oracle => "Oracle read-only transaction",
+    Sqlserver => "SQL Server statement",
+    Mongodb => "MongoDB cursor",
+    Databricks => "Databricks statement",
+    Iceberg => "Iceberg snapshot",
+    Delta => "Delta version",
+    Snowflake => "Snowflake time travel",
+    Bigquery => "BigQuery time travel",
+    Trino => "Trino statement",
+    Clickhouse => "ClickHouse statement",
+    Spanner => "Spanner read-only transaction",
+    Hana => "SAP HANA statement",
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ReadStats {
     requests: AtomicU64,

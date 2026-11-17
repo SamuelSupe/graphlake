@@ -3663,24 +3663,67 @@ edges:
     assert_eq!(third["graph"], first["graph"]);
     assert_eq!(first_csr["vertices"], 2);
     assert_eq!(first_csr["edges"], 2);
+    let manifest: Value = serde_json::from_slice(&fs::read(
+        store
+            .join("graphlake-v1")
+            .join(&name)
+            .join("csr")
+            .join("keyless")
+            .join(keyless_revision.as_str().unwrap())
+            .join(first_csr["generation"].as_str().unwrap())
+            .join("manifest.json"),
+    )?)?;
+    let partitions = manifest["partitions"].as_array().unwrap();
+    let block_bytes = |block: &Value| block["bytes"].as_u64().unwrap();
+    let vertex_blocks: Vec<_> = partitions
+        .iter()
+        .flat_map(|shard| shard["vertices"].as_array().unwrap())
+        .map(block_bytes)
+        .collect();
+    let reachable: Value = coordinator
+        .request(Method::POST, "models/keyless/query")
+        .json(&csr(
+            json!({"kind": "reachable", "start": {"label":"Account", "key":["1", "9007199254740993"]}, "max_hops":0}),
+            &first_csr["generation"],
+            &keyless_revision,
+        ))
+        .send().await?.error_for_status()?.json().await?;
+    assert_eq!(reachable["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(reachable["csr_stats"]["rounds"], 0);
+    assert!(vertex_blocks.contains(&reachable["csr_stats"]["object_bytes"].as_u64().unwrap()));
+
+    let unresponsive =
+        tokio::net::TcpListener::bind(addresses[0].strip_prefix("http://").unwrap()).await?;
+    let csr_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let blackhole = axum::Router::new()
+        .route(
+            "/internal/v1/csr",
+            axum::routing::post({
+                let csr_attempts = csr_attempts.clone();
+                move || async move {
+                    csr_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        )
+        .fallback(|| async { StatusCode::BAD_GATEWAY });
+    let blackhole = tokio::spawn(async move { axum::serve(unresponsive, blackhole).await });
     let op = json!({
         "kind": "all_shortest",
         "start": {"label":"Account", "key":["1", "9007199254740993"]},
         "target": {"label":"Merchant", "key":["1", "7"]},
         "max_hops": 1, "max_paths": 2
     });
-    let response: Value = coordinator
+    let mut payload = csr(op.clone(), &first_csr["generation"], &keyless_revision);
+    payload["timeout_ms"] = json!(4_000);
+    let response = coordinator
         .request(Method::POST, "models/keyless/query")
-        .json(&csr(
-            op.clone(),
-            &first_csr["generation"],
-            &keyless_revision,
-        ))
+        .json(&payload)
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    blackhole.abort();
+    assert!(csr_attempts.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    let response: Value = response.error_for_status()?.json().await?;
     assert_eq!(response["csr_generation"], first_csr["generation"]);
     let rows = response["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -3692,6 +3735,23 @@ edges:
         })
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(keys, [json!(["1"]), json!(["2"])]);
+    let distinct_bytes = vertex_blocks.iter().sum::<u64>()
+        + manifest["edge_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(block_bytes)
+            .sum::<u64>()
+        + partitions
+            .iter()
+            .flat_map(|shard| shard["arcs"].as_array().unwrap())
+            .map(block_bytes)
+            .sum::<u64>();
+    assert!(
+        response["csr_stats"]["object_bytes"].as_u64().unwrap() <= distinct_bytes,
+        "{response}"
+    );
+
     assert!(response["csr_stats"]["retries"].as_u64().unwrap() > 0);
     let keyless_paths: Value = coordinator
         .request(Method::POST, "models/keyless/query")

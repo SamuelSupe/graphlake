@@ -1,3 +1,5 @@
+use crate::source::SourceConsistency;
+
 use super::*;
 
 pub(super) async fn prepare<'a, 'q>(
@@ -148,10 +150,12 @@ pub(super) async fn prepare<'a, 'q>(
                         .await?
                 };
                 let (key, consistency) = match source {
-                    Source::Duckdb { .. } => (name, "DuckDB read transaction"),
-                    Source::OracleNative { .. } => (name, "Oracle read-only transaction"),
-                    Source::SqlserverNative { .. } => (reference, "SQL Server statement"),
-                    _ => (reference, "MongoDB cursor"),
+                    Source::Duckdb { .. } => (name, SourceConsistency::Duckdb.label()),
+                    Source::OracleNative { .. } => (name, SourceConsistency::Oracle.label()),
+                    Source::SqlserverNative { .. } => {
+                        (reference, SourceConsistency::Sqlserver.label())
+                    }
+                    _ => (reference, SourceConsistency::Mongodb.label()),
                 };
                 versions.entry(key.into()).or_insert_with(|| SourceVersion {
                     source: key.into(),
@@ -188,7 +192,7 @@ pub(super) async fn prepare<'a, 'q>(
                     SourceVersion {
                         source: reference.into(),
                         version: uuid::Uuid::new_v4().to_string(),
-                        consistency: "Databricks statement",
+                        consistency: SourceConsistency::Databricks.label(),
                     },
                 );
                 reservations.push(budget);
@@ -272,7 +276,7 @@ pub(super) async fn prepare<'a, 'q>(
                             SourceVersion {
                                 source: name.into(),
                                 version: snapshot.version.clone(),
-                                consistency: "SQLite read transaction",
+                                consistency: SourceConsistency::Sqlite.label(),
                             },
                         );
                         entry.insert(snapshot)
@@ -322,7 +326,7 @@ pub(super) async fn prepare<'a, 'q>(
                             SourceVersion {
                                 source: name.into(),
                                 version: snapshot.version.clone(),
-                                consistency: "PostgreSQL repeatable read",
+                                consistency: SourceConsistency::PostgresRepeatableRead.label(),
                             },
                         );
                         entry.insert(snapshot)
@@ -344,7 +348,7 @@ pub(super) async fn prepare<'a, 'q>(
                         SourceVersion {
                             source: reference.into(),
                             version: snapshot.relation_version(relation).await?,
-                            consistency: "PostgreSQL relation content",
+                            consistency: SourceConsistency::PostgresContent.label(),
                         },
                     );
                 }
@@ -386,7 +390,7 @@ pub(super) async fn prepare<'a, 'q>(
                                 SourceVersion {
                                     source: name.into(),
                                     version: snapshot.version.clone(),
-                                    consistency: "MySQL InnoDB repeatable read",
+                                    consistency: SourceConsistency::MysqlRepeatableRead.label(),
                                 },
                             );
                         }
@@ -416,7 +420,7 @@ pub(super) async fn prepare<'a, 'q>(
                         SourceVersion {
                             source: reference.into(),
                             version: uuid::Uuid::new_v4().to_string(),
-                            consistency: "MySQL-compatible statement",
+                            consistency: SourceConsistency::MysqlStatement.label(),
                         },
                     );
                 }
@@ -489,7 +493,7 @@ pub(super) async fn prepare<'a, 'q>(
                     SourceVersion {
                         source: reference.into(),
                         version,
-                        consistency: "ClickHouse statement",
+                        consistency: SourceConsistency::Clickhouse.label(),
                     },
                 );
                 reservations.push(budget);
@@ -530,7 +534,7 @@ pub(super) async fn prepare<'a, 'q>(
                     SourceVersion {
                         source: reference.into(),
                         version,
-                        consistency: "Trino statement",
+                        consistency: SourceConsistency::Trino.label(),
                     },
                 );
                 reservations.push(budget);
@@ -554,7 +558,7 @@ pub(super) async fn prepare<'a, 'q>(
                             SourceVersion {
                                 source: name.into(),
                                 version: snapshot.version.clone(),
-                                consistency: "Spanner read-only transaction",
+                                consistency: SourceConsistency::Spanner.label(),
                             },
                         );
                         entry.insert(snapshot)
@@ -603,7 +607,7 @@ pub(super) async fn prepare<'a, 'q>(
                     SourceVersion {
                         source: reference.into(),
                         version,
-                        consistency: "SAP HANA statement",
+                        consistency: SourceConsistency::Hana.label(),
                     },
                 );
                 reservations.push(budget);
@@ -629,7 +633,7 @@ pub(super) async fn prepare<'a, 'q>(
                     SourceVersion {
                         source: reference.into(),
                         version: version.to_string(),
-                        consistency: "Delta version",
+                        consistency: SourceConsistency::Delta.label(),
                     },
                 );
                 Arc::clone(table)

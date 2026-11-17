@@ -23,6 +23,7 @@ fn stage(root: &Path, version: i64) -> Result<NamedTempFile> {
 async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
     let root = tempfile::tempdir()?;
     let anchor = root.path().join("copy.parquet");
+    let index = anchor.with_extension("keys.sqlite");
     let keys = vec!["id".to_owned()];
     let old_value = ScalarValue::Int64(Some(5));
     let next_value = ScalarValue::Int64(Some(6));
@@ -30,6 +31,7 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
     let current = QueryScope::new(QueryOptions::default(), &admission).await?;
     full(
         &anchor,
+        true,
         &stage(root.path(), 5)?,
         &keys,
         "version",
@@ -37,6 +39,7 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
         Uuid::new_v4(),
         &current,
     )?;
+    assert!(index.is_file());
     let old = Snapshot::read(&anchor)?.context("missing committed snapshot")?;
     let mut snapshot = old.clone();
     snapshot.generation = Uuid::new_v4();
@@ -48,7 +51,7 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
         staged: Vec::new(),
     };
     let file = stage(root.path(), 6)?;
-    let mut conn = open(&anchor, &current)?;
+    let mut conn = open(&anchor, true, &current)?;
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM position", [])?;
     insert_file(
@@ -74,6 +77,7 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
     assert_eq!(
         incremental(
             &anchor,
+            true,
             Some(&old),
             &file,
             &keys,
@@ -90,5 +94,8 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
     assert_eq!(current.parts[0].deleted, [0]);
     overlay::clean(&anchor)?;
     assert!(!interrupted.snapshot.parts[0].path(&anchor).exists());
+    drop(file);
+    root.close()?;
+    assert!(!index.exists());
     Ok(())
 }

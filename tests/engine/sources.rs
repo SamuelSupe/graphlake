@@ -524,7 +524,8 @@ async fn sqlite_sources_query_typed_rows_and_do_not_create_files() -> Result<()>
             "properties: [status, enabled, bytes]",
         ),
     )?;
-    let engine = Engine::new(Catalog::load(&path)?)?;
+    let catalog = Catalog::load(&path)?;
+    let engine = Engine::new(catalog.clone())?.with_cache(dir.path().join("csr"), "sqlite")?;
     let mut options = QueryOptions {
         batch_size: 2,
         ..Default::default()
@@ -545,6 +546,22 @@ async fn sqlite_sources_query_typed_rows_and_do_not_create_files() -> Result<()>
     let result = rows(&mut result).await?;
     assert_eq!(result[0]["enabled"], true);
     assert!(!result[0]["bytes"].is_null());
+    let mut request = traversal_request(Direction::Outgoing, TraversalKind::Reachable);
+    request.start[0] = ScalarValue::Int64(Some(1));
+    let mut live = engine
+        .traverse_with_strategy(request.clone(), Default::default(), TraversalStrategy::Scan)
+        .await?;
+    let mut expected = rows(&mut live).await?;
+    engine.refresh("Transfer", Default::default()).await?;
+    let reader = Engine::new(catalog)?.with_cache(dir.path().join("csr"), "sqlite")?;
+    let mut cached = reader
+        .traverse_with_strategy(request, Default::default(), TraversalStrategy::Cached)
+        .await?;
+    let mut actual = rows(&mut cached).await?;
+    expected.sort_by_key(ToString::to_string);
+    actual.sort_by_key(ToString::to_string);
+    assert_eq!(actual, expected);
+    assert_eq!(cached.versions[0].consistency, "SQLite read transaction");
     connection.execute_batch("UPDATE accounts SET enabled=2 WHERE id=1")?;
     assert!(
         engine

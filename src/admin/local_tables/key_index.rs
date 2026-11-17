@@ -104,6 +104,7 @@ fn indexed(
 
 pub(super) fn full(
     anchor: &Path,
+    managed: bool,
     file: &NamedTempFile,
     keys: &[String],
     column: &str,
@@ -126,7 +127,7 @@ pub(super) fn full(
         pruning: None,
         indexed: Some(indexed(meta.schema(), keys, column, value, run_id)?),
     };
-    let mut conn = open(anchor, scope)?;
+    let mut conn = open(anchor, managed, scope)?;
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM position", [])?;
     insert_file(&tx, &part, data, keys, scope)?;
@@ -272,6 +273,7 @@ pub(super) fn compact(
 /// None means the batch cannot be published within the existing overlay bounds.
 pub(super) fn incremental(
     anchor: &Path,
+    managed: bool,
     previous: Option<&Snapshot>,
     file: &NamedTempFile,
     keys: &[String],
@@ -314,7 +316,7 @@ pub(super) fn incremental(
             );
         }
     }
-    let mut connection = open(anchor, scope)?;
+    let mut connection = open(anchor, managed, scope)?;
     let tx = connection.transaction()?;
     let cached = tx
         .query_row("SELECT value FROM generation", [], |row| {

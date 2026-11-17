@@ -1,3 +1,5 @@
+use crate::source::SourceConsistency;
+
 use std::{collections::HashMap, fmt, io::Cursor, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
@@ -130,7 +132,7 @@ impl IcebergTable {
             source: reference.into(),
             version: snapshot
                 .map_or_else(|| format!("empty:{}", metadata.uuid()), |id| id.to_string()),
-            consistency: "Iceberg snapshot",
+            consistency: SourceConsistency::Iceberg.label(),
         };
         Ok((
             Self {

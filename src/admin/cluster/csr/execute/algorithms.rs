@@ -345,6 +345,22 @@ async fn node_results(
         &graph.scope.runtime.memory_pool,
         Some(&graph.scope.runtime.disk_manager),
     );
+    let selected_memory = graph.budget.new_empty();
+    let selected = if let Some(ids) = subset {
+        let mut blocks = BTreeSet::new();
+        for &id in ids.keys() {
+            graph.scope.check()?;
+            let shard = partition(id, graph.manifest.partitions.len());
+            let index = identity_block(&graph.manifest.partitions[shard].vertices, id)
+                .context("missing CSR vertex identity block")?;
+            if blocks.insert((shard, index)) {
+                selected_memory.try_grow(64)?;
+            }
+        }
+        Some(blocks)
+    } else {
+        None
+    };
     for shard in 0..graph.manifest.partitions.len() {
         let mut ids = Vec::new();
         let mut identities = Vec::new();
@@ -362,8 +378,14 @@ async fn node_results(
             }
             Ok(())
         };
+        let indices = selected.as_ref().map(|blocks| {
+            blocks
+                .range((shard, 0)..=(shard, usize::MAX))
+                .map(|&(_, index)| index)
+                .collect::<Vec<_>>()
+        });
         graph
-            .vertices(shard, |id, identity| {
+            .vertices(shard, indices.as_deref(), |id, identity| {
                 if subset.is_some_and(|vertices| !vertices.contains_key(&id)) {
                     return Ok(());
                 }

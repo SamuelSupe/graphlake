@@ -464,22 +464,8 @@ impl Manifest {
             .map(|v| SourceVersion {
                 source: v.source.clone(),
                 version: v.version.clone(),
-                consistency: match v.consistency.as_str() {
-                    "pinned object" => "pinned object",
-                    "PostgreSQL repeatable read" => "PostgreSQL repeatable read",
-                    "MySQL InnoDB repeatable read" => "MySQL InnoDB repeatable read",
-                    "SQLite read transaction" => "SQLite read transaction",
-                    "DuckDB read transaction" => "DuckDB read transaction",
-                    "Oracle read-only transaction" => "Oracle read-only transaction",
-                    "SQL Server statement" => "SQL Server statement",
-                    "MongoDB cursor" => "MongoDB cursor",
-                    "Databricks statement" => "Databricks statement",
-                    "MySQL-compatible statement" => "MySQL-compatible statement",
-                    "Iceberg snapshot" => "Iceberg snapshot",
-                    "Delta version" => "Delta version",
-                    "Spanner read-only transaction" => "Spanner read-only transaction",
-                    _ => "published CSR",
-                },
+                consistency: crate::source::SourceConsistency::persisted_label(&v.consistency)
+                    .unwrap_or("published CSR"),
             })
             .collect()
     }

@@ -524,6 +524,8 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml --diagnostics \
 
 同一进程通过 `Engine::new` 创建的实例共享 8 个活动查询、2 GiB 内存预算和 8 GiB 临时磁盘预算。查询进入时预留声明的额度，读取完成或关闭结果流后释放。等待资源计入查询超时，也可以取消。Rust 可通过 `Engine::new_with_limits` 为一个实例及其克隆配置独立预算。CLI 单次执行按命令行参数分配预算。
 
+查询在运行时检查字符串重复、填充、替换、连接以及列表重复、扩展和序列生成的内存需求。估算包含当前批次的输出和临时空间，超过可用查询预算时在分配前返回错误。受控函数即使参数都是常量，也在相同预算下执行。
+
 CSV、JSON Lines、SQLite、MySQL、Trino、ClickHouse、Snowflake、BigQuery、Spanner 和 SAP HANA 的查询结果可以物化到受磁盘配额约束的 Arrow IPC 临时文件。多表映射去重、无键边身份、相关 `CALL` 的分批或逐行求值结果也可溢写。Cypher 诊断的 `spilled_bytes` 包含已完成的批量子查询执行阶段和 `collect()` 的算子溢写。低内存下引擎可降低内部并行度，保留排序归并的工作内存。诊断中的 `reads.snapshot_spilled_bytes` 记录这些物化操作产生的磁盘字节。MySQL、Trino、ClickHouse、Spanner 和 SAP HANA 可把单节点标签查询的整数业务键条件及可安全转换的映射或分区条件下推到源端。引擎仍在本地应用条件，ClickHouse 也支持对原生 String 列下推文本等值条件。复杂查询仍可能扫描整个源表。
 
 ## 整图算法

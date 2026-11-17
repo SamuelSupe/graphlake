@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use datafusion::{
     arrow::{
         array::{Array, RecordBatch},
@@ -376,18 +376,8 @@ impl Manifest {
         self.versions
             .into_iter()
             .map(|(source, version, consistency)| {
-                let consistency = match consistency.as_str() {
-                    "PostgreSQL repeatable read" => "PostgreSQL repeatable read",
-                    "pinned object" => "pinned object",
-                    "Iceberg snapshot" => "Iceberg snapshot",
-                    "Delta version" => "Delta version",
-                    "Snowflake time travel" => "Snowflake time travel",
-                    "BigQuery time travel" => "BigQuery time travel",
-                    "Trino statement" => "Trino statement",
-                    "ClickHouse statement" => "ClickHouse statement",
-                    "MySQL InnoDB repeatable read" => "MySQL InnoDB repeatable read",
-                    _ => bail!("unknown CSR source consistency"),
-                };
+                let consistency = crate::source::SourceConsistency::persisted_label(&consistency)
+                    .context("unknown CSR source consistency")?;
                 Ok(SourceVersion {
                     source,
                     version,

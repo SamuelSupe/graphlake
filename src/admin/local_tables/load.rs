@@ -380,6 +380,7 @@ async fn load(
         match tokio::task::block_in_place(|| {
             key_index::incremental(
                 path,
+                table.managed,
                 snapshot.as_ref(),
                 &delta,
                 &config.key_columns,
@@ -535,6 +536,7 @@ async fn load(
         tokio::task::block_in_place(|| {
             key_index::full(
                 path,
+                table.managed,
                 &output,
                 &config.key_columns,
                 column,

@@ -64,7 +64,7 @@ impl Managed {
                 let state = Record {
                     table: table.clone(),
                     head: None,
-                    retired: Vec::new(),
+                    retired: Default::default(),
                     pending: None,
                 };
                 ensure!(

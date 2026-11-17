@@ -1,7 +1,7 @@
 import { useRef, useSyncExternalStore, type ReactNode } from 'react';
 import { Menu } from 'lucide-react';
 import { t } from './locale.ts';
-import { Mark } from './ui';
+import { BrandLogo } from './ui';
 import './navigation.css';
 
 const compact = window.matchMedia('(max-width: 760px)');
@@ -28,7 +28,7 @@ export function ConsoleNavigation({ page, home, account, children }: {
 
   return <header className="app-rail" data-collapsed={collapsed || undefined}>
     <button className="rail-brand" aria-label={t('GraphLake 首页')} onClick={home}>
-      <Mark size={26} /><span>GraphLake</span>
+      <BrandLogo /><span>GraphLake</span>
     </button>
     <nav className="rail-nav" aria-label={t('主导航')}>
       {collapsed && <button className="rail-menu-trigger button compact" type="button"

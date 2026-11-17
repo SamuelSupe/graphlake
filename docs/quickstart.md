@@ -40,6 +40,8 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 
 Choose a password when prompted. Open [http://127.0.0.1:7337](http://127.0.0.1:7337/) and sign in as `admin`. The valid model is adopted on startup.
 
+Select the GraphLake logo in the console navigation to return to the graph model list.
+
 The console opens in English by default. Choose **English** or **简体中文** on the sign-in page or in the main navigation. On small screens, tap the navigation button beside GraphLake to find the language selector and workspace links. GraphLake reloads the current page and remembers the language in this browser. If your current workspace has unsaved changes, the browser prompts you before leaving.
 
 1. Open **Graph Models** (图模型) and select `graph` to inspect the mapping.

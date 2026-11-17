@@ -12,11 +12,10 @@
 .app-rail :is(button, a) { color: inherit; }
 .app-rail :is(button, a):focus-visible { outline-offset: -3px; }
 .rail-brand {
-  display: flex; align-items: center; justify-content: center; gap: 10px; flex: none; width: 100%; height: var(--header-height);
+  display: flex; align-items: center; justify-content: center; gap: 5px; flex: none; width: 100%; height: var(--header-height);
   background: transparent; border: 0; border-bottom: 1px solid var(--line);
 }
 .rail-brand span { color: #24324b; font-size: 1.0625rem; font-weight: 700; letter-spacing: -.03em; }
-.rail-brand .brand-mark { color: var(--blue); }
 .rail-items { display: grid; gap: 5px; padding: 16px 10px; grid-template-columns: minmax(0, 1fr); }
 .rail-account { margin-block-start: auto; grid-template-columns: minmax(0, 1fr); border-block-start: 1px solid var(--line); padding-block: 10px; }
 .rail-identity { display: flex; align-items: center; gap: 12px; padding: 6px 14px; }

@@ -3622,7 +3622,7 @@ dependencies = [
 
 [[package]]
 name = "graphlake"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3691,7 +3691,7 @@ dependencies = [
 
 [[package]]
 name = "graphlake-c"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.2",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "graphlake-python"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "arrow-pyarrow",

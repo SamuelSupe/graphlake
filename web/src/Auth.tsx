@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from
 import { api, authRequired, errorText } from './api';
 import { clearPendingQueries } from './Query';
 import { clearPendingMutations } from './Mutations';
-import { Mark, WorkspaceLocked } from './ui';
+import { BrandLogo, WorkspaceLocked } from './ui';
 import { LanguageSelect } from './LanguageSelect';
 
 export type Session = { authenticated: boolean; enabled: boolean; username: string | null; administrator: boolean; subject?: string | null; authorization?: string | null; proxy_sign_in?: boolean };
@@ -47,7 +47,7 @@ function Login({ expired, username, proxySignIn, signedIn }: { expired: boolean;
   return <main className="auth-page">
     <section className="auth-card" aria-labelledby="login-heading">
       <div className="auth-card-heading">
-        <div className="auth-brand"><span className="model-icon"><Mark size={22} /></span>GraphLake</div>
+        <div className="auth-brand"><BrandLogo size={40} />GraphLake</div>
         <LanguageSelect />
       </div>
       <h1 id="login-heading">{expired ? t('会话已过期') : t('登录管理后台')}</h1>

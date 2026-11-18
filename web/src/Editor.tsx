@@ -476,30 +476,46 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     {allow.configure && <button className="tool-button" disabled={!saved.revision} onClick={() => setLocalTables(true)}><Database size={16} aria-hidden="true" />{t('本地表')}</button>}
   </>;
 
+  const modelSwitcher = !!saved?.revision && otherModels.length > 0 && <label className="model-switch">
+    <span className="sr-only">{t('切换图模型')}</span>
+    <select value="" onChange={event => changeModel(event.target.value)}>
+      <option value="" disabled>{t('切换图模型')}</option>
+      {otherModels.map(other => <option value={other.id} key={other.id}>{other.name} · {other.id}</option>)}
+    </select>
+  </label>;
+  const version = saved && (workspace !== 'query' || !saved.active_revision || saved.archive_error) &&
+    <code className="version-chip" title={saved.active_revision ?? undefined}>{saved.archive_error ? t('版本存储异常') : saved.active_revision ? t('生效 {0}', saved.active_revision.slice(0, 10)) : t('未发布')}</code>;
+  const dirtyLabel = workspace !== 'query' && dirty && <span className="dirty"><i />{t('未保存')}</span>;
+
   return <main className={'workbench editor workspace-' + workspace}>
-    <header className="workspace-header model-workspace-header">
+    {workspace === 'catalogs' ? <header className="workspace-header catalog-header">
+      <div className="catalog-header-nav">
+        <button className="catalog-back" type="button" aria-label={title + ' · ' + t('返回模型列表')} title={t('返回模型列表')} onClick={close}>
+          <ArrowLeft size={16} aria-hidden="true" />{title}
+        </button>
+        {modelSwitcher}
+      </div>
+      <div className="catalog-heading-row">
+        <div className="catalog-heading-info">
+          <h1>{modelName}</h1>
+          {(version || dirtyLabel) && <div className="catalog-model-status">{version}{dirtyLabel}</div>}
+        </div>
+        {model && allow.configure && allow.edit && <button className="button primary catalog-add" type="button"
+          disabled={!!busy} aria-haspopup="dialog" onClick={openSource}><Plus size={16} aria-hidden="true" />{t('添加数据源')}</button>}
+      </div>
+    </header> : <header className="workspace-header model-workspace-header">
       <div className="workspace-title">
         <button className="icon-button" aria-label={t('返回模型列表')} title={t('返回模型列表')} onClick={close}><ArrowLeft size={17} aria-hidden="true" /></button>
         <div className="model-heading"><span>{title}</span><h1>{modelName}</h1></div>
-        {workspace === 'catalogs' && model && allow.configure && allow.edit && <button className="button primary compact catalog-add" type="button"
-          disabled={!!busy} aria-haspopup="dialog" aria-label={t('添加数据源')} onClick={openSource}>
-          <Plus size={16} aria-hidden="true" /><span className="label-full">{t('添加数据源')}</span><span className="label-compact">{t('添加来源')}</span>
-        </button>}
       </div>
       <div className="workspace-context">
-        {workspace !== 'query' && dirty && <span className="dirty"><i />{t('未保存')}</span>}
-        {saved?.revision && otherModels.length > 0 && <label className="model-switch"><span className="sr-only">{t('切换图模型')}</span>
-          <select value="" onChange={event => changeModel(event.target.value)}>
-            <option value="" disabled>{t('切换图模型')}</option>
-            {otherModels.map(other =>
-              <option value={other.id} key={other.id}>{other.name} · {other.id}</option>)}
-          </select>
-        </label>}
+        {dirtyLabel}
+        {modelSwitcher}
         {workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" aria-label={t('编辑模型名称')}
           disabled={busy || !!yamlError} onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} /></button>}
-        {saved && (workspace !== 'query' || !saved.active_revision || saved.archive_error) && <code className="version-chip" title={saved.active_revision ?? undefined}>{saved.archive_error ? t('版本存储异常') : saved.active_revision ? t('生效 {0}', saved.active_revision.slice(0, 10)) : t('未发布')}</code>}
+        {version}
       </div>
-    </header>
+    </header>}
     {saved?.archive_error && <p className="notice error" role="alert">{diagnosticText(saved.archive_error)}{' '}
       <button className="button compact" onClick={() => setModal('versions')}>{t('查看版本历史')}</button>
     </p>}

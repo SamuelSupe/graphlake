@@ -69,7 +69,7 @@ MATCH p = (:Account)-[:Transfer]->(:Account)
 RETURN p
 ```
 
-To add another source, open **Data Sources** (数据源), select **Add data source**, choose a connector, and fill in its connection settings or file/table mapping. Click **Add to draft** (添加到草稿), then save, validate, and publish. Filter the connector picker by category and keyword, and search existing sources by name or type. **Back to connectors** restores the picker filters and keeps the current form if you choose the same connector again. Each configured source row offers **Configure** (配置), with saving and status feedback inside the dialog, and **Browse tables and columns** (浏览表与字段). Closing configuration keeps unsaved edits in the current draft; cancelling a new source leaves the model unchanged. Credentials are referenced by server environment variable names.
+To add another source, open **Data Sources** (数据源), select **Add data source** on the right of the model header, choose a connector, and fill in its connection settings or file/table mapping. Click **Add to draft** (添加到草稿), then save, validate, and publish. Filter the connector picker by category and keyword, and search existing sources by name or type. **Back to connectors** restores the picker filters and keeps the current form if you choose the same connector again. Each configured source row offers **Configure** (配置), with saving and status feedback inside the dialog, and **Browse tables and columns** (浏览表与字段). Closing configuration keeps unsaved edits in the current draft; cancelling a new source leaves the model unchanged. Credentials are referenced by server environment variable names.
 
 Use [Deployment](deployment.md) to move from a local demo to a Linux service.
 

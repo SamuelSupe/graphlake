@@ -174,8 +174,8 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
       setError(field.validationMessage);
       requestAnimationFrame(() => field.focus());
     }}>
-      <section {...panel('telemetry')}><div className="settings-workspace">
-        <div className="settings-card">
+      <section {...panel('telemetry')}><div className="settings-workspace telemetry-workspace">
+        <div className="settings-card telemetry-summary">
           <h2 id="telemetry-title">{t('指标、日志与链路')}</h2>
           <div className="settings-status" role="status">
             <span>{t('当前 OTLP ')}<strong>{snapshot.active.enabled ? t('已开启') : t('已关闭')}</strong></span>
@@ -193,6 +193,8 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
               </label>)}
             </div>
           </fieldset>
+        </div>
+        <div className="settings-card telemetry-export">
           <fieldset className="settings-fields" disabled={readOnly}>
             <legend>{t('OpenTelemetry 上报')}</legend>
             <Toggle name="enabled" label={t('启用 OTLP 上报')} checked={config.enabled} change={value => change('enabled', value)} />

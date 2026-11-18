@@ -16,14 +16,18 @@ export function Catalogs({ model, selected, configure, browse }: {
   const sources = Object.entries(model.sources);
   const matches = sources.filter(([name, source]) => `${name} ${sourceLabel(text(source.type))}`.toLowerCase().includes(query));
   return <section className="listing catalog-list" aria-label={t('已配置的数据源')}>
-    <div className="catalog-section-heading"><h2>{t('已配置的数据源 ')}<span className="catalog-count">{sources.length}</span></h2>
-      <p className="muted small">{t('配置当前模型的连接，浏览可用于建模的表与字段。')}</p></div>
-    {!!sources.length && <search className="catalog-search" aria-label={t('查找已配置的数据源')}>
-      <label className="search"><Search size={17} aria-hidden="true" /><span className="sr-only">{t('搜索已配置的数据源')}</span>
-        <input type="search" placeholder={t('搜索名称或连接器类型')} value={search} onChange={event => setSearch(event.target.value)} /></label>
-      <span className="muted small" role="status">{matches.length} / {sources.length}{t(' 个数据源')}</span>
-    </search>}
-    {matches.length ? <div className="source-card-grid">
+    <div className="catalog-section-heading">
+      <div>
+        <h2>{t('已配置的数据源 ')}<span className="catalog-count">{sources.length}</span></h2>
+        <p className="muted small">{t('配置当前模型的连接，浏览可用于建模的表与字段。')}</p>
+      </div>
+      {!!sources.length && <search className="catalog-search" aria-label={t('查找已配置的数据源')}>
+        <label className="search"><Search size={17} aria-hidden="true" /><span className="sr-only">{t('搜索已配置的数据源')}</span>
+          <input type="search" placeholder={t('搜索名称或连接器类型')} value={search} onChange={event => setSearch(event.target.value)} /></label>
+        <span className="muted small" role="status">{matches.length} / {sources.length}{t(' 个数据源')}</span>
+      </search>}
+    </div>
+    {matches.length ? <div className="catalog-sources">
       {matches.map(([name, source]) => {
         const uses = sourceUsers(model, name).length;
         return <article className="source-card" key={name} data-selected={selected === name || undefined}>

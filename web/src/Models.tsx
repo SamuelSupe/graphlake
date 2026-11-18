@@ -46,6 +46,7 @@ export function Models({ models, error, importError, workspace, open, query, can
   const activeFilter = workspace === 'query' ? 'all' : filter;
   const filtered = available?.filter(model => matches(model, activeFilter)
     && (model.name.toLowerCase().includes(needle) || model.id.toLowerCase().includes(needle))) ?? [];
+  const statusFilters = filters.map(item => ({ ...item, count: error ? undefined : available?.filter(model => matches(model, item.key)).length }));
   const narrowed = !!needle || activeFilter !== 'all';
   const { title, description } = workspaces[workspace];
 
@@ -64,43 +65,49 @@ export function Models({ models, error, importError, workspace, open, query, can
 
   return <main className="workbench model-directory">
     <header className="directory-cover">
-      <div className="directory-heading"><h1>{title}</h1><p>{description}</p></div>
-      {workspace === 'graph' && administrator && <div className="workspace-context">
-        <button className="button primary" onClick={create}><Plus size={16} aria-hidden="true" />{t('新建模型')}</button>
-        <label className="button"><Upload size={16} aria-hidden="true" />{t('导入 YAML')}<input className="sr-only" type="file" accept=".yaml,.yml" onChange={event => {
-          const file = event.target.files?.[0]; event.target.value = '';
-          if (file) importModel(file);
-        }} /></label>
-      </div>}
+      <div className="directory-intro">
+        <div className="directory-heading"><h1>{title}</h1><p>{description}</p></div>
+        {workspace === 'graph' && administrator && <div className="workspace-context">
+          <button className="button primary" onClick={create}><Plus size={16} aria-hidden="true" />{t('新建模型')}</button>
+          <label className="button"><Upload size={16} aria-hidden="true" />{t('导入 YAML')}<input className="sr-only" type="file" accept=".yaml,.yml" onChange={event => {
+            const file = event.target.files?.[0]; event.target.value = '';
+            if (file) importModel(file);
+          }} /></label>
+        </div>}
+      </div>
+      <dl className="directory-metrics" aria-label={t('可见模型的结构汇总')}>
+        {metrics.map(({ label, Icon, value }) => <div key={label}>
+          <dt><Icon size={16} aria-hidden="true" />{label}</dt>
+          <dd>{error || value === undefined ? '—' : value.toLocaleString()}</dd>
+        </div>)}
+      </dl>
     </header>
-    <dl className="directory-metrics" aria-label={t('可见模型的结构汇总')}>
-      {metrics.map(({ label, Icon, value }) => <div key={label}>
-        <dt><Icon size={16} aria-hidden="true" />{label}</dt>
-        <dd>{error || value === undefined ? '—' : value.toLocaleString()}</dd>
-      </div>)}
-    </dl>
     <section className="model-library" aria-labelledby="library-heading">
       <div className="library-heading">
         <h2 id="library-heading">{t('模型目录')}</h2>
+        <div className="directory-search">
+          <label className="search"><Search size={17} aria-hidden="true" /><input ref={searchInput} type="search"
+            aria-label={t('搜索模型名称或标识')} placeholder={t('搜索模型名称或标识')} value={search} onChange={event => setSearch(event.target.value)} /></label>
+          {workspace !== 'query' && <select className="compact-model-filter" aria-label={t('按模型状态筛选')} value={activeFilter}
+            onChange={event => setFilter(event.target.value as Filter)}>
+            {statusFilters.map(({ key, label, count }) => <option key={key} value={key}>{label}{count !== undefined && ` (${count})`}</option>)}
+          </select>}
+          <button className="button refresh-models" aria-label={t('刷新模型列表')} title={t('刷新模型列表')} onClick={retry}><RefreshCw size={17} aria-hidden="true" /></button>
+        </div>
         <div className="library-views" role="group" aria-label={t('目录视图')}>
           {([{ mode: 'cards', label: t('卡片视图'), Icon: LayoutGrid }, { mode: 'table', label: t('列表视图'), Icon: List }] as const)
             .map(({ mode, label, Icon }) => <button type="button" key={mode} aria-label={label} title={label} aria-pressed={mode === view}
               onClick={() => { memory.view = mode; setView(mode); }}><Icon size={16} aria-hidden="true" /></button>)}
         </div>
       </div>
-      <div className="directory-tools">
-        {workspace !== 'query' && <div className="model-filters" role="group" aria-label={t('按模型状态筛选')}>
-          {filters.map(item => <button key={item.key} aria-pressed={activeFilter === item.key}
+      {workspace !== 'query' && <div className="directory-tools">
+        <div className="model-filters" role="group" aria-label={t('按模型状态筛选')}>
+          {statusFilters.map(item => <button key={item.key} aria-pressed={activeFilter === item.key}
             onClick={() => setFilter(item.key)}>{item.label}
-            {available && !error && <span>{available.filter(model => matches(model, item.key)).length}</span>}
+            {item.count !== undefined && <span>{item.count}</span>}
           </button>)}
-        </div>}
-        <div className="directory-search">
-          <label className="search"><Search size={17} aria-hidden="true" /><input ref={searchInput} type="search"
-            aria-label={t('搜索模型名称或标识')} placeholder={t('搜索模型名称或标识')} value={search} onChange={event => setSearch(event.target.value)} /></label>
-          <button className="button refresh-models" aria-label={t('刷新模型列表')} title={t('刷新模型列表')} onClick={retry}><RefreshCw size={17} aria-hidden="true" /></button>
         </div>
-      </div>
+      </div>}
       {importError && <p className="notice error listing-notice" role="alert">{importError}</p>}
       {error ? <div className="directory-empty panel-table" role="alert"><CircleAlert size={28} aria-hidden="true" />
         <h2>{t('暂时无法读取模型')}</h2><p>{error}</p><button className="button" onClick={retry}>{t('重新加载')}</button>

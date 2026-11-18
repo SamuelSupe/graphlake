@@ -470,6 +470,12 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     </fieldset>
   </aside>;
 
+  const canvasBrowseActions = workspace === 'graph' && model && saved && <>
+    <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={16} aria-hidden="true" />{t('节点 ')}<span className="tool-count">{nodeNames.length}</span></button>
+    <button className="tool-button" onClick={() => setModal('edges-list')}><List size={16} aria-hidden="true" />{t('边 ')}<span className="tool-count">{Object.keys(model.edges).length}</span></button>
+    {allow.configure && <button className="tool-button" disabled={!saved.revision} onClick={() => setLocalTables(true)}><Database size={16} aria-hidden="true" />{t('本地表')}</button>}
+  </>;
+
   return <main className={'workbench editor workspace-' + workspace}>
     <header className="workspace-header model-workspace-header">
       <div className="workspace-title">
@@ -578,9 +584,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
                 onClick={() => setConnection(connecting ? undefined : {})}><Waypoints size={16} aria-hidden="true" />{t('连线建边')}</button>
             </>}
             <div className="graph-label-actions">
-              <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={16} aria-hidden="true" />{t('节点 ')}<span className="tool-count">{nodeNames.length}</span></button>
-              <button className="tool-button" onClick={() => setModal('edges-list')}><List size={16} aria-hidden="true" />{t('边 ')}<span className="tool-count">{Object.keys(model.edges).length}</span></button>
-              {allow.configure && <button className="tool-button" disabled={!saved.revision} onClick={() => setLocalTables(true)}><Database size={16} aria-hidden="true" />{t('本地表')}</button>}
+              <div className="canvas-browse-buttons">{canvasBrowseActions}</div>
+              <WorkspaceTools label={t('浏览模型')}>{canvasBrowseActions}</WorkspaceTools>
             </div>
           </div>
           <Suspense fallback={<div className="canvas-panel"><p className="empty" role="status">{t('正在打开画布…')}</p></div>}>

@@ -68,7 +68,7 @@ The GitHub release ships **ARM64 (`aarch64`)** and **AMD64 (`x86_64`)** packages
 - **Through Trino** — SQL Server, Oracle, Hive, Hudi, MongoDB, Elasticsearch, and Redshift. The corresponding Trino catalog supplies access to the source. SQL Server and Oracle have dedicated `sqlserver` and `oracle` configuration choices.
 - **Clients** — Browser, HTTP API and MCP, Bolt and Gremlin WebSocket, command line, embedded Rust, and source-built Python and C bindings. Explicit Bolt transactions are available for PostgreSQL and Parquet.
 
-Configure sources directly from connector cards in the **Data Sources** workspace, then save and publish the model draft.
+In **Data Sources**, use **Configure** on a source row to edit its connection, then save and publish the model draft.
 
 See the [technical reference](docs/reference.zh-CN.md#图映射与连接器) for source configuration, query semantics, the API, and the bindings.
 

@@ -875,6 +875,7 @@ export const english: Record<string, string> = {
   '连接数据源，定义节点和边，再发布模型开始查询。': 'Connect a data source, define nodes and edges, then publish the model to run queries.',
   '获得模型访问权限后，可在这里查看模型。': 'Models will appear here when you have access to them.',
   '模型': 'Model',
+  '浏览模型': 'Browse model',
   '模型结构': 'Structure',
   '发布状态': 'Publication status',
   '草稿校验': 'Draft validation',

@@ -1,6 +1,6 @@
 .app-shell {
-  --rail-width: 214px;
-  --header-height: 74px;
+  --rail-width: clamp(11.75rem, 14.5vw, 14rem);
+  --header-height: 66px;
   display: grid;
   grid-template-columns: var(--rail-width) minmax(0, 1fr);
   min-height: 100dvh;

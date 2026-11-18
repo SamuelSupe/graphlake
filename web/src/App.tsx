@@ -7,6 +7,7 @@ import { AuthGate, type Session } from './Auth';
 import { LanguageSelect } from './LanguageSelect';
 import { Access, type Grants } from './Access';
 import { Query } from './Query';
+import { AppLink, modelPath } from './AppLink';
 import { useMutations } from './Mutations';
 import type { Workspace } from './Editor';
 import type { Point } from './modelCanvasGeometry';
@@ -31,10 +32,6 @@ const nav = [
   { key: 'catalogs', label: t('数据源'), Icon: Database },
   { key: 'query', label: t('查询'), Icon: Terminal },
 ] as const;
-
-function modelPath(id: string, workspace: Workspace = 'graph') {
-  return '/models/' + id + (workspace === 'graph' ? '' : '/' + workspace);
-}
 
 const isOverview = (path: string) => /^\/overview\/?$/.test(path);
 
@@ -76,7 +73,6 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   const dirty = useRef(new Set<string>());
   const current = useRef(path);
   const currentWorkspace = useRef<Workspace>('graph');
-  const lastModel = useRef<string>(undefined);
   const onDirty = useCallback((id: string, value: boolean) => {
     if (value) dirty.current.add(id);
     else dirty.current.delete(id);
@@ -165,17 +161,20 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   const hasModelAccess = administrator || Object.values(grants ?? {}).some(roles => roles.some(role => role !== 'query' && role !== 'export'));
   const canUseQuery = administrator || Object.values(grants ?? {}).some(roles => roles.includes('query'));
   const workspace = location.workspace === 'graph' && !hasModelAccess && canUseQuery ? 'query' : location.workspace;
+  const workspaceModels = availableModels?.filter(model => workspace === 'query' ? canQuery(model.id) : canReadModel(model.id));
   currentWorkspace.current = workspace;
   const mutations = useMutations(actor, receipts, model => {
     setRecovered(model);
     reloadModels();
     if (model && path === '/new') navigate(modelPath(model.id), true);
   });
-  useEffect(() => { if (id) lastModel.current = id; }, [id]);
   useLayoutEffect(() => { window.scrollTo(0, ['/', '/catalogs', '/query'].includes(path) ? directory.current[workspace].scroll : 0); }, [path, workspace]);
   const pageTitle = overviewPage ? t('平台概览') : aiPage ? 'AI' : settingsPage ? t('运行配置') : accessPage ? t('权限管理')
     : nav.find(item => item.key === workspace)!.label;
-  useEffect(() => { if (!locked) document.title = 'GraphLake · ' + pageTitle; }, [locked, pageTitle]);
+  const selectedName = id && availableModels?.find(model => model.id === id)?.name;
+  useEffect(() => {
+    if (!locked) document.title = [selectedName, pageTitle, 'GraphLake'].filter(Boolean).join(' · ');
+  }, [locked, pageTitle, selectedName]);
   const newModel = administrator && path === '/new' ? draft : undefined;
 
   async function importModel(file: File) {
@@ -188,20 +187,10 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
     } catch (cause) { setImportError(errorText(cause)); }
   }
 
-  function openWorkspace(next: Workspace) {
-    if (newModel) {
-      if (next !== 'graph') navigate('/' + next);
-      return;
-    }
-    if (next === 'graph') {
-      navigate(id ? modelPath(id) : '/');
-      return;
-    }
-    const candidates = availableModels?.filter(model => next === 'query'
-      ? canQuery(model.id) && model.active_revision && !model.archive_error
-      : canReadModel(model.id));
-    const target = candidates?.find(model => model.id === (id ?? lastModel.current))?.id ?? candidates?.[0]?.id;
-    navigate(target ? modelPath(target, next) : '/' + next);
+  function workspaceHref(next: Workspace) {
+    if (newModel && next === 'graph') return '/new';
+    if (id && (next === 'query' ? canQuery(id) : canReadModel(id))) return modelPath(id, next);
+    return next === 'graph' ? '/' : '/' + next;
   }
 
   async function signOut() {
@@ -233,31 +222,25 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
     <a className="skip-link" href="#workspace-content">{t('跳转到工作区')}</a>
     <ConsoleNavigation page={pageTitle} home={() => navigate('/')} account={account}>
       <span className="rail-section">{t('工作区')}</span>
-      {administrator && <a className="rail-link" href="/overview" aria-current={overviewPage ? 'page' : undefined} onClick={event => {
-        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-        event.preventDefault();
-        navigate('/overview');
-      }}>
+      {administrator && <AppLink className="rail-link" href="/overview" navigate={navigate} aria-current={overviewPage ? 'page' : undefined}>
         <LayoutDashboard size={20} aria-hidden="true" /><span>{t('平台概览')}</span>
-      </a>}
+      </AppLink>}
       {nav.filter(({ key }) => key === 'query' ? canUseQuery : key === 'catalogs' ? administrator : hasModelAccess)
       .map(({ key, label, Icon }) =>
-        <button key={key} className="rail-link" aria-current={!overviewPage && !accessPage && !settingsPage && !aiPage && workspace === key ? 'page' : undefined} onClick={() => openWorkspace(key)}>
+        <AppLink key={key} className="rail-link" href={workspaceHref(key)} navigate={navigate}
+          aria-current={!overviewPage && !accessPage && !settingsPage && !aiPage && workspace === key ? 'page' : undefined}>
           <Icon size={20} aria-hidden="true" /><span>{label}</span>
-        </button>)}
-      <a className="rail-link" href="/ai" aria-current={aiPage ? 'page' : undefined} onClick={event => {
-        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-        event.preventDefault(); navigate('/ai');
-      }}>
+        </AppLink>)}
+      <AppLink className="rail-link" href="/ai" navigate={navigate} aria-current={aiPage ? 'page' : undefined}>
         <Bot size={20} aria-hidden="true" /><span>AI</span>
-      </a>
+      </AppLink>
       {administrator && <span className="rail-section">{t('管理')}</span>}
-      {administrator && identity.enabled && <button className="rail-link" aria-current={accessPage ? 'page' : undefined} onClick={() => navigate('/access')}>
+      {administrator && identity.enabled && <AppLink className="rail-link" href="/access" navigate={navigate} aria-current={accessPage ? 'page' : undefined}>
         <ShieldCheck size={20} aria-hidden="true" /><span>{t('权限管理')}</span>
-      </button>}
-      {administrator && <button className="rail-link" aria-current={settingsPage ? 'page' : undefined} onClick={() => { setSettingsTab(undefined); navigate('/settings'); }}>
+      </AppLink>}
+      {administrator && <AppLink className="rail-link" href="/settings" navigate={next => { setSettingsTab(undefined); navigate(next); }} aria-current={settingsPage ? 'page' : undefined}>
         <Settings2 size={20} aria-hidden="true" /><span>{t('运行配置')}</span>
-      </button>}
+      </AppLink>}
     </ConsoleNavigation>
     <div className="app-content" id="workspace-content" tabIndex={-1}>
     {mutations.banner && <div className="global-mutation">{mutations.banner}</div>}
@@ -267,12 +250,12 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
       const page = !canReadModel(model) || workspace === 'query' && canQuery(model) ? 'query' : administrator && workspace === 'catalogs' ? 'catalogs' : 'graph';
       const show = model === id;
       const summary = availableModels?.find(entry => entry.id === model);
-      if (!canReadModel(model) && (!canQuery(model) || !summary?.active_revision)) return null;
+      if (!canReadModel(model) && !canQuery(model)) return null;
       return <div className="model-workspace" key={model} data-inactive={!show || undefined}
         inert={!show} aria-hidden={!show || undefined}>
         {canReadModel(model)
           ? <Suspense fallback={<p className="empty" role="status">{t('正在打开模型…')}</p>}>
-            <Editor id={model} active={show} onDirty={onDirty} workspace={show ? page : 'query'} models={availableModels ?? []}
+            <Editor id={model} active={show} onDirty={onDirty} workspace={show ? page : 'query'} models={workspaceModels ?? []}
               allow={{ configure: administrator, edit: modelers, publish: publishers, query: canQuery(model), export: canExport(model) }}
               actor={actor} mutations={mutations} recovered={recovered?.id === model ? recovered : undefined} canvasLayouts={canvasLayouts.current}
               close={() => navigate(page === 'graph' ? '/' : '/' + page)} goTo={next => navigate(modelPath(model, next))}
@@ -280,9 +263,16 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
               changed={reloadModels} created={key => navigate(modelPath(key), true)} />
             </Suspense>
           : <main className="workbench workspace-query">
-              <ModelWorkspaceHeader workspace={t('查询')} name={summary!.name} back={() => navigate('/query')} />
-              <Query id={model} actor={actor} revision={summary!.active_revision!} draftPending={false}
-                refresh={reloadModels} visible={show} canExport={canExport(model)} />
+              {summary?.active_revision && !summary.archive_error ? <>
+                <ModelWorkspaceHeader workspace={t('查询')} name={summary.name} back={() => navigate('/query')} />
+                <Query id={model} actor={actor} revision={summary.active_revision} draftPending={false}
+                  refresh={reloadModels} visible={show} canExport={canExport(model)} />
+              </> : <div className="directory-empty empty">
+                <h1>{t('查询')}</h1>
+                {error ? <><p role="alert">{error}</p><button className="button" onClick={reloadModels}>{t('重新加载')}</button></>
+                  : <p role="status">{models ? t('此模型当前不可查询。请选择其他已发布的模型。') : t('正在读取模型…')}</p>}
+                <AppLink className="text-button" href="/query" navigate={navigate}>{t('查询模型列表')}</AppLink>
+              </div>}
             </main>}
       </div>;
     })}
@@ -306,11 +296,10 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
         openServiceSettings={administrator ? () => { setSettingsTab('mcp'); navigate('/settings'); } : undefined} />
     </Suspense>}
     {!overviewPage && !accessPage && !settingsPage && !aiPage && !newModel && (!id || !canReadModel(id) && !canQuery(id)) &&
-      <Models key={workspace} memory={directory.current[workspace]} models={id && !administrator && grants ? [] : workspace === 'query' ? availableModels?.filter(model => canQuery(model.id)) : availableModels?.filter(model => canReadModel(model.id))} error={permissionError || error}
+      <Models key={workspace} memory={directory.current[workspace]} models={id && !administrator && grants ? [] : workspaceModels} error={permissionError || error}
         importError={workspace === 'graph' ? importError : ''} retry={reloadModels} workspace={workspace}
         administrator={administrator} canQuery={canQuery} health={() => { setSettingsTab('health'); navigate('/settings'); }}
-        query={workspace === 'graph' ? key => navigate(modelPath(key, 'query')) : undefined}
-        open={key => navigate(modelPath(key, canReadModel(key) ? workspace : 'query'))}
+        navigate={navigate}
         create={() => setCreating(true)} importModel={file => void importModel(file)} />}
     </div>
     {logoutError && <p className="notice error auth-logout-error" role="alert">{logoutError}</p>}

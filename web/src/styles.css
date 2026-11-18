@@ -139,8 +139,9 @@ thead th { font-weight: 700; white-space: nowrap; }
 .connector-chip { display: inline-block; border-radius: 5px; background: var(--panel); padding: 2px 7px; font-size: .8125rem; }
 .model-name {
   display: inline-flex; align-items: center; gap: 13px; border: 0; background: none; padding: 0;
-  text-align: left; font-weight: 650; font-size: 15px;
+  text-align: left; font-weight: 650; font-size: 15px; color: var(--ink); text-decoration: none;
 }
+.model-actions a { text-decoration: none; }
 .model-name:hover { color: var(--accent); }
 .model-icon .brand-mark { color: inherit; }
 .model-icon { display: inline-grid; place-items: center; width: 36px; height: 36px; border-radius: 8px; background: var(--tint); color: var(--accent); flex: none; }

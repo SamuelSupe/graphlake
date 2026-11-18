@@ -1,7 +1,8 @@
 import { diagnosticText, t } from './locale.ts';
-import { useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { Activity, ArrowRight, Box, CircleAlert, Database, GitFork, LayoutGrid, List, Network, Plus, RefreshCw, Search, Terminal, Upload } from 'lucide-react';
 import type { ModelSummary } from './api';
+import { AppLink, modelPath } from './AppLink';
 import type { Workspace } from './Editor';
 import { Mark, StatusLabel } from './ui';
 
@@ -18,7 +19,7 @@ const filters = [
 ] as const;
 export type Filter = typeof filters[number]['key'];
 
-export type DirectoryState = { search: string; filter: Filter; scroll: number; view?: 'cards' | 'table' };
+export type DirectoryState = { search: string; filter: Filter; scroll: number; view?: 'cards' | 'table'; returnFocus?: string };
 
 function matches(model: ModelSummary, filter: Filter) {
   if (filter === 'published') return !!model.active_revision && !model.archive_error;
@@ -27,12 +28,12 @@ function matches(model: ModelSummary, filter: Filter) {
   return true;
 }
 
-export function Models({ models, error, importError, workspace, open, query, canQuery, memory, health, create, importModel, retry, administrator }: {
+export function Models({ models, error, importError, workspace, navigate, canQuery, memory, health, create, importModel, retry, administrator }: {
   health: () => void;
   memory: DirectoryState;
   administrator: boolean; models?: ModelSummary[]; error: string; importError: string; workspace: Workspace;
   canQuery: (id: string) => boolean;
-  open: (id: string) => void; query?: (id: string) => void; create: () => void;
+  navigate: (path: string) => void; create: () => void;
   importModel: (file: File) => void; retry: () => void;
 }) {
   const [view, setView] = useState(memory.view ?? 'cards');
@@ -41,6 +42,17 @@ export function Models({ models, error, importError, workspace, open, query, can
   const [filter, updateFilter] = useState<Filter>(memory.filter);
   const setFilter = (value: Filter) => { memory.filter = value; updateFilter(value); };
   const searchInput = useRef<HTMLInputElement>(null);
+  useLayoutEffect(() => {
+    if (!models || !memory.returnFocus) return;
+    document.getElementById(memory.returnFocus)?.focus({ preventScroll: true });
+    delete memory.returnFocus;
+  }, [memory, models]);
+
+  function follow(path: string) {
+    memory.returnFocus = document.activeElement?.id;
+    navigate(path);
+  }
+
   const needle = search.trim().toLowerCase();
   const available = models?.filter(model => workspace !== 'query' || matches(model, 'published'));
   const activeFilter = workspace === 'query' ? 'all' : filter;
@@ -123,9 +135,9 @@ export function Models({ models, error, importError, workspace, open, query, can
         : <div className="panel-table directory" data-view={view}><table className="models-table" role="table" aria-label={title}>
           <thead role="rowgroup"><tr role="row"><th scope="col">{t('模型')}</th><th scope="col">{t('模型结构')}</th><th scope="col">{t('发布状态')}</th><th scope="col">{t('草稿校验')}</th><th scope="col"><span className="sr-only">{t('操作')}</span></th></tr></thead>
           <tbody role="rowgroup">{filtered.map(model => <tr key={model.id} role="row" className="directory-row">
-            <th scope="row" role="rowheader" className="directory-name"><button className="model-name" onClick={() => open(model.id)}>
+            <th scope="row" role="rowheader" className="directory-name"><AppLink id={'model-name-' + model.id} className="model-name" href={modelPath(model.id, workspace)} navigate={follow}>
               <span className="model-icon"><Mark size={20} /></span><span>{model.name}<code className="model-id">{model.id}</code></span>
-            </button></th>
+            </AppLink></th>
             <td role="cell" className="directory-structure"><div className="model-counts">
               <span>{t('数据源')} <strong>{model.sources}</strong></span>
               <span>{t('节点标签')} <strong>{model.nodes}</strong></span>
@@ -140,8 +152,8 @@ export function Models({ models, error, importError, workspace, open, query, can
             </td>
             <td role="cell" className="directory-status"><small className="directory-field-label">{t('草稿校验')}</small><StatusLabel status={model.status} /></td>
             <td role="cell" className="directory-actions"><div className="model-actions">
-              {workspace !== 'query' && query && canQuery(model.id) && matches(model, 'published') && <button className="text-button" aria-label={t('查询 {0}', model.name)} onClick={() => query(model.id)}><Terminal size={15} aria-hidden="true" />{t('查询')}</button>}
-              <button className="text-button" aria-label={(workspace === 'query' ? t('查询 ') : t('打开 ')) + model.name} onClick={() => open(model.id)}>{workspace === 'query' ? t('查询') : t('打开')} <ArrowRight size={16} aria-hidden="true" /></button>
+              {workspace === 'graph' && canQuery(model.id) && matches(model, 'published') && <AppLink id={'model-query-' + model.id} className="text-button" aria-label={t('查询 {0}', model.name)} href={modelPath(model.id, 'query')} navigate={follow}><Terminal size={15} aria-hidden="true" />{t('查询')}</AppLink>}
+              <AppLink id={'model-open-' + model.id} className="text-button" aria-label={(workspace === 'query' ? t('查询 ') : t('打开 ')) + model.name} href={modelPath(model.id, workspace)} navigate={follow}>{workspace === 'query' ? t('查询') : t('打开')} <ArrowRight size={16} aria-hidden="true" /></AppLink>
             </div></td>
           </tr>)}</tbody>
         </table></div>}

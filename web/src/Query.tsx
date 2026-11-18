@@ -2,6 +2,7 @@ import { locale, t } from './locale.ts';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2, Download, GitFork, Network, Play, Square, Table2 } from 'lucide-react';
 import type { GraphSelection } from './GraphCanvas';
+import { queryParameterError } from './queryParameters';
 import { GraphExplorer, type GraphExplorerHandle } from './GraphExplorer';
 import { api, ApiError, downloadFile, errorText, request, type FreshnessPolicy, type GraphSchema, type QueryResult } from './api';
 
@@ -73,6 +74,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const [queries, setQueries] = useState(defaults);
   const query = queries[language];
   const [parameters, setParameters] = useState('');
+  const [parameterError, setParameterError] = useState('');
   const [timeout, setTimeoutText] = useState('');
   const [defaultTimeout, setDefaultTimeout] = useState<number>();
   const [recoverable, setRecoverable] = useState(false);
@@ -174,6 +176,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
     setLanguage(statement.language);
     setQueries(old => ({ ...old, [statement.language]: statement.query }));
     setParameters(statement.parameters_json ?? '');
+    setParameterError('');
     setGraphOptions(statement.graph_options ?? '');
     setFreshness(statement.freshness ?? {});
     setSnapshot(statement.csr_generation ? { generation: statement.csr_generation, revision: statement.model_revision } : undefined);
@@ -283,6 +286,15 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
 
   async function run(operation: 'query' | 'export' = 'query', mode: QueryMode = 'replace') {
     if (active.current || pending || operation === 'export' && !canExport || operation === 'query' && mode !== 'replay' && !canRun) return;
+    if (operation === 'query' && mode !== 'replay' && language === 'cypher') {
+      const problem = queryParameterError(parameters);
+      if (problem) {
+        setParameterError(problem);
+        if (optionsPanel.current) optionsPanel.current.open = true;
+        parameterInput.current?.focus();
+        return;
+      }
+    }
     let statement = operation === 'export' ? result?.statement : mode === 'replay' ? canvas?.statement : statementFromEditor();
     if (!statement || statement.model_revision !== revision && !(mode === 'replay' && statement.csr_generation)) return;
     const requestId = crypto.randomUUID();
@@ -392,8 +404,10 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
             <details ref={optionsPanel} className="query-details query-parameters" open={parameterRequired && language === 'cypher' || !timeoutValid || undefined}>
               <summary>{t('查询选项')}{(timeout || captureResult || generation || language === 'cypher' && parameters.trim()) ? t(' · 已设置') : ''}</summary>
               <div className="query-options-grid">
-                {language === 'cypher' && <label>{t('Cypher 参数（JSON）')}<textarea ref={parameterInput} value={parameters} onChange={event => setParameters(event.target.value)} placeholder="{}" spellCheck={false} rows={3} className="mono"
-                  aria-describedby={parameterRequired && !parameters.trim() ? id + '-query-parameters-hint' : undefined} /></label>}
+                {language === 'cypher' && <label>{t('Cypher 参数（JSON）')}<textarea ref={parameterInput} value={parameters} onChange={event => { setParameters(event.target.value); setParameterError(''); }}
+                  onBlur={event => setParameterError(queryParameterError(event.target.value))} placeholder="{}" spellCheck={false} rows={3} className="mono"
+                  aria-invalid={!!parameterError || undefined} aria-describedby={parameterError ? id + '-parameter-error' : parameterRequired && !parameters.trim() ? id + '-query-parameters-hint' : undefined} />
+                  {parameterError && <span className="inline-error" id={id + '-parameter-error'} role="status">{parameterError}</span>}</label>}
                 <div className="form-fields execution-options">
                 <label className="query-timeout">{t('超时（毫秒）')}<input type="number" min={1} max={60_000} step={1} value={timeout}
                   disabled={!!running} aria-invalid={!timeoutValid} aria-describedby={timeoutValid ? undefined : id + '-query-timeout-error'} placeholder={defaultTimeout ? String(defaultTimeout) : t('服务器默认')}

@@ -16,11 +16,19 @@ export default function QueryScope({ value, save, close }: { value: string; save
   const [raw, setRaw] = useState(value);
   const [json, setJson] = useState(initial.json);
   const [error, setError] = useState('');
+  const form = useRef<HTMLFormElement>(null);
+  const addCondition = useRef<HTMLButtonElement>(null);
   const feedback = useRef<HTMLParagraphElement>(null);
 
   function update(change: Partial<ScopeDraft>) {
     setDraft(previous => ({ ...previous, ...change }));
     setError('');
+  }
+  function focusCondition(index: number) {
+    requestAnimationFrame(() => {
+      const column = form.current?.querySelectorAll('.scope-rule')[index]?.querySelector('input');
+      (column ?? addCondition.current)?.focus();
+    });
   }
   function filter(index: number, change: Partial<PartitionDraft>) {
     update({ filters: draft.filters.map((rule, i) => i === index ? { ...rule, ...change } : rule) });
@@ -34,6 +42,7 @@ export default function QueryScope({ value, save, close }: { value: string; save
       if (json) setDraft(scopeDraft(raw));
       else setRaw(scopeJson(draft));
       setJson(!json);
+      requestAnimationFrame(() => form.current?.querySelector<HTMLElement>('[data-initial-focus]')?.focus());
       setError('');
     } catch (cause) { report(cause); }
   }
@@ -46,7 +55,7 @@ export default function QueryScope({ value, save, close }: { value: string; save
   }
 
   return <Modal layout="center" title={t('查询范围')} size="medium" description={t('限定本次查询读取的数据；应用后运行查询才会生效。')} close={close}>
-    <form className="panel-layout query-scope-form" onSubmit={apply}>
+    <form ref={form} className="panel-layout query-scope-form" onSubmit={apply}>
       <div className="panel-body dialog-form">
       {json ? <label>{t('查询范围 JSON')}<textarea rows={8} className="mono" spellCheck={false}
         value={raw} onChange={event => { setRaw(event.target.value); setError(''); }} data-initial-focus /></label>
@@ -67,9 +76,15 @@ export default function QueryScope({ value, save, close }: { value: string; save
             {!nullCheck(op) && <label>{t('值')}<input value={value} required className="mono" placeholder={t('例如 1、true、"华东"')}
               onChange={event => filter(index, { value: event.target.value })} /></label>}
             <button type="button" className="icon-button" aria-label={t('移除条件 {0}', (index + 1))}
-              onClick={() => update({ filters: draft.filters.filter((_, i) => i !== index) })}><X size={16} /></button>
+              onClick={() => {
+                update({ filters: draft.filters.filter((_, i) => i !== index) });
+                focusCondition(Math.min(index, draft.filters.length - 2));
+              }}><X size={16} /></button>
           </div>)}
-          <button type="button" className="button compact" onClick={() => update({ filters: [...draft.filters, { column: '', op: 'eq', value: '' }] })}>
+          <button ref={addCondition} type="button" className="button compact" onClick={() => {
+            update({ filters: [...draft.filters, { column: '', op: 'eq', value: '' }] });
+            focusCondition(draft.filters.length);
+          }}>
             <Plus size={16} />{t('添加条件')}
           </button>
         </fieldset>

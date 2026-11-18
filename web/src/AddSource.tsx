@@ -16,16 +16,18 @@ export function AddSource({ close, submit, modelId }: {
 }) {
   const [type, setType] = useState<string>();
   const [choosing, setChoosing] = useState(true);
+  const selectedCard = useRef<HTMLButtonElement>(null);
   const stages = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
-    stages.current?.querySelector<HTMLElement>('[data-initial-focus]')?.focus();
+    const target = choosing && selectedCard.current ? selectedCard.current : stages.current?.querySelector<HTMLElement>('[data-initial-focus]');
+    target?.focus();
   }, [choosing, type]);
 
   return <Modal title={choosing || !type ? t('选择数据源连接器') : t('配置 {0}', sourceLabel(type))}
     size={choosing ? 'wide' : 'medium'} close={close}>
     <div className="panel-layout" ref={stages}>
       <div className="panel-body" hidden={!choosing}>
-        <ConnectorGallery active={choosing} add={next => { setType(next); setChoosing(false); }} />
+        <ConnectorGallery active={choosing} add={(next, trigger) => { selectedCard.current = trigger; setType(next); setChoosing(false); }} />
       </div>
       {type && <SourceDraft key={type} modelId={modelId} type={type} hidden={choosing}
         back={() => setChoosing(true)} close={close} submit={submit} />}

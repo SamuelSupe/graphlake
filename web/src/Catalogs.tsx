@@ -1,5 +1,5 @@
 import { t } from './locale.ts';
-import { useId, useState } from 'react';
+import { useId, useRef, useState } from 'react';
 import { ChevronRight, Database, FolderOpen, Search, Settings2 } from 'lucide-react';
 import { ConnectorIcon } from './ConnectorIcon';
 import { connectorChoices, connectorDetails } from './connectors';
@@ -11,6 +11,7 @@ export function Catalogs({ model, selected, configure, browse }: {
   configure: (name: string) => void;
   browse: (name: string) => void;
 }) {
+  const searchInput = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
   const query = search.trim().toLowerCase();
   const sources = Object.entries(model.sources);
@@ -23,7 +24,7 @@ export function Catalogs({ model, selected, configure, browse }: {
       </div>
       {!!sources.length && <search className="catalog-search" aria-label={t('查找已配置的数据源')}>
         <label className="search"><Search size={17} aria-hidden="true" /><span className="sr-only">{t('搜索已配置的数据源')}</span>
-          <input type="search" placeholder={t('搜索名称或连接器类型')} value={search} onChange={event => setSearch(event.target.value)} /></label>
+          <input ref={searchInput} type="search" placeholder={t('搜索名称或连接器类型')} value={search} onChange={event => setSearch(event.target.value)} /></label>
         <span className="muted small" role="status">{matches.length} / {sources.length}{t(' 个数据源')}</span>
       </search>}
     </div>
@@ -42,12 +43,13 @@ export function Catalogs({ model, selected, configure, browse }: {
         </article>;
       })}
     </div> : sources.length ? <div className="catalog-empty"><p>{t('没有匹配的数据源')}</p>
-      <button className="text-button" onClick={() => setSearch('')}>{t('清除搜索')}</button></div> : <div className="catalog-empty"><Database size={24} aria-hidden="true" /><p>{t('还没有数据源')}</p>
+      <button className="text-button" onClick={() => { setSearch(''); searchInput.current?.focus(); }}>{t('清除搜索')}</button></div> : <div className="catalog-empty"><Database size={24} aria-hidden="true" /><p>{t('还没有数据源')}</p>
       <p className="muted small">{t('使用「添加数据源」为此模型选择连接器。')}</p></div>}
   </section>;
 }
 
-export function ConnectorGallery({ add, active }: { add: (type: string) => void; active: boolean }) {
+export function ConnectorGallery({ add, active }: { add: (type: string, trigger: HTMLButtonElement) => void; active: boolean }) {
+  const searchInput = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
   const [group, setGroup] = useState(t('全部'));
   const filterId = useId();
@@ -59,7 +61,7 @@ export function ConnectorGallery({ add, active }: { add: (type: string) => void;
   return <div className="connector-gallery">
     <search className="connector-search" aria-label={t('查找连接器')}>
       <label className="search"><Search size={17} aria-hidden="true" /><span className="sr-only">{t('搜索连接器')}</span>
-        <input type="search" data-initial-focus={active || undefined} placeholder={t('搜索数据库、文件格式或连接器')} value={search} onChange={event => setSearch(event.target.value)} /></label>
+        <input ref={searchInput} type="search" data-initial-focus={active || undefined} placeholder={t('搜索数据库、文件格式或连接器')} value={search} onChange={event => setSearch(event.target.value)} /></label>
       <fieldset className="connector-filters"><legend className="sr-only">{t('连接器类别')}</legend>
         {groups.map(category => <label className="connector-filter" key={category}>
           <input type="radio" name={filterId} value={category} checked={group === category} onChange={() => setGroup(category)} />
@@ -71,7 +73,7 @@ export function ConnectorGallery({ add, active }: { add: (type: string) => void;
     <div className="source-card-grid">
       {choices.map(([type, label]) => {
         const details = connectorDetails[type];
-        return <button type="button" className="connector-card" key={type} onClick={() => add(type)}
+        return <button type="button" className="connector-card" key={type} onClick={event => add(type, event.currentTarget)}
           aria-label={t('配置 {0}', label)} aria-describedby={filterId + '-' + type}>
           <ConnectorIcon type={type} />
           <span className="connector-copy"><strong>{label}</strong>
@@ -81,6 +83,6 @@ export function ConnectorGallery({ add, active }: { add: (type: string) => void;
       })}
     </div>
     {!choices.length && <div className="catalog-empty"><p>{t('没有匹配的连接器')}</p><p className="muted small">{t('试试其他名称，或清除类别与关键词。')}</p>
-      <button className="text-button" onClick={() => { setSearch(''); setGroup(t('全部')); }}>{t('清除筛选')}</button></div>}
+      <button className="text-button" onClick={() => { setSearch(''); setGroup(t('全部')); searchInput.current?.focus(); }}>{t('清除筛选')}</button></div>}
   </div>;
 }

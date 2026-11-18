@@ -328,6 +328,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   }
 
   const listSection = modal === 'nodes-list' ? 'nodes' : modal === 'edges-list' ? 'edges' : undefined;
+  const otherModels = models.filter(other => other.id !== id && (workspace !== 'query' || other.active_revision && !other.archive_error));
   const title = { graph: t('图模型'), catalogs: t('数据源'), query: t('查询') }[workspace];
   const busy = mutations.pending || saving || checking || activating;
   const nodeNames = Object.keys(model?.nodes ?? {});
@@ -473,7 +474,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     <header className="workspace-header model-workspace-header">
       <div className="workspace-title">
         <button className="icon-button" aria-label={t('返回模型列表')} title={t('返回模型列表')} onClick={close}><ArrowLeft size={17} aria-hidden="true" /></button>
-        <h1>{title}</h1>
+        <div className="model-heading"><span>{title}</span><h1>{modelName}</h1></div>
         {workspace === 'catalogs' && model && allow.configure && allow.edit && <button className="button primary compact catalog-add" type="button"
           disabled={!!busy} aria-haspopup="dialog" aria-label={t('添加数据源')} onClick={openSource}>
           <Plus size={16} aria-hidden="true" /><span className="label-full">{t('添加数据源')}</span><span className="label-compact">{t('添加来源')}</span>
@@ -481,14 +482,13 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       </div>
       <div className="workspace-context">
         {workspace !== 'query' && dirty && <span className="dirty"><i />{t('未保存')}</span>}
-        {saved?.revision && <label className="model-switch"><span className="sr-only">{t('切换图模型')}</span>
-          <select value={id} onChange={event => changeModel(event.target.value)}>
-            <option value={id}>{modelName}</option>
-            {models.filter(other => other.id !== id && (workspace !== 'query' || other.active_revision && !other.archive_error)).map(other =>
+        {saved?.revision && otherModels.length > 0 && <label className="model-switch"><span className="sr-only">{t('切换图模型')}</span>
+          <select value="" onChange={event => changeModel(event.target.value)}>
+            <option value="" disabled>{t('切换图模型')}</option>
+            {otherModels.map(other =>
               <option value={other.id} key={other.id}>{other.name} · {other.id}</option>)}
           </select>
         </label>}
-        {!saved?.revision && preview.model?.graph && <strong className="draft-name">{modelName}</strong>}
         {workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" aria-label={t('编辑模型名称')}
           disabled={busy || !!yamlError} onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} /></button>}
         {saved && (workspace !== 'query' || !saved.active_revision || saved.archive_error) && <code className="version-chip" title={saved.active_revision ?? undefined}>{saved.archive_error ? t('版本存储异常') : saved.active_revision ? t('生效 {0}', saved.active_revision.slice(0, 10)) : t('未发布')}</code>}

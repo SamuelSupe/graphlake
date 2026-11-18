@@ -17,7 +17,7 @@
 }
 .canvas-instructions > p { display: flex; align-items: center; gap: 6px; min-inline-size: 0; overflow-wrap: anywhere; }
 .canvas-instructions svg { flex: none; }
-.canvas-instructions[data-active] { background: #edf2ff; color: #254895; }
+.canvas-instructions[data-active] { background: var(--tint); color: var(--accent-hover); }
 .canvas-instructions .text-button { min-block-size: 26px; font-size: .8125rem; }
 .graph-vertex { position: absolute; z-index: 1; }
 .graph-vertex:focus-within, .graph-vertex:hover, .graph-vertex[data-moving] { z-index: 2; }
@@ -40,17 +40,17 @@
   block-size: 26px;
   padding: 0;
   transform: translateY(-50%);
-  border: 1px solid #c5d3eb;
+  border: 1px solid var(--control-line);
   border-radius: 50%;
   background: var(--surface);
-  color: var(--blue-dark);
+  color: var(--accent-hover);
 }
-.graph-port:hover, .graph-port:focus-visible { border-color: var(--blue); background: #e9f0ff; }
-.graph-vertex[data-link-source] .node-dot { box-shadow: 0 0 0 2px var(--blue), 0 0 0 5px #bed2ff; }
-.graph-vertex[data-link-target] .node-dot { box-shadow: 0 0 0 2px var(--blue), 0 0 0 5px #d5e1ff; }
+.graph-port:hover, .graph-port:focus-visible { border-color: var(--accent); background: var(--tint); }
+.graph-vertex[data-link-source] .node-dot { box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px #d9b3bb; }
+.graph-vertex[data-link-target] .node-dot { box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px #eed6d9; }
 .graph-stage[data-placing] { cursor: crosshair; }
 .graph-stage[data-linking] .graph-node { cursor: crosshair; }
-.graph-toolbar .tool-button[aria-pressed="true"] { color: var(--blue-dark); background: var(--tint); border-color: #c9d7ff; }
+.graph-toolbar .tool-button[aria-pressed="true"] { color: var(--accent-hover); background: var(--tint); border-color: #dbbac3; }
 @media (pointer: coarse) {
   .canvas-controls :is(button, select) { min-block-size: 44px; min-inline-size: 44px; }
   .graph-port { inset-inline-start: 24px; inline-size: 44px; block-size: 44px; }

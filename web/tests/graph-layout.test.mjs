@@ -109,3 +109,29 @@ test('dense rendering retains each subpath and the search anchors of reversed pa
   assert.equal(packed.length, 2);
   assert.equal(packed.join(' '), paths.join(' '));
 });
+
+test('parallel transfer labels have separate pointer targets in every orientation', () => {
+  const start = { x: 0, y: 0 };
+  const lanes = edgeLanes([{ id: '100', from: 'a', to: 'b' }, { id: '200', from: 'a', to: 'b' },
+    { id: '300', from: 'b', to: 'a' }]);
+  for (const end of [{ x: 160, y: 0 }, { x: 0, y: 160 }, { x: 130, y: -80 }]) {
+    const labels = lanes.map(edge => edge.from === 'a' ? edgeCurve(edge, start, end).label : edgeCurve(edge, end, start).label);
+    labels.forEach((label, i) => {
+      for (const other of labels.slice(0, i)) {
+        assert.ok(Math.abs(label.x - other.x) >= 120 || Math.abs(label.y - other.y) >= 24);
+      }
+    });
+  }
+});
+
+test('a three-account transfer cycle leaves all three relationships visible in radial layout', () => {
+  const vertices = ['a', 'b', 'c'].map(id => ({ id, kind: 'node' }));
+  const edges = [['a', 'b'], ['b', 'c'], ['c', 'a']].map(([from, to]) => ({ id: from + to, from, to }));
+  const points = positions({ vertices, edges }, 'radial');
+  for (const [index, edge] of edges.entries()) {
+    const a = points.get(edge.from), b = points.get(edge.to), c = points.get(vertices[(index + 2) % 3].id);
+    const length = Math.hypot(b.x - a.x, b.y - a.y);
+    const distance = Math.abs((b.x - a.x) * (a.y - c.y) - (a.x - c.x) * (b.y - a.y)) / length;
+    assert.ok(distance > 15, 'an edge should pass clear of the unrelated account');
+  }
+});

@@ -66,7 +66,7 @@ export function placeNodes(names: string[], width: number, height: number, colum
   if (layout === 'spread' && names.length <= 10) {
     const radial = names.map((_, index): Point => {
       const angle = index * 2 * Math.PI / names.length - Math.PI / 2;
-      const x = Math.min(width / 2 - horizontalInset, Math.max(145, names.length * 31));
+      const x = Math.min(width / 2 - horizontalInset, Math.max(145, names.length * 47));
       const y = Math.min(height / 2 - verticalInset, Math.max(118, names.length * 24));
       return [width / 2 + x * Math.cos(angle), height / 2 + y * Math.sin(angle)];
     });

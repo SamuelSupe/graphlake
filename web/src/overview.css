@@ -32,7 +32,16 @@
   justify-content: space-between;
   gap: 8px 12px;
 }
-.overview-service { padding: 15px 18px; }
+.overview-service {
+  padding: clamp(20px, 2.6vw, 38px);
+  min-block-size: 9rem;
+  background: linear-gradient(90deg, var(--wine) 14%, #581b2cee 54%, #581b2cb3), var(--relief) center right / cover var(--wine);
+  color: #fff6f0;
+}
+.overview-service :is(.muted, .overview-service-details) { color: #f3e0d8; }
+.overview-service .overview-service-icon { background: var(--apricot); color: var(--wine); border-radius: 50%; }
+.overview-service .overview-service-title h2 { font: 500 clamp(1.5rem, 2.5vw, 2.15rem)/1.2 var(--display); }
+.overview-service :is(.overview-error, .overview-unavailable) { color: #fff0ca; }
 .overview-service-title { flex-wrap: wrap; gap: 8px 12px; }
 .overview-service-title p { margin-block-start: 3px; font-size: .8125rem; }
 .overview-service-icon {
@@ -42,7 +51,7 @@
   inline-size: 44px;
   block-size: 44px;
   border-radius: 8px;
-  color: var(--blue);
+  color: var(--accent);
   background: var(--tint);
 }
 .overview-service-details { gap: 8px 16px; }
@@ -121,7 +130,7 @@
   list-style: none;
 }
 .trend-legend li { display: flex; align-items: center; gap: 5px; }
-.trend-legend i { flex: none; inline-size: 14px; border-block-start: 2px solid #2855d9; }
+.trend-legend i { flex: none; inline-size: 14px; border-block-start: 2px solid var(--accent); }
 .trend-legend li:nth-child(2) i { border-block-start: 2px dashed #a04e17; }
 .trend-legend strong { color: #27334b; font-variant-numeric: tabular-nums; }
 .trend-plot { display: block; inline-size: 100%; block-size: 108px; }
@@ -130,7 +139,7 @@
 .trend-empty { display: grid; min-block-size: 135px; place-items: center; text-align: center; background: var(--panel); border-radius: 6px; }
 .trend-data { padding-block-start: 0; font-size: .8125rem; }
 .trend-data :is(th, td) { padding: 9px 8px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.trend-data thead th { position: sticky; inset-block-start: 0; background: #f0f3f9; }
+.trend-data thead th { position: sticky; inset-block-start: 0; background: var(--panel); }
 .trend-data th[scope="row"] { font-weight: 500; }
 @media (max-width: 1000px) {
   .overview-grid { grid-template-columns: minmax(0, 1fr); }

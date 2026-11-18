@@ -1,4 +1,12 @@
 export const english: Record<string, string> = {
+  '工作区': 'Workspace',
+  '管理': 'Administration',
+  '模型总数': 'Models',
+  '可见模型的结构汇总': 'Structure across visible models',
+  '模型目录': 'Model library',
+  '目录视图': 'Library view',
+  '卡片视图': 'Card view',
+  '列表视图': 'List view',
   // AI.tsx
   '查询数据': 'Query data',
   '列出我可查询的模型，查看模型结构，再统计各类节点数量。': 'List the models I can query, inspect their schemas, and count the nodes of each type.',

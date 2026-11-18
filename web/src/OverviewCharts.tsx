@@ -4,7 +4,7 @@ import { ChartNoAxesCombined, Table2 } from 'lucide-react';
 import { maxSampleGapMs, trendsInWindow, type ChartPoint, type RuntimeSample } from './overviewSeries';
 import { Modal } from './ui';
 
-const colors = ['#2855d9', '#a04e17'];
+const colors = ['#822640', '#a04e17'];
 const format = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
 const clock = new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 
@@ -23,7 +23,7 @@ function TrendPlot({ points }: { points: ChartPoint[] }) {
       canvas.width = Math.round(width * ratio);
       canvas.height = Math.round(height * ratio);
       ctx.scale(ratio, ratio);
-      ctx.fillStyle = '#5d687a';
+      ctx.fillStyle = '#695e60';
       ctx.font = '11px system-ui, sans-serif';
       const left = ctx.measureText(format.format(max)).width + 10;
       const right = width - 7;
@@ -34,7 +34,7 @@ function TrendPlot({ points }: { points: ChartPoint[] }) {
       ctx.textBaseline = 'middle';
       for (const tick of [0, max / 2, max]) {
         ctx.fillText(format.format(tick), 0, y(tick));
-        ctx.strokeStyle = '#e2e6ed';
+        ctx.strokeStyle = '#e2d9d4';
         ctx.beginPath();
         ctx.moveTo(left, y(tick));
         ctx.lineTo(right, y(tick));

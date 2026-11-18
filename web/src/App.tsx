@@ -17,6 +17,7 @@ import { Models, type DirectoryState } from './Models';
 import type { SettingsTab } from './Settings';
 import './styles.css';
 import './panels.css';
+import './directory.css';
 
 const Settings = lazy(() => import('./Settings'));
 const AI = lazy(() => import('./AI'));
@@ -230,6 +231,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   return <div className="app-shell">
     <a className="skip-link" href="#workspace-content">{t('跳转到工作区')}</a>
     <ConsoleNavigation page={pageTitle} home={() => navigate('/')} account={account}>
+      <span className="rail-section">{t('工作区')}</span>
       {administrator && <a className="rail-link" href="/overview" aria-current={overviewPage ? 'page' : undefined} onClick={event => {
         if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
         event.preventDefault();
@@ -248,6 +250,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
       }}>
         <Bot size={20} aria-hidden="true" /><span>AI</span>
       </a>
+      {administrator && <span className="rail-section">{t('管理')}</span>}
       {administrator && identity.enabled && <button className="rail-link" aria-current={accessPage ? 'page' : undefined} onClick={() => navigate('/access')}>
         <ShieldCheck size={20} aria-hidden="true" /><span>{t('权限管理')}</span>
       </button>}

@@ -19,7 +19,7 @@ type Editing = {
   pick: (node: string) => void;
   cancel: () => void;
 };
-const tones = ['#326cce', '#2e839d', '#5e73c6', '#286e94', '#596cb8'];
+const tones = ['#843b52', '#9a612c', '#537785', '#765f80', '#70734f'];
 
 function drawCurve(context: CanvasRenderingContext2D, points: Curve, color: string, weight: number, preview = false) {
   const [from, c1, c2, to] = points;
@@ -151,9 +151,9 @@ export default function GraphCanvas({ model, selected, select, editing, viewStat
     context.clearRect(0, 0, width, height);
     for (const curve of curves) {
       const current = selectedEdge === curve.name;
-      drawCurve(context, curve.points, current ? '#2457d7' : '#93a9ca', current ? 2.3 : 1.6);
+      drawCurve(context, curve.points, current ? '#8a2946' : '#aa9095', current ? 2.3 : 1.6);
     }
-    if (preview) drawCurve(context, preview, '#2457d7', 2, true);
+    if (preview) drawCurve(context, preview, '#8a2946', 2, true);
   }, [width, height, curves, selectedEdge, preview]);
 
   function stagePoint(x: number, y: number): Point {

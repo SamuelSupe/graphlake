@@ -1,10 +1,10 @@
 dialog {
   padding: 0; color: inherit; background: var(--surface); border: 1px solid var(--line);
-  box-shadow: -12px 0 48px #17223b24; overflow: hidden;
+  box-shadow: -12px 0 48px #3a172024; overflow: hidden;
 }
 dialog[open] { display: flex; flex-direction: column; }
 dialog:modal { overscroll-behavior: contain; }
-dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior: contain; }
+dialog::backdrop { background: #31131e50; overflow: hidden; overscroll-behavior: contain; }
 .dialog-drawer {
   --panel-width: 480px;
   position: fixed; inset: 0 0 0 auto; margin: 0; inline-size: min(var(--panel-width), 100%);
@@ -15,10 +15,10 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .dialog-center { inline-size: min(calc(100% - 24px), 480px); max-block-size: calc(100dvh - 24px); border-radius: 12px; }
 .dialog-heading {
   display: flex; flex: none; align-items: flex-start; justify-content: space-between; gap: 16px;
-  padding: 22px 24px; border-block-end: 1px solid var(--line);
+  padding: 22px 24px; background: var(--paper); border-block-end: 1px solid var(--line);
 }
 .dialog-heading > div { min-inline-size: 0; }
-.dialog-heading h2 { font-size: 1.125rem; overflow-wrap: anywhere; }
+.dialog-heading h2 { color: var(--wine); font: 550 clamp(1.45rem, 2vw, 1.8rem)/1.2 var(--display); overflow-wrap: anywhere; }
 .dialog-heading h2[tabindex="-1"]:focus-visible { outline: none; }
 .dialog-heading p { margin-block-start: 7px; color: var(--muted); font-size: .8125rem; line-height: 1.6; }
 .dialog-heading .icon-button { min-inline-size: 34px; min-block-size: 34px; margin-block-start: -5px; }
@@ -49,7 +49,7 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .business-task-options:not(:disabled) .business-task-choice:hover { background: var(--panel); }
 .business-task-choice strong { display: block; font-size: .875rem; }
 .business-task-choice .field-help { display: block; margin-block-start: 4px; }
-.business-task-icon { display: grid; place-items: center; inline-size: 36px; block-size: 36px; color: var(--blue); background: var(--tint); border-radius: 7px; }
+.business-task-icon { display: grid; place-items: center; inline-size: 36px; block-size: 36px; color: var(--accent); background: var(--tint); border-radius: 7px; }
 .business-task-choice input { margin: 0; }
 .business-suite-fields { padding: 0; margin: 0; border: 0; min-inline-size: 0; }
 .suite-toolbar, .scenario-list-heading, .scenario-editor-heading {
@@ -72,7 +72,7 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 }
 .scenario-choices small { color: var(--muted); }
 .scenario-choices button:hover { background: var(--panel); }
-.scenario-choices button[aria-pressed="true"] { background: var(--tint); border-color: #c9d7ff; color: var(--blue-dark); }
+.scenario-choices button[aria-pressed="true"] { background: var(--tint); border-color: #dbbac3; color: var(--accent-hover); }
 .scenario-editor { min-inline-size: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); }
 .scenario-editor.scenario-with-tabs { padding: 0; }
 .scenario-editor-heading { align-items: start; flex-wrap: nowrap; padding: 16px 16px 8px; overflow-wrap: anywhere; }
@@ -120,14 +120,14 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .business-preview dt { color: var(--muted); }
 .business-parameters { overflow: auto; white-space: pre-wrap; }
 .panel-placeholder { display: grid; align-content: center; justify-items: center; gap: 10px; min-block-size: 200px; padding: 24px 12px; color: var(--muted); text-align: center; }
-.panel-placeholder h3 { color: #34445e; }
+.panel-placeholder h3 { color: var(--ink); }
 .source-browser-grid { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr); gap: 28px; }
 .source-picker { display: grid; align-content: start; gap: 18px; min-inline-size: 0; }
 .source-preview { min-inline-size: 0; padding-inline-start: 24px; border-inline-start: 1px solid var(--line); }
 .source-column-table { overflow: auto; max-block-size: 65dvh; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: 6px; }
 .source-column-table table { font-size: .8125rem; }
 .source-column-table th, .source-column-table td { padding: 10px 12px; overflow-wrap: anywhere; }
-.source-column-table thead th { position: sticky; inset-block-start: 0; background: #f0f3f9; }
+.source-column-table thead th { position: sticky; inset-block-start: 0; background: var(--panel); }
 .source-column-table th[scope="row"] { font-weight: 500; }
 .versions-body { display: flex; flex-direction: column; gap: 16px; }
 .versions-layout { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr); gap: 28px; min-inline-size: 0; }
@@ -136,12 +136,12 @@ dialog::backdrop { background: #101d3d40; overflow: hidden; overscroll-behavior:
 .versions-choices { display: grid; gap: 8px; list-style: none; margin: 0; padding: 0; max-block-size: 55dvh; overflow: auto; overscroll-behavior: contain; }
 .versions-choices > li { min-inline-size: 0; }
 .version-choice { display: grid; gap: 8px; inline-size: 100%; text-align: start; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; }
-.version-choice:hover, .version-choice[aria-pressed="true"] { border-color: #7f9de7; background: var(--tint); }
+.version-choice:hover, .version-choice[aria-pressed="true"] { border-color: #b48b95; background: var(--tint); }
 .version-choice[aria-disabled="true"] { cursor: wait; }
-.version-choice[aria-pressed="true"] { box-shadow: inset 3px 0 0 var(--blue); }
+.version-choice[aria-pressed="true"] { box-shadow: inset 3px 0 0 var(--accent); }
 .version-choice code { overflow-wrap: anywhere; }
 .version-choice small { color: var(--muted); }
-.version-choice-action { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; color: var(--blue); font-size: .75rem; }
+.version-choice-action { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; color: var(--accent); font-size: .75rem; }
 .version-management { padding-block-start: 12px; border-block-start: 1px solid var(--line); }
 .version-management summary { cursor: pointer; color: var(--muted); font-size: .8125rem; }
 .version-management > div { margin-block-start: 12px; }

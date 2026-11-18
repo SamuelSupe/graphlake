@@ -1,6 +1,6 @@
 import { diagnosticText, t } from './locale.ts';
 import { useRef, useState } from 'react';
-import { Activity, ArrowRight, CircleAlert, Network, Plus, RefreshCw, Search, Terminal, Upload } from 'lucide-react';
+import { Activity, ArrowRight, Box, CircleAlert, Database, GitFork, LayoutGrid, List, Network, Plus, RefreshCw, Search, Terminal, Upload } from 'lucide-react';
 import type { ModelSummary } from './api';
 import type { Workspace } from './Editor';
 import { Mark, StatusLabel } from './ui';
@@ -18,7 +18,7 @@ const filters = [
 ] as const;
 export type Filter = typeof filters[number]['key'];
 
-export type DirectoryState = { search: string; filter: Filter; scroll: number };
+export type DirectoryState = { search: string; filter: Filter; scroll: number; view?: 'cards' | 'table' };
 
 function matches(model: ModelSummary, filter: Filter) {
   if (filter === 'published') return !!model.active_revision && !model.archive_error;
@@ -35,6 +35,7 @@ export function Models({ models, error, importError, workspace, open, query, can
   open: (id: string) => void; query?: (id: string) => void; create: () => void;
   importModel: (file: File) => void; retry: () => void;
 }) {
+  const [view, setView] = useState(memory.view ?? 'cards');
   const [search, updateSearch] = useState(memory.search);
   const setSearch = (value: string) => { memory.search = value; updateSearch(value); };
   const [filter, updateFilter] = useState<Filter>(memory.filter);
@@ -54,18 +55,39 @@ export function Models({ models, error, importError, workspace, open, query, can
     searchInput.current?.focus();
   }
 
+  const metrics = [
+    { label: t('模型总数'), Icon: Network, value: available?.length },
+    { label: t('数据源'), Icon: Database, value: available?.reduce((sum, model) => sum + model.sources, 0) },
+    { label: t('节点标签'), Icon: Box, value: available?.reduce((sum, model) => sum + model.nodes, 0) },
+    { label: t('边类型'), Icon: GitFork, value: available?.reduce((sum, model) => sum + model.edges, 0) },
+  ];
+
   return <main className="workbench model-directory">
-    <header className="workspace-header directory-header">
+    <header className="directory-cover">
       <div className="directory-heading"><h1>{title}</h1><p>{description}</p></div>
       {workspace === 'graph' && administrator && <div className="workspace-context">
+        <button className="button primary" onClick={create}><Plus size={16} aria-hidden="true" />{t('新建模型')}</button>
         <label className="button"><Upload size={16} aria-hidden="true" />{t('导入 YAML')}<input className="sr-only" type="file" accept=".yaml,.yml" onChange={event => {
           const file = event.target.files?.[0]; event.target.value = '';
           if (file) importModel(file);
         }} /></label>
-        <button className="button primary" onClick={create}><Plus size={16} aria-hidden="true" />{t('新建模型')}</button>
       </div>}
     </header>
-    <div className="listing">
+    <dl className="directory-metrics" aria-label={t('可见模型的结构汇总')}>
+      {metrics.map(({ label, Icon, value }) => <div key={label}>
+        <dt><Icon size={16} aria-hidden="true" />{label}</dt>
+        <dd>{error || value === undefined ? '—' : value.toLocaleString()}</dd>
+      </div>)}
+    </dl>
+    <section className="model-library" aria-labelledby="library-heading">
+      <div className="library-heading">
+        <h2 id="library-heading">{t('模型目录')}</h2>
+        <div className="library-views" role="group" aria-label={t('目录视图')}>
+          {([{ mode: 'cards', label: t('卡片视图'), Icon: LayoutGrid }, { mode: 'table', label: t('列表视图'), Icon: List }] as const)
+            .map(({ mode, label, Icon }) => <button type="button" key={mode} aria-label={label} title={label} aria-pressed={mode === view}
+              onClick={() => { memory.view = mode; setView(mode); }}><Icon size={16} aria-hidden="true" /></button>)}
+        </div>
+      </div>
       <div className="directory-tools">
         {workspace !== 'query' && <div className="model-filters" role="group" aria-label={t('按模型状态筛选')}>
           {filters.map(item => <button key={item.key} aria-pressed={activeFilter === item.key}
@@ -91,7 +113,7 @@ export function Models({ models, error, importError, workspace, open, query, can
           {narrowed ? <button className="button" onClick={resetFilters}>{t('清除筛选')}</button>
             : workspace === 'graph' && administrator && <button className="button primary" onClick={create}><Plus size={16} aria-hidden="true" />{t('新建模型')}</button>}
         </div>
-        : <div className="panel-table directory"><table className="models-table" role="table" aria-label={title}>
+        : <div className="panel-table directory" data-view={view}><table className="models-table" role="table" aria-label={title}>
           <thead role="rowgroup"><tr role="row"><th scope="col">{t('模型')}</th><th scope="col">{t('模型结构')}</th><th scope="col">{t('发布状态')}</th><th scope="col">{t('草稿校验')}</th><th scope="col"><span className="sr-only">{t('操作')}</span></th></tr></thead>
           <tbody role="rowgroup">{filtered.map(model => <tr key={model.id} role="row" className="directory-row">
             <th scope="row" role="rowheader" className="directory-name"><button className="model-name" onClick={() => open(model.id)}>
@@ -122,6 +144,6 @@ export function Models({ models, error, importError, workspace, open, query, can
           {workspace === 'graph' && administrator && <button className="text-button" onClick={health}><Activity size={16} aria-hidden="true" />{t('运行健康')}</button>}
         </div>
       </div>}
-    </div>
+    </section>
   </main>;
 }

@@ -312,9 +312,8 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
         </div>
       </div>
     </Modal>}
-    {imported && <NameDialog title={t('导入图模型')} initial={imported.name} withId close={() => setImported(undefined)}
+    {imported && <NameDialog title={t('导入图模型')} initial={imported.name} modelIds={models?.map(model => model.id) ?? []} close={() => setImported(undefined)}
       submit={(name, key) => {
-        if (models?.some(model => model.id === key)) throw new Error(t('模型标识已存在'));
         let yaml = imported.yaml;
         if (modelOf(yaml).graph !== name) {
           const doc = documentOf(yaml);
@@ -324,7 +323,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
         setDraft({ id: key, yaml, revision: '', active_revision: null, status: 'unchecked' });
         navigate('/new');
       }} />}
-    {creating && <NameDialog title={t('新建图模型')} withId close={() => setCreating(false)}
+    {creating && <NameDialog title={t('新建图模型')} modelIds={models?.map(model => model.id) ?? []} close={() => setCreating(false)}
       submit={(name, key) => {
         setDraft({ id: key, yaml: emptyModel(name), revision: '', active_revision: null, status: 'unchecked' });
         navigate('/new');

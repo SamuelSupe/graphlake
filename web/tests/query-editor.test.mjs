@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { queryParameterError } from '../src/queryParameters.ts';
+import { queryLimitErrors, queryParameterError } from '../src/queryParameters.ts';
 import { schemaCompletions } from '../src/queryCompletions.ts';
 
 test('model completion includes business keys and safely quotes identifiers for each dialect', () => {
@@ -22,4 +22,16 @@ test('Cypher parameter input accepts optional objects and enforces the API byte 
   assert.equal(Buffer.byteLength(value), 65536);
   assert.equal(queryParameterError(value), '');
   assert.ok(queryParameterError(value + ' '));
+});
+
+test('query and template limits identify the field to correct and allow server defaults', () => {
+  const valid = { timeout: false, max_observation_age_seconds: false, max_reconciliation_age_seconds: false };
+  assert.deepEqual(queryLimitErrors('', {}), valid);
+  assert.deepEqual(queryLimitErrors('60000', { max_observation_age_seconds: 1, max_reconciliation_age_seconds: 2592000 }), valid);
+  assert.deepEqual(queryLimitErrors('60001', { max_observation_age_seconds: 0 }), {
+    ...valid, timeout: true, max_observation_age_seconds: true,
+  });
+  assert.deepEqual(queryLimitErrors('1', { max_observation_age_seconds: 60, max_reconciliation_age_seconds: 1.5 }), {
+    ...valid, max_reconciliation_age_seconds: true,
+  });
 });

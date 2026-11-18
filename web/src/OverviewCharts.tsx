@@ -4,7 +4,6 @@ import { ChartNoAxesCombined, Table2 } from 'lucide-react';
 import { maxSampleGapMs, trendsInWindow, type ChartPoint, type RuntimeSample } from './overviewSeries';
 import { Modal } from './ui';
 
-const colors = ['#822640', '#a04e17'];
 const format = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
 const clock = new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 
@@ -15,6 +14,10 @@ function TrendPlot({ points }: { points: ChartPoint[] }) {
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
     const first = points[0].at;
+    const style = getComputedStyle(canvas);
+    const colors = [style.getPropertyValue('--accent').trim(), '#a04e17'];
+    const muted = style.getPropertyValue('--muted').trim();
+    const grid = style.getPropertyValue('--line').trim();
     const last = points[points.length - 1].at;
     const max = Math.max(2, Math.ceil(Math.max(...points.flatMap(({ values }) => values ?? [0])) / 2) * 2);
     function draw(width: number, height: number) {
@@ -23,7 +26,7 @@ function TrendPlot({ points }: { points: ChartPoint[] }) {
       canvas.width = Math.round(width * ratio);
       canvas.height = Math.round(height * ratio);
       ctx.scale(ratio, ratio);
-      ctx.fillStyle = '#695e60';
+      ctx.fillStyle = muted;
       ctx.font = '11px system-ui, sans-serif';
       const left = ctx.measureText(format.format(max)).width + 10;
       const right = width - 7;
@@ -34,7 +37,7 @@ function TrendPlot({ points }: { points: ChartPoint[] }) {
       ctx.textBaseline = 'middle';
       for (const tick of [0, max / 2, max]) {
         ctx.fillText(format.format(tick), 0, y(tick));
-        ctx.strokeStyle = '#e2d9d4';
+        ctx.strokeStyle = grid;
         ctx.beginPath();
         ctx.moveTo(left, y(tick));
         ctx.lineTo(right, y(tick));

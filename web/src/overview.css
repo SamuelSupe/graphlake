@@ -35,11 +35,11 @@
 .overview-service {
   padding: clamp(16px, 1.8vw, 26px);
   min-block-size: 5.5rem;
-  background: linear-gradient(90deg, var(--wine) 14%, #581b2cee 54%, #581b2cb3), var(--relief) center right / cover var(--wine);
-  color: #fff6f0;
+  background: var(--brand-cover);
+  color: #ffffff;
 }
-.overview-service :is(.muted, .overview-service-details) { color: #f3e0d8; }
-.overview-service .overview-service-icon { background: var(--apricot); color: var(--wine); border-radius: 50%; }
+.overview-service :is(.muted, .overview-service-details) { color: #e4efff; }
+.overview-service .overview-service-icon { background: var(--brand-light); color: var(--brand-deep); border-radius: 50%; }
 .overview-service .overview-service-title h2 { font: 500 clamp(1.5rem, 2.5vw, 2.15rem)/1.2 var(--display); }
 .overview-service :is(.overview-error, .overview-unavailable) { color: #fff0ca; }
 .overview-service-title { flex-wrap: wrap; gap: 8px 12px; }

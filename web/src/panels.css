@@ -1,10 +1,10 @@
 dialog {
   padding: 0; color: inherit; background: var(--surface); border: 1px solid var(--line);
-  box-shadow: -12px 0 48px #3a172024; overflow: hidden;
+  box-shadow: -12px 0 48px #14306424; overflow: hidden;
 }
 dialog[open] { display: flex; flex-direction: column; }
 dialog:modal { overscroll-behavior: contain; }
-dialog::backdrop { background: #31131e50; overflow: hidden; overscroll-behavior: contain; }
+dialog::backdrop { background: #0c1e3e5c; overflow: hidden; overscroll-behavior: contain; }
 .dialog-drawer {
   --panel-width: 480px;
   position: fixed; inset: 0 0 0 auto; margin: 0; inline-size: min(var(--panel-width), 100%);
@@ -18,7 +18,7 @@ dialog::backdrop { background: #31131e50; overflow: hidden; overscroll-behavior:
   padding: 16px 22px; background: var(--paper); border-block-end: 1px solid var(--line);
 }
 .dialog-heading > div { min-inline-size: 0; }
-.dialog-heading h2 { color: var(--wine); font: 550 clamp(1.45rem, 2vw, 1.8rem)/1.2 var(--display); overflow-wrap: anywhere; }
+.dialog-heading h2 { color: var(--brand-deep); font: 550 clamp(1.45rem, 2vw, 1.8rem)/1.2 var(--display); overflow-wrap: anywhere; }
 .dialog-heading h2[tabindex="-1"]:focus-visible { outline: none; }
 .dialog-heading p { margin-block-start: 7px; color: var(--muted); font-size: .8125rem; line-height: 1.6; }
 .dialog-heading .icon-button { min-inline-size: 34px; min-block-size: 34px; margin-block-start: -5px; }
@@ -72,7 +72,7 @@ dialog::backdrop { background: #31131e50; overflow: hidden; overscroll-behavior:
 }
 .scenario-choices small { color: var(--muted); }
 .scenario-choices button:hover { background: var(--panel); }
-.scenario-choices button[aria-pressed="true"] { background: var(--tint); border-color: #dbbac3; color: var(--accent-hover); }
+.scenario-choices button[aria-pressed="true"] { background: var(--tint); border-color: #a7bdf2; color: var(--accent-hover); }
 .scenario-editor { min-inline-size: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); }
 .scenario-editor.scenario-with-tabs { padding: 0; }
 .scenario-editor-heading { align-items: start; flex-wrap: nowrap; padding: 16px 16px 8px; overflow-wrap: anywhere; }
@@ -136,7 +136,7 @@ dialog::backdrop { background: #31131e50; overflow: hidden; overscroll-behavior:
 .versions-choices { display: grid; gap: 8px; list-style: none; margin: 0; padding: 0; max-block-size: 55dvh; overflow: auto; overscroll-behavior: contain; }
 .versions-choices > li { min-inline-size: 0; }
 .version-choice { display: grid; gap: 8px; inline-size: 100%; text-align: start; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; }
-.version-choice:hover, .version-choice[aria-pressed="true"] { border-color: #b48b95; background: var(--tint); }
+.version-choice:hover, .version-choice[aria-pressed="true"] { border-color: #7897dd; background: var(--tint); }
 .version-choice[aria-disabled="true"] { cursor: wait; }
 .version-choice[aria-pressed="true"] { box-shadow: inset 3px 0 0 var(--accent); }
 .version-choice code { overflow-wrap: anywhere; }

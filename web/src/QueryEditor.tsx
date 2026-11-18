@@ -13,11 +13,11 @@ import { keywords, schemaCompletions, type Dialect } from './queryCompletions';
 import type { GraphSchema } from './api';
 
 const queryHighlight = HighlightStyle.define([
-  { tag: [tags.keyword, tags.operatorKeyword, tags.bool, tags.null], color: '#ffc8ab' },
-  { tag: [tags.string, tags.regexp], color: '#dce7ac' },
+  { tag: [tags.keyword, tags.operatorKeyword, tags.bool, tags.null], color: '#9ac6ff' },
+  { tag: [tags.string, tags.regexp], color: '#a5e8cb' },
   { tag: [tags.number, tags.atom], color: '#f2cb83' },
   { tag: [tags.propertyName, tags.typeName, tags.className], color: '#c9ddec' },
-  { tag: tags.comment, color: '#c1aeb3', fontStyle: 'italic' },
+  { tag: tags.comment, color: '#a9b9d3', fontStyle: 'italic' },
 ]);
 
 const externalEdit = Annotation.define<boolean>();

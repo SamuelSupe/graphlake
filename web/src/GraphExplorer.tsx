@@ -8,7 +8,7 @@ import { NeighborControls } from './NeighborControls';
 import { appendGraph, combineVersions, focusNeighborhood, graphLabel, graphType, maxElements, mergePage, removeElement, searchCanvas, visibleGraphElements } from './graphExploration';
 import { edgeCurve, edgeLanes, forceVertexLimit, packPaths, positions, scene, type Layout, type Point } from './graphLayout';
 
-const tones = ['#843b52', '#9a612c', '#537785', '#765f80', '#70734f', '#b0645b'];
+const tones = ['var(--accent)', '#317d93', '#6a5ca1', '#375f9e', '#447258', '#a06630'];
 const layoutNames = { radial: t('径向布局'), layered: t('分层布局'), force: t('力导向布局') } as const;
 const minZoom = .005;
 const clampZoom = (value: number) => Math.max(minZoom, Math.min(4, value));
@@ -668,7 +668,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       }} onPointerMove={move} onPointerUp={end} onPointerCancel={end} onLostPointerCapture={end}>
         <svg ref={svg} className="explorer-lines" aria-hidden="true">
           <defs><marker id={arrow} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#a58b91" />
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--graph-line)" />
           </marker></defs>
           <g transform={'translate(' + (viewportWidth / 2 + camera.x) + ' ' + (viewportHeight / 2 + camera.y) + ') scale(' + camera.zoom + ')'}>
             <EdgePaths edges={visibleCurves} dense={dense} selected={selected} matched={matched} arrow={arrow} />

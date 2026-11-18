@@ -7,7 +7,7 @@
 }
 .app-rail {
   position: sticky; top: 0; align-self: start; height: 100dvh; overflow-y: auto; min-inline-size: 0;
-  display: flex; flex-direction: column; color: var(--muted); background: #fdfaf7; border-inline-end: 1px solid var(--line); z-index: 5;
+  display: flex; flex-direction: column; color: var(--muted); background: #fbfcff; border-inline-end: 1px solid var(--line); z-index: 5;
 }
 .app-rail :is(button, a) { color: inherit; }
 .app-rail :is(button, a):focus-visible { outline-offset: -3px; }
@@ -15,7 +15,7 @@
   display: flex; align-items: center; justify-content: flex-start; padding-inline: 20px; gap: 5px; flex: none; width: 100%; height: var(--header-height);
   background: transparent; border: 0; border-bottom: 1px solid var(--line);
 }
-.rail-brand span { color: var(--wine); font-size: 1.38rem; font-weight: 680; letter-spacing: -.03em; }
+.rail-brand span { color: var(--brand-deep); font-size: 1.38rem; font-weight: 680; letter-spacing: -.03em; }
 .rail-items { display: grid; gap: 4px; padding: 16px 12px; grid-template-columns: minmax(0, 1fr); }
 .rail-account { margin-block-start: auto; grid-template-columns: minmax(0, 1fr); border-block-start: 1px solid var(--line); padding-block: 10px; }
 .rail-identity { display: flex; align-items: center; gap: 12px; padding: 6px 14px; }
@@ -30,16 +30,16 @@
 .rail-link > svg { flex: none; }
 .rail-link:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
 .rail-link:hover { background: var(--panel); }
-.rail-link[aria-current="page"] { color: #fff8f2; background: var(--wine); font-weight: 650; }
+.rail-link[aria-current="page"] { color: #ffffff; background: var(--accent); font-weight: 650; }
 .rail-link[aria-current="page"]::before {
   content: ""; position: absolute; width: 5px; height: 5px; inset-inline-end: 12px; top: calc(50% - 2px);
-  background: var(--apricot); border-radius: 50%;
+  background: var(--brand-light); border-radius: 50%;
 }
 
 .rail-nav { min-inline-size: 0; }
 .rail-section { margin: 20px 10px 4px; font: 600 .69rem/1.5 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .rail-section:first-child { margin-block-start: 3px; }
-.rail-link[aria-current="page"]:focus-visible { outline-color: var(--apricot); }
+.rail-link[aria-current="page"]:focus-visible { outline-color: var(--brand-light); }
 .rail-account .language-picker { margin-inline: 8px; }
 .rail-account .language-picker select { background-color: transparent; }
 .rail-link svg { stroke-width: 1.65; }

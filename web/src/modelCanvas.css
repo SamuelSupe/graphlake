@@ -46,11 +46,11 @@
   color: var(--accent-hover);
 }
 .graph-port:hover, .graph-port:focus-visible { border-color: var(--accent); background: var(--tint); }
-.graph-vertex[data-link-source] .node-dot { box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px #d9b3bb; }
-.graph-vertex[data-link-target] .node-dot { box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px #eed6d9; }
+.graph-vertex[data-link-source] .node-dot { box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px #a2bcff; }
+.graph-vertex[data-link-target] .node-dot { box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px #d4e2ff; }
 .graph-stage[data-placing] { cursor: crosshair; }
 .graph-stage[data-linking] .graph-node { cursor: crosshair; }
-.graph-toolbar .tool-button[aria-pressed="true"] { color: var(--accent-hover); background: var(--tint); border-color: #dbbac3; }
+.graph-toolbar .tool-button[aria-pressed="true"] { color: var(--accent-hover); background: var(--tint); border-color: #a7bdf2; }
 @media (pointer: coarse) {
   .canvas-controls :is(button, select) { min-block-size: 44px; min-inline-size: 44px; }
   .graph-port { inset-inline-start: 24px; inline-size: 44px; block-size: 44px; }

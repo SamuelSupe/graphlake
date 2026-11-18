@@ -462,6 +462,7 @@ mod tests {
                         owner: Principal::Admin,
                         attempt: Uuid::new_v4(),
                         worker: None,
+                        worker_claim: None,
                         worker_seen_ms: 0,
                         retried: false,
                         managed_only: false,
@@ -561,7 +562,8 @@ mod tests {
         assert_eq!(inventory(&objects, &retired).await?.len(), 2);
         sweep(&metadata, &objects, now, Some(&leader), None).await?;
         objects.object_meta(&orphan).await?;
-        sweep(&metadata, &objects, later, Some(&leader), None).await?;
+        let after_marking = Utc::now() + GRACE + TimeDelta::seconds(1);
+        sweep(&metadata, &objects, after_marking, Some(&leader), None).await?;
         assert!(objects.object_meta(&orphan).await.is_err());
         assert!(objects.object_meta(&stale_file).await.is_err());
         for key in old_files
@@ -590,7 +592,8 @@ mod tests {
         }
         sweep(&metadata, &objects, later, Some(&leader), None).await?;
         assert_eq!(inventory(&objects, &retired).await?.len(), 2);
-        sweep(&metadata, &objects, later, Some(&leader), None).await?;
+        let after_marking = Utc::now() + GRACE + TimeDelta::seconds(1);
+        sweep(&metadata, &objects, after_marking, Some(&leader), None).await?;
         for key in old_files.iter().chain([&old_manifest]) {
             assert!(objects.object_meta(key).await.is_err(), "{key}");
         }

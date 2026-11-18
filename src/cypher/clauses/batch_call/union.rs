@@ -160,6 +160,12 @@ pub(super) fn plan(
             sql.push_str(&format!(" ORDER BY {}", ident(&sequence)));
         }
         let table = internal("result");
+        let uses_traversal_seed = state.expansions.iter().any(|expansion| {
+            expansion
+                .start_seed
+                .as_ref()
+                .is_some_and(|input| input.table == seed)
+        });
         state.calls.push(crate::cypher::apply::Apply {
             table: table.clone(),
             seed,
@@ -177,6 +183,7 @@ pub(super) fn plan(
                 single_key_only: false,
                 push_group_limit: false,
                 table: groups,
+                uses_traversal_seed,
             }),
         });
         format!("SELECT * FROM {}", ident(&table))

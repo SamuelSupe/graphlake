@@ -256,12 +256,26 @@ async fn accept(
         return Err(timeout());
     }
     job.worker = Some(worker.id);
+    job.worker_claim = Some(Uuid::new_v4());
     job.worker_seen_ms = now_ms();
-    if !metadata
-        .replace(id, saved.revision, &job)
-        .await
-        .map_err(storage)?
-    {
+    let claimed = match metadata.replace(id, saved.revision, &job).await {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            // An etcd transaction can commit even if its response is lost.
+            // Confirm this exact claim before starting any work.
+            let current = tokio::time::timeout_at(deadline, metadata.get(id))
+                .await
+                .map_err(|_| timeout())?
+                .map_err(|_| storage(error))?;
+            current.is_some_and(|current| {
+                current.job.attempt == job.attempt
+                    && current.job.worker == job.worker
+                    && current.job.worker_claim == job.worker_claim
+                    && matches!(current.job.state, JobState::Running)
+            })
+        }
+    };
+    if !claimed {
         return Err(Error::not_found());
     }
     let span = telemetry::start_span("query", "worker", None);
@@ -442,11 +456,13 @@ impl Worker {
     }
 
     async fn maintain_lease(&self, id: Uuid, job: &Job, token: &CancellationToken) {
-        let mut next_heartbeat = Instant::now() + Duration::from_secs(1);
+        const HEARTBEAT: Duration = Duration::from_secs(2);
+        const OWNERSHIP_POLL: Duration = Duration::from_millis(500);
+        let mut next_heartbeat = Instant::now() + HEARTBEAT;
         loop {
             tokio::select! {
                 _ = token.cancelled() => return,
-                _ = tokio::time::sleep(WAIT) => {}
+                _ = tokio::time::sleep(OWNERSHIP_POLL) => {}
             }
             match self.shared.metadata.get(id).await {
                 Ok(Some(saved))
@@ -462,7 +478,7 @@ impl Worker {
                             .metadata
                             .replace(id, saved.revision, &current)
                             .await;
-                        next_heartbeat = Instant::now() + Duration::from_secs(1);
+                        next_heartbeat = Instant::now() + HEARTBEAT;
                     }
                 }
                 Ok(_) => {
@@ -651,6 +667,7 @@ mod tests {
             owner: super::super::Principal::Admin,
             attempt: Uuid::new_v4(),
             worker: Some(worker_id),
+            worker_claim: None,
             worker_seen_ms: now_ms(),
             retried: false,
             managed_only: false,

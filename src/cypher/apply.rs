@@ -137,7 +137,7 @@ impl Apply {
             replace(context, seed.clone(), Arc::clone(&outer_schema), Vec::new())?;
         }
         let _nested_schema = self
-            .prepare_inner(catalog, context, scope, true, false)
+            .prepare_inner(catalog, context, scope, lookup::LookupMode::Schema)
             .await?;
         let groups = if let Mode::Batch(batch) = &self.mode {
             let frame = graph_frame(context, &batch.groups).await?;
@@ -252,8 +252,9 @@ impl Apply {
                                     catalog,
                                     context,
                                     scope,
-                                    false,
-                                    remaining.is_some_and(|n| n <= 64),
+                                    lookup::LookupMode::Batch {
+                                        bounded: remaining.is_some_and(|n| n <= 64),
+                                    },
                                 )
                                 .await?;
                             let frame = graph_frame(context, &self.inner).await?;
@@ -404,9 +405,12 @@ impl Apply {
         } else {
             None
         };
-        let _nested = self
-            .prepare_inner(catalog, context, scope, explain_only, false)
-            .await?;
+        let mode = if explain_only {
+            lookup::LookupMode::Schema
+        } else {
+            lookup::LookupMode::Batch { bounded: false }
+        };
+        let _nested = self.prepare_inner(catalog, context, scope, mode).await?;
         let result =
             Self::materialize(context, scope, &self.table, &self.inner, explain_only).await?;
         self.remove_nested(context)?;
@@ -422,10 +426,10 @@ impl Apply {
         catalog: &Catalog,
         context: &SessionContext,
         scope: &QueryScope,
-        explain_only: bool,
-        bounded: bool,
+        mode: lookup::LookupMode,
     ) -> Result<Vec<MemoryReservation>> {
         let mut budgets = Vec::new();
+        let explain_only = matches!(mode, lookup::LookupMode::Schema);
         let mut lookups = self.lookups.iter().peekable();
         for (index, child) in self.nested.iter().enumerate() {
             // Later MATCH seeds can depend on the output of a nested CALL.
@@ -438,18 +442,14 @@ impl Apply {
                     lookups
                         .next()
                         .expect("pending lookup")
-                        .register(context, scope, explain_only, bounded)
+                        .register(context, scope, mode)
                         .await?,
                 );
             }
             budgets.push(Box::pin(child.register(catalog, context, scope, explain_only)).await?);
         }
         for lookup in lookups {
-            budgets.extend(
-                lookup
-                    .register(context, scope, explain_only, bounded)
-                    .await?,
-            );
+            budgets.extend(lookup.register(context, scope, mode).await?);
         }
         Ok(budgets)
     }

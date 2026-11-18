@@ -44,12 +44,12 @@ impl Client {
         let Source::Spanner { database, uri } = source else {
             bail!("expected Spanner source");
         };
-        let database = {
+        let database = tokio::time::timeout(timeout, async {
             // The SDK runs channel and session maintenance on the creating runtime.
             let runtime = tokio::runtime::Handle::current().id();
             let mut cached = self.database.lock().await;
             if let Some((_, client)) = cached.as_ref().filter(|(id, _)| *id == runtime) {
-                client.clone()
+                Ok::<_, anyhow::Error>(client.clone())
             } else {
                 let _ = rustls::crypto::ring::default_provider().install_default();
                 let mut builder = Spanner::builder();
@@ -60,9 +60,11 @@ impl Client {
                 stats.request();
                 let database = client.database_client(database).build().await?;
                 *cached = Some((runtime, database.clone()));
-                database
+                Ok(database)
             }
-        };
+        })
+        .await
+        .context("Spanner connection timed out")??;
         stats.request();
         let tx = database
             .read_only_transaction()

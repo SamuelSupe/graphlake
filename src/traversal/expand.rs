@@ -316,7 +316,7 @@ impl Expansion {
 pub(crate) fn text_key(alias: &str, fields: &[String]) -> String {
     let fields = fields
         .iter()
-        .map(|field| format!("CAST({} AS VARCHAR)", qualified(alias, field)))
+        .map(|field| format!("__graphlake_key_text({})", qualified(alias, field)))
         .collect::<Vec<_>>();
     format!("make_array({})", fields.join(", "))
 }

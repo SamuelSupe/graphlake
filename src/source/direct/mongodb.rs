@@ -164,7 +164,7 @@ impl Driver {
                 options.app_name = Some("GraphLake".into());
                 options.connect_timeout = Some(timeout);
                 options.server_selection_timeout = Some(timeout);
-                options.max_pool_size = Some(2);
+                options.max_pool_size.get_or_insert(16);
                 Ok::<_, anyhow::Error>(Client::with_options(options)?)
             })
             .await?

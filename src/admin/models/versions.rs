@@ -18,10 +18,50 @@ struct Entry {
     impact: Option<ImpactStamp>,
 }
 
+const HISTORY_FILE_BYTES: usize = 8 * CATALOG_LIMIT;
+const HISTORY_PAGE_ENTRIES: usize = 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum HistoryLog {
+    Inline(Vec<Entry>),
+    Paged {
+        pages: Vec<String>,
+        tail: Vec<Entry>,
+    },
+}
+
+impl Default for HistoryLog {
+    fn default() -> Self {
+        Self::Inline(Vec::new())
+    }
+}
+
+impl HistoryLog {
+    fn tail(&self) -> &[Entry] {
+        match self {
+            Self::Inline(entries) | Self::Paged { tail: entries, .. } => entries,
+        }
+    }
+
+    fn tail_mut(&mut self) -> &mut Vec<Entry> {
+        match self {
+            Self::Inline(entries) | Self::Paged { tail: entries, .. } => entries,
+        }
+    }
+
+    fn pages(&self) -> &[String] {
+        match self {
+            Self::Inline(_) => &[],
+            Self::Paged { pages, .. } => pages,
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct VersionState {
     pub(super) active: Option<String>,
-    history: Vec<Entry>,
+    history: HistoryLog,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offline_at_ms: Option<u64>,
 }
@@ -65,6 +105,14 @@ pub(super) fn archive_error(id: &str, revision: &str, reason: &str) -> Error {
     )
 }
 
+fn manifest_error(id: &str, reason: &str) -> Error {
+    Error::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "model_manifest_unavailable",
+        format!("模型 {id} 的版本清单不可用（{reason}）"),
+    )
+}
+
 pub(in crate::admin) fn valid_revision(revision: &str) -> bool {
     revision.len() == 43
         && revision
@@ -88,50 +136,137 @@ impl Models {
 
     pub(super) fn version_state(&self, id: &str) -> ApiResult<Option<VersionState>> {
         let path = self.state_path(id)?;
-        let manifest_error = |reason: &str| {
-            Error::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "model_manifest_unavailable",
-                format!("模型 {id} 的版本清单不可用（{reason}）"),
-            )
-        };
-        if let Some(text) =
-            read_file(&path, 8 * CATALOG_LIMIT).map_err(|error| manifest_error(&error.message))?
+        if let Some(text) = read_file(&path, HISTORY_FILE_BYTES)
+            .map_err(|error| manifest_error(id, &error.message))?
         {
             let state: VersionState =
-                serde_json::from_str(&text).map_err(|_| manifest_error("清单格式无效"))?;
+                serde_json::from_str(&text).map_err(|_| manifest_error(id, "清单格式无效"))?;
+            if !state
+                .history
+                .pages()
+                .iter()
+                .all(|hash| valid_revision(hash))
+            {
+                return Err(manifest_error(id, "历史分段标识无效"));
+            }
             if let Some(active) = &state.active
                 && (!valid_revision(active)
-                    || !state.history.iter().any(|entry| &entry.revision == active))
+                    || self
+                        .find_history(id, &state.history, |entry| &entry.revision == active)?
+                        .is_none())
             {
-                return Err(manifest_error("活动版本不在历史记录中"));
+                return Err(manifest_error(id, "活动版本不在历史记录中"));
             }
             return Ok(Some(state));
         }
         // An archive without its manifest is incomplete state, even when a valid draft exists.
         if self.archived_ids()?.contains(id) {
-            return Err(manifest_error("归档存在但缺少版本清单"));
+            return Err(manifest_error(id, "归档存在但缺少版本清单"));
         }
         Ok(None)
+    }
+
+    fn history_page(&self, id: &str, hash: &str) -> ApiResult<Vec<Entry>> {
+        let path = self
+            .dir
+            .join(format!(".graphlake-{id}.history.{hash}.json"));
+        let text = read_file(&path, HISTORY_FILE_BYTES)
+            .map_err(|error| manifest_error(id, &error.message))?
+            .ok_or_else(|| manifest_error(id, "历史分段缺失"))?;
+        if revision(&text) != hash {
+            return Err(manifest_error(id, "历史分段哈希不匹配"));
+        }
+        serde_json::from_str(&text).map_err(|_| manifest_error(id, "历史分段格式无效"))
+    }
+
+    fn find_history(
+        &self,
+        id: &str,
+        history: &HistoryLog,
+        matches: impl Fn(&Entry) -> bool,
+    ) -> ApiResult<Option<Entry>> {
+        if let Some(entry) = history.tail().iter().rev().find(|entry| matches(entry)) {
+            return Ok(Some(entry.clone()));
+        }
+        for hash in history.pages().iter().rev() {
+            if let Some(entry) = self
+                .history_page(id, hash)?
+                .into_iter()
+                .rev()
+                .find(&matches)
+            {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
+    fn history_entries(&self, id: &str, history: HistoryLog) -> ApiResult<Vec<Entry>> {
+        match history {
+            HistoryLog::Inline(entries) => Ok(entries),
+            HistoryLog::Paged { pages, tail } => {
+                let mut entries = Vec::new();
+                for hash in pages {
+                    entries.extend(self.history_page(id, &hash)?);
+                }
+                entries.extend(tail);
+                Ok(entries)
+            }
+        }
     }
 
     pub(in crate::admin) fn check_archive_history(&self) -> ApiResult<()> {
         for id in self.managed_ids()? {
             if let Some(state) = self.version_state(&id)? {
-                for entry in state.history {
-                    self.archived(&id, &entry.revision)?;
+                let mut checked = std::collections::BTreeSet::new();
+                for entry in self.history_entries(&id, state.history)? {
+                    if checked.insert(entry.revision.clone()) {
+                        self.archived(&id, &entry.revision)?;
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    pub(super) fn write_state(&self, id: &str, state: &VersionState) -> ApiResult<()> {
-        let content = serde_json::to_vec(state).map_err(|_| Error::storage())?;
-        if content.len() > 8 * CATALOG_LIMIT {
-            return Err(Error::invalid("history_limit", "模型版本历史超过大小上限"));
+    pub(super) fn write_state(&self, id: &str, mut state: VersionState) -> ApiResult<()> {
+        let path = self.state_path(id)?;
+        if state.history.tail().len() > 2 * HISTORY_PAGE_ENTRIES {
+            let mut pages = state.history.pages().to_vec();
+            let entries = state.history.tail_mut();
+            let keep = entries.len() % HISTORY_PAGE_ENTRIES + HISTORY_PAGE_ENTRIES;
+            for page in entries[..entries.len() - keep].chunks(HISTORY_PAGE_ENTRIES) {
+                let content = serde_json::to_string(page).map_err(|_| Error::storage())?;
+                if content.len() > HISTORY_FILE_BYTES {
+                    return Err(Error::invalid(
+                        "history_limit",
+                        "模型版本历史分段超过大小上限",
+                    ));
+                }
+                let hash = revision(&content);
+                let page = self
+                    .dir
+                    .join(format!(".graphlake-{id}.history.{hash}.json"));
+                // Write immutable pages first. An interrupted manifest replacement
+                // leaves either the old history or the complete paged history readable.
+                if metadata(&page)?.is_none() {
+                    atomic_write(&page, content.as_bytes(), true)?;
+                } else {
+                    self.history_page(id, &hash)?;
+                }
+                pages.push(hash);
+            }
+            let tail = entries.split_off(entries.len() - keep);
+            state.history = HistoryLog::Paged { pages, tail };
         }
-        atomic_write(&self.state_path(id)?, &content, false)
+        let content = serde_json::to_vec(&state).map_err(|_| Error::storage())?;
+        if content.len() > HISTORY_FILE_BYTES {
+            return Err(Error::invalid(
+                "history_limit",
+                "模型版本历史清单超过大小上限",
+            ));
+        }
+        atomic_write(&path, &content, false)
     }
 
     pub(super) fn archive_path(&self, id: &str, revision: &str) -> ApiResult<PathBuf> {
@@ -170,7 +305,7 @@ impl Models {
                 self.archive(id, model)?;
                 state.activate(&model.revision, Action::Adopt, None);
             }
-            self.write_state(id, &state)?;
+            self.write_state(id, state)?;
         }
         Ok(())
     }
@@ -185,9 +320,12 @@ impl Models {
     }
 
     pub(in crate::admin) fn has_task_history(&self, id: &str) -> ApiResult<bool> {
+        let Some(state) = self.version_state(id)? else {
+            return Ok(false);
+        };
         Ok(self
-            .version_state(id)?
-            .is_some_and(|state| state.history.iter().any(|entry| entry.impact.is_some())))
+            .find_history(id, &state.history, |entry| entry.impact.is_some())?
+            .is_some())
     }
 
     fn recorded_impact(&self, id: &str, revision: &str) -> ApiResult<Option<ImpactStamp>> {
@@ -195,12 +333,9 @@ impl Models {
         if state.active.as_deref() != Some(revision) {
             return Err(active_conflict());
         }
-        Ok(state
-            .history
-            .iter()
-            .rev()
-            .find(|entry| entry.revision == revision)
-            .and_then(|entry| entry.impact.clone()))
+        Ok(self
+            .find_history(id, &state.history, |entry| entry.revision == revision)?
+            .and_then(|entry| entry.impact))
     }
 
     pub(in crate::admin) fn task_stamp(
@@ -272,10 +407,11 @@ impl Models {
             return Err(active_conflict());
         }
         let state = self.version_state(id)?.ok_or_else(Error::not_found)?;
-        if !state
-            .history
-            .iter()
-            .any(|entry| entry.revision == request.revision)
+        if self
+            .find_history(id, &state.history, |entry| {
+                entry.revision == request.revision
+            })?
+            .is_none()
         {
             return Err(Error::not_found());
         }
@@ -312,10 +448,11 @@ impl Models {
                 self.archive(&model.id, &model)?;
             }
             Action::Rollback => {
-                if !state
-                    .history
-                    .iter()
-                    .any(|entry| entry.revision == request.revision)
+                if self
+                    .find_history(&model.id, &state.history, |entry| {
+                        entry.revision == request.revision
+                    })?
+                    .is_none()
                 {
                     return Err(Error::not_found());
                 }
@@ -325,12 +462,12 @@ impl Models {
         }
         if state.active.as_deref() != Some(request.revision.as_str()) {
             state.activate(&request.revision, action, impact);
-            self.write_state(&model.id, &state)?;
-        } else if let Some(last) = state.history.last_mut()
+            self.write_state(&model.id, state)?;
+        } else if let Some(last) = state.history.tail_mut().last_mut()
             && last.impact != impact
         {
             last.impact = impact;
-            self.write_state(&model.id, &state)?;
+            self.write_state(&model.id, state)?;
         }
         self.get(&model.id)
     }
@@ -344,7 +481,7 @@ impl VersionState {
     fn activate(&mut self, revision: &str, action: Action, impact: Option<ImpactStamp>) {
         self.active = Some(revision.to_owned());
         self.offline_at_ms = None;
-        self.history.push(Entry {
+        self.history.tail_mut().push(Entry {
             revision: revision.to_owned(),
             action,
             at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
@@ -357,44 +494,53 @@ pub(crate) async fn history(
     State(app): State<Arc<App>>,
     RoutePath(id): RoutePath<String>,
 ) -> ApiResult<Json<History>> {
-    let models = app.models.lock().unwrap();
-    let model = models.get(&id)?;
-    let mut state = models.version_state(&id)?.unwrap_or_else(|| VersionState {
-        active: model.active_revision.clone(),
-        offline_at_ms: None,
-        history: vec![Entry {
-            revision: model.revision,
-            action: Action::Adopt,
-            at_ms: 0,
-            impact: None,
-        }],
-    });
-    state.history.reverse();
-    Ok(Json(History {
-        active_revision: state.active,
-        offline_at_ms: state.offline_at_ms,
-        versions: state.history,
-    }))
+    app.read_models(move |models| {
+        let model = models.get(&id)?;
+        let state = models.version_state(&id)?.unwrap_or_else(|| VersionState {
+            active: model.active_revision.clone(),
+            offline_at_ms: None,
+            history: HistoryLog::Inline(vec![Entry {
+                revision: model.revision,
+                action: Action::Adopt,
+                at_ms: 0,
+                impact: None,
+            }]),
+        });
+        let mut versions = models.history_entries(&id, state.history)?;
+        versions.reverse();
+        Ok(Json(History {
+            active_revision: state.active,
+            offline_at_ms: state.offline_at_ms,
+            versions,
+        }))
+    })
+    .await
 }
 
 pub(crate) async fn archived_yaml(
     State(app): State<Arc<App>>,
     RoutePath((id, revision)): RoutePath<(String, String)>,
 ) -> ApiResult<Json<Edit>> {
-    let models = app.models.lock().unwrap();
-    let model = models.get(&id)?;
-    let state = models.version_state(&id)?;
-    let listed = state
-        .as_ref()
-        .is_some_and(|state| state.history.iter().any(|entry| entry.revision == revision));
-    let yaml = if listed {
-        models.archived(&id, &revision)?
-    } else if state.is_none() && model.active_revision.as_ref() == Some(&revision) {
-        model.yaml
-    } else {
-        return Err(Error::not_found());
-    };
-    Ok(Json(Edit { yaml }))
+    app.read_models(move |models| {
+        let model = models.get(&id)?;
+        let state = models.version_state(&id)?;
+        let listed = if let Some(state) = &state {
+            models
+                .find_history(&id, &state.history, |entry| entry.revision == revision)?
+                .is_some()
+        } else {
+            false
+        };
+        let yaml = if listed {
+            models.archived(&id, &revision)?
+        } else if state.is_none() && model.active_revision.as_ref() == Some(&revision) {
+            model.yaml
+        } else {
+            return Err(Error::not_found());
+        };
+        Ok(Json(Edit { yaml }))
+    })
+    .await
 }
 
 pub(crate) async fn restore_archive(
@@ -420,13 +566,13 @@ pub(crate) async fn restore_archive(
     }
     let _policy = app.users.writes.lock().await;
     super::super::users::check(&app, &principal, &id, super::super::users::Role::Publisher)?;
-    Ok(Json(
+    let model = crate::blocking(|| {
         app.models
             .lock()
             .unwrap()
-            .restore(&id, &expected, &request.yaml)?,
-    )
-    .into_response())
+            .restore(&id, &expected, &request.yaml)
+    })?;
+    Ok(Json(model).into_response())
 }
 
 impl Models {
@@ -434,7 +580,10 @@ impl Models {
         self.get(id)?;
         let path = self.archive_path(id, expected)?;
         let state = self.version_state(id)?.ok_or_else(Error::not_found)?;
-        if !state.history.iter().any(|entry| entry.revision == expected) {
+        if self
+            .find_history(id, &state.history, |entry| entry.revision == expected)?
+            .is_none()
+        {
             return Err(Error::not_found());
         }
         parse(yaml, &self.source_path(id)?)?;
@@ -471,11 +620,11 @@ pub(crate) async fn publish(
         .await;
     }
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let (model, path, impact) = {
+    let (model, path, impact) = crate::blocking(|| {
         let models = app.models.lock().unwrap();
         let (model, impact) = models.draft_impact(&id, &request)?;
-        (model, models.source_path(&id)?, impact)
-    };
+        Ok((model, models.source_path(&id)?, impact))
+    })?;
     let validation = async {
         inspect(&model.yaml, &path, &app.options, true, &app, &id).await?;
         impact
@@ -497,12 +646,15 @@ pub(crate) async fn publish(
     };
     let _policy = app.users.writes.lock().await;
     super::super::users::check(&app, &principal, &id, super::super::users::Role::Publisher)?;
-    let mut models = app.models.lock().unwrap();
-    let model = models.get(&id)?;
-    let published = models.activate(model, request, Action::Publish, impact)?;
-    models
-        .checks
-        .insert(id, (published.revision.clone(), Status::Passed));
+    let published = crate::blocking(|| {
+        let mut models = app.models.lock().unwrap();
+        let model = models.get(&id)?;
+        let published = models.activate(model, request, Action::Publish, impact)?;
+        models
+            .checks
+            .insert(id, (published.revision.clone(), Status::Passed));
+        Ok(published)
+    })?;
     Ok(Json(Model {
         status: Status::Passed,
         ..published
@@ -529,11 +681,11 @@ pub(crate) async fn rollback(
         .await;
     }
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let (yaml, path, impact) = {
+    let (yaml, path, impact) = crate::blocking(|| {
         let models = app.models.lock().unwrap();
         let (yaml, impact) = models.rollback_impact(&id, &request)?;
-        (yaml, models.source_path(&id)?, impact)
-    };
+        Ok((yaml, models.source_path(&id)?, impact))
+    })?;
     inspect(&yaml, &path, &app.options, true, &app, &id).await?;
     let impact = impact
         .run(app.options.clone())
@@ -541,9 +693,12 @@ pub(crate) async fn rollback(
         .require_pass(request.preview.as_ref())?;
     let _policy = app.users.writes.lock().await;
     super::super::users::check(&app, &principal, &id, super::super::users::Role::Publisher)?;
-    let models = app.models.lock().unwrap();
-    let model = models.get(&id)?;
-    Ok(Json(models.activate(model, request, Action::Rollback, impact)?).into_response())
+    let model = crate::blocking(|| {
+        let models = app.models.lock().unwrap();
+        let model = models.get(&id)?;
+        models.activate(model, request, Action::Rollback, impact)
+    })?;
+    Ok(Json(model).into_response())
 }
 
 pub(crate) async fn unpublish(
@@ -566,7 +721,8 @@ pub(crate) async fn unpublish(
     }
     let _policy = app.users.writes.lock().await;
     super::super::users::check(&app, &principal, &id, super::super::users::Role::Publisher)?;
-    Ok(Json(app.models.lock().unwrap().deactivate(&id, request)?).into_response())
+    let model = crate::blocking(|| app.models.lock().unwrap().deactivate(&id, request))?;
+    Ok(Json(model).into_response())
 }
 
 impl Models {
@@ -582,7 +738,7 @@ impl Models {
         let mut state = self.version_state(id)?.ok_or_else(Error::storage)?;
         state.active = None;
         state.offline_at_ms = Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
-        self.write_state(id, &state)?;
+        self.write_state(id, state)?;
         self.engines.lock().unwrap().retain(|entry| entry.id != id);
         model.active_revision = None;
         Ok(model)
@@ -630,5 +786,91 @@ impl Models {
             Mutation::SaveTaskSuite(request) => tasks::save_suite(self, id, request)?,
         };
         Ok((StatusCode::OK, model))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_legacy_manifest_can_publish_and_roll_back_without_losing_history()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let models = Models::new(root.path().to_owned());
+        let api = |error: Error| anyhow::anyhow!(error.message);
+        let id = "payments";
+        let old_yaml = "graph: Old\nsources: {}\nnodes: {}\nedges: {}\n";
+        let new_yaml = "graph: New\nsources: {}\nnodes: {}\nedges: {}\n";
+        let old = revision(old_yaml);
+        let new = revision(new_yaml);
+        fs::write(models.path(id).map_err(api)?, new_yaml)?;
+        fs::write(models.archive_path(id, &old).map_err(api)?, old_yaml)?;
+
+        let entry = Entry {
+            revision: old.clone(),
+            action: Action::Publish,
+            at_ms: 0,
+            impact: None,
+        };
+        let size = serde_json::to_vec(&entry)?.len() + 1;
+        let mut state = VersionState {
+            active: Some(old.clone()),
+            history: HistoryLog::Inline(Vec::new()),
+            offline_at_ms: None,
+        };
+        let overhead = serde_json::to_vec(&state)?.len();
+        let count = (HISTORY_FILE_BYTES - overhead + 1) / size;
+        *state.history.tail_mut() = vec![entry; count];
+        let legacy = serde_json::to_vec(&state)?;
+        assert!(legacy.len() <= HISTORY_FILE_BYTES && legacy.len() + size > HISTORY_FILE_BYTES);
+        fs::write(models.state_path(id).map_err(api)?, legacy)?;
+
+        let published = models
+            .activate(
+                models.get(id).map_err(api)?,
+                Activation {
+                    revision: new.clone(),
+                    active_revision: Some(old.clone()),
+                    preview: None,
+                },
+                Action::Publish,
+                None,
+            )
+            .map_err(api)?;
+        assert_eq!(published.active_revision.as_deref(), Some(new.as_str()));
+        let state = models.version_state(id).map_err(api)?.unwrap();
+        assert!(!state.history.pages().is_empty());
+        assert_eq!(
+            models
+                .history_entries(id, state.history)
+                .map_err(api)?
+                .len(),
+            count + 1
+        );
+        models.check_archive_history().map_err(api)?;
+
+        let rolled_back = models
+            .activate(
+                published,
+                Activation {
+                    revision: old.clone(),
+                    active_revision: Some(new),
+                    preview: None,
+                },
+                Action::Rollback,
+                None,
+            )
+            .map_err(api)?;
+        assert_eq!(rolled_back.active_revision, Some(old));
+        let state = models.version_state(id).map_err(api)?.unwrap();
+        assert_eq!(
+            models
+                .history_entries(id, state.history)
+                .map_err(api)?
+                .len(),
+            count + 2
+        );
+        Ok(())
     }
 }

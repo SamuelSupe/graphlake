@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Roll large model version histories into immutable pages while preserving published revisions, rollback and backups.
+- Correct multi-start Cypher traversal and binary graph identities. Push eligible ALL and NONE shortest-path predicates into traversal, filter candidate rows before correlated path predicates, and use a set join for eligible unbounded correlated CALLs with broad frontiers, including nested calls. Push down eligible Gremlin loop limits.
+- Bound Cypher expression generation, driver rows and Bolt spools. Compact CSR spill runs during ingestion, cap batch rows before sorting CSR properties, and stop retrying partitions that report exhausted storage.
+- Retry failed full reconciliations without advancing their schedule. Reclaim legacy single-file snapshots during incremental loads and limit retired local parts while readers pin old generations.
+- Confirm ambiguous Worker task claims, reduce etcd polling, and reuse managed snapshot GC references. Batch OpenDAL deletes and move remaining MCP draft reads off the async runtime threads.
+
 ## v1.1.3
 
 - Stream eligible CSV and JSON Lines previews after validating business keys for the pinned source version. Revalidate when the file version changes.

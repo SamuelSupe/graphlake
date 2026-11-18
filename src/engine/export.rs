@@ -128,33 +128,42 @@ impl Destination {
     async fn save(
         &self,
         batches: &mut SendableRecordBatchStream,
-        scope: &QueryScope,
+        scope: &Arc<QueryScope>,
     ) -> Result<u64> {
         scope.check()?;
         match &self.target {
             Target::File(path) => {
-                let parent = path.parent().expect("validated destination parent");
-                let stage = tempfile::NamedTempFile::new_in(parent)?;
-                let count = self
-                    .serialize(BufWriter::new(stage.as_file().try_clone()?), batches, scope)
-                    .await?;
-                scope.check()?;
-                stage.as_file().sync_all()?;
-                stage
-                    .persist_noclobber(path)
-                    .with_context(|| format!("publishing export {}", self.name))?;
-                Ok(count)
+                let path = path.clone();
+                let parent = path
+                    .parent()
+                    .expect("validated destination parent")
+                    .to_owned();
+                let stage =
+                    tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
+                        .await??;
+                let (_, count) = self.serialize(stage.reopen()?, batches, scope).await?;
+                let scope = scope.clone();
+                let name = self.name.clone();
+                tokio::task::spawn_blocking(move || {
+                    stage.as_file().sync_all()?;
+                    scope.check()?;
+                    stage
+                        .persist_noclobber(path)
+                        .with_context(|| format!("publishing export {name}"))?;
+                    Ok(count)
+                })
+                .await?
             }
             Target::S3(target) => {
-                let stage = scope
-                    .runtime
-                    .disk_manager
-                    .create_tmp_file("staging a GraphLake S3 export")?;
-                let mut writer = stage.open_writer()?;
-                let count = self
-                    .serialize(BufWriter::new(&mut writer), batches, scope)
-                    .await?;
-                writer.finish()?;
+                let disk = scope.runtime.disk_manager.clone();
+                let (stage, writer) = tokio::task::spawn_blocking(move || {
+                    let stage = disk.create_tmp_file("staging a GraphLake S3 export")?;
+                    let writer = stage.open_writer()?;
+                    Ok::<_, anyhow::Error>((stage, writer))
+                })
+                .await??;
+                let (mut writer, count) = self.serialize(writer, batches, scope).await?;
+                tokio::task::spawn_blocking(move || writer.finish()).await??;
                 let path = stage
                     .path()
                     .context("S3 export requires a local temporary file")?;
@@ -164,17 +173,47 @@ impl Destination {
         }
     }
 
-    async fn serialize(
+    async fn serialize<W: Write + Send + 'static>(
         &self,
-        writer: impl Write + Send,
+        writer: W,
         batches: &mut SendableRecordBatchStream,
+        scope: &Arc<QueryScope>,
+    ) -> Result<(W, u64)> {
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        let parquet = self.parquet;
+        let schema = batches.schema();
+        let worker_scope = scope.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            Self::encode(
+                BufWriter::new(writer),
+                schema,
+                receive,
+                &worker_scope,
+                parquet,
+            )
+        });
+        while let Some(batch) = batches.try_next().await? {
+            scope.check()?;
+            if send.send(batch).await.is_err() {
+                break;
+            }
+        }
+        drop(send);
+        worker.await?
+    }
+
+    fn encode<W: Write + Send>(
+        writer: BufWriter<W>,
+        schema: SchemaRef,
+        mut batches: tokio::sync::mpsc::Receiver<RecordBatch>,
         scope: &QueryScope,
-    ) -> Result<u64> {
+        parquet: bool,
+    ) -> Result<(W, u64)> {
         let mut count = 0;
         let budget = MemoryConsumer::new("GraphLake export").register(&scope.runtime.memory_pool);
-        if self.parquet {
-            let mut writer = ArrowWriter::try_new(writer, batches.schema(), None)?;
-            while let Some(batch) = batches.try_next().await? {
+        let writer = if parquet {
+            let mut writer = ArrowWriter::try_new(writer, schema, None)?;
+            while let Some(batch) = batches.blocking_recv() {
                 scope.check()?;
                 let batch_memory = batch.get_array_memory_size().saturating_mul(2);
                 if budget.try_grow(batch_memory).is_err() {
@@ -191,10 +230,9 @@ impl Destination {
                 }
                 count += batch.num_rows() as u64;
             }
-            writer.into_inner()?.flush()?;
+            writer.into_inner()?
         } else {
             let mut writer = writer;
-            let schema: SchemaRef = batches.schema();
             let columns: Vec<_> = schema
                 .fields()
                 .iter()
@@ -205,7 +243,7 @@ impl Destination {
                 "CSV export requires unique column names"
             );
             csv_row(&mut writer, columns.iter().copied().map(Some))?;
-            while let Some(batch) = batches.try_next().await? {
+            while let Some(batch) = batches.blocking_recv() {
                 scope.check()?;
                 budget.try_grow(batch.get_array_memory_size().saturating_mul(4))?;
                 let mut json = crate::json_writer().build::<_, LineDelimited>(Vec::new());
@@ -233,9 +271,10 @@ impl Destination {
                 count += batch.num_rows() as u64;
                 budget.free();
             }
-            writer.flush()?;
-        }
-        Ok(count)
+            writer
+        };
+        let writer = writer.into_inner().map_err(|error| error.into_error())?;
+        Ok((writer, count))
     }
 }
 

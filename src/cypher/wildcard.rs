@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail, ensure};
-use opencypher::{Direction, Expr, Match, PatternPart, Properties, RelationshipPattern};
+use opencypher::{Direction, Expr, Match, PatternPart, Properties, RelationshipPattern, Variable};
 
 use crate::{
     Catalog,
@@ -14,7 +14,7 @@ use super::{
     alternatives::{self, Domains, Node},
     entities::{self, IdentityList, PathTypes},
     paths,
-    pattern::{bounded_range, concatenate, ranking},
+    pattern::{bounded_range, concatenate, path_edge_terms, ranking},
     property_terms, start_terms, string,
 };
 
@@ -54,7 +54,7 @@ pub(super) fn bind<'a>(
                 };
                 let rank = ranking(pattern, part, relationship, mode, bounds.0, bounds.1)?;
                 let table = format!("__graphlake_expand_{}", base + plan.expansions.len());
-                let step = ranged(
+                let (step, rank) = ranged(
                     catalog,
                     &mut plan,
                     relationship,
@@ -62,7 +62,10 @@ pub(super) fn bind<'a>(
                     table,
                     Range {
                         bounds,
-                        mode: if rank.is_some() { None } else { mode },
+                        mode,
+                        rank,
+                        path: part.variable.as_ref(),
+                        disjoint: endpoints[0].0.labels.is_disjoint(&endpoints[1].0.labels),
                         track: part.variable.is_some(),
                         predicate: pattern.where_clause.as_ref(),
                         #[cfg(feature = "admin")]
@@ -367,6 +370,9 @@ fn fixed(
 struct Range<'a> {
     bounds: (usize, usize),
     mode: Option<paths::Shortest>,
+    rank: Option<bool>,
+    path: Option<&'a Variable>,
+    disjoint: bool,
     track: bool,
     predicate: Option<&'a Expr>,
     #[cfg(feature = "admin")]
@@ -380,7 +386,7 @@ fn ranged(
     start: &Node<'_>,
     table: String,
     range: Range<'_>,
-) -> Result<Step> {
+) -> Result<(Step, Option<bool>)> {
     let direction = match relationship.direction {
         Direction::Outgoing => crate::Direction::Outgoing,
         Direction::Incoming => crate::Direction::Incoming,
@@ -388,21 +394,39 @@ fn ranged(
         Direction::Both => bail!("relationship arrows at both ends are unsupported"),
     };
     let allowed = alternatives::edge_labels(catalog, relationship)?;
+    let mut prefiltered = range.rank == Some(true);
     let edges = catalog
         .edges
         .iter()
         .filter(|(name, _)| allowed.contains(*name))
         .map(|(name, edge)| {
-            let filters = filters(
-                &columns([&edge.key, &edge.properties]),
+            let fields = columns([&edge.key, &edge.properties]);
+            let mut filters = filters(
+                &fields,
                 relationship.properties.as_ref(),
                 !matches!(relationship.types, Some(opencypher::LabelExpr::Leaf(_))),
             )?;
+            if range.rank == Some(true)
+                && let Some(predicate) = range.predicate
+            {
+                prefiltered &= path_edge_terms(
+                    predicate,
+                    range.path,
+                    relationship.variable.as_ref(),
+                    &fields,
+                    &mut filters,
+                );
+            }
             plan.labels
                 .extend([name.clone(), edge.from.node.clone(), edge.to.node.clone()]);
             Ok((name.clone(), filters))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
+    let rank = if prefiltered {
+        (range.bounds.0 > 1 || range.bounds.0 == 1 && !range.disjoint).then_some(false)
+    } else {
+        range.rank
+    };
     let labels = edges.keys().cloned().collect::<BTreeSet<_>>();
     let endpoints = |node: &Node<'_>| {
         node.labels
@@ -443,7 +467,7 @@ fn ranged(
         edge: String::new(),
         mixed: Some(MixedExpansion { edges, starts }),
         direction,
-        shortest: range.mode,
+        shortest: if rank.is_none() { range.mode } else { None },
         start_node: String::new(),
         track_vertices: range.track,
         min: range.bounds.0,
@@ -480,13 +504,16 @@ fn ranged(
             qualified(&alias, &format!("{side}_1")),
         ]
     });
-    Ok(Step {
-        endpoints,
-        hops,
-        vertices: qualified(&alias, PATH_NODES),
-        edges,
-        labels,
-    })
+    Ok((
+        Step {
+            endpoints,
+            hops,
+            vertices: qualified(&alias, PATH_NODES),
+            edges,
+            labels,
+        },
+        rank,
+    ))
 }
 
 fn tagged(label: &str, key: &str) -> String {

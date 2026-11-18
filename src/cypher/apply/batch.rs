@@ -34,6 +34,7 @@ pub(crate) struct Batch {
     pub(crate) single_key_only: bool,
     pub(crate) push_group_limit: bool,
     pub(crate) table: String,
+    pub(crate) uses_traversal_seed: bool,
 }
 
 struct CachedBatch {
@@ -53,13 +54,47 @@ impl Apply {
         output: &mut Buffer,
         (plan, group_schema): (&Batch, &SchemaRef),
     ) -> Result<()> {
-        const MAX_SEEDS: usize = 16;
         let mut remaining = self.limit.unwrap_or(usize::MAX);
         if remaining == 0 {
             return Ok(());
         }
         let seed = TableReference::bare(self.seed.as_str());
         let groups = TableReference::bare(plan.table.as_str());
+        let reusable = self.limit.is_none() && self.nested.is_empty() && self.lookups.is_empty();
+        if self.limit.is_none() && !plan.uses_traversal_seed {
+            // A full CALL can share one spillable set of outer rows between
+            // the grouped inner scan and the join that restores multiplicity.
+            let mut input = Buffer::new(
+                &scope.runtime.memory_pool,
+                Some(&scope.runtime.disk_manager),
+            );
+            let schema = Arc::clone(outer.schema().inner());
+            let mut stream = outer.execute_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                scope.check()?;
+                input.push(batch)?;
+            }
+            let (input, _budget) = input.finish(schema, &scope.reads)?;
+            context.deregister_table(seed.clone())?;
+            context.register_table(seed.clone(), input)?;
+            let _nested_budget = self
+                .prepare_inner(catalog, context, scope, super::lookup::LookupMode::Set)
+                .await?;
+            let group = graph_frame(context, &plan.groups).await?;
+            context.deregister_table(groups.clone())?;
+            context.register_table(groups.clone(), group.into_view())?;
+            let frame = graph_frame(context, &self.inner).await?;
+            let physical = frame.create_physical_plan().await?;
+            let mut stream = execute_stream(physical.clone(), context.task_ctx())?;
+            while let Some(batch) = stream.try_next().await? {
+                scope.check()?;
+                output.push(batch)?;
+            }
+            scope.record_spill(physical.as_ref());
+            self.remove_nested(context)?;
+            context.deregister_table(groups)?;
+            return Ok(());
+        }
         let cache_limit = (scope.options.memory_bytes / 8).min(8 * 1024 * 1024);
         let mut memo = VecDeque::<CachedBatch>::new();
         let mut cached_bytes = 0usize;
@@ -69,13 +104,12 @@ impl Apply {
         replay::register_seed(context, seed.clone(), outer_schema)?;
         let keys = graph_frame(context, &plan.keys).await?;
         let key_plan = replay::Plan::new(context, &keys, seed.clone()).await?;
-        let group_plan =
-            if self.limit.is_none() && self.nested.is_empty() && self.lookups.is_empty() {
-                let groups = graph_frame(context, &plan.groups).await?;
-                Some(replay::Plan::new(context, &groups, seed.clone()).await?)
-            } else {
-                None
-            };
+        let group_plan = if reusable {
+            let groups = graph_frame(context, &plan.groups).await?;
+            Some(replay::Plan::new(context, &groups, seed.clone()).await?)
+        } else {
+            None
+        };
         let converter = RowConverter::new(vec![SortField::new(
             keys.schema().field(0).data_type().clone(),
         )])?;
@@ -84,7 +118,12 @@ impl Apply {
             let mut offset = 0;
             while offset < batch.num_rows() {
                 scope.check()?;
-                let mut rows = MAX_SEEDS.min(batch.num_rows() - offset);
+                let mut rows = if self.limit.is_none() {
+                    scope.options.batch_size.clamp(16, 1024)
+                } else {
+                    16
+                }
+                .min(batch.num_rows() - offset);
                 let mut input = batch.slice(offset, rows);
                 let keys = key_plan
                     .execute(input.clone())?
@@ -155,10 +194,11 @@ impl Apply {
                                 catalog,
                                 context,
                                 scope,
-                                false,
-                                plan.push_group_limit
-                                    && single_key
-                                    && prefix.is_some_and(|n| n <= SINGLE_KEY_PAGE),
+                                super::lookup::LookupMode::Batch {
+                                    bounded: plan.push_group_limit
+                                        && single_key
+                                        && prefix.is_some_and(|n| n <= SINGLE_KEY_PAGE),
+                                },
                             )
                             .await?;
                         let mut frame = graph_frame(context, &plan.groups).await?;

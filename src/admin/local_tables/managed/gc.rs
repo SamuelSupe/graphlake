@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, sync::Weak, time::Duration};
+use object_store::path::Path as Key;
+use std::{
+    collections::{BTreeSet, VecDeque},
+    sync::Weak,
+    time::Duration,
+};
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -6,8 +11,16 @@ use uuid::Uuid;
 use super::{Managed, api_error, backend};
 use crate::admin::{App, cluster::control::Leadership, local_tables::store::now, ops::Metrics};
 
+type ManifestFiles = VecDeque<(Key, String, Vec<Key>)>;
+
 impl Managed {
-    async fn collect(&self, table: Uuid, leader: &Leadership, metrics: &Metrics) -> Result<()> {
+    async fn collect(
+        &self,
+        table: Uuid,
+        leader: &Leadership,
+        metrics: &Metrics,
+        cache: &mut ManifestFiles,
+    ) -> Result<()> {
         self.migrate_retirements(table, leader).await?;
         // Take the object listing first. Any pre-existing object a later publisher
         // can reference is either in a retained manifest or in its pending upload.
@@ -30,10 +43,24 @@ impl Managed {
                 .filter(|item| !due(item))
                 .map(|item| &item.head),
         ) {
-            keep.insert(self.manifest_key(table, head));
-            for file in self.snapshot(table, head).await?.files.values() {
-                keep.insert(self.objects.local_key(table, &file.location)?);
-            }
+            let key = self.manifest_key(table, head);
+            let entry = if let Some(index) = cache
+                .iter()
+                .position(|(cached, hash, _)| *cached == key && *hash == head.sha256)
+            {
+                cache.remove(index).expect("cached manifest")
+            } else {
+                let files = self.snapshot(table, head).await?.files;
+                let keys = files
+                    .values()
+                    .map(|file| self.objects.local_key(table, &file.location))
+                    .collect::<Result<Vec<_>>>()?;
+                (key.clone(), head.sha256.clone(), keys)
+            };
+            keep.insert(key);
+            keep.extend(entry.2.iter().cloned());
+            cache.push_front(entry);
+            cache.truncate(256);
         }
         let pending = state
             .pending
@@ -72,12 +99,17 @@ impl Managed {
             .await
     }
 
-    async fn collect_all(&self, leader: &Leadership, app: &App) -> Result<()> {
+    async fn collect_all(
+        &self,
+        leader: &Leadership,
+        app: &App,
+        cache: &mut ManifestFiles,
+    ) -> Result<()> {
         let mut result = Ok(());
         for (record, _) in self.records().await? {
             leader.admission().map_err(api_error)?;
             if let Err(error) = self
-                .collect(record.table.data_id, leader, &app.metrics)
+                .collect(record.table.data_id, leader, &app.metrics, cache)
                 .await
             {
                 result =
@@ -89,6 +121,7 @@ impl Managed {
 }
 
 pub(in crate::admin) async fn watch(app: Weak<App>) {
+    let mut cache = ManifestFiles::new();
     loop {
         let Some(app) = app.upgrade() else {
             return;
@@ -101,7 +134,7 @@ pub(in crate::admin) async fn watch(app: Weak<App>) {
         }
         let interval = Duration::from_millis(managed.grace_ms.clamp(1000, 60_000));
         if !ha.recovery_pending() && ha.leader.confirm().await.is_ok() {
-            let result = managed.collect_all(&ha.leader, &app).await;
+            let result = managed.collect_all(&ha.leader, &app, &mut cache).await;
             app.metrics
                 .gc_finished(result.as_ref().ok().map(|()| now()));
             if let Err(error) = result {
@@ -284,7 +317,9 @@ mod tests {
         assert_eq!(managed.record(table).await?.unwrap().1, revision);
         // The object store timestamps uploads with second-level precision.
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        managed.collect(table, &leader, &Metrics::new(1)).await?;
+        managed
+            .collect(table, &leader, &Metrics::new(1), &mut ManifestFiles::new())
+            .await?;
         let history = managed.retirements(table).await?;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].head, fresh);

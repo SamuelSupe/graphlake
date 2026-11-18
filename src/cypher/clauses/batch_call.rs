@@ -448,6 +448,12 @@ fn single(
             }
         }
         let table = internal("result");
+        let uses_traversal_seed = state.expansions.iter().any(|expansion| {
+            expansion
+                .start_seed
+                .as_ref()
+                .is_some_and(|input| input.table == seed)
+        });
         state.calls.push(crate::cypher::apply::Apply {
             table: table.clone(),
             seed,
@@ -473,6 +479,7 @@ fn single(
                         _ => true,
                     }),
                 table: groups,
+                uses_traversal_seed,
             }),
         });
         format!("SELECT * FROM {}", ident(&table))

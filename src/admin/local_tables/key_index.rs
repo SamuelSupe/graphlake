@@ -134,8 +134,9 @@ pub(super) fn full(
     let staged = Prepared {
         snapshot,
         staged: Vec::new(),
+        anchor_part: None,
     };
-    let written = overlay::publish(anchor, file, false, &staged, scope, || {
+    let written = overlay::publish(anchor, file, &staged, scope, || {
         set_generation(&tx, staged.snapshot.generation)?;
         tx.commit()?;
         Ok(())
@@ -442,8 +443,10 @@ pub(super) fn incremental(
     drop(encoded);
     drop(delta);
     drop(memory);
+    let anchor_part = first.then(|| parts[0].id);
     let Some(mut prepared) = overlay::finish(
         anchor,
+        anchor_part,
         parts,
         base_parts,
         file.reopen()?,
@@ -460,15 +463,18 @@ pub(super) fn incremental(
             .reads
             .local_parquet_write(file.as_file().metadata()?.len());
     }
-    let committed = overlay::publish(anchor, file, first, &prepared, scope, || {
-        if let Some(previous) = previous {
-            for part in &previous.parts {
-                if !prepared.snapshot.parts.iter().any(|p| p.id == part.id) {
-                    tx.execute(
-                        "DELETE FROM position WHERE part = ?",
-                        [part.id.as_bytes().as_slice()],
-                    )?;
-                }
+    let committed = overlay::publish(anchor, file, &prepared, scope, || {
+        let old_ids = anchor_part.into_iter().chain(
+            previous
+                .into_iter()
+                .flat_map(|s| s.parts.iter().map(|p| p.id)),
+        );
+        for id in old_ids {
+            if !prepared.snapshot.parts.iter().any(|p| p.id == id) {
+                tx.execute(
+                    "DELETE FROM position WHERE part = ?",
+                    [id.as_bytes().as_slice()],
+                )?;
             }
         }
         for (id, staged) in &prepared.staged {

@@ -26,6 +26,8 @@ pub(super) struct Job {
     pub owner: Principal,
     pub attempt: Uuid,
     pub worker: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_claim: Option<Uuid>,
     pub worker_seen_ms: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub retried: bool,

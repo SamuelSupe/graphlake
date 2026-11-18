@@ -55,6 +55,7 @@ pub(crate) fn register(context: &SessionContext) {
         "__graphlake_gremlin_sum_zero",
         "__graphlake_gremlin_key",
         "__graphlake_cypher_index",
+        "__graphlake_key_text",
     ] {
         context.register_udf(ScalarUDF::from(QueryValue {
             name,
@@ -321,6 +322,7 @@ impl ScalarUDFImpl for QueryValue {
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
         match self.name {
+            "__graphlake_key_text" => Ok(DataType::Utf8),
             "__graphlake_gremlin_number" if args[0].is_numeric() || args[0].is_null() => {
                 Ok(DataType::Float64)
             }
@@ -368,6 +370,7 @@ impl ScalarUDFImpl for QueryValue {
             }
             "__graphlake_cypher_index" => cast(&input, &DataType::Int64)?,
             "__graphlake_gremlin_key" => group_key(&input)?,
+            "__graphlake_key_text" => key_text(&input)?,
             "__graphlake_gremlin_repeat_depth" => {
                 if input
                     .as_primitive::<Int64Type>()
@@ -383,6 +386,28 @@ impl ScalarUDFImpl for QueryValue {
         };
         Ok(ColumnarValue::Array(value))
     }
+}
+
+pub(crate) fn key_text(input: &ArrayRef) -> Result<ArrayRef> {
+    if !matches!(
+        input.data_type(),
+        DataType::Binary
+            | DataType::BinaryView
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+    ) {
+        return Ok(cast(input, &DataType::Utf8)?);
+    }
+    let formatter = ArrayFormatter::try_new(input.as_ref(), &FormatOptions::default())?;
+    let mut output = StringBuilder::new();
+    for row in 0..input.len() {
+        if input.is_null(row) {
+            output.append_null();
+        } else {
+            output.append_value(formatter.value(row).try_to_string()?);
+        }
+    }
+    Ok(Arc::new(output.finish()))
 }
 
 fn group_key(input: &ArrayRef) -> Result<ArrayRef> {

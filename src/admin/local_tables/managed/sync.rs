@@ -1,4 +1,4 @@
-use std::{io::Write as _, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, io::Write as _, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, ensure};
 use uuid::Uuid;
@@ -30,6 +30,22 @@ fn owner(leader: &Leadership) -> String {
         .as_str()
         .expect("encoded leadership owner")
         .to_owned()
+}
+
+pub(in crate::admin::local_tables) struct ScheduleCache {
+    revision: i64,
+    next_full: std::time::Instant,
+    records: BTreeMap<Uuid, (Record, i64)>,
+}
+
+impl Default for ScheduleCache {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            next_full: std::time::Instant::now(),
+            records: BTreeMap::new(),
+        }
+    }
 }
 
 fn view(record: &Record) -> View {
@@ -225,13 +241,19 @@ impl Managed {
                 .unwrap()
                 .insert(key.clone(), cancel.clone());
             tokio::spawn(async move {
+                use futures::FutureExt;
                 let result = tokio::select! {
                     biased;
                     _ = lease.cancelled() => Err(anyhow::anyhow!("managed sync interrupted by leadership change")),
                     _ = cancel.cancelled() => Err(anyhow::anyhow!("managed sync cancelled")),
                     result = tokio::time::timeout(Duration::from_secs(record.table.config.timeout_seconds),
-                        managed.sync(&app, &record, &task, &cancel)) => {
-                        result.unwrap_or_else(|_| Err(anyhow::anyhow!("deadline exceeded")))
+                        std::panic::AssertUnwindSafe(managed.sync(&app, &record, &task, &cancel))
+                            .catch_unwind()) => {
+                        match result {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(_)) => Err(anyhow::anyhow!("managed local-table load panicked")),
+                            Err(_) => Err(anyhow::anyhow!("deadline exceeded")),
+                        }
                     }
                 };
                 drop(permit);
@@ -404,23 +426,46 @@ impl Managed {
         anyhow::bail!("managed table changed too often to finish sync")
     }
 
-    pub(in crate::admin::local_tables) async fn tick(&self, app: &Arc<App>) {
+    pub(in crate::admin::local_tables) async fn tick(
+        &self,
+        app: &Arc<App>,
+        cache: &mut ScheduleCache,
+    ) {
         let Ok(leader) = leader(app) else {
             return;
         };
         let owner = owner(leader);
-        let Ok(records) = self.records().await else {
+        // Incremental ranges omit deleted keys, so rebuild periodically.
+        // Scheduling and orphan recovery still compare current etcd state.
+        let full = cache.next_full <= std::time::Instant::now();
+        let since = if full {
+            0
+        } else {
+            cache.revision.saturating_add(1)
+        };
+        let Ok((revision, records)) = self.records_since(since).await else {
             return;
         };
-        for (mut record, rev) in records {
+        if full {
+            cache.records.clear();
+            cache.next_full = std::time::Instant::now() + Duration::from_secs(60);
+        }
+        cache.revision = revision;
+        cache.records.extend(
+            records
+                .into_iter()
+                .map(|(record, rev)| (record.table.data_id, (record, rev))),
+        );
+        for (record, rev) in cache.records.values() {
             if record.pending.is_some() {
                 // start() holds the same lock across publishing pending and
                 // registering the task locally.
                 let _serial = app.local_tables.create_work.lock().await;
                 let key = format!("{}/{}", record.table.model, record.table.config.name);
                 let running = app.local_tables.running.lock().unwrap().contains_key(&key);
+                let mut record = record.clone();
                 if recover(&mut record, &owner, running) {
-                    let _ = self.save(&record, rev, leader).await;
+                    let _ = self.save(&record, *rev, leader).await;
                 }
                 continue;
             }

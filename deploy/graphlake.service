@@ -16,6 +16,7 @@ ExecStart=/opt/graphlake/current/bin/graphlake-admin --catalog-dir /var/lib/grap
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=15s
+LimitNOFILE=32768
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes

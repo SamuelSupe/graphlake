@@ -38,6 +38,7 @@ pub(super) struct Access {
     sockets: tokio::sync::Semaphore,
     pending_sockets: Arc<tokio::sync::Semaphore>,
     expedited_socket: Arc<tokio::sync::Semaphore>,
+    bolt_spill: Arc<tokio::sync::Semaphore>,
 }
 
 impl Access {
@@ -51,6 +52,9 @@ impl Access {
             sockets: tokio::sync::Semaphore::new(16),
             pending_sockets: Arc::new(tokio::sync::Semaphore::new(16)),
             expedited_socket: Arc::new(tokio::sync::Semaphore::new(1)),
+            bolt_spill: Arc::new(tokio::sync::Semaphore::new(
+                crate::QueryOptions::default().spill_bytes as usize,
+            )),
         })
     }
 }
@@ -491,9 +495,7 @@ fn value_at(
         ($($type:ty),+ => $variant:ident) => {
             $(if let Some(array) = array.downcast_ref::<$type>() {
                 let value = array.value(row);
-                if value.len() > *remaining {
-                    return Err(result_limit());
-                }
+                *remaining = remaining.checked_sub(value.len()).ok_or_else(result_limit)?;
                 return Ok(BoltValue::$variant(value.to_owned()));
             })+
         };
@@ -592,4 +594,24 @@ fn value_at(
             BoltValue::String(formatter.value(row).to_string())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variable_width_values_spend_the_shared_row_budget() {
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["abc", "de"]));
+        let mut remaining = 2 * std::mem::size_of::<BoltValue>() + 5;
+        assert!(matches!(
+            value_at(&text, 0, 0, false, &mut remaining),
+            Ok(BoltValue::String(_))
+        ));
+        assert!(matches!(
+            value_at(&text, 1, 0, false, &mut remaining),
+            Ok(BoltValue::String(_))
+        ));
+        assert_eq!(remaining, 0);
+    }
 }

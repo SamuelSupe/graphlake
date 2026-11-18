@@ -477,6 +477,7 @@ impl Coordinator {
                 freshness: proof,
                 attempt: dispatch.attempt,
                 worker: None,
+                worker_claim: None,
                 worker_seen_ms: now_ms(),
                 retried: false,
                 managed_only,
@@ -604,6 +605,7 @@ impl Coordinator {
                 job.attempt = dispatch.attempt;
                 job.fingerprint = fingerprint(&dispatch)?;
                 job.worker = None;
+                job.worker_claim = None;
                 job.worker_seen_ms = now_ms();
                 job.retried = true;
                 let key = self

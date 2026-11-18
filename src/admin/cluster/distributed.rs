@@ -338,7 +338,12 @@ impl Distributed {
                         self.unavailable.lock().unwrap().insert(worker.clone());
                         retries += 1;
                     }
-                    Some(Ok(response)) if response.status().is_server_error() => retries += 1,
+                    Some(Ok(response))
+                        if response.status().is_server_error()
+                            && response.status() != StatusCode::INSUFFICIENT_STORAGE =>
+                    {
+                        retries += 1;
+                    }
                     Some(Ok(response)) => {
                         let status = response.status();
                         let error = response

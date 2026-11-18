@@ -133,12 +133,16 @@ impl Managed {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<Value>> {
+        self.list_since(prefix, 0).await.map(|(_, rows)| rows)
+    }
+
+    async fn list_since(&self, prefix: &str, since: i64) -> Result<(i64, Vec<Value>)> {
         let mut end = prefix.as_bytes().to_vec();
         // All prefixes are ASCII and end in a slash.
         *end.last_mut().unwrap() += 1;
         let end = B64.encode(end);
         let mut key = B64.encode(prefix);
-        let mut at_revision = None;
+        let mut at_revision = 0;
         let mut entries = Vec::new();
         loop {
             let result = self
@@ -147,28 +151,26 @@ impl Managed {
                     "/v3/kv/range",
                     json!({
                         "key":key, "range_end":end, "limit":"128",
-                        "sort_order":"ASCEND", "revision":at_revision.as_deref().unwrap_or("0")
+                        "sort_order":"ASCEND", "revision":at_revision.to_string(),
+                        "min_mod_revision":since.to_string()
                     }),
                 )
                 .await?;
+            if at_revision == 0 {
+                at_revision = result["header"]["revision"]
+                    .as_str()
+                    .context("missing metadata list revision")?
+                    .parse()?;
+            }
             let page = result["kvs"].as_array();
             entries.extend(page.into_iter().flatten().cloned());
             if result["more"].as_bool() != Some(true) {
-                return Ok(entries);
+                return Ok((at_revision, entries));
             }
             let last = entries.last().context("empty managed metadata page")?;
             let mut after = B64.decode(last["key"].as_str().context("missing metadata key")?)?;
             after.push(0);
             key = B64.encode(after);
-            if at_revision.is_none() {
-                at_revision = Some(
-                    result["header"]["revision"]
-                        .as_str()
-                        .context("missing metadata list revision")?
-                        .parse::<i64>()?
-                        .to_string(),
-                );
-            }
         }
     }
 
@@ -178,11 +180,18 @@ impl Managed {
     }
 
     pub(super) async fn records(&self) -> Result<Vec<(Record, i64)>> {
-        self.list(&format!("{}/local-table/state/", self.meta.prefix))
-            .await?
+        self.records_since(0).await.map(|(_, rows)| rows)
+    }
+
+    pub(super) async fn records_since(&self, since: i64) -> Result<(i64, Vec<(Record, i64)>)> {
+        let (at, rows) = self
+            .list_since(&format!("{}/local-table/state/", self.meta.prefix), since)
+            .await?;
+        let records = rows
             .iter()
             .map(|v| Ok((decode(&v["value"])?, revision(v)?)))
-            .collect()
+            .collect::<Result<_>>()?;
+        Ok((at, records))
     }
 
     pub(super) async fn record(&self, id: Uuid) -> Result<Option<(Record, i64)>> {

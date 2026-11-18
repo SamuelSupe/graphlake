@@ -197,9 +197,23 @@ async fn check_frontier(
         ]
     );
     assert!(cypher.metrics().reads.frontier_requests > 0);
+    let mut cypher = engine
+        .query(
+            Language::Cypher,
+            "MATCH (a:Account)-[:Transfer*1..2]->(b:Account)
+             WHERE a.tenant=1 AND a.id IN [1,2] AND b.tenant=1
+             RETURN DISTINCT a.id AS id ORDER BY id",
+            opts.clone(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut cypher).await?,
+        [serde_json::json!({"id": 1}), serde_json::json!({"id": 2}),]
+    );
 
     let mut broad = traversal_request(Direction::Outgoing, TraversalKind::Reachable);
     broad.start[0] = ScalarValue::Int32(Some(3));
+    broad.max_hops = 1;
     let mut auto = engine.traverse(broad, opts.clone()).await?;
     assert_eq!(rows(&mut auto).await?.len(), 500);
     assert_eq!(auto.metrics().reads.frontier_scan_fallbacks, 1);

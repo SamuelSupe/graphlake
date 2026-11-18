@@ -14,7 +14,11 @@ use datafusion::{
 use serde::Deserialize;
 
 use super::{Http, credential};
-use crate::{Comparison, Source, catalog::ident, source::ReadStats};
+use crate::{Comparison, Source, source::ReadStats};
+
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+}
 
 #[derive(Clone)]
 pub(crate) struct ClickHouse {

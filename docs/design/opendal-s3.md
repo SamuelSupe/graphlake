@@ -48,7 +48,7 @@ etcd -> 领导权、提交指针、任务状态和变更回执
 
 ## 验证与切换
 
-1. **存储行为。** 在远程 Linux 复用 [RustFS 及 etcd 夹具](../../tests/production-compose.yml)。在一次性桶启用版本管理并设置 `GRAPHLAKE_TEST_VERSIONED_BUCKET`，运行 `cargo test --locked --features admin --lib admin::cluster::s3::tests -- --include-ignored`。该测试组覆盖对象互读、版本、key、分段上传和 409/412 注入。
+1. **存储行为。** 在远程 Linux 复用 [RustFS 及 etcd 夹具](../../tests/production-compose.yml)。在一次性桶启用版本管理并设置 `GRAPHLAKE_TEST_VERSIONED_BUCKET`，运行 `cargo test --locked --features admin --lib admin::cluster::s3::tests -- --include-ignored`。该测试组覆盖对象互读、版本、原始对象键、分段上传、批量删除和 409/412 注入。OpenDAL 每批提交最多 128 个待删除对象，只有整批确认后才返回这一批的成功结果。
 2. **集群行为。** 给 [托管表验收](../../tests/managed_local_tables.py) 设置 `GRAPHLAKE_CLUSTER_S3_BACKEND=object_store` 与 `--standby-s3-backend opendal`，再交换两者。传入 `--s3-prefix 'snap%2F2026+雪/space name'` 可覆盖现有转义 key 的查询及恢复。脚本验证旧领导者事务被拒绝、接管后读取旧代次、重新同步、Worker 丢失后重试同代次和异后端恢复。可另运行 [备份恢复](../../tests/local_backup_recovery.py) 覆盖 PostgreSQL 与外部 Parquet 的恢复入口。
 3. **性能和互读。** 用同一数据、内存预算、并发、网络条件和查询结果对照两种后端。记录 Range 请求数与字节、查询和下载 P50/P95、上传吞吐、峰值 RSS、GC 请求数和错误率。验证旧写新读、新写旧读，包含托管 Parquet 直接查询、版本化桶和有条件的多段导出试验。导出试验结果单独用于判断导出链路是否可以迁移。
 4. **试点与回滚。** 先用独立前缀完成验收。面向 AWS S3 和部署实际使用的自动凭据做一次演练后，再扩大启用范围。回滚时将变量切回 `object_store` 或移除，重启 Coordinator、Worker 和相关备份进程。沿用原 bucket、prefix、etcd 和备份文件，并用默认客户端读取试点期间提交的代次。

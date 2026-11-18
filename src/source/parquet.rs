@@ -1,6 +1,11 @@
 use crate::source::SourceConsistency;
 
-use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ops::Range,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -52,13 +57,37 @@ pub(crate) async fn object_version(
 ) -> Result<SourceVersion> {
     if store.is_none()
         && let Some(path) = parquet_snapshot::managed_location(location)
-        && let Some(snapshot) = Snapshot::read(&path)?
+        && let Some(snapshot) = tokio::task::spawn_blocking(move || Snapshot::read(&path)).await??
     {
         return Ok(snapshot_version(location, &snapshot));
     }
     Ok(PinnedFile::open_storage(location, store, pool, stats)
         .await?
         .version(location))
+}
+
+fn http_store(url: &Url) -> Result<Arc<dyn ObjectStore>> {
+    type Entry = (tokio::runtime::Id, String, Arc<dyn ObjectStore>);
+    static STORES: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
+    let origin = &url[..url::Position::BeforePath];
+    let runtime = tokio::runtime::Handle::current().id();
+    let mut stores = STORES.lock().unwrap();
+    let entry: Entry = if let Some(index) = stores
+        .iter()
+        .position(|(id, cached, _)| *id == runtime && cached == origin)
+    {
+        stores.remove(index).expect("cached HTTP origin")
+    } else {
+        let store = HttpBuilder::new()
+            .with_url(origin)
+            .with_client_options(ClientOptions::new().with_allow_http(url.scheme() == "http"))
+            .build()?;
+        (runtime, origin.to_owned(), Arc::new(store))
+    };
+    let store = entry.2.clone();
+    stores.push_front(entry);
+    stores.truncate(16);
+    Ok(store)
 }
 
 fn snapshot_version(location: &str, snapshot: &Snapshot) -> SourceVersion {
@@ -140,11 +169,7 @@ impl PinnedFile {
                 super::storage::s3_from_env(url.host_str().context("S3 URL requires a bucket")?)?;
             (store, ObjectPath::from_url_path(url.path())?)
         } else if matches!(url.scheme(), "http" | "https") {
-            let store = HttpBuilder::new()
-                .with_url(&url[..url::Position::BeforePath])
-                .with_client_options(ClientOptions::new().with_allow_http(url.scheme() == "http"))
-                .build()?;
-            (Arc::new(store), ObjectPath::from_url_path(url.path())?)
+            (http_store(&url)?, ObjectPath::from_url_path(url.path())?)
         } else {
             let (store, path) = object_store::parse_url(&url)?;
             (Arc::from(store), path)

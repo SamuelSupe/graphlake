@@ -1100,7 +1100,7 @@ pub(in crate::admin) fn exploration_key_match(
         ) {
             ScalarValue::try_from_string(key.clone(), ty)?
         } else {
-            operand = format!("CAST({operand} AS VARCHAR)");
+            operand = format!("__graphlake_key_text({operand})");
             ScalarValue::Utf8(Some(key.clone()))
         };
         bound.push(value);

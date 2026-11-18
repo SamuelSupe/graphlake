@@ -2,7 +2,7 @@ use std::{fmt, io, sync::Arc, time::Duration};
 
 use anyhow::{Context, ensure};
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures::{StreamExt, stream::BoxStream};
 use object_store::{
     Attributes, ClientConfigKey, ClientOptions, CopyOptions, Error, GetOptions, GetRange,
     GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
@@ -385,23 +385,34 @@ impl ObjectStore for OpenDalS3 {
         keys: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
         let op = self.0.clone();
-        keys.and_then(move |key| {
-            let op = op.clone();
-            async move {
-                let mut deleter = op
-                    .service()
-                    .delete(op.context())
-                    .map_err(|error| store_error(&key, error, false))?;
-                oio::Delete::delete(&mut deleter, key.as_ref(), OpDelete::default())
-                    .await
-                    .map_err(|error| store_error(&key, error, false))?;
-                oio::Delete::close(&mut deleter)
-                    .await
-                    .map_err(|error| store_error(&key, error, false))?;
-                Ok(key)
-            }
-        })
-        .boxed()
+        keys.chunks(128)
+            .then(move |keys| {
+                let op = op.clone();
+                async move {
+                    let result = async {
+                        let mut deleter = op.service().delete(op.context())?;
+                        for key in keys.iter().filter_map(|key| key.as_ref().ok()) {
+                            // Preserve the literal object key, including encoded slashes.
+                            oio::Delete::delete(&mut deleter, key.as_ref(), OpDelete::default())
+                                .await?;
+                        }
+                        oio::Delete::close(&mut deleter).await
+                    }
+                    .await;
+                    let failure = result.err().map(Arc::new);
+                    futures::stream::iter(keys.into_iter().map(move |key| {
+                        let key = key?;
+                        // OpenDAL closes the whole batch at once and does not return
+                        // the per-key successes if the batch only partially succeeds.
+                        match &failure {
+                            Some(error) => Err(generic(error.clone())),
+                            None => Ok(key),
+                        }
+                    }))
+                }
+            })
+            .flatten()
+            .boxed()
     }
 
     async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> Result<()> {

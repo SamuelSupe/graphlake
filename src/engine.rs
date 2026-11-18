@@ -7,6 +7,7 @@ pub(crate) use model::{KEY_VALIDATOR, key_validator};
 mod model;
 mod query;
 mod query_functions;
+pub(crate) use query_functions::key_text;
 pub(crate) mod sources;
 #[cfg(feature = "admin")]
 pub(crate) use query_functions::register as register_graph_functions;

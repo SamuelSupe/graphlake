@@ -36,8 +36,7 @@ impl PgTable {
         self.snapshot.stats.request();
         let row = self
             .snapshot
-            .client
-            .query_opt(
+            .request(self.snapshot.client.query_opt(
                 "SELECT t.reltuples::float8 FROM pg_class t
              WHERE t.oid = to_regclass($1) AND EXISTS (
                SELECT FROM pg_index i JOIN pg_class ix ON ix.oid = i.indexrelid
@@ -52,7 +51,7 @@ impl PgTable {
                  ) = ARRAY(SELECT key FROM unnest($3::text[]) AS key ORDER BY key COLLATE \"C\")
              )",
                 &[&self.relation, &width, &columns],
-            )
+            ))
             .await?;
         Ok(row
             .map(|row| row.try_get::<_, f64>(0))
@@ -118,6 +117,7 @@ impl PgTable {
         let output = Arc::clone(&schema);
         let stream = async_stream::try_stream! {
             snapshot.stats.frontier_request();
+            let mut request = snapshot.active_request();
             let result = snapshot.client.query_raw(sql.as_str(), args.iter().map(|arg| arg.as_ref() as &(dyn ToSql + Sync)))
                 .await.map_err(external)?;
             futures::pin_mut!(result);
@@ -129,6 +129,7 @@ impl PgTable {
             loop {
                 let row = result.try_next().await.map_err(external)?;
                 let done = row.is_none();
+                if done { request.finish(); }
                 if let Some(row) = row {
                     raw.try_grow(row.raw_size_bytes().saturating_add(std::mem::size_of::<Row>()))?;
                     rows.push(row);

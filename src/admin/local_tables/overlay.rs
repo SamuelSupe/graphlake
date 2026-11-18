@@ -43,6 +43,7 @@ const SCATTERED_GROUPS: usize = 8;
 pub(super) struct Prepared {
     pub snapshot: Snapshot,
     pub(super) staged: Vec<(Uuid, NamedTempFile)>,
+    pub(super) anchor_part: Option<Uuid>,
 }
 
 pub(super) fn prepare(
@@ -141,8 +142,10 @@ pub(super) fn prepare(
         part.deleted.dedup();
     }
 
+    let anchor_part = previous.is_none().then(|| changed[0].id);
     finish(
         anchor,
+        anchor_part,
         changed,
         base_parts,
         delta,
@@ -154,6 +157,7 @@ pub(super) fn prepare(
 
 pub(super) fn finish(
     anchor: &Path,
+    anchor_part: Option<Uuid>,
     mut changed: Vec<Part>,
     mut base_parts: usize,
     delta: File,
@@ -168,7 +172,15 @@ pub(super) fn finish(
         .sum::<usize>();
     if base_deleted > MAX_DELETED {
         let mut base = changed.drain(..base_parts).collect();
-        if !maintenance::reclaim(anchor, key, &mut base, base_deleted, &mut staged, scope)? {
+        if !maintenance::reclaim(
+            anchor,
+            anchor_part,
+            key,
+            &mut base,
+            base_deleted,
+            &mut staged,
+            scope,
+        )? {
             return Ok(None);
         }
         base_parts = base.len();
@@ -226,6 +238,7 @@ pub(super) fn finish(
             }),
         },
         staged,
+        anchor_part,
     }))
 }
 
@@ -350,7 +363,6 @@ fn integers(array: &dyn Array) -> Result<&Int64Array> {
 pub(super) fn publish(
     anchor: &Path,
     delta: &NamedTempFile,
-    first: bool,
     prepared: &Prepared,
     scope: &QueryScope,
     before_manifest: impl FnOnce() -> Result<()>,
@@ -366,8 +378,12 @@ pub(super) fn publish(
         .open(reader_lock(anchor))?
         .sync_all()?;
     scope.check()?;
-    if first {
-        match fs::hard_link(anchor, snapshot.parts[0].path(anchor)) {
+    if let Some(part) = snapshot
+        .parts
+        .iter()
+        .find(|part| Some(part.id) == prepared.anchor_part)
+    {
+        match fs::hard_link(anchor, part.path(anchor)) {
             Ok(()) => {}
             Err(error) if links_unavailable(&error) => return Ok(false),
             Err(error) => return Err(error.into()),
@@ -417,25 +433,25 @@ pub(super) fn links_unavailable(error: &io::Error) -> bool {
     )
 }
 
-pub(super) fn clean(anchor: &Path) -> Result<()> {
+pub(super) fn clean(anchor: &Path) -> Result<bool> {
     let lock = match File::options()
         .read(true)
         .write(true)
         .open(reader_lock(anchor))
     {
         Ok(lock) => lock,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error.into()),
     };
     match lock.try_lock() {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
         Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
     }
     let directory = parts_dir(anchor);
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error.into()),
     };
     let live = Snapshot::read(anchor)?
@@ -444,17 +460,44 @@ pub(super) fn clean(anchor: &Path) -> Result<()> {
     // Establish the current manifest on disk before reclaiming any previous parts.
     File::open(anchor.parent().expect("managed local table path"))?.sync_all()?;
     for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let id = path
+        let path = entry?.path();
+        if retired(&path, &live) {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(true)
+}
+
+fn retired(path: &Path, live: &[Part]) -> bool {
+    path.extension().is_some_and(|ext| ext == "parquet")
+        && path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .and_then(|stem| Uuid::parse_str(stem).ok());
-        if path.extension().is_some_and(|ext| ext == "parquet")
-            && let Some(id) = id
-            && !live.iter().any(|part| part.id == id)
-        {
-            fs::remove_file(path)?;
+            .and_then(|stem| Uuid::parse_str(stem).ok())
+            .is_some_and(|id| !live.iter().any(|part| part.id == id))
+}
+
+pub(super) fn check_retired_space(anchor: &Path, limit: u64) -> Result<()> {
+    if clean(anchor)? {
+        return Ok(());
+    }
+    let entries = match fs::read_dir(parts_dir(anchor)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let live = Snapshot::read(anchor)?
+        .map(|snapshot| snapshot.parts)
+        .unwrap_or_default();
+    let mut bytes = 0u64;
+    for entry in entries {
+        let entry = entry?;
+        if retired(&entry.path(), &live) {
+            bytes = bytes.saturating_add(entry.metadata()?.len());
+            ensure!(
+                bytes <= limit,
+                "本地副本旧分区等待查询释放，已超过保留空间预算"
+            );
         }
     }
     Ok(())

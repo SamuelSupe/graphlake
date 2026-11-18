@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail, ensure};
 use opencypher::{
     BinaryOp, CallKind, Clause, ComparisonOp, Direction, Expr, ExprKind, LabelExpr, NodePattern,
-    Properties, Query, Variable, Visitor, walk_expr,
+    Properties, QuantifierKind, Query, UnaryOp, Variable, Visitor, walk_expr,
 };
 
 use super::{
@@ -313,13 +313,24 @@ pub(super) fn bind_pattern(
                     || shortest.is_some()
                     || builder.partitioned_csr)
             {
-                let rank = ranking(pattern, part, relationship, shortest, min, max)?;
+                let mut rank = ranking(pattern, part, relationship, shortest, min, max)?;
                 let incoming = relationship.direction == Direction::Incoming;
-                let filters = property_terms(
-                    "src",
-                    &columns([&edge.key, &edge.properties]),
-                    relationship.properties.as_ref(),
-                )?;
+                let edge_fields = columns([&edge.key, &edge.properties]);
+                let mut filters =
+                    property_terms("src", &edge_fields, relationship.properties.as_ref())?;
+                if rank == Some(true)
+                    && let Some(predicate) = &pattern.where_clause
+                {
+                    if path_edge_terms(
+                        predicate,
+                        part.variable.as_ref(),
+                        relationship.variable.as_ref(),
+                        &edge_fields,
+                        &mut filters,
+                    ) {
+                        rank = (min > 1 || min == 1 && !heterogeneous).then_some(false);
+                    }
+                }
                 let left_node = if lengths.is_empty() {
                     &path.start
                 } else {
@@ -689,6 +700,139 @@ struct Segment {
     edges: Option<String>,
 }
 
+// An edge-local universal test can run before expansion. Return whether
+// all path-dependent WHERE conditions were applied to the topology.
+pub(super) fn path_edge_terms(
+    expression: &Expr,
+    path: Option<&Variable>,
+    relationship: Option<&Variable>,
+    fields: &[String],
+    filters: &mut Vec<String>,
+) -> bool {
+    if let ExprKind::Binary {
+        op: BinaryOp::And,
+        lhs,
+        rhs,
+    } = &expression.kind
+    {
+        let left = path_edge_terms(lhs, path, relationship, fields, filters);
+        let right = path_edge_terms(rhs, path, relationship, fields, filters);
+        return left && right;
+    }
+    if let ExprKind::Quantifier {
+        kind: kind @ (QuantifierKind::All | QuantifierKind::None),
+        variable,
+        list,
+        predicate: Some(predicate),
+    } = &expression.kind
+    {
+        let edge_list = match &list.kind {
+            ExprKind::Variable(name) => Some(name) == relationship,
+            ExprKind::FunctionCall {
+                name,
+                distinct: false,
+                args,
+            } if name.0.eq_ignore_ascii_case("relationships") => {
+                matches!(&args[..], [arg] if matches!(&arg.kind,
+                    ExprKind::Variable(name) if Some(name) == path))
+            }
+            _ => false,
+        };
+        if edge_list {
+            if *kind == QuantifierKind::All {
+                return all_edge_terms(predicate, &variable.0, fields, filters);
+            }
+            if let Some(sql) = edge_predicate(predicate, &variable.0, fields) {
+                filters.push(format!("NOT ({sql})"));
+                return true;
+            }
+        }
+    }
+    !depends_on_path(expression, [path, relationship])
+}
+
+fn all_edge_terms(
+    expression: &Expr,
+    variable: &str,
+    fields: &[String],
+    filters: &mut Vec<String>,
+) -> bool {
+    if let ExprKind::Binary {
+        op: BinaryOp::And,
+        lhs,
+        rhs,
+    } = &expression.kind
+    {
+        let left = all_edge_terms(lhs, variable, fields, filters);
+        let right = all_edge_terms(rhs, variable, fields, filters);
+        return left && right;
+    }
+    if let Some(sql) = edge_predicate(expression, variable, fields) {
+        filters.push(sql);
+        return true;
+    }
+    false
+}
+
+fn edge_predicate(expression: &Expr, variable: &str, fields: &[String]) -> Option<String> {
+    match &expression.kind {
+        ExprKind::Binary {
+            op: op @ (BinaryOp::And | BinaryOp::Or),
+            lhs,
+            rhs,
+        } => {
+            let left = edge_predicate(lhs, variable, fields)?;
+            let right = edge_predicate(rhs, variable, fields)?;
+            let op = if *op == BinaryOp::And { "AND" } else { "OR" };
+            Some(format!("(({left}) {op} ({right}))"))
+        }
+        ExprKind::Unary {
+            op: UnaryOp::Not,
+            operand,
+        } => Some(format!(
+            "NOT ({})",
+            edge_predicate(operand, variable, fields)?
+        )),
+        ExprKind::IsNull(inner) | ExprKind::IsNotNull(inner) => {
+            let ExprKind::Property { base, key } = &inner.kind else {
+                return None;
+            };
+            if !fields.contains(&key.0)
+                || !matches!(&base.kind, ExprKind::Variable(var) if var.0 == variable)
+            {
+                return None;
+            }
+            let test = if matches!(expression.kind, ExprKind::IsNull(_)) {
+                "IS NULL"
+            } else {
+                "IS NOT NULL"
+            };
+            Some(format!("{} {test}", qualified("src", &key.0)))
+        }
+        ExprKind::Boolean(_) => literal(expression).ok(),
+        _ => {
+            let mut terms = Vec::new();
+            start_terms(
+                expression,
+                variable,
+                fields,
+                &mut terms,
+                &mut BTreeSet::new(),
+            );
+            terms.pop()
+        }
+    }
+}
+
+fn depends_on_path(expr: &Expr, names: [Option<&Variable>; 2]) -> bool {
+    let mut finder = FindVariable {
+        names,
+        found: false,
+    };
+    finder.visit_expr(expr);
+    finder.found
+}
+
 pub(super) fn ranking(
     pattern: &opencypher::Match,
     part: &opencypher::PatternPart,
@@ -701,13 +845,10 @@ pub(super) fn ranking(
         return Ok(None);
     }
     let dependent = pattern.where_clause.as_ref().is_some_and(|expr| {
-        let names = [part.variable.as_ref(), relationship.variable.as_ref()];
-        let mut finder = FindVariable {
-            names,
-            found: false,
-        };
-        finder.visit_expr(expr);
-        finder.found
+        depends_on_path(
+            expr,
+            [part.variable.as_ref(), relationship.variable.as_ref()],
+        )
     });
     if min <= 1 && !dependent {
         return Ok(None);

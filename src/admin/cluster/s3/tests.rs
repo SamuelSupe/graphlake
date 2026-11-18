@@ -206,9 +206,22 @@ async fn s3_backends_share_versioned_objects_and_literal_keys() -> Result<()> {
             .common_prefixes
             .contains(&prefix)
     );
-    opendal.delete(&key).await?;
+    let other = Path::parse(format!("{prefix}/delete %2F second"))?;
+    legacy.put(&other, "other literal key".into()).await?;
+    let requested = [key.clone(), other.clone()];
+    assert_eq!(
+        opendal
+            .delete_stream(futures::stream::iter(requested.clone().map(Ok)).boxed())
+            .try_collect::<Vec<_>>()
+            .await?,
+        requested
+    );
     assert!(matches!(
         legacy.head(&key).await,
+        Err(Error::NotFound { .. })
+    ));
+    assert!(matches!(
+        legacy.head(&other).await,
         Err(Error::NotFound { .. })
     ));
     assert_eq!(legacy.get(&neighbor).await?.bytes().await?, "other");

@@ -237,6 +237,12 @@ fn catalog_file(name: &str) -> bool {
         if let Some(id) = suffix.strip_suffix(".tasks.json") {
             return models::valid_id(id);
         }
+        if let Some((id, hash)) = suffix
+            .strip_suffix(".json")
+            .and_then(|name| name.split_once(".history."))
+        {
+            return models::valid_id(id) && models::versions::valid_revision(hash);
+        }
         if let Some(id) = suffix.strip_suffix(".json") {
             return models::valid_id(id);
         }
@@ -715,6 +721,25 @@ pub(super) async fn change_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_snapshot_round_trips_version_history_pages() -> anyhow::Result<()> {
+        let source = tempfile::tempdir()?;
+        let target = tempfile::tempdir()?;
+        let content = "[]";
+        let hash = models::revision(content);
+        let name = format!(".graphlake-test.history.{hash}.json");
+        fs::write(source.path().join(&name), content)?;
+        fs::write(
+            source.path().join(".graphlake-test.history.unknown.json"),
+            "ignored",
+        )?;
+        let snapshot = capture(source.path()).map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(snapshot.files.len(), 1);
+        restore(target.path(), &snapshot).map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(fs::read_to_string(target.path().join(name))?, content);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn timed_out_storage_probe_keeps_its_slot_until_the_syscall_returns() {

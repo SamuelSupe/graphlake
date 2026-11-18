@@ -119,8 +119,8 @@ cargo run --locked --features admin --bin graphlake-admin -- \
 | `tidb` / `oceanbase` | 同样使用 MySQL 连接字段；OceanBase 仅支持 MySQL 模式租户。按语句读取，不声明跨表一致快照。 |
 | `mariadb` | 使用 MySQL 连接字段；InnoDB 只读重复读事务，使用 MariaDB 的 `max_statement_time`。 |
 | `sqlserver_native` | `host`、`port`、`database`、`user`、`password_env`，TLS 默认开启，可配置 `ca_file`。通过 TDS 直接执行生成的 SELECT；按语句读取，不声明跨表同一快照。读取账号应只授予 SELECT 和所需元数据权限。 |
-| `oracle_native` | `connect_string`、`user`、`password_env`。使用 Easy Connect 或 TNS 名称；GraphLake 进程所在机器需安装 Oracle Instant Client，库搜索路径需能找到客户端库。使用只读事务，`NUMBER(p,s)` 在可表达时使用整数或 Decimal128；无固定精度的 `NUMBER`、Oracle `FLOAT` 和超出 Arrow 定点类型范围的数值以文本保留原始精度。需要数值排序或计算时，可在源视图中声明合适的 `NUMBER(p,s)`。Oracle DATE 保留时分秒。 |
-| `mongodb_native` | `dsn_env` 保存 `mongodb://` 或 `mongodb+srv://` 连接串。引用使用 `source.database.collection`。默认采样 1000 条推断结构，`schema_sample_size` 可设为 1–10000；空集合或采样内全为空的字段无法推断。嵌套对象展开为点分字段，数组保留为 Extended JSON 文本，ObjectId 为十六进制文本，Decimal128 保留为十进制文本。采样和后续读取发现类型不一致时失败，不做静默转换。普通游标不保证一致快照，`require_consistent_snapshot` 拒绝此来源。 |
+| `oracle_native` | `connect_string`、`user`、`password_env`。使用 Easy Connect 或 TNS 名称。GraphLake 进程所在机器需安装 Oracle Instant Client，库搜索路径需能找到客户端库。GraphLake 按请求超时结束等待，进程内最多同时执行 4 次 OCI 建连。通过 Oracle Net 的 CONNECT_TIMEOUT 为客户端底层建连设定期限。使用只读事务，`NUMBER(p,s)` 在可表达时使用整数或 Decimal128；无固定精度的 `NUMBER`、Oracle `FLOAT` 和超出 Arrow 定点类型范围的数值以文本保留原始精度。需要数值排序或计算时，可在源视图中声明合适的 `NUMBER(p,s)`。Oracle DATE 保留时分秒。 |
+| `mongodb_native` | `dsn_env` 保存 `mongodb://` 或 `mongodb+srv://` 连接串。引用使用 `source.database.collection`。连接池默认上限 16，可用连接串的 `maxPoolSize` 覆盖。默认采样 1000 条推断结构，`schema_sample_size` 可设为 1–10000；空集合或采样内全为空的字段无法推断。嵌套对象展开为点分字段，数组保留为 Extended JSON 文本，ObjectId 为十六进制文本，Decimal128 保留为十进制文本。采样和后续读取发现类型不一致时失败，不做静默转换。普通游标不保证一致快照，`require_consistent_snapshot` 拒绝此来源。 |
 | `duckdb` | `path` 指向服务端数据库文件，引用使用 `source.schema.table`（常见模式为 `main`）。只读打开并使用事务；禁止外部访问与自动扩展访问，关闭 DuckDB 临时落盘，查询结果通过 GraphLake 的磁盘配额溢写。DuckDB 执行引擎预留查询内存预算的一半；读取期间文件不能由其他进程写入。 |
 | `databricks` | 工作区 `uri`、`token_env`、SQL Warehouse ID `warehouse`、`catalog`；引用使用 `source.schema.table`。通过 Statement Execution API 读取 JSON_ARRAY 分页，校验行数、游标和截断标记，超时取消语句。使用 INLINE 结果，受 Databricks 的 INLINE 大小限制；超过限制需缩小远端视图，不会返回部分结果。复杂类型应在远端视图转为标量。 |
 
@@ -288,7 +288,7 @@ SQL Server 和 Oracle 可使用 `type: sqlserver`、`type: oracle`，配置结�
 
 [MongoDB](https://trino.io/docs/current/connector/mongodb.html)、[Elasticsearch](https://trino.io/docs/current/connector/elasticsearch.html) 和 [Redshift](https://trino.io/docs/current/connector/redshift.html) 使用各自的 Trino 插件。先在协调器配置 Catalog，然后在 GraphLake 配置 `type: mongodb`、`type: elasticsearch` 或 `type: redshift`，并在 `catalog` 填入 Trino Catalog 名。三种类型共享 Trino 的 `uri`、`user`、`token_env` 和 `password_env`。节点或边引用分别使用 `docs.finance.accounts`（MongoDB 数据库和集合）、`search.default.accounts`（Elasticsearch schema 和索引）或 `warehouse.public.accounts`（Redshift schema 和表）。集合、索引或表名称可以包含点，例如 `search.default.transfers.2026.11`。嵌套字段通过 Trino 提供标量列后再映射。MongoDB ObjectId 读取为 12 字节的 Arrow Binary，可以直接作为业务键。MongoDB 的字段类型由 Trino 的 schema collection 管理。多个协调器并行访问新集合前，先写入该集合的字段定义，避免首次查询同时推断并写入定义。
 
-[Spanner](https://docs.cloud.google.com/spanner/docs/) 通过官方 Rust 客户端读取 GoogleSQL 数据库。生产连接使用 Application Default Credentials。可为本机模拟器指定 `uri: http://127.0.0.1:9010` 或使用 SDK 的 `SPANNER_EMULATOR_HOST`。节点或边引用使用 `global.Accounts` 或 `global.schema.Accounts`。同一个来源内的多表读取共享 Spanner 的只读事务并记录读时间戳。同一引擎在同一 Tokio 运行时复用数据库会话。支持标量列，`NUMERIC` 映射为 Decimal128(38,9)，时间戳以 UTC 微秒读取。数组、结构和含有非零亚微秒位的时间戳返回错误。
+[Spanner](https://docs.cloud.google.com/spanner/docs/) 通过官方 Rust 客户端读取 GoogleSQL 数据库。生产连接使用 Application Default Credentials。可为本机模拟器指定 `uri: http://127.0.0.1:9010` 或使用 SDK 的 `SPANNER_EMULATOR_HOST`。节点或边引用使用 `global.Accounts` 或 `global.schema.Accounts`。同一个来源内的多表读取共享 Spanner 的只读事务并记录读时间戳。同一引擎在同一 Tokio 运行时复用数据库会话，等待缓存和首次建连受请求超时限制。支持标量列，`NUMERIC` 映射为 Decimal128(38,9)，时间戳以 UTC 微秒读取。数组、结构和含有非零亚微秒位的时间戳返回错误。
 
 SAP HANA 直连租户 SQL 端口，使用 `hana.SCHEMA.TABLE` 引用表。schema、表及列按映射中的精确大小写读取。TLS 默认启用并校验证书，可以使用 `ca_file` 增加私有 CA。明文仅用于回环测试。支持常用标量和定点十进制列，LOB、数组、空间类型和含有非零亚微秒位的时间戳需要在远端视图转换。每张表按独立语句读取，GraphLake 为该读取生成诊断 ID。
 
@@ -454,7 +454,7 @@ RETURN type(edge) AS relationship, count(*) AS appearances
 
 `UNWIND nodes(p) AS node`、`UNWIND relationships(p) AS edge` 和 `UNWIND r AS edge` 将元素绑定为实体，可以读取身份、标签或关系类型以及属性。列表下标、列表推导和谓词也可以访问实体，例如 `[edge IN relationships(p) | edge.amount]`。实体绑定支持经 `WITH` 投影的路径和路径列表。`collect(nodes(p))`、`collect(relationships(p))` 和返回实体列表的 `CASE` 可逐层展开或参与嵌套推导，元素保留身份及属性。路径列表与实体列表按元素身份比较。列表表达式按实际路径引用的实体键关联属性，并按路径位置恢复顺序。
 
-`shortestPath()` 返回一条无权最短路，`allShortestPaths()` 返回全部并列最短路。每个函数接受单一关系模式，可省略关系类型。涉及整条路径的过滤以及大于一的跳数下界需要显式上界，执行时先筛选路径再选择最短结果。
+`shortestPath()` 返回一条无权最短路，`allShortestPaths()` 返回全部并列最短路。每个函数接受单一关系模式，可省略关系类型。涉及整条路径的过滤以及大于一的跳数下界需要显式上界，执行时先筛选路径再选择最短结果。路径谓词中的相关子查询只从满足端点和关系模式约束的候选路径提取输入。
 
 ```sh
 cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml query \
@@ -559,7 +559,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml \
   analyze --edge Transfer --direction undirected node2vec --dimensions 32 --seed 42
 ```
 
-- `route` 使用 Dijkstra 查找加权最短路，`--k` 大于一时使用 Yen 算法返回最多 K 条无环路径。权重累加和排序保留整数、Decimal 及浮点存储值的精度。平行边按独立身份计入。结果包含 `rank`、`cost`、`cost_exact`、`hops` 以及有序的 `vertices` 和 `edges`。`cost_exact` 是精确的十进制字符串，`cost` 是兼容原有调用的近似 Float64，超出有限值范围时为空。两个端点均存在且不可达时返回空结果。
+- `route` 使用 Dijkstra 查找加权最短路，`--k` 的范围为 1–100，大于一时使用 Yen 算法返回最多 K 条无环路径。权重累加和排序保留整数、Decimal 及浮点存储值的精度。平行边按独立身份计入。结果包含 `rank`、`cost`、`cost_exact`、`hops` 以及有序的 `vertices` 和 `edges`。`cost_exact` 是精确的十进制字符串，`cost` 是兼容原有调用的近似 Float64，超出有限值范围时为空。两个端点均存在且不可达时返回空结果。
 - `route --strategy bellman-ford|delta-stepping|johnson|dag-longest` 使用指定策略，要求 `--k 1`。Bellman–Ford 和 Johnson 支持负权。Bellman–Ford 拒绝从起点可达的负权环，Johnson 检查整个投影的负权环，并返回所指定端点之间的最短路。Delta-Stepping 使用非负权。DAG 最长路支持负权，要求整个投影无环。
 - 投影版 PageRank 按出边权重分配质量，弱连通分量忽略方向和权重。两者分别输出 `__graphlake_rank` 和 `__graphlake_component`。
 - `analyze --edge Transfer --direction undirected label-propagation` 按投影方向和边权传播社区标签，支持 `--max-iterations`，输出 `__graphlake_community`。

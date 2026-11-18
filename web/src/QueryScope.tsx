@@ -45,7 +45,7 @@ export default function QueryScope({ value, save, close }: { value: string; save
     } catch (cause) { report(cause); }
   }
 
-  return <Modal title={t('查询范围')} size="medium" description={t('限定本次查询读取的数据；应用后运行查询才会生效。')} close={close}>
+  return <Modal layout="center" title={t('查询范围')} size="medium" description={t('限定本次查询读取的数据；应用后运行查询才会生效。')} close={close}>
     <form className="panel-layout query-scope-form" onSubmit={apply}>
       <div className="panel-body dialog-form">
       {json ? <label>{t('查询范围 JSON')}<textarea rows={8} className="mono" spellCheck={false}

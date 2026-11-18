@@ -97,7 +97,7 @@ function Trend({ title, points, labels, empty, active }: {
         {points.length > 1 && <span>{clock.format(points[points.length - 1].at)}</span>}
       </div>
     </> : <p className="trend-empty muted">{empty}</p>}
-    {active && inspecting && <Modal
+    {active && inspecting && <Modal layout="center" size="medium"
       title={t('{0}采样数据', title)}
       description={t('{0} 个采样点 · 按时间从近到远 · “—”表示该时刻无有效值', inspecting.length)}
       close={() => setInspecting(undefined)}>

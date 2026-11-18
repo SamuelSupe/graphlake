@@ -158,10 +158,12 @@ function Member({ item, close, removed, saved }: {
   const [consoleAccess, setConsoleAccess] = useState(item?.console_access ?? true);
   const [mcpAccess, setMcpAccess] = useState(item?.mcp_access ?? true);
   const [disabled, setDisabled] = useState(item?.disabled ?? false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const showCredential = service || consoleAccess;
   const canIssue = !service && !consoleAccess && mcpAccess && !disabled;
   async function remove() {
-    if (!item || !window.confirm(t('删除 {0} 并将其从所有角色移除？', item.username))) return;
+    if (!item) return;
+    setConfirmDelete(false);
     setError('');
     setBusy(true);
     try {
@@ -195,7 +197,7 @@ function Member({ item, close, removed, saved }: {
     finally { setBusy(false); }
   }
 
-  return <Modal title={item ? t('编辑成员 · {0}', item.username) : t('新建成员')} size="medium" close={() => { if (!busy) close(); }}>
+  return <Modal title={item ? t('编辑成员 · {0}', item.username) : t('新建成员')} size="medium" beforeClose={() => !busy} close={close}>
     <form className="panel-layout access-form" method="post" onSubmit={submit} aria-busy={busy}>
       <div className="panel-body dialog-form">
       {!item && <fieldset className="access-members">
@@ -231,9 +233,20 @@ function Member({ item, close, removed, saved }: {
       <p className="muted">{t('将账号加入角色后才可访问对应的模型。')}</p>
       {item && <p className="muted">{service ? t('保存后会关闭此账号的现有连接。') : t('保存后该成员需要重新登录。')}</p>}
       {error && <p className="notice error" role="alert">{error}</p>}
-      </div><footer className="panel-footer">{item && <button type="button" className="button danger" disabled={busy} onClick={() => void remove()}>{t('删除成员')}</button>}<button type="button" className="button" onClick={close} disabled={busy}>{t('取消')}</button>
+      </div><footer className="panel-footer">{item && <button type="button" className="button danger" disabled={busy} onClick={() => setConfirmDelete(true)}>{t('删除成员')}</button>}<button type="button" className="button" onClick={close} disabled={busy}>{t('取消')}</button>
         <button type="submit" className="button primary" disabled={busy}>{busy ? t('保存中…') : t('保存成员')}</button></footer>
     </form>
+    {item && confirmDelete && <DeleteConfirmation title={t('删除成员')} message={t('删除 {0} 并将其从所有角色移除？', item.username)}
+      close={() => setConfirmDelete(false)} confirm={() => void remove()} />}
+  </Modal>;
+}
+
+function DeleteConfirmation({ title, message, close, confirm }: { title: string; message: string; close: () => void; confirm: () => void }) {
+  return <Modal title={title} layout="center" close={close}>
+    <div className="dialog-form"><p>{message}</p><div className="dialog-actions">
+      <button type="button" className="button" data-initial-focus onClick={close}>{t('取消')}</button>
+      <button type="button" className="button danger" onClick={confirm}>{t('确认删除')}</button>
+    </div></div>
   </Modal>;
 }
 
@@ -289,7 +302,7 @@ function RoleEditor({ name, item, models, users, close, saved }: {
     finally { setBusy(false); }
   }
 
-  return <Modal title={item ? t('编辑角色 · {0}', name) : t('新建角色')} size="medium" description={t('先选择成员，再分配模型权限与可查询的租户范围。')} close={() => { if (!busy) close(); }}>
+  return <Modal title={item ? t('编辑角色 · {0}', name) : t('新建角色')} size="medium" description={t('先选择成员，再分配模型权限与可查询的租户范围。')} beforeClose={() => !busy} close={close}>
     <form className="panel-layout access-form" aria-busy={busy} onSubmit={event => {
       event.preventDefault();
       void persist(name || String(new FormData(event.currentTarget).get('role')), false);
@@ -349,14 +362,13 @@ function RoleEditor({ name, item, models, users, close, saved }: {
       </div>
       {item && <p className="muted">{t('角色变更后，受影响的成员需重新登录。')}</p>}
       {error && <p className="notice error" role="alert">{error}</p>}
-      {confirmDelete && <p role="status">{t('删除角色后会撤销该角色授予的全部权限。')}</p>}
       </div><footer className="panel-footer">
-        {item && <button type="button" className="button danger" disabled={busy} onClick={() => {
-          if (confirmDelete) void persist(name, true); else setConfirmDelete(true);
-        }}>{confirmDelete ? t('确认删除') : t('删除角色')}</button>}
-        <button type="button" className="button" onClick={confirmDelete ? () => setConfirmDelete(false) : close} disabled={busy}>{t('取消')}</button>
-        {!confirmDelete && <button type="submit" className="button primary" disabled={busy}>{busy ? t('保存中…') : t('保存角色')}</button>}
+        {item && <button type="button" className="button danger" disabled={busy} onClick={() => setConfirmDelete(true)}>{t('删除角色')}</button>}
+        <button type="button" className="button" onClick={close} disabled={busy}>{t('取消')}</button>
+        <button type="submit" className="button primary" disabled={busy}>{busy ? t('保存中…') : t('保存角色')}</button>
       </footer>
     </form>
+    {confirmDelete && <DeleteConfirmation title={t('删除角色') + ' · ' + name} message={t('删除角色后会撤销该角色授予的全部权限。')}
+      close={() => setConfirmDelete(false)} confirm={() => { setConfirmDelete(false); void persist(name, true); }} />}
   </Modal>;
 }

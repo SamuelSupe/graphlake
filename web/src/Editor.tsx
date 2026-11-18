@@ -618,8 +618,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         </footer>
       </div>
     </Modal>}
-    {listSection && model && <Modal title={listSection === 'nodes' ? t('节点标签') : t('边类型')} description={t('选择标签，返回画布继续配置映射。')} close={() => setModal(undefined)}>
-      <div className="panel-layout"><div className="panel-body form-fields">
+    {listSection && model && <Modal layout="center" title={listSection === 'nodes' ? t('节点标签') : t('边类型')} description={t('选择标签，返回画布继续配置映射。')} close={() => setModal(undefined)}>
+      <div className="panel-layout"><div className="panel-body type-picker">
         {!Object.keys(model[listSection]).length && <p className="muted">{t('暂无{0}', listSection === 'nodes' ? t('节点标签') : t('边类型'))}</p>}
         {Object.keys(model[listSection]).map(name => <button className="sidebar-item" key={name} onClick={() => {
           setSelection({ section: listSection, name }); setModal(undefined);
@@ -684,9 +684,9 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       <div className="dialog-form">
         <p>{t('下线后将拒绝新的查询、导出和邻居展开。草稿和历史版本会保留，可以重新发布。')}</p>
         <div className="dialog-actions">
+          <button type="button" className="button" data-initial-focus onClick={() => setModal('versions')}>{t('取消')}</button>
           <button type="button" className="button danger" disabled={activating}
             onClick={() => void activate(undefined, 'unpublish')}>{t('确认下线')}</button>
-          <button type="button" className="button" data-initial-focus onClick={() => setModal('versions')}>{t('取消')}</button>
         </div>
       </div>
     </Modal>}

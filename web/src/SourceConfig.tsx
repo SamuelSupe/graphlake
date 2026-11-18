@@ -52,7 +52,6 @@ export function SourceConfig({ type, item, path, edit, openYaml, form, modelId }
     const message = field.kind === 'integer' ? t('请输入大于 0 的整数。') : field.key === 'uri' ? t('请输入完整的服务地址，例如 https://example.com。') : t('请填写{0}。', field.label);
     return <div className="source-field" key={field.key}>
       <label htmlFor={id}>{field.label}<span className="field-requirement">{field.optional ? t('选填') : t('必填')}</span></label>
-      {field.hint && <p id={id + '-hint'} className="muted small">{field.hint}</p>}
       <input id={id} name={field.key} form={form} required={!!form && !field.optional} className="mono" value={configText(item[field.key])}
       type={field.key === 'uri' ? 'url' : 'text'}
       pattern={field.kind === 'integer' ? '0*[1-9][0-9]*' : !field.optional ? '.*\\S.*' : undefined}
@@ -70,6 +69,7 @@ export function SourceConfig({ type, item, path, edit, openYaml, form, modelId }
           else doc.setIn([...path, field.key], next);
         });
       }} />
+      {field.hint && <p id={id + '-hint'} className="muted small">{field.hint}</p>}
       {invalid[field.key] && <p id={id + '-error'} className="inline-error">{message}</p>}
     </div>;
   }
@@ -79,11 +79,11 @@ export function SourceConfig({ type, item, path, edit, openYaml, form, modelId }
   const entries = record(item[tableGroup]);
   const advanced = fields.filter(field => field.advanced);
   return <>
-    {fields.filter(field => !field.advanced).map(input)}
+    <div className="connection-fields">{fields.filter(field => !field.advanced).map(input)}</div>
     {(advanced.length > 0 || delta || type === 'iceberg') && <details className="form-disclosure" open={delta || undefined}>
       <summary>{delta ? t('表映射') : type === 'iceberg' ? t('快照设置') : t('高级连接设置')}</summary>
       <div className="form-fields">
-        {advanced.map(input)}
+        {advanced.length > 0 && <div className="connection-fields">{advanced.map(input)}</div>}
         {(delta || type === 'iceberg') && <>
           {Object.entries(entries).map(([table, value]) => {
             const entry = [...path, tableGroup, table];

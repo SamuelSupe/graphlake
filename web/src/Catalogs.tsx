@@ -1,6 +1,6 @@
 import { t } from './locale.ts';
 import { useId, useState } from 'react';
-import { Database, FolderOpen, Plus, Search, Settings2 } from 'lucide-react';
+import { ChevronRight, Database, FolderOpen, Search, Settings2 } from 'lucide-react';
 import { ConnectorIcon } from './ConnectorIcon';
 import { connectorChoices, connectorDetails } from './connectors';
 import { record, sourceLabel, sourceUsers, text, type Model } from './model';
@@ -71,12 +71,13 @@ export function ConnectorGallery({ add, active }: { add: (type: string) => void;
     <div className="source-card-grid">
       {choices.map(([type, label]) => {
         const details = connectorDetails[type];
-        return <article className="source-card connector-card" key={type}>
-          <header><ConnectorIcon type={type} /><div><h3>{label}</h3><span className="muted small">{details?.group}</span></div></header>
-          <p className="muted small">{details?.description}</p>
-          <footer><button className="button compact" onClick={() => add(type)}>
-            <Plus size={15} aria-hidden="true" />{t('配置')}<span className="sr-only"> {label}</span></button></footer>
-        </article>;
+        return <button type="button" className="connector-card" key={type} onClick={() => add(type)}
+          aria-label={t('配置 {0}', label)} aria-describedby={filterId + '-' + type}>
+          <ConnectorIcon type={type} />
+          <span className="connector-copy"><strong>{label}</strong>
+            <span className="small muted" id={filterId + '-' + type}>{details.description}</span></span>
+          <ChevronRight size={16} aria-hidden="true" />
+        </button>;
       })}
     </div>
     {!choices.length && <div className="catalog-empty"><p>{t('没有匹配的连接器')}</p><p className="muted small">{t('试试其他名称，或清除类别与关键词。')}</p>

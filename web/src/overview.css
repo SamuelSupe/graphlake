@@ -57,7 +57,7 @@
 .overview-service-details { gap: 8px 16px; }
 .overview-service > p { flex-basis: 100%; }
 .overview-service[data-tone="warning"] { border-color: #e9cb94; }
-.overview-service[data-tone="error"] { border-color: #e7b8b2; }
+.overview-service[data-tone="error"] { border-color: var(--danger-line); }
 .overview-attention {
   display: flex;
   flex-wrap: wrap;
@@ -66,7 +66,7 @@
   padding: 8px 14px;
   border: 1px solid #edd8b3;
   border-radius: var(--radius);
-  color: #85470c;
+  color: var(--warning);
   background: #fff8eb;
 }
 .overview-attention h2, .overview-attention a { display: inline-flex; align-items: center; gap: 7px; }
@@ -87,9 +87,9 @@
   font-weight: 650;
 }
 .overview-status::before { content: ""; flex: none; inline-size: 6px; block-size: 6px; border-radius: 50%; background: currentColor; }
-.overview-status[data-tone="ok"] { background: #eaf7ee; color: #19653c; }
-.overview-status[data-tone="warning"] { background: #fff3dd; color: #85470c; }
-.overview-status[data-tone="error"] { background: #fff0ef; color: #9c322b; }
+.overview-status[data-tone="ok"] { background: var(--success-bg); color: var(--success); }
+.overview-status[data-tone="warning"] { background: var(--warning-bg); color: var(--warning); }
+.overview-status[data-tone="error"] { background: var(--danger-bg); color: var(--danger); }
 .overview-load, .overview-side, .overview-panel, .overview-rows { display: grid; align-content: start; gap: 12px; }
 .overview-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--radius); overflow: clip; background: var(--surface); }
 .overview-stat { padding: 12px 16px; border: 0; border-radius: 0; box-shadow: none; }
@@ -115,8 +115,8 @@
   overflow-wrap: anywhere;
   font-size: .8125rem;
 }
-.overview-warning { background: #fff5e4; color: #85470c; }
-.overview-error { background: #fff0ef; color: #9c322b; }
+.overview-warning { background: var(--warning-bg); color: var(--warning); }
+.overview-error { background: var(--danger-bg); color: var(--danger); }
 .overview-trends { display: grid; gap: 12px; }
 .trend-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; }
 .trend { margin: 0; gap: 9px; }

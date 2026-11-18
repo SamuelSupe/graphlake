@@ -36,12 +36,12 @@ export function StorageConfig({ item, path, edit, form, modelId }: {
     <p className="muted small">{t('对象路径相对于所配置的桶或容器。凭据填写服务端环境变量名，留空时使用服务端默认身份。')}</p>
     {provider === 'oss' && <p className="muted small">{t('OSS 账号需启用 S3 兼容认证；使用所在区域的 OSS 服务端点。')}</p>}
     {provider === 'tos' && <p className="muted small">{t('TOS 使用 tos-s3-区域.volces.com 端点，并填写对应区域。')}</p>}
-    {fields.map(([key, label, required, placeholder]) => <div className="source-field" key={key}>
+    <div className="connection-fields">{fields.map(([key, label, required, placeholder]) => <div className="source-field" key={key}>
       <label htmlFor={id + '-' + key}>{label}<span className="field-requirement">{required ? t('必填') : t('选填')}</span></label>
       <input id={id + '-' + key} name={'storage-' + key} form={form} required={!!form && required} type={key === 'endpoint' ? 'url' : 'text'}
         className="mono" spellCheck={false} autoCapitalize="none" autoCorrect="off" autoComplete="off" placeholder={placeholder}
         value={text(storage[key])} onChange={event => edit(doc => setOptional(doc, [...path, 'storage', key], event.target.value))} />
-    </div>)}
+    </div>)}</div>
     <label htmlFor={id + '-format'}>{t('文件格式')}<select id={id + '-format'} form={form} value={format} onChange={event => edit(doc => doc.setIn([...path, 'format'], event.target.value))}>
       <option value="parquet">Parquet</option><option value="csv">CSV</option><option value="jsonl">JSON Lines</option>
     </select></label>

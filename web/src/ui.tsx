@@ -27,6 +27,7 @@ export function Modal({ title, description, close, beforeClose, children, layout
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const heading = useId();
+  const descriptionId = useId();
   const locked = useContext(WorkspaceLocked);
   useLayoutEffect(() => {
     if (locked) return;
@@ -35,10 +36,10 @@ export function Modal({ title, description, close, beforeClose, children, layout
     element?.showModal();
     return () => element?.close();
   }, [locked]);
-  return <dialog ref={dialog} className={'dialog-' + layout + ' dialog-' + size} aria-labelledby={heading}
+  return <dialog ref={dialog} className={'dialog-' + layout + ' dialog-' + size} aria-labelledby={heading} aria-describedby={description ? descriptionId : undefined}
     onCancel={event => { if (beforeClose && !beforeClose()) event.preventDefault(); }}
     onClose={event => { if (!event.currentTarget.open && !locked) close(); }}>
-    <header className="dialog-heading"><div><h2 id={heading} tabIndex={-1}>{title}</h2>{description && <p>{description}</p>}</div>
+    <header className="dialog-heading"><div><h2 id={heading} tabIndex={-1}>{title}</h2>{description && <p id={descriptionId}>{description}</p>}</div>
       <form method="dialog" onSubmit={event => { if (beforeClose && !beforeClose()) event.preventDefault(); }}>
         <button className="icon-button" aria-label={t('关闭')}><X size={18} /></button></form></header>
     <div className="dialog-content">{children}</div>
@@ -70,7 +71,7 @@ export function NameDialog({ title, close, submit, initial = '', withId = false,
       setError(cause instanceof Error ? cause.message : t('无法保存'));
     }
   }
-  return <Modal title={title} description={withId ? t('先填写基本信息，随后配置数据来源与图映射。') : choices ? t('选择连接器，下一步填写连接和表映射。') : undefined} close={close}>
+  return <Modal layout="center" title={title} description={withId ? t('先填写基本信息，随后配置数据来源与图映射。') : choices ? t('选择连接器，下一步填写连接和表映射。') : undefined} close={close}>
     <form onSubmit={send} className="panel-layout">
       <div className="panel-body form-fields">
       <label>{label}<input data-initial-focus required maxLength={128} placeholder={placeholder} value={name} onChange={event => { setName(event.target.value); setError(''); }} /></label>

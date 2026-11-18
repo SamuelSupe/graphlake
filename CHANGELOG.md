@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.5
+
+- Redesign the console around the GraphLake blue palette. Align page titles, actions and dialogs across the model editor, data sources, query workspace and administration pages on desktop and narrow screens.
+- Keep directory filters, view, scroll position and keyboard focus when returning from a model. On a temporary refresh failure, keep the previous results available and identify them as the last loaded list.
+- Preserve inputs when retrying model creation, browsing source metadata and saving query templates. When loading a template, restore explicitly saved parameters or focus the parameter field if values are required.
+- Keep telemetry and MCP drafts through failed reloads. Show revision conflicts in the form and keep background health updates from overwriting current edits.
+
 ## v1.1.4
 
 - Roll large model version histories into immutable pages while preserving published revisions, rollback and backups.

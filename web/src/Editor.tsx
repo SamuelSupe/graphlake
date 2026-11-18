@@ -1,7 +1,7 @@
 import { diagnosticText, t } from './locale.ts';
 import type { useMutations } from './Mutations';
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, Waypoints, X } from 'lucide-react';
+import { Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, Waypoints, X } from 'lucide-react';
 import { api, ApiError, errorText, type BusinessStatus, type Column, type ImpactReport, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
 import { BusinessImpact, impactLabels, type ImpactTarget } from './BusinessImpact';
 import { BusinessTasks } from './BusinessTasks';
@@ -22,6 +22,7 @@ import { ModelYamlEditor } from './ModelYamlEditor';
 import { useModelDraft } from './useModelDraft';
 import { setupIssue } from './modelWorkflow';
 import { Modal, NameDialog, StatusLabel } from './ui';
+import { ModelWorkspaceHeader } from './ModelWorkspaceHeader';
 import { WorkspaceTools } from './WorkspaceTools';
 
 export type Workspace = 'graph' | 'catalogs' | 'query';
@@ -328,6 +329,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   }
 
   const listSection = modal === 'nodes-list' ? 'nodes' : modal === 'edges-list' ? 'edges' : undefined;
+  const otherModels = models.filter(other => other.id !== id && (workspace !== 'query' || other.active_revision && !other.archive_error));
   const title = { graph: t('图模型'), catalogs: t('数据源'), query: t('查询') }[workspace];
   const busy = mutations.pending || saving || checking || activating;
   const nodeNames = Object.keys(model?.nodes ?? {});
@@ -469,31 +471,31 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     </fieldset>
   </aside>;
 
+  const canvasBrowseActions = workspace === 'graph' && model && saved && <>
+    <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={16} aria-hidden="true" />{t('节点 ')}<span className="tool-count">{nodeNames.length}</span></button>
+    <button className="tool-button" onClick={() => setModal('edges-list')}><List size={16} aria-hidden="true" />{t('边 ')}<span className="tool-count">{Object.keys(model.edges).length}</span></button>
+    {allow.configure && <button className="tool-button" disabled={!saved.revision} onClick={() => setLocalTables(true)}><Database size={16} aria-hidden="true" />{t('本地表')}</button>}
+  </>;
+
+  const modelSwitcher = !!saved?.revision && otherModels.length > 0 && <label className="model-switch">
+    <span className="sr-only">{t('切换图模型')}</span>
+    <select value="" onChange={event => changeModel(event.target.value)}>
+      <option value="" disabled>{t('切换图模型')}</option>
+      {otherModels.map(other => <option value={other.id} key={other.id}>{other.name} · {other.id}</option>)}
+    </select>
+  </label>;
+  const version = saved && (workspace !== 'query' || !saved.active_revision || saved.archive_error) &&
+    <code className="version-chip" title={saved.active_revision ?? undefined}>{saved.archive_error ? t('版本存储异常') : saved.active_revision ? t('生效 {0}', saved.active_revision.slice(0, 10)) : t('未发布')}</code>;
+  const dirtyLabel = workspace !== 'query' && dirty && <span className="dirty"><i />{t('未保存')}</span>;
+
   return <main className={'workbench editor workspace-' + workspace}>
-    <header className="workspace-header model-workspace-header">
-      <div className="workspace-title">
-        <button className="icon-button" aria-label={t('返回模型列表')} title={t('返回模型列表')} onClick={close}><ArrowLeft size={17} aria-hidden="true" /></button>
-        <h1>{title}</h1>
-        {workspace === 'catalogs' && model && allow.configure && allow.edit && <button className="button primary compact catalog-add" type="button"
-          disabled={!!busy} aria-haspopup="dialog" aria-label={t('添加数据源')} onClick={openSource}>
-          <Plus size={16} aria-hidden="true" /><span className="label-full">{t('添加数据源')}</span><span className="label-compact">{t('添加来源')}</span>
-        </button>}
-      </div>
-      <div className="workspace-context">
-        {workspace !== 'query' && dirty && <span className="dirty"><i />{t('未保存')}</span>}
-        {saved?.revision && <label className="model-switch"><span className="sr-only">{t('切换图模型')}</span>
-          <select value={id} onChange={event => changeModel(event.target.value)}>
-            <option value={id}>{modelName}</option>
-            {models.filter(other => other.id !== id && (workspace !== 'query' || other.active_revision && !other.archive_error)).map(other =>
-              <option value={other.id} key={other.id}>{other.name} · {other.id}</option>)}
-          </select>
-        </label>}
-        {!saved?.revision && preview.model?.graph && <strong className="draft-name">{modelName}</strong>}
-        {workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" aria-label={t('编辑模型名称')}
-          disabled={busy || !!yamlError} onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} /></button>}
-        {saved && (workspace !== 'query' || !saved.active_revision || saved.archive_error) && <code className="version-chip" title={saved.active_revision ?? undefined}>{saved.archive_error ? t('版本存储异常') : saved.active_revision ? t('生效 {0}', saved.active_revision.slice(0, 10)) : t('未发布')}</code>}
-      </div>
-    </header>
+    <ModelWorkspaceHeader workspace={title} name={modelName} back={close} switcher={modelSwitcher}
+      rename={workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" type="button"
+        aria-label={t('编辑模型名称')} title={t('编辑模型名称')} disabled={busy || !!yamlError}
+        onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} aria-hidden="true" /></button>}
+      status={(version || dirtyLabel) && <>{version}{dirtyLabel}</>}
+      action={workspace === 'catalogs' && model && allow.configure && allow.edit && <button className="button primary catalog-add" type="button"
+        disabled={!!busy} aria-haspopup="dialog" onClick={openSource}><Plus size={16} aria-hidden="true" />{t('添加数据源')}</button>} />
     {saved?.archive_error && <p className="notice error" role="alert">{diagnosticText(saved.archive_error)}{' '}
       <button className="button compact" onClick={() => setModal('versions')}>{t('查看版本历史')}</button>
     </p>}
@@ -578,9 +580,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
                 onClick={() => setConnection(connecting ? undefined : {})}><Waypoints size={16} aria-hidden="true" />{t('连线建边')}</button>
             </>}
             <div className="graph-label-actions">
-              <button className="tool-button" onClick={() => setModal('nodes-list')}><List size={16} aria-hidden="true" />{t('节点 ')}<span className="tool-count">{nodeNames.length}</span></button>
-              <button className="tool-button" onClick={() => setModal('edges-list')}><List size={16} aria-hidden="true" />{t('边 ')}<span className="tool-count">{Object.keys(model.edges).length}</span></button>
-              {allow.configure && <button className="tool-button" disabled={!saved.revision} onClick={() => setLocalTables(true)}><Database size={16} aria-hidden="true" />{t('本地表')}</button>}
+              <div className="canvas-browse-buttons">{canvasBrowseActions}</div>
+              <WorkspaceTools label={t('浏览模型')}>{canvasBrowseActions}</WorkspaceTools>
             </div>
           </div>
           <Suspense fallback={<div className="canvas-panel"><p className="empty" role="status">{t('正在打开画布…')}</p></div>}>
@@ -613,8 +614,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         </footer>
       </div>
     </Modal>}
-    {listSection && model && <Modal title={listSection === 'nodes' ? t('节点标签') : t('边类型')} description={t('选择标签，返回画布继续配置映射。')} close={() => setModal(undefined)}>
-      <div className="panel-layout"><div className="panel-body form-fields">
+    {listSection && model && <Modal layout="center" title={listSection === 'nodes' ? t('节点标签') : t('边类型')} description={t('选择标签，返回画布继续配置映射。')} close={() => setModal(undefined)}>
+      <div className="panel-layout"><div className="panel-body type-picker">
         {!Object.keys(model[listSection]).length && <p className="muted">{t('暂无{0}', listSection === 'nodes' ? t('节点标签') : t('边类型'))}</p>}
         {Object.keys(model[listSection]).map(name => <button className="sidebar-item" key={name} onClick={() => {
           setSelection({ section: listSection, name }); setModal(undefined);
@@ -679,9 +680,9 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       <div className="dialog-form">
         <p>{t('下线后将拒绝新的查询、导出和邻居展开。草稿和历史版本会保留，可以重新发布。')}</p>
         <div className="dialog-actions">
+          <button type="button" className="button" data-initial-focus onClick={() => setModal('versions')}>{t('取消')}</button>
           <button type="button" className="button danger" disabled={activating}
             onClick={() => void activate(undefined, 'unpublish')}>{t('确认下线')}</button>
-          <button type="button" className="button" data-initial-focus onClick={() => setModal('versions')}>{t('取消')}</button>
         </div>
       </div>
     </Modal>}

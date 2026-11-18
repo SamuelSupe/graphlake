@@ -42,7 +42,7 @@ export function BusinessTasks({ id, selected, toggle, saveSuite, close }: {
   </fieldset>;
 
   if (saveSuite) return <FixedSuite id={id} save={saveSuite} close={close}>{options}</FixedSuite>;
-  return <Modal title={title} size="wide" close={close}>
+  return <Modal layout="center" title={title} size="medium" close={close}>
     <div className="panel-layout">
       <div className="panel-body form-fields business-config">
         {options}

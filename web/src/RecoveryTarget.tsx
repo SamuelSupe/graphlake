@@ -20,7 +20,7 @@ export default function RecoveryTarget({ local, close }: { local: boolean; close
     }
   }
 
-  return <Modal title={t('恢复备份')} description={t('在目标站选择恢复点、检查并确认恢复。')} close={close}>
+  return <Modal layout="center" title={t('恢复备份')} description={t('在目标站选择恢复点、检查并确认恢复。')} close={close}>
     <form className="panel-layout" onSubmit={open}>
       <div className="panel-body form-fields">
         <label>{t('目标站地址')}<input type="url" required data-initial-focus placeholder="https://recovery.example.com"

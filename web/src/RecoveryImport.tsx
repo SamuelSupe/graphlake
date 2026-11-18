@@ -104,7 +104,7 @@ export default function RecoveryImport({ token, job, start }: {
       </ol>
       {job.failure && <p className="notice error" role="alert">{diagnosticText(job.failure)}</p>}
     </section>}
-    {confirm && <Modal title={t('开始灾备恢复')} close={() => setConfirm(undefined)}>
+    {confirm && <Modal layout="center" title={t('开始灾备恢复')} close={() => setConfirm(undefined)}>
       <div className="panel-layout">
         <div className="panel-body form-fields">
           <p>{t('将从 ')}<b>{confirm.bundle}</b>{confirm.postgres_relations ? t(' 恢复数据和控制状态。请确认目标集群和 PostgreSQL 数据库专用于本次恢复。') : t(' 恢复数据和控制状态。请确认目标集群专用于本次恢复。')}</p>

@@ -29,6 +29,7 @@ export default function LocalTables({ saved, clean, close, attach }: {
   const [error, setError] = useState('');
   const [loadError, setLoadError] = useState('');
   const [notice, setNotice] = useState('');
+  const searchInput = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all');
   const [editing, setEditing] = useState<LocalTable | 'new'>();
@@ -88,12 +89,12 @@ export default function LocalTables({ saved, clean, close, attach }: {
       {notice && <p className="sync-notice" role="status"><Check size={16} aria-hidden="true" /><span>{notice}</span><button className="icon-button" aria-label={t('关闭提示')} onClick={() => setNotice('')}><X size={14} /></button></p>}
       <div className="sync-directory-heading"><div><h3>{t('本地表')}</h3><span>{tables ? t('{0} 张表', tables.length) : t('正在连接…')}</span></div>
         <button className="button primary" onClick={() => setEditing('new')} disabled={!clean}><Plus size={16} aria-hidden="true" />{t('创建本地表')}</button></div>
-      <div className="sync-filters"><label className="sync-search"><Search size={16} aria-hidden="true" /><span className="sr-only">{t('搜索本地表')}</span><input type="search" value={search} placeholder={t('搜索表名或来源…')} onChange={event => setSearch(event.target.value)} /></label>
+      <div className="sync-filters"><label className="sync-search"><Search size={16} aria-hidden="true" /><span className="sr-only">{t('搜索本地表')}</span><input ref={searchInput} type="search" value={search} placeholder={t('搜索表名或来源…')} onChange={event => setSearch(event.target.value)} /></label>
         <label><span className="sr-only">{t('筛选同步状态')}</span><select value={filter} onChange={event => setFilter(event.target.value)}><option value="all">{t('全部状态')}</option><option value="ready">{t('副本已就绪')}</option><option value="running">{t('同步中')}</option><option value="attention">{t('需要关注')}</option><option value="empty">{t('尚未加载')}</option></select></label>
         <span className="sync-list-count" role="status">{tables ? t('{0} 个结果', visible?.length) : t('正在读取…')}</span></div>
       {!tables && <div className="sync-loading" role="status"><div /><div /><span className="sr-only">{t('正在读取本地表…')}</span></div>}
       {tables?.length === 0 && <div className="sync-empty"><span className="sync-empty-icon"><Database size={26} /><ArrowRight size={18} /><HardDrive size={26} /></span><h3>{t('让源表拥有本地副本')}</h3><p>{t('选择来源与字段，按需启用增量更新和定时刷新。')}<br />{t('加载完成后，即可用于图模型查询。')}</p><button className="button" disabled={!clean} onClick={() => setEditing('new')}><Plus size={15} />{t('创建第一张本地表')}</button></div>}
-      {tables && tables.length > 0 && !visible?.length && <div className="sync-empty"><Search size={28} /><h3>{t('没有匹配的本地表')}</h3><p>{t('尝试其他表名或同步状态。')}</p><button className="text-button" onClick={() => { setSearch(''); setFilter('all'); }}>{t('清除筛选')}</button></div>}
+      {tables && tables.length > 0 && !visible?.length && <div className="sync-empty"><Search size={28} /><h3>{t('没有匹配的本地表')}</h3><p>{t('尝试其他表名或同步状态。')}</p><button className="text-button" onClick={() => { setSearch(''); setFilter('all'); searchInput.current?.focus(); }}>{t('清除筛选')}</button></div>}
       <div className="local-table-list">{visible?.map(table => {
         const run = table.history[0];
         const running = run?.status === 'running';

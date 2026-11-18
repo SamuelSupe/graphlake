@@ -2,6 +2,7 @@ import { locale, t } from './locale.ts';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2, Download, GitFork, Network, Play, Square, Table2 } from 'lucide-react';
 import type { GraphSelection } from './GraphCanvas';
+import { queryLimitErrors, queryParameterError } from './queryParameters';
 import { GraphExplorer, type GraphExplorerHandle } from './GraphExplorer';
 import { api, ApiError, downloadFile, errorText, request, type FreshnessPolicy, type GraphSchema, type QueryResult } from './api';
 
@@ -53,6 +54,10 @@ const views = [
 ] as const;
 type ResultView = typeof views[number]['key'];
 
+const ageFields = [
+  ['max_observation_age_seconds', t('来源观察最大年龄（秒）')],
+  ['max_reconciliation_age_seconds', t('全量对账最大年龄（秒）')],
+] as const;
 const defaults = { cypher: 'MATCH (n) RETURN n LIMIT 25', sql: 'SELECT 1', gremlin: 'g.V().limit(25)' };
 const actorKey = (id: string, actor: string) => actor === 'admin' || actor === '@dev' ? id : actor + ':' + id;
 const historyKey = (id: string) => 'graphlake-query-history-v1:' + id;
@@ -73,6 +78,9 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const [queries, setQueries] = useState(defaults);
   const query = queries[language];
   const [parameters, setParameters] = useState('');
+  const [parametersTouched, setParametersTouched] = useState(false);
+  const parameterProblem = useMemo(() => queryParameterError(parameters), [parameters]);
+  const showParameterError = parametersTouched && !!parameterProblem;
   const [timeout, setTimeoutText] = useState('');
   const [defaultTimeout, setDefaultTimeout] = useState<number>();
   const [recoverable, setRecoverable] = useState(false);
@@ -93,6 +101,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const [parameterRequired, setParameterRequired] = useState(false);
   const [loadNotice, setLoadNotice] = useState('');
   const [templateName, setTemplateName] = useState('');
+  const [templateError, setTemplateError] = useState('');
   const [keepParameters, setKeepParameters] = useState(false);
   const [templates, setTemplates] = useState<SavedQuery[]>(() => {
     try { return JSON.parse(localStorage.getItem(savedKey(scope)) ?? '[]'); } catch { return []; }
@@ -110,8 +119,10 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const composer = useRef<HTMLDivElement>(null);
   const optionsPanel = useRef<HTMLDetailsElement>(null);
   const parameterInput = useRef<HTMLTextAreaElement>(null);
-  const timeoutValid = !timeout || /^\d+$/.test(timeout) && Number(timeout) >= 1 && Number(timeout) <= 60_000;
-  const agesValid = [freshness.max_observation_age_seconds, freshness.max_reconciliation_age_seconds].every(age => age === undefined || Number.isInteger(age) && age >= 1 && age <= 2592000);
+  const limitErrors = queryLimitErrors(timeout, freshness);
+  const timeoutValid = !limitErrors.timeout;
+  const agesValid = !limitErrors.max_observation_age_seconds && !limitErrors.max_reconciliation_age_seconds;
+  const hasFreshness = ageFields.some(([key]) => freshness[key] !== undefined) || language === 'cypher' && freshness.require_current_csr;
   const canRun = !!query.trim() && timeoutValid && agesValid && (!parameterRequired || language !== 'cypher' || !!parameters.trim());
   const statementFromEditor = (): Statement => ({
     model_revision: revision, language, query,
@@ -174,6 +185,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
     setLanguage(statement.language);
     setQueries(old => ({ ...old, [statement.language]: statement.query }));
     setParameters(statement.parameters_json ?? '');
+    setParametersTouched(false);
     setGraphOptions(statement.graph_options ?? '');
     setFreshness(statement.freshness ?? {});
     setSnapshot(statement.csr_generation ? { generation: statement.csr_generation, revision: statement.model_revision } : undefined);
@@ -276,13 +288,25 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
     try {
       localStorage.setItem(savedKey(scope), JSON.stringify(next));
       setTemplates(next);
+      setTemplateError('');
+      return true;
     } catch {
-      setError({ message: t('浏览器无法保存查询模板，请检查存储空间。') });
+      setTemplateError(t('浏览器无法保存查询模板，请检查存储空间。'));
+      return false;
     }
+  }
+
+  function validateParameters() {
+    if (language !== 'cypher' || !parameterProblem) return true;
+    setParametersTouched(true);
+    if (optionsPanel.current) optionsPanel.current.open = true;
+    parameterInput.current?.focus();
+    return false;
   }
 
   async function run(operation: 'query' | 'export' = 'query', mode: QueryMode = 'replace') {
     if (active.current || pending || operation === 'export' && !canExport || operation === 'query' && mode !== 'replay' && !canRun) return;
+    if (operation === 'query' && mode !== 'replay' && !validateParameters()) return;
     let statement = operation === 'export' ? result?.statement : mode === 'replay' ? canvas?.statement : statementFromEditor();
     if (!statement || statement.model_revision !== revision && !(mode === 'replay' && statement.csr_generation)) return;
     const requestId = crypto.randomUUID();
@@ -368,59 +392,69 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const selectedType = schemaSelection && shownSchema?.data?.[schemaSelection.section][schemaSelection.name];
 
   return <section className="query-workspace" aria-label={t('只读查询')}>
-    <div className="query-composer" ref={composer}>
-    <div className="query-toolbar">
-      {running ? <button className="button" disabled={stopping} onClick={() => void stop()}><Square size={16} />{stopping ? t('正在取消…') : t('取消查询')}</button>
-        : <button className="button primary" disabled={!canRun || !!pending} onClick={() => void run()}><Play size={16} />{t('运行查询')}</button>}
-      {canvas && <button className="button compact" disabled={!!running || !!pending || !canRun || canvas.page.model_revision !== revision}
-        onClick={() => void run('query', 'append')}>{t('运行并追加到画布')}</button>}
-      <label><span className="sr-only">{t('查询语言')}</span><select value={language} disabled={!!running} onChange={event => { setLanguage(event.target.value as Dialect); setSnapshot(undefined); }}>
-        <option value="cypher">Cypher</option><option value="sql">SQL</option><option value="gremlin">Gremlin</option>
-      </select></label>
-      {draftPending && <span className="query-revision muted">{t('草稿待发布 · 查询使用生效版本')}</span>}
-    </div>
-    {!timeoutValid && <p className="inline-error query-notice" id={id + '-query-timeout-error'} role="alert">{t('请输入 1 至 60000 毫秒的整数。')}</p>}
-    <Suspense fallback={<label className="query-input">{t('查询语句')}<textarea value={query} onChange={event => setQueries(old => ({ ...old, [language]: event.target.value }))} className="mono" rows={4} /></label>}>
-      <QueryEditor key={language} value={query} language={language} schema={schema?.revision === revision ? schema.data : undefined}
-        change={value => { setQueries(old => ({ ...old, [language]: value })); setParameterRequired(false); }} run={() => void run()} />
-    </Suspense>
-    <div className="query-settings">
-      <div className="query-disclosures">
-        <button className="button compact scope-button" disabled={!!generation || !!running} onClick={() => setEditingScope(true)}>{t('查询范围')}{graphOptions.trim() && !generation ? t(' · 已设置') : ''}
-        </button>
-        <details ref={optionsPanel} className="query-details query-parameters" open={parameterRequired && language === 'cypher' || !timeoutValid || undefined}>
-          <summary>{t('查询选项')}{(timeout || captureResult || generation || language === 'cypher' && parameters.trim()) ? t(' · 已设置') : ''}</summary>
-          <div className="query-options-grid">
-            {language === 'cypher' && <label>{t('Cypher 参数（JSON）')}<textarea ref={parameterInput} value={parameters} onChange={event => setParameters(event.target.value)} placeholder="{}" spellCheck={false} rows={3} className="mono"
-              aria-describedby={parameterRequired && !parameters.trim() ? id + '-query-parameters-hint' : undefined} /></label>}
-            <div className="form-fields execution-options">
-            <label className="query-timeout">{t('超时（毫秒）')}<input type="number" min={1} max={60_000} step={1} value={timeout}
-              disabled={!!running} aria-invalid={!timeoutValid} aria-describedby={timeoutValid ? undefined : id + '-query-timeout-error'} placeholder={defaultTimeout ? String(defaultTimeout) : t('服务器默认')}
-              onChange={event => setTimeoutText(event.target.value)} /></label>
-            {canExport && <label className="check-label"><input type="checkbox" checked={captureResult}
-              onChange={event => setCaptureResult(event.target.checked)} />{t('保留完整结果')}</label>}
-            <label>{t('来源观察最大年龄（秒）')}<input type="number" min={1} max={2592000} placeholder={t('模型默认')} value={freshness.max_observation_age_seconds ?? ''} onChange={event => setFreshness(old => ({...old, max_observation_age_seconds: event.target.value ? event.target.valueAsNumber : undefined}))} /></label>
-            <label>{t('全量对账最大年龄（秒）')}<input type="number" min={1} max={2592000} placeholder={t('模型默认')} value={freshness.max_reconciliation_age_seconds ?? ''} onChange={event => setFreshness(old => ({...old, max_reconciliation_age_seconds: event.target.value ? event.target.valueAsNumber : undefined}))} /></label>
-            {!agesValid && <p role="alert">{t('有效范围为 1 至 2592000 秒。')}</p>}
-            {language === 'cypher' && <label className="check-label"><input type="checkbox" checked={!!freshness.require_current_csr} onChange={event => setFreshness(old => ({...old, require_current_csr: event.target.checked}))} />{t('要求 CSR 与当前副本一致')}</label>}
-            {recoverable && language === 'cypher' && (generation
-              ? <button className="button compact" disabled={!!running} onClick={() => setSnapshot(undefined)}>{t('切换至实时来源')}</button>
-              : <button className="button compact" disabled={!!running} onClick={() => void selectSnapshot()}>{t('使用已发布 CSR')}</button>)}
-            </div>
+    <div className="query-input-column">
+      <div className="query-composer" ref={composer}>
+        <div className="query-toolbar">
+          {running ? <button className="button" disabled={stopping} onClick={() => void stop()}><Square size={16} />{stopping ? t('正在取消…') : t('取消查询')}</button>
+            : <button className="button primary" disabled={!canRun || !!pending} onClick={() => void run()}><Play size={16} />{t('运行查询')}</button>}
+          {canvas && <button className="button compact" disabled={!!running || !!pending || !canRun || canvas.page.model_revision !== revision}
+            onClick={() => void run('query', 'append')}>{t('运行并追加到画布')}</button>}
+          <label><span className="sr-only">{t('查询语言')}</span><select value={language} disabled={!!running} onChange={event => { setLanguage(event.target.value as Dialect); setSnapshot(undefined); }}>
+            <option value="cypher">Cypher</option><option value="sql">SQL</option><option value="gremlin">Gremlin</option>
+          </select></label>
+          {draftPending && <span className="query-revision muted">{t('草稿待发布 · 查询使用生效版本')}</span>}
+        </div>
+        {!timeoutValid && <p className="inline-error query-notice" id={id + '-query-timeout-error'} role="alert">{t('请输入 1 至 60000 毫秒的整数。')}</p>}
+        <Suspense fallback={<label className="query-input">{t('查询语句')}<textarea value={query} onChange={event => setQueries(old => ({ ...old, [language]: event.target.value }))} className="mono" rows={4} /></label>}>
+          <QueryEditor key={language} value={query} language={language} schema={schema?.revision === revision ? schema.data : undefined}
+            change={value => { setQueries(old => ({ ...old, [language]: value })); setParameterRequired(false); }} run={() => void run()} />
+        </Suspense>
+        <div className="query-settings">
+          <div className="query-disclosures">
+            <button className="button compact scope-button" disabled={!!generation || !!running} onClick={() => setEditingScope(true)}>{t('查询范围')}{graphOptions.trim() && !generation ? t(' · 已设置') : ''}
+            </button>
+            <details ref={optionsPanel} className="query-details query-parameters" open={parameterRequired && language === 'cypher' || !timeoutValid || undefined}>
+              <summary>{t('查询选项')}{(timeout || captureResult || generation || hasFreshness || language === 'cypher' && parameters.trim()) ? t(' · 已设置') : ''}</summary>
+              <div className="query-options-grid">
+                {language === 'cypher' && <div className="form-fields">
+                  <label>{t('Cypher 参数（JSON）')}<textarea ref={parameterInput} value={parameters} onChange={event => setParameters(event.target.value)}
+                    onBlur={() => setParametersTouched(true)} placeholder="{}" spellCheck={false} rows={3} className="mono"
+                    aria-invalid={showParameterError || undefined} aria-describedby={showParameterError ? id + '-parameter-error' : parameterRequired && !parameters.trim() ? id + '-query-parameters-hint' : undefined} /></label>
+                  {/* Reserve the message height before blur so a pointer's next target stays put. */}
+                  {parameterProblem && <span className="inline-error" id={id + '-parameter-error'} role="status"
+                    style={{ visibility: showParameterError ? 'visible' : 'hidden' }}>{parameterProblem}</span>}
+                </div>}
+                <div className="form-fields execution-options">
+                <label className="query-timeout">{t('超时（毫秒）')}<input type="number" min={1} max={60_000} step={1} value={timeout}
+                  disabled={!!running} aria-invalid={!timeoutValid} aria-describedby={timeoutValid ? undefined : id + '-query-timeout-error'} placeholder={defaultTimeout ? String(defaultTimeout) : t('服务器默认')}
+                  onChange={event => setTimeoutText(event.target.value)} /></label>
+                {canExport && <label className="check-label"><input type="checkbox" checked={captureResult}
+                  onChange={event => setCaptureResult(event.target.checked)} />{t('保留完整结果')}</label>}
+                {ageFields.map(([key, label]) => <label key={key}>{label}<input type="number" min={1} max={2592000}
+                  placeholder={t('模型默认')} value={freshness[key] ?? ''} aria-invalid={limitErrors[key] || undefined}
+                  aria-describedby={limitErrors[key] ? id + '-freshness-error' : undefined}
+                  onChange={event => { const age = event.target.value ? event.target.valueAsNumber : undefined; setFreshness(old => ({ ...old, [key]: age })); }} /></label>)}
+                {language === 'cypher' && <label className="check-label"><input type="checkbox" checked={!!freshness.require_current_csr} onChange={event => setFreshness(old => ({...old, require_current_csr: event.target.checked}))} />{t('要求 CSR 与当前副本一致')}</label>}
+                {recoverable && language === 'cypher' && (generation
+                  ? <button className="button compact" disabled={!!running} onClick={() => setSnapshot(undefined)}>{t('切换至实时来源')}</button>
+                  : <button className="button compact" disabled={!!running} onClick={() => void selectSnapshot()}>{t('使用已发布 CSR')}</button>)}
+                </div>
+              </div>
+            </details>
           </div>
-        </details>
+        </div>
+        {!agesValid && <p className="inline-error query-notice" id={id + '-freshness-error'} role="alert">{t('来源观察和全量对账的最大年龄须为 1 至 2592000 秒的整数。')}</p>}
+        {parameterRequired && language === 'cypher' && !parameters.trim() && <p className="notice query-notice" id={id + '-query-parameters-hint'} role="status">{t('此查询需要参数。填写 Cypher 参数后即可运行。')}</p>}
+        {loadNotice && <p className="notice query-notice" role="status">{loadNotice}</p>}
       </div>
+      {visible && editingScope && <Suspense><QueryScope value={graphOptions} save={setGraphOptions} close={() => setEditingScope(false)} /></Suspense>}
+      {error && <div className="notice error query-notice" role="alert">{error.message}{error.stale && <button className="text-button" onClick={refresh}>{t('重新加载模型')}</button>}</div>}
+      {pending && !running && <div className="notice query-notice" role="status">{t('检测到未确认的查询。')}
+        <button className="text-button" onClick={() => void recover()}>{t('找回原查询')}</button>
+        <button className="text-button" onClick={() => remember()}>{t('忽略')}</button></div>}
+      {exported && <p className="notice query-notice" role="status">{t('完整 Arrow 文件已交给浏览器下载。')}</p>}
+      {running && <p className="query-running" role="status">{running === 'export' ? t('正在生成完整结果…') : t('正在运行查询…')}</p>}
     </div>
-    {parameterRequired && language === 'cypher' && !parameters.trim() && <p className="notice query-notice" id={id + '-query-parameters-hint'} role="status">{t('此查询需要参数。填写 Cypher 参数后即可运行。')}</p>}
-    {loadNotice && <p className="notice query-notice" role="status">{loadNotice}</p>}
-    </div>
-    {visible && editingScope && <Suspense><QueryScope value={graphOptions} save={setGraphOptions} close={() => setEditingScope(false)} /></Suspense>}
-    {error && <div className="notice error query-notice" role="alert">{error.message}{error.stale && <button className="text-button" onClick={refresh}>{t('重新加载模型')}</button>}</div>}
-    {pending && !running && <div className="notice query-notice" role="status">{t('检测到未确认的查询。')}
-      <button className="text-button" onClick={() => void recover()}>{t('找回原查询')}</button>
-      <button className="text-button" onClick={() => remember()}>{t('忽略')}</button></div>}
-    {exported && <p className="notice query-notice" role="status">{t('完整 Arrow 文件已交给浏览器下载。')}</p>}
-    {running && <p className="query-running" role="status">{running === 'export' ? t('正在生成完整结果…') : t('正在运行查询…')}</p>}
     <section className="query-output" aria-label={t('查询结果')}>
       {page && <div className="result-heading" ref={resultHeading} tabIndex={-1} aria-label={t('查询完成')}>
         <strong>{t('结果行数 {0}', page.rows.length)}</strong>
@@ -515,17 +549,27 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
     <details className="query-details query-history-section"><summary>{t('查询模板 ')}<span className="tool-count">{templates.length}</span></summary>
       <form className="query-toolbar template-form" onSubmit={event => {
         event.preventDefault();
-        if (!templateName.trim() || !query.trim() || !timeoutValid) return;
+        if (!templateName.trim() || !query.trim()) return;
+        if (!timeoutValid || !agesValid) {
+          if (optionsPanel.current) {
+            optionsPanel.current.open = true;
+            optionsPanel.current.querySelector<HTMLInputElement>('input:invalid, input[aria-invalid="true"]')?.focus();
+          }
+          return;
+        }
+        if (keepParameters && !validateParameters()) return;
         const statement = statementFromEditor();
         const needsParameters = !!statement.parameters_json || language === 'cypher' && parameterRequired;
         if (!keepParameters) delete statement.parameters_json;
-        saveTemplates([{ id: crypto.randomUUID(), name: templateName.trim(), statement, needsParameters }, ...templates]);
-        setTemplateName(''); setKeepParameters(false);
+        if (saveTemplates([{ id: crypto.randomUUID(), name: templateName.trim(), statement, needsParameters }, ...templates])) {
+          setTemplateName(''); setKeepParameters(false);
+        }
       }}>
         <label>{t('模板名称')}<input value={templateName} maxLength={80} onChange={event => setTemplateName(event.target.value)} /></label>
         {language === 'cypher' && <label><input type="checkbox" checked={keepParameters} onChange={event => setKeepParameters(event.target.checked)} />{t('在此浏览器保存参数值')}</label>}
-        <button className="button compact" disabled={!templateName.trim() || !query.trim() || !timeoutValid}>{t('保存查询模板')}</button>
+        <button className="button compact" disabled={!templateName.trim() || !query.trim()}>{t('保存查询模板')}</button>
       </form>
+      {templateError && <p className="inline-error query-notice" role="alert">{templateError}</p>}
       {!templates.length && <p className="query-library-hint">{t('把常用语句存为模板，下次直接载入。')}</p>}
       <ul className="version-list query-history">{templates.map(item => <li key={item.id}>
         <div><strong>{item.name}</strong><small>{item.statement.language} · {item.statement.query}</small></div>

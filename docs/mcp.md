@@ -21,7 +21,7 @@ The **AI** sidebar opens a three-step Agent setup guide: generate a personal tok
 
 Administrators can enable query and modeling independently under **运行配置 → MCP 服务**. When both are disabled, **前往 MCP 配置** in the AI guide takes administrators directly to this tab. Each service applies the owner's live model permissions in addition to its own tool set. Query results are limited to 1–500 rows and a 1–60000 ms timeout, capped by the existing server timeout. The regular queue, memory and tenant controls still apply. Built-in administrator tokens represent the administrator and can use all models through the tools each service exposes.
 
-MCP edits stay in place when switching tabs within **运行配置**. Save or discard pending edits before returning to the AI guide to test the connection. Revision conflicts retain edits and require explicitly discarding them before reloading.
+MCP edits stay in place when switching tabs within **运行配置**. Save or discard pending edits before returning to the AI guide to test the connection. After a revision conflict, **Discard changes and reload** replaces the form with the latest configuration once the read succeeds. If it fails, your edits remain available and you can retry.
 
 ## Personal token lifecycle
 

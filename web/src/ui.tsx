@@ -27,6 +27,7 @@ export function Modal({ title, description, close, beforeClose, children, layout
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const heading = useId();
+  const descriptionId = useId();
   const locked = useContext(WorkspaceLocked);
   useLayoutEffect(() => {
     if (locked) return;
@@ -35,22 +36,22 @@ export function Modal({ title, description, close, beforeClose, children, layout
     element?.showModal();
     return () => element?.close();
   }, [locked]);
-  return <dialog ref={dialog} className={'dialog-' + layout + ' dialog-' + size} aria-labelledby={heading}
+  return <dialog ref={dialog} className={'dialog-' + layout + ' dialog-' + size} aria-labelledby={heading} aria-describedby={description ? descriptionId : undefined}
     onCancel={event => { if (beforeClose && !beforeClose()) event.preventDefault(); }}
     onClose={event => { if (!event.currentTarget.open && !locked) close(); }}>
-    <header className="dialog-heading"><div><h2 id={heading} tabIndex={-1}>{title}</h2>{description && <p>{description}</p>}</div>
+    <header className="dialog-heading"><div><h2 id={heading} tabIndex={-1}>{title}</h2>{description && <p id={descriptionId}>{description}</p>}</div>
       <form method="dialog" onSubmit={event => { if (beforeClose && !beforeClose()) event.preventDefault(); }}>
         <button className="icon-button" aria-label={t('关闭')}><X size={18} /></button></form></header>
     <div className="dialog-content">{children}</div>
   </dialog>;
 }
 
-export function NameDialog({ title, close, submit, initial = '', withId = false, choices, label = t('名称'), placeholder, action = t('继续') }: {
+export function NameDialog({ title, close, submit, initial = '', modelIds, choices, label = t('名称'), placeholder, action = t('继续') }: {
   title: string;
   close: () => void;
   submit: (name: string, extra: string) => void;
   initial?: string;
-  withId?: boolean;
+  modelIds?: string[];
   choices?: [string, string][];
   label?: string;
   placeholder?: string;
@@ -59,9 +60,17 @@ export function NameDialog({ title, close, submit, initial = '', withId = false,
   const [name, setName] = useState(initial);
   const [extra, setExtra] = useState(choices?.[0]?.[0] ?? '');
   const [error, setError] = useState('');
+  const [idError, setIdError] = useState('');
+  const idInput = useRef<HTMLInputElement>(null);
   const idHint = useId();
   function send(event: FormEvent) {
     event.preventDefault();
+    if (modelIds?.includes(extra.trim())) {
+      setIdError(t('模型标识已存在'));
+      idInput.current?.focus();
+      idInput.current?.select();
+      return;
+    }
     try {
       if (!name.trim()) throw new Error(t('请输入名称'));
       submit(name.trim(), extra.trim());
@@ -70,13 +79,15 @@ export function NameDialog({ title, close, submit, initial = '', withId = false,
       setError(cause instanceof Error ? cause.message : t('无法保存'));
     }
   }
-  return <Modal title={title} description={withId ? t('先填写基本信息，随后配置数据来源与图映射。') : choices ? t('选择连接器，下一步填写连接和表映射。') : undefined} close={close}>
+  return <Modal layout="center" title={title} description={modelIds ? t('先填写基本信息，随后配置数据来源与图映射。') : choices ? t('选择连接器，下一步填写连接和表映射。') : undefined} close={close}>
     <form onSubmit={send} className="panel-layout">
       <div className="panel-body form-fields">
       <label>{label}<input data-initial-focus required maxLength={128} placeholder={placeholder} value={name} onChange={event => { setName(event.target.value); setError(''); }} /></label>
-      {withId && <div className="form-fields"><label>{t('模型标识')}<input className="mono" required pattern={modelIdPattern} maxLength={64} aria-describedby={idHint}
-        placeholder="payments" value={extra} onChange={event => setExtra(event.target.value)} /></label>
-        <p id={idHint} className="field-help">{t('用于访问模型，可包含英文字母、数字、下划线和连字符。')}</p></div>}
+      {modelIds && <div className="form-fields"><label>{t('模型标识')}<input ref={idInput} className="mono" required pattern={modelIdPattern} maxLength={64}
+        aria-invalid={idError ? true : undefined} aria-describedby={idError ? idHint + ' ' + idHint + '-error' : idHint}
+        placeholder="payments" value={extra} onChange={event => { setExtra(event.target.value); setIdError(''); }} /></label>
+        <p id={idHint} className="field-help">{t('用于访问模型，可包含英文字母、数字、下划线和连字符。')}</p>
+        {idError && <p id={idHint + '-error'} className="inline-error" role="alert">{idError}</p>}</div>}
       {choices && <label>{t('连接器')}<select value={extra} onChange={event => setExtra(event.target.value)}>
         {choices.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
       </select></label>}

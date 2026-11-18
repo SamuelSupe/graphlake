@@ -22,7 +22,10 @@ export function edgeLanes(edges: Scene['edges']) {
 export function edgeCurve(edge: ReturnType<typeof edgeLanes>[number], a: Point, b: Point) {
   const { from, to, lane } = edge;
   const dx = b.x - a.x, dy = b.y - a.y, length = Math.max(1, Math.hypot(dx, dy));
-  const bend = (lane ? Math.ceil(lane / 2) * (lane % 2 ? 24 : -24) : 0) * (from > to ? -1 : 1);
+  // Labels are horizontal (up to 120px wide). Separate their hit areas on the cheaper axis.
+  // A quadratic curve's midpoint moves half as far as its control point.
+  const pitch = Math.min(126 * length / Math.max(1, Math.abs(dy)), 28 * length / Math.max(1, Math.abs(dx)));
+  const bend = Math.ceil(lane / 2) * 2 * pitch * (lane % 2 ? 1 : -1) * (from > to ? -1 : 1);
   const mid = { x: (a.x + b.x) / 2 - dy / length * bend, y: (a.y + b.y) / 2 + dx / length * bend };
   const start = { x: a.x + dx / length * 15, y: a.y + dy / length * 15 };
   const end = { x: b.x - dx / length * 17, y: b.y - dy / length * 17 };
@@ -98,8 +101,11 @@ export function positions({ vertices, edges }: Scene, layout: Layout): Map<strin
 
   levels.forEach((level, depth) => {
     const radius = depth === 0 && level.length === 1 ? 0 : Math.max(depth * 130, level.length * 15, 70);
+    // With two children, a third of a turn keeps their connecting edge off the central vertex.
+    const slots = depth > 0 && level.length === 2 ? 3 : level.length;
     level.forEach((id, index) => {
-      const angle = (2 * Math.PI * index / level.length) - Math.PI / 3;
+      // Rotate successive rings so a cycle with one vertex per ring stays legible.
+      const angle = (2 * Math.PI * index / slots) + (depth - 1) * Math.PI / 3;
       result.set(id, { x: radius * Math.cos(angle), y: radius * Math.sin(angle) });
     });
   });

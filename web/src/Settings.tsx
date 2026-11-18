@@ -1,10 +1,12 @@
 import { locale, t } from './locale.ts';
-import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import { Plus, RefreshCw, X } from 'lucide-react';
 import { api, errorText, type ModelSummary } from './api';
 import { ModelHealth } from './ModelHealth';
 import BackupStatus from './BackupStatus';
 import McpServiceSettings from './McpServiceSettings';
+import { useSettingsRead } from './useSettingsRead';
+import { telemetryDraftChanged, telemetryHeaderMap, type TelemetryConfig } from './telemetryDraft';
 
 const tabs = [
   ['telemetry', t('日志与遥测'), t('遥测')],
@@ -15,14 +17,8 @@ const tabs = [
 export type SettingsTab = typeof tabs[number][0];
 
 type Signal = 'metrics' | 'logs' | 'traces';
-type Config = {
-  enabled: boolean; endpoint: string | null; service_name: string; instance_id: string | null;
-  log_format: 'text' | 'json'; metrics: boolean; logs: boolean; traces: boolean;
-  trace_sample_ratio: number; export_interval_ms: number; timeout_ms: number;
-  allow_insecure_http: boolean; include_audit_identity: boolean; headers_env: Record<string, string>;
-};
 export type SettingsSnapshot = {
-  active: Config; config: Config; revision: string;
+  active: TelemetryConfig; config: TelemetryConfig; revision: string;
   restart_required: boolean; role: 'coordinator' | 'standalone' | null; file: string | null;
   signals: { name: Signal; failures: number; rejected: number; last_success_ms: number | null }[];
 };
@@ -46,16 +42,17 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
     id: tabPanel(value), role: 'tabpanel', 'aria-labelledby': tabButton(value), hidden: tab !== value, 'data-settings-panel': value,
   });
   const [snapshot, setSnapshot] = useState<SettingsSnapshot>();
-  const [config, setConfig] = useState<Config>();
+  const [config, setConfig] = useState<TelemetryConfig>();
   const [headers, setHeaders] = useState<Header[]>([]);
   const headerId = useRef(0);
   const errorRef = useRef<HTMLParagraphElement>(null);
-  const dirty = useRef(false);
+  const dirty = !!(snapshot && config && telemetryDraftChanged(snapshot.config, config, headers));
+  useLayoutEffect(() => { onDirty('/settings', dirty); }, [dirty, onDirty]);
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [healthError, setHealthError] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
-  const [attempt, reload] = useState(0);
   const [mcpDirty, setMcpDirty] = useState(false);
   const onMcpDirty = useCallback((value: boolean) => {
     setMcpDirty(value);
@@ -65,50 +62,44 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
   function adopt(next: SettingsSnapshot) {
     setSnapshot(next); setConfig(next.config);
     setHeaders(Object.entries(next.config.headers_env).map(([name, variable]) => ({ id: headerId.current++, name, variable })));
-    dirty.current = false; onDirty('/settings', false);
   }
 
-  useEffect(() => {
-    if (locked) return;
-    const controller = new AbortController();
-    api<SettingsSnapshot>('/settings', { signal: controller.signal }).then(value => {
-      if (!controller.signal.aborted) {
-        setError('');
-        if (dirty.current) setSnapshot(previous => previous && { ...previous, signals: value.signals });
-        else adopt(value);
-      }
-    }, cause => { if (!controller.signal.aborted) setError(errorText(cause)); });
-    return () => controller.abort();
-  }, [attempt, locked, onDirty]);
+  const { loading, reload } = useSettingsRead<SettingsSnapshot>('/settings', !locked, true, (value, explicit) => {
+    setError('');
+    if (explicit || !dirty) adopt(value);
+    else setSnapshot(previous => previous && { ...previous, signals: value.signals });
+  }, message => setError(dirty ? t('读取配置失败，已保留表单中的修改。{0}', message) : message));
   useEffect(() => () => {
     onDirty('/settings', false);
     onDirty('/settings/mcp', false);
   }, [onDirty]);
 
   function changed() {
-    dirty.current = true; onDirty('/settings', true); setMessage(''); setError('');
+    setMessage(''); setError('');
   }
-  function change<K extends keyof Config>(key: K, value: Config[K]) {
+  function change<K extends keyof TelemetryConfig>(key: K, value: TelemetryConfig[K]) {
     setConfig(current => current && { ...current, [key]: value }); changed();
   }
 
   async function refreshStatus() {
+    if (refreshing || locked || (!snapshot && loading)) return;
+    if (!snapshot) { void reload(); return; }
     setRefreshing(true);
+    setHealthError('');
     try {
       const next = await api<SettingsSnapshot>('/settings');
-      if (dirty.current) setSnapshot(previous => previous && { ...previous, signals: next.signals });
-      else adopt(next);
-    } catch (cause) { setError(errorText(cause)); }
+      setSnapshot(previous => previous && { ...previous, active: next.active, signals: next.signals });
+    } catch (cause) { setHealthError(errorText(cause)); }
     finally { setRefreshing(false); }
   }
 
   async function save(event: FormEvent) {
     event.preventDefault();
-    if (locked || busy || !config || !snapshot?.file) return;
+    if (locked || busy || loading || !dirty || !config || !snapshot?.file) return;
     setBusy(true); setMessage(''); setError('');
     try {
-      const entries = headers.map(({ name, variable }) => [name.trim().toLowerCase(), variable.trim()]);
-      if (new Set(entries.map(([name]) => name)).size !== entries.length) throw new Error(t('同一个 HTTP 请求头只能配置一次。'));
+      const entries = telemetryHeaderMap(headers);
+      if (entries.size !== headers.length) throw new Error(t('同一个 HTTP 请求头只能配置一次。'));
       const next = await api<SettingsSnapshot>('/settings', {
         method: 'PUT', headers: { 'If-Match': '"' + snapshot.revision + '"' },
         // PUT replaces the document, so preserve server fields this form does not edit.
@@ -123,23 +114,17 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
   }
 
   function reloadConfig() {
-    if (dirty.current && !window.confirm(t('重新加载会放弃本页未保存的修改。继续？'))) return;
-    if (snapshot) adopt(snapshot);
-    setMessage(''); setError(''); reload(value => value + 1);
+    if (locked || busy || loading) return;
+    if (dirty && !window.confirm(t('重新加载会放弃本页未保存的修改。继续？'))) return;
+    setMessage('');
+    void reload();
   }
 
-  const readOnly = !snapshot?.file || locked || busy;
-  const editableTab = tab === 'telemetry';
-  return <main className="workbench">
+  const readOnly = !snapshot?.file || locked || busy || loading;
+  return <main className="workbench framed-workspace runtime-workspace">
     <header className="workspace-header">
       <div className="workspace-title"><h1>{t('运行配置')}</h1></div>
-      <div className="workspace-context">
-        {(dirty.current || mcpDirty) && <span className="dirty"><i />{t('未保存')}</span>}
-        {editableTab && snapshot && <>
-        <button className="button compact" type="button" disabled={busy} onClick={reloadConfig}>{t('重新加载配置')}</button>
-        <button className="button primary compact" type="submit" form="runtime-settings" disabled={readOnly || !dirty.current}>{busy ? t('正在保存…') : t('保存配置')}</button>
-        </>}
-      </div>
+      {(dirty || mcpDirty) && <span className="dirty"><i />{t('未保存')}</span>}
     </header>
     <div className="workspace-tabs settings-tabs" role="tablist" aria-label={t('运行配置分类')}>
       {tabs.map(([key, label, compactLabel], index) => <button key={key} id={tabButton(key)} type="button" role="tab"
@@ -155,11 +140,10 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
           document.getElementById(tabButton(key))?.focus();
         }}><span className="label-full">{label}</span><span className="label-compact">{compactLabel}</span></button>)}
     </div>
-    {(editableTab || tab === 'health') && error && <p ref={errorRef} tabIndex={-1} role="alert" className="notice error settings-feedback">{error}</p>}
-    {editableTab && message && <p role="status" className="notice settings-feedback">{message}</p>}
-    {(!config || !snapshot) && <section {...panel('telemetry')} aria-busy={!error}>
+    {(!config || !snapshot) && <section {...panel('telemetry')} aria-busy={loading}>
       <div className="settings-workspace">
-        {error ? <button className="button" type="button" onClick={reloadConfig}>{t('重试读取配置')}</button> : <p role="status">{t('正在读取配置…')}</p>}
+        {error ? <><p role="alert" className="notice error">{error}</p><button className="button" type="button" disabled={loading} onClick={reloadConfig}>
+          {loading ? t('正在刷新…') : t('重试读取配置')}</button></> : <p role="status">{t('正在读取配置…')}</p>}
       </div>
     </section>}
     {config && snapshot && <form id="runtime-settings" method="post" action="/api/v1/settings" onSubmit={save} onInvalidCapture={event => {
@@ -174,8 +158,8 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
       setError(field.validationMessage);
       requestAnimationFrame(() => field.focus());
     }}>
-      <section {...panel('telemetry')}><div className="settings-workspace">
-        <div className="settings-card">
+      <section {...panel('telemetry')}><div className="settings-workspace telemetry-workspace">
+        <div className="settings-card telemetry-summary">
           <h2 id="telemetry-title">{t('指标、日志与链路')}</h2>
           <div className="settings-status" role="status">
             <span>{t('当前 OTLP ')}<strong>{snapshot.active.enabled ? t('已开启') : t('已关闭')}</strong></span>
@@ -193,6 +177,8 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
               </label>)}
             </div>
           </fieldset>
+        </div>
+        <div className="settings-card telemetry-export">
           <fieldset className="settings-fields" disabled={readOnly}>
             <legend>{t('OpenTelemetry 上报')}</legend>
             <Toggle name="enabled" label={t('启用 OTLP 上报')} checked={config.enabled} change={value => change('enabled', value)} />
@@ -230,15 +216,22 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
           </fieldset>
           </details>
         </div>
+        <div className="telemetry-actions">
+          {error && <p ref={errorRef} tabIndex={-1} role="alert" className="notice error">{error}</p>}
+          {message && <p role="status" className="notice">{message}</p>}
+          <button className="button" type="button" aria-disabled={locked || busy || loading} onClick={reloadConfig}>{loading ? t('正在刷新…') : t('重新加载配置')}</button>
+          <button className="button primary" type="submit" disabled={readOnly || !dirty}>{busy ? t('正在保存…') : t('保存配置')}</button>
+        </div>
       </div></section>
     </form>}
     <section {...panel('health')}>
       <div className="settings-workspace settings-health">
         <ModelHealth models={models} openModel={openModel} />
         <section className="settings-card">
-          <div className="settings-section-title"><h2>{t('上报状态')}</h2><button className="button compact" type="button" disabled={!snapshot || refreshing}
-            onClick={() => void refreshStatus()}><RefreshCw size={14} aria-hidden="true" />{t('刷新状态')}</button></div>
+          <div className="settings-section-title"><h2>{t('上报状态')}</h2><button className="button compact" type="button" aria-disabled={locked || refreshing || (!snapshot && loading)}
+            onClick={() => void refreshStatus()}><RefreshCw size={14} aria-hidden="true" />{refreshing || (!snapshot && loading) ? t('正在刷新…') : t('刷新状态')}</button></div>
           <p className="settings-hint">{t('当前进程的上报记录。失败及拒收自进程启动累计。')}</p>
+          {(healthError || (!snapshot && error)) && <p className="notice error" role="alert">{healthError || error}</p>}
           {snapshot && <dl className="settings-signals" aria-live="polite">
             {snapshot.signals.map(({ name, failures, rejected, last_success_ms }) => <div key={name}>
               <dt>{names[name]}</dt><dd>{snapshot.active.enabled && snapshot.active[name] ? <>

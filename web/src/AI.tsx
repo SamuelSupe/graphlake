@@ -41,7 +41,7 @@ export default function AI({ locked, authEnabled, openServiceSettings }: {
     catch { setCopyError(t('无法访问剪贴板，请选中示例文字手动复制。')); }
   }
 
-  return <main className="workbench">
+  return <main className="workbench framed-workspace ai-workspace">
     <header className="workspace-header"><div className="workspace-title"><h1>AI</h1><span className="settings-hint">{t('Agent 接入指南')}</span></div>
       {access && <div className="workspace-context"><span>{t('当前用户 · {0}', access.owner)}</span></div>}
     </header>

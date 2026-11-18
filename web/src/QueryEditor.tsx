@@ -3,13 +3,22 @@ import { useEffect, useId, useRef } from 'react';
 import { Annotation, Compartment, EditorState } from '@codemirror/state';
 import { EditorView, keymap, lineNumbers, highlightActiveLine } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
-import { bracketMatching, defaultHighlightStyle, StreamLanguage, syntaxHighlighting, syntaxTree } from '@codemirror/language';
+import { bracketMatching, HighlightStyle, StreamLanguage, syntaxHighlighting, syntaxTree } from '@codemirror/language';
 import { autocompletion, completionKeymap, startCompletion, type CompletionContext } from '@codemirror/autocomplete';
+import { tags } from '@lezer/highlight';
 import { sql } from '@codemirror/lang-sql';
 import { cypher } from '@codemirror/legacy-modes/mode/cypher';
 import { groovy } from '@codemirror/legacy-modes/mode/groovy';
 import { keywords, schemaCompletions, type Dialect } from './queryCompletions';
 import type { GraphSchema } from './api';
+
+const queryHighlight = HighlightStyle.define([
+  { tag: [tags.keyword, tags.operatorKeyword, tags.bool, tags.null], color: '#9ac6ff' },
+  { tag: [tags.string, tags.regexp], color: '#a5e8cb' },
+  { tag: [tags.number, tags.atom], color: '#f2cb83' },
+  { tag: [tags.propertyName, tags.typeName, tags.className], color: '#c9ddec' },
+  { tag: tags.comment, color: '#a9b9d3', fontStyle: 'italic' },
+]);
 
 const externalEdit = Annotation.define<boolean>();
 
@@ -26,7 +35,8 @@ export default function QueryEditor({ value, language, schema, change, run }: {
 
   useEffect(() => {
     const editor = new EditorView({ parent: host.current!, state: EditorState.create({ doc: value, extensions: [
-      lineNumbers(), highlightActiveLine(), history(), bracketMatching(), syntaxHighlighting(defaultHighlightStyle),
+      lineNumbers(), highlightActiveLine(), history(), bracketMatching(), syntaxHighlighting(queryHighlight),
+      EditorView.theme({}, { dark: true }),
       EditorView.lineWrapping, EditorState.tabSize.of(2),
       EditorView.contentAttributes.of({ 'aria-labelledby': labelId, 'aria-describedby': hintId, 'aria-multiline': 'true', spellcheck: 'false' }),
       keymap.of([{ key: 'Mod-Enter', run: editor => { if (!editor.composing) callbacks.current.run(); return true; } }, ...completionKeymap, ...defaultKeymap, ...historyKeymap]),

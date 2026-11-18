@@ -2,7 +2,7 @@ import { t } from './locale.ts';
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { ArrowLeft, ShieldCheck } from 'lucide-react';
 import { errorText } from './api';
-import { Mark, Modal } from './ui';
+import { BrandLogo, Modal } from './ui';
 import { LanguageSelect } from './LanguageSelect';
 import RecoveryImport from './RecoveryImport';
 import { recovery, type Gate, type RecoveryPointCheck, type RecoveryStatus, type RestoreStatus } from './recoveryApi';
@@ -128,7 +128,7 @@ export default function RecoveryConsole() {
 
   return <main className="recovery-console">
     <header className="recovery-heading">
-      <span className="brand-mark"><Mark size={23} /></span>
+      <BrandLogo size={40} />
       <div><h1>{restore ? t('灾备恢复') : t('灾备恢复验收')}</h1><p className="muted">{window.location.host}</p></div>
       <LanguageSelect />
       {canCutOver && <a href="/settings" className="button compact"><ArrowLeft size={15} aria-hidden="true" />{t('返回管理后台')}</a>}

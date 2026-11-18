@@ -1,46 +1,54 @@
 .app-shell {
-  --rail-width: 192px;
-  --header-height: 64px;
+  --rail-width: clamp(11.75rem, 14.5vw, 14rem);
+  --header-height: 66px;
   display: grid;
   grid-template-columns: var(--rail-width) minmax(0, 1fr);
   min-height: 100dvh;
 }
 .app-rail {
   position: sticky; top: 0; align-self: start; height: 100dvh; overflow-y: auto; min-inline-size: 0;
-  display: flex; flex-direction: column; color: var(--muted); background: var(--surface); border-inline-end: 1px solid var(--line); z-index: 5;
+  display: flex; flex-direction: column; color: var(--muted); background: #fbfcff; border-inline-end: 1px solid var(--line); z-index: 5;
 }
 .app-rail :is(button, a) { color: inherit; }
 .app-rail :is(button, a):focus-visible { outline-offset: -3px; }
 .rail-brand {
-  display: flex; align-items: center; justify-content: center; gap: 5px; flex: none; width: 100%; height: var(--header-height);
+  display: flex; align-items: center; justify-content: flex-start; padding-inline: 20px; gap: 5px; flex: none; width: 100%; height: var(--header-height);
   background: transparent; border: 0; border-bottom: 1px solid var(--line);
 }
-.rail-brand span { color: #24324b; font-size: 1.0625rem; font-weight: 700; letter-spacing: -.03em; }
-.rail-items { display: grid; gap: 5px; padding: 16px 10px; grid-template-columns: minmax(0, 1fr); }
+.rail-brand span { color: var(--brand-deep); font-size: 1.38rem; font-weight: 680; letter-spacing: -.03em; }
+.rail-items { display: grid; gap: 4px; padding: 16px 12px; grid-template-columns: minmax(0, 1fr); }
 .rail-account { margin-block-start: auto; grid-template-columns: minmax(0, 1fr); border-block-start: 1px solid var(--line); padding-block: 10px; }
 .rail-identity { display: flex; align-items: center; gap: 12px; padding: 6px 14px; }
-.rail-identity > svg { flex: none; }
+.rail-identity > svg { flex: none; inline-size: 30px; block-size: 30px; padding: 7px; border-radius: 50%; background: var(--tint); color: var(--accent-hover); }
 .rail-identity-text { display: grid; grid-template-columns: minmax(0, 1fr); min-inline-size: 0; gap: 2px; font-size: .6875rem; line-height: 1.3; }
-.rail-username { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #24324b; font-size: .8125rem; font-weight: 650; }
+.rail-username { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: .8125rem; font-weight: 650; }
 .rail-link {
   position: relative; display: flex; align-items: center; gap: 10px;
-  min-height: 44px; padding: 10px 12px; border: 0; border-radius: 7px; background: transparent;
+  min-height: 42px; padding: 10px 12px; border: 0; border-radius: 7px; background: transparent;
   color: inherit; text-decoration: none; font-size: .875rem; font-weight: 550; text-align: start;
 }
 .rail-link > svg { flex: none; }
-.rail-link:focus-visible { outline: 2px solid var(--blue); outline-offset: -3px; }
+.rail-link:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
 .rail-link:hover { background: var(--panel); }
-.rail-link[aria-current="page"] { color: var(--blue-dark); background: var(--tint); }
+.rail-link[aria-current="page"] { color: #ffffff; background: var(--accent); font-weight: 650; }
 .rail-link[aria-current="page"]::before {
-  content: ""; position: absolute; width: 3px; height: 19px; top: calc(50% - 9px); left: -10px;
-  background: var(--blue); border-radius: 0 3px 3px 0;
+  content: ""; position: absolute; width: 5px; height: 5px; inset-inline-end: 12px; top: calc(50% - 2px);
+  background: var(--brand-light); border-radius: 50%;
 }
 
 .rail-nav { min-inline-size: 0; }
+.rail-section { margin: 20px 10px 4px; font: 600 .69rem/1.5 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.rail-section:first-child { margin-block-start: 3px; }
+.rail-link[aria-current="page"]:focus-visible { outline-color: var(--brand-light); }
+.rail-account .language-picker { margin-inline: 8px; }
+.rail-account .language-picker select { background-color: transparent; }
+.rail-link svg { stroke-width: 1.65; }
+
 
 @media (min-width: 761px) and (max-width: 1100px) {
   .app-shell { --rail-width: 76px; }
-  .rail-brand span { display: none; }
+  .rail-brand { justify-content: center; padding: 0; }
+  .rail-brand span, .rail-section { display: none; }
   .rail-items { padding: 10px 6px; }
   .rail-identity { justify-content: center; padding-inline: 0; text-align: center; }
   .rail-identity > svg { display: none; }
@@ -48,7 +56,8 @@
     display: grid; justify-items: center; align-content: center; gap: 5px; min-height: 56px;
     padding: 0 3px; font-size: .6875rem; text-align: center; line-height: 1.2;
   }
-  .rail-link[aria-current="page"]::before { left: -6px; }
+  .rail-link[aria-current="page"]::before { inset: 6px 6px auto auto; }
+  .rail-account .language-picker { margin: 0; }
   .rail-account .language-picker select { padding-inline: 4px 16px; background-position: right 2px center; font-size: .6875rem; }
   @supports (appearance: base-select) and selector(::picker(select)) {
     .rail-account .language-picker select { padding-inline-end: 4px; gap: 2px; }
@@ -63,6 +72,8 @@
   }
   .rail-brand { width: fit-content; padding-inline: var(--gutter); border: 0; }
   .rail-nav { grid-row: 2; grid-column: 1 / -1; }
+  .rail-section { display: none; }
+  .rail-menu[popover] .rail-section { display: block; }
   .rail-destinations { display: flex; overflow-x: auto; padding: 4px var(--gutter); }
   .rail-destinations .rail-link { flex: none; white-space: nowrap; }
   .rail-account { grid-row: 1; display: flex; align-items: center; overflow: hidden; border: 0; margin: 0; padding: 4px 8px; }
@@ -71,8 +82,11 @@
     width: 18px; height: 2px; inset: auto auto 1px calc(50% - 9px); border-radius: 2px;
   }
 
-  .app-rail[data-collapsed] .rail-nav { grid-row: 1; grid-column: 2; padding-inline-end: var(--gutter); }
-  .rail-nav > .rail-menu-trigger { gap: 7px; max-inline-size: min(54vw, 14rem); min-block-size: 44px; }
+  .app-rail[data-collapsed] { grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; padding-inline: var(--gutter); }
+  .app-rail[data-collapsed] .rail-brand { padding-inline: 0; }
+  .app-rail[data-collapsed] .rail-brand span { font-size: clamp(1.1rem, 5.5vw, 1.38rem); }
+  .app-rail[data-collapsed] .rail-nav { grid-row: 1; grid-column: 2; justify-self: end; max-inline-size: 100%; }
+  .rail-nav > .rail-menu-trigger { gap: 7px; max-inline-size: 100%; min-block-size: 44px; }
   .rail-menu-trigger > svg { flex: none; }
   .rail-menu-trigger > span { min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; }
   .rail-menu[popover]:popover-open {

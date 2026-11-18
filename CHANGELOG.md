@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.1.4
 
 - Roll large model version histories into immutable pages while preserving published revisions, rollback and backups.
 - Correct multi-start Cypher traversal and binary graph identities. Push eligible ALL and NONE shortest-path predicates into traversal, filter candidate rows before correlated path predicates, and use a set join for eligible unbounded correlated CALLs with broad frontiers, including nested calls. Push down eligible Gremlin loop limits.

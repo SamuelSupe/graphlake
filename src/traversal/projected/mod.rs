@@ -229,11 +229,7 @@ impl Engine {
         strategy: RouteStrategy,
         options: QueryOptions,
     ) -> Result<QueryResult> {
-        ensure!(request.k > 0, "route k must be positive");
-        ensure!(
-            matches!(strategy, RouteStrategy::Auto) || request.k == 1,
-            "selected route strategy requires k=1"
-        );
+        validate_route_count(request.k, strategy)?;
         let labels = Labels::new(&self.catalog, &projection)?;
         let scope = self.scope(options).await?;
         scope
@@ -331,6 +327,15 @@ pub(crate) async fn projection_table(
     buffer.finish(schema, &scope.reads)
 }
 
+fn validate_route_count(k: usize, strategy: RouteStrategy) -> Result<()> {
+    ensure!((1..=100).contains(&k), "route k must be between 1 and 100");
+    ensure!(
+        matches!(strategy, RouteStrategy::Auto) || k == 1,
+        "selected route strategy requires k=1"
+    );
+    Ok(())
+}
+
 pub(crate) async fn route_table(
     catalog: &crate::Catalog,
     projection: &GraphProjection,
@@ -340,11 +345,7 @@ pub(crate) async fn route_table(
     scope: &Arc<QueryScope>,
     explain_only: bool,
 ) -> Result<(Arc<dyn TableProvider>, MemoryReservation)> {
-    ensure!(request.k > 0, "route k must be positive");
-    ensure!(
-        matches!(strategy, RouteStrategy::Auto) || request.k == 1,
-        "selected route strategy requires k=1"
-    );
+    validate_route_count(request.k, strategy)?;
     let labels = Labels::new(catalog, projection)?;
     let schema = Arc::new(Schema::new(vec![
         Field::new("rank", DataType::UInt64, false),

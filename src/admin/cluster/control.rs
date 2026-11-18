@@ -765,8 +765,9 @@ impl Leadership {
             json!({"key":key,"target":"MOD","result":"EQUAL","mod_revision":previous.to_string()}),
         ];
         let mut puts = vec![json!({"request_put":{"key":key,"value":encoded(value)?}})];
-        if let Some((id, value)) = receipt {
+        let receipt_lease = if let Some((id, value)) = receipt {
             let key = self.control.key(&format!("receipts/{id}"));
+            let value = encoded(value)?;
             let lease = self
                 .control
                 .meta
@@ -776,24 +777,42 @@ impl Leadership {
             let lease = lease["ID"].as_str().ok_or_else(unavailable)?;
             compares
                 .push(json!({"key":key,"target":"CREATE","result":"EQUAL","create_revision":"0"}));
-            puts.push(json!({"request_put":{"key":key,"value":encoded(value)?,"lease":lease}}));
+            puts.push(json!({"request_put":{"key":key,"value":value,"lease":lease}}));
+            Some(lease.to_owned())
+        } else {
+            None
+        };
+        if let Err(error) = self.admission() {
+            if let Some(lease) = &receipt_lease {
+                self.control.revoke(lease).await;
+            }
+            return Err(error);
         }
-        self.admission()?;
-        let written = self.control.txn(compares, puts).await.map_err(|error| {
-            if error
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(|e| e.is_connect())
+        let written = match self.control.txn(compares, puts).await {
+            Ok(written) => written,
+            Err(error)
+                if error
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|e| e.is_connect()) =>
             {
-                unavailable()
-            } else {
-                Error::new(
+                if let Some(lease) = &receipt_lease {
+                    self.control.revoke(lease).await;
+                }
+                return Err(unavailable());
+            }
+            // An ambiguous write may have attached the receipt to the lease.
+            Err(_) => {
+                return Err(Error::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     MUTATION_UNKNOWN,
                     "集群写入结果未知，请使用同一请求标识查询或重试",
-                )
+                ));
             }
-        })?;
+        };
         if written.is_none() {
+            if let Some(lease) = &receipt_lease {
+                self.control.revoke(lease).await;
+            }
             self.confirm().await?;
         }
         Ok(written)

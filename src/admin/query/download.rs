@@ -1,4 +1,7 @@
-use std::io::{BufWriter, Seek, Write};
+use std::{
+    collections::VecDeque,
+    io::{BufWriter, Seek, Write},
+};
 
 use axum::{body::Body, http::header};
 use tokio::sync::OwnedSemaphorePermit;
@@ -21,7 +24,7 @@ pub(in crate::admin) struct ResultSnapshot {
     model: String,
     revision: String,
     owner: Principal,
-    arrow: Option<Captured>,
+    arrow: Option<Arc<Captured>>,
     length: u64,
     created: std::time::Instant,
     graph: Option<(Vec<Arc<graph::Fragment>>, bool)>,
@@ -64,8 +67,10 @@ enum CaptureSink {
 
 impl Capture {
     pub(super) fn new(schema: &crate::arrow::datatypes::Schema, budget: u64) -> ApiResult<Self> {
-        let file = tempfile::NamedTempFile::new().map_err(|_| write_error())?;
-        Self::open(schema, budget, CaptureSink::File(BufWriter::new(file)))
+        crate::blocking(|| {
+            let file = tempfile::NamedTempFile::new().map_err(|_| write_error())?;
+            Self::open(schema, budget, CaptureSink::File(BufWriter::new(file)))
+        })
     }
 
     pub(super) fn preview(schema: &crate::arrow::datatypes::Schema) -> ApiResult<Self> {
@@ -120,15 +125,15 @@ pub(super) fn save_snapshot(
         model,
         revision,
         owner,
-        arrow,
+        arrow: arrow.map(Arc::new),
         length,
         created: std::time::Instant::now(),
         graph: graph
             .map(|(pages, incomplete)| (pages.into_iter().map(Arc::new).collect(), incomplete)),
     };
     let mut results = app.results.lock().unwrap();
-    results.retain(|saved| saved.created.elapsed() < SNAPSHOT_TTL);
-    let first_owned = |results: &std::collections::VecDeque<ResultSnapshot>| {
+    let mut removed = expired_snapshots(&mut results);
+    let first_owned = |results: &VecDeque<ResultSnapshot>| {
         results
             .iter()
             .position(|saved| saved.owner == snapshot.owner)
@@ -140,16 +145,30 @@ pub(super) fn save_snapshot(
         >= SNAPSHOTS_PER_OWNER
     {
         if let Some(index) = first_owned(&results) {
-            results.remove(index);
+            removed.extend(results.remove(index).and_then(|saved| saved.arrow));
         }
     }
     while results.len() >= SNAPSHOTS_TOTAL
         || snapshot.length + results.iter().map(|saved| saved.length).sum::<u64>() > SNAPSHOT_BUDGET
     {
         let index = first_owned(&results).unwrap_or(0);
-        results.remove(index);
+        removed.extend(results.remove(index).and_then(|saved| saved.arrow));
     }
     results.push_back(snapshot);
+    drop(results);
+    crate::blocking(|| drop(removed));
+}
+
+fn expired_snapshots(results: &mut VecDeque<ResultSnapshot>) -> Vec<Arc<Captured>> {
+    let mut removed = Vec::new();
+    results.retain(|saved| {
+        if saved.created.elapsed() < SNAPSHOT_TTL {
+            return true;
+        }
+        removed.extend(saved.arrow.iter().cloned());
+        false
+    });
+    removed
 }
 
 pub(in crate::admin) async fn expire_results(app: std::sync::Weak<App>) {
@@ -159,14 +178,14 @@ pub(in crate::admin) async fn expire_results(app: std::sync::Weak<App>) {
         if app.shutdown.is_cancelled() {
             return;
         }
-        app.results
-            .lock()
-            .unwrap()
-            .retain(|saved| saved.created.elapsed() < SNAPSHOT_TTL);
-        app.downloads
-            .lock()
-            .unwrap()
-            .retain(|download| download.created.elapsed() < TICKET_TTL);
+        crate::blocking(|| {
+            let removed = expired_snapshots(&mut app.results.lock().unwrap());
+            drop(removed);
+            app.downloads
+                .lock()
+                .unwrap()
+                .retain(|download| download.created.elapsed() < TICKET_TTL);
+        });
     }
 }
 
@@ -181,15 +200,15 @@ pub(in crate::admin) async fn snapshot(
             .arrow(&app, &principal, Some(&model), id, method)
             .await;
     }
-    let (file, length, revision) = {
-        let mut results = app.results.lock().unwrap();
-        results.retain(|saved| saved.created.elapsed() < SNAPSHOT_TTL);
+    let (captured, length, revision) = {
+        let results = app.results.lock().unwrap();
         let saved = results
             .iter()
             .find(|saved| {
                 saved.id == id
                     && saved.model == model
                     && saved.arrow.is_some()
+                    && saved.created.elapsed() < SNAPSHOT_TTL
                     && access::owns_query(&principal, &saved.owner)
             })
             .ok_or_else(|| {
@@ -200,15 +219,23 @@ pub(in crate::admin) async fn snapshot(
                 )
             })?;
         (
-            saved.arrow.as_ref().expect("Arrow result").body()?,
+            if method == axum::http::Method::HEAD {
+                None
+            } else {
+                saved.arrow.clone()
+            },
             saved.length,
             saved.revision.clone(),
         )
     };
-    let permit = if method == axum::http::Method::HEAD {
-        None
+    let (file, permit) = if let Some(captured) = captured {
+        let permit = download_slot(&app, &principal).await?;
+        let file = tokio::task::spawn_blocking(move || captured.body())
+            .await
+            .map_err(|_| write_error())??;
+        (Some(file), Some(permit))
     } else {
-        Some(download_slot(&app, &principal).await?)
+        (None, None)
     };
     Ok(attachment(
         file,
@@ -367,7 +394,7 @@ pub(in crate::admin) async fn download(
         downloads.remove(index).expect("matching download")
     };
     let mut response = attachment(
-        DownloadSource::File(download.file),
+        Some(DownloadSource::File(download.file)),
         download.length,
         download.filename,
         download.model_revision,
@@ -448,20 +475,21 @@ enum DownloadSource {
 }
 
 fn attachment(
-    source: DownloadSource,
+    source: Option<DownloadSource>,
     length: u64,
     filename: String,
     revision: String,
     permit: Option<DownloadPermit>,
 ) -> Response {
     let body = match source {
-        DownloadSource::Memory(bytes) => download_body(
+        Some(DownloadSource::Memory(bytes)) => download_body(
             futures::stream::once(async move { Ok::<_, std::io::Error>(bytes) }),
             permit,
         ),
-        DownloadSource::File(file) => {
+        Some(DownloadSource::File(file)) => {
             download_body(ReaderStream::new(tokio::fs::File::from_std(file)), permit)
         }
+        None => Body::empty(),
     };
     (
         [

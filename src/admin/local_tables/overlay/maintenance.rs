@@ -22,6 +22,7 @@ const TARGET_PART_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) fn reclaim(
     anchor: &Path,
+    anchor_part: Option<Uuid>,
     key: Option<&str>,
     base: &mut Vec<Part>,
     mut deleted: usize,
@@ -39,14 +40,17 @@ pub(super) fn reclaim(
             .enumerate()
             .filter(|(_, p)| !p.deleted.is_empty())
         {
-            let size = part.path(anchor).metadata()?.len();
+            let size = part_file(anchor, anchor_part, part, staged)?
+                .metadata()?
+                .len();
             if size > TARGET_PART_BYTES * 2 && largest.is_none_or(|(_, previous)| size > previous) {
                 largest = Some((index, size));
             }
         }
         if let Some((index, size)) = largest {
             let count = available.min(size.div_ceil(TARGET_PART_BYTES) as usize);
-            let Some(parts) = split(anchor, key, &base[index], count, staged, scope)? else {
+            let Some(parts) = split(anchor, anchor_part, key, &base[index], count, staged, scope)?
+            else {
                 return Ok(false);
             };
             base.splice(index..=index, parts);
@@ -59,7 +63,9 @@ pub(super) fn reclaim(
         .enumerate()
         .filter(|(_, p)| !p.deleted.is_empty())
     {
-        let size = part_file(anchor, part, staged)?.metadata()?.len();
+        let size = part_file(anchor, anchor_part, part, staged)?
+            .metadata()?
+            .len();
         candidates.push((index, part.deleted.len() as u128, size as u128));
     }
     candidates.sort_by(|a, b| (b.1 * a.2).cmp(&(a.1 * b.2)).then_with(|| a.2.cmp(&b.2)));
@@ -69,7 +75,7 @@ pub(super) fn reclaim(
         }
         scope.check()?;
         let part = &mut base[index];
-        let file = part_file(anchor, part, staged)?;
+        let file = part_file(anchor, anchor_part, part, staged)?;
         let output = staging_file(root)?;
         let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?
             .with_batch_size(scope.options.batch_size);
@@ -115,13 +121,14 @@ pub(super) fn reclaim(
 
 fn split(
     anchor: &Path,
+    anchor_part: Option<Uuid>,
     key: Option<&str>,
     part: &Part,
     count: usize,
     staged: &mut Vec<(Uuid, NamedTempFile)>,
     scope: &QueryScope,
 ) -> Result<Option<Vec<Part>>> {
-    let file = File::open(part.path(anchor))?;
+    let file = part_file(anchor, anchor_part, part, staged)?;
     let meta = ArrowReaderMetadata::load(
         &file,
         ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
@@ -167,11 +174,13 @@ fn split(
 
 fn part_file(
     anchor: &Path,
+    anchor_part: Option<Uuid>,
     part: &Part,
     staged: &[(Uuid, NamedTempFile)],
 ) -> std::io::Result<File> {
     match staged.iter().find(|(id, _)| *id == part.id) {
         Some((_, file)) => file.reopen(),
+        None if anchor_part == Some(part.id) => File::open(anchor),
         None => File::open(part.path(anchor)),
     }
 }

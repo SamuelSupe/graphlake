@@ -106,6 +106,7 @@ pub(super) struct Models {
     snapshot: Option<Arc<tempfile::TempDir>>,
     checks: BTreeMap<String, (String, Status)>,
     engines: Arc<Mutex<VecDeque<CachedEngine>>>,
+    activations: Arc<Mutex<VecDeque<(String, ArchiveStamp, Option<String>)>>>,
 }
 
 struct CachedEngine {
@@ -156,6 +157,7 @@ impl Models {
             snapshot: None,
             checks: BTreeMap::new(),
             engines: Default::default(),
+            activations: Default::default(),
         }
     }
 
@@ -378,7 +380,42 @@ impl Models {
     }
 
     pub(super) fn active_revision(&self, id: &str) -> ApiResult<Option<String>> {
-        Ok(self.version_state(id)?.and_then(|state| state.active))
+        Ok(self.activation(id)?.flatten())
+    }
+
+    fn activation(&self, id: &str) -> ApiResult<Option<Option<String>>> {
+        let path = self.state_path(id)?;
+        let stamp = || {
+            metadata(&path)
+                .ok()
+                .flatten()
+                .as_ref()
+                .and_then(ArchiveStamp::new)
+        };
+        let before = stamp();
+        if let Some(stamp) = &before {
+            let mut activations = self.activations.lock().unwrap();
+            if let Some(index) = activations
+                .iter()
+                .position(|(model, cached, _)| model == id && cached == stamp)
+            {
+                let cached = activations.remove(index).expect("cached model activation");
+                let active = cached.2.clone();
+                activations.push_front(cached);
+                return Ok(Some(active));
+            }
+        }
+        let active = self.version_state(id)?.map(|state| state.active);
+        if let Some(active) = &active
+            && let Some(before) = before
+            && stamp().as_ref() == Some(&before)
+        {
+            let mut activations = self.activations.lock().unwrap();
+            activations.retain(|(model, _, _)| model != id);
+            activations.push_front((id.to_owned(), before, active.clone()));
+            activations.truncate(64);
+        }
+        Ok(active)
     }
 
     pub(super) fn has_driver_model(&self, id: &str) -> ApiResult<bool> {
@@ -484,7 +521,7 @@ impl Models {
             match self.version_state(id)? {
                 Some(state) if state.active.is_some() => return Err(exists()),
                 Some(_) => {}
-                None => self.write_state(id, &versions::VersionState::default())?,
+                None => self.write_state(id, versions::VersionState::default())?,
             }
             if let Err(error) = atomic_write(&path, yaml.as_bytes(), true) {
                 if metadata(&path)?.is_none() {
@@ -513,6 +550,7 @@ impl Models {
             snapshot: self.snapshot.clone(),
             checks: self.checks.clone(),
             engines: Arc::clone(&self.engines),
+            activations: Arc::clone(&self.activations),
         }
     }
 
@@ -524,10 +562,10 @@ impl Models {
         principal: &Principal,
     ) -> ApiResult<(String, String, Engine)> {
         let path = self.path(id)?;
-        let active = match self.version_state(id)? {
-            Some(state) => {
+        let active = match self.activation(id)? {
+            Some(active) => {
                 metadata(&path)?.ok_or_else(Error::not_found)?;
-                let active = state.active.ok_or_else(unpublished)?;
+                let active = active.ok_or_else(unpublished)?;
                 if expected.is_some_and(|expected| active != expected) {
                     return Err(versions::active_conflict());
                 }
@@ -639,17 +677,20 @@ impl Models {
 
 impl App {
     pub(super) async fn read_models<T: Send + 'static>(
-        &self,
+        self: &Arc<Self>,
         read: impl FnOnce(Models) -> ApiResult<T> + Send + 'static,
     ) -> ApiResult<T> {
-        let files = self.models.lock().unwrap().read_files();
-        tokio::task::spawn_blocking(move || read(files))
-            .await
-            .map_err(|_| Error::storage())?
+        let app = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let files = app.models.lock().unwrap().read_files();
+            read(files)
+        })
+        .await
+        .map_err(|_| Error::storage())?
     }
 
     pub(super) async fn published_model_revision(&self, id: &str) -> ApiResult<String> {
-        let files = self.models.lock().unwrap().read_files();
+        let files = crate::blocking(|| self.models.lock().unwrap().read_files());
         let admission = self.admission.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -882,15 +923,17 @@ pub(super) async fn create(
         .await;
     }
     let _policy = app.users.writes.lock().await;
-    let mut models = app.models.lock().unwrap();
-    models.check_create_input(
-        &app,
-        &draft.id,
-        &draft.yaml,
-        draft.template_model.as_deref(),
-        &principal,
-    )?;
-    let model = models.save(&draft.id, draft.yaml, None)?;
+    let model = crate::blocking(|| {
+        let mut models = app.models.lock().unwrap();
+        models.check_create_input(
+            &app,
+            &draft.id,
+            &draft.yaml,
+            draft.template_model.as_deref(),
+            &principal,
+        )?;
+        models.save(&draft.id, draft.yaml, None)
+    })?;
     let audited_model = super::access::AuditModel(model.id.clone());
     Ok((
         StatusCode::CREATED,
@@ -933,9 +976,12 @@ pub(super) async fn update(
     }
     let _policy = app.users.writes.lock().await;
     super::users::check(&app, &principal, &id, super::users::Role::Modeler)?;
-    let mut models = app.models.lock().unwrap();
-    models.check_modeler_input(&id, &edit.yaml, &principal)?;
-    Ok(model_response(models.save(&id, edit.yaml, Some(expected))?).into_response())
+    let model = crate::blocking(|| {
+        let mut models = app.models.lock().unwrap();
+        models.check_modeler_input(&id, &edit.yaml, &principal)?;
+        models.save(&id, edit.yaml, Some(expected))
+    })?;
+    Ok(model_response(model).into_response())
 }
 
 pub(super) async fn validate(

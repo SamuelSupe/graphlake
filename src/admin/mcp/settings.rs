@@ -114,6 +114,6 @@ pub(in crate::admin) async fn access(
     effective.query &= effective.enabled && account_allowed;
     effective.modeling &= effective.enabled && account_allowed;
     effective.publish &= effective.modeling;
-    value["scope"] = super::tools::scope(&app, &principal, &effective)?;
+    value["scope"] = super::tools::scope(&app, &principal, &effective).await?;
     Ok(Json(value))
 }

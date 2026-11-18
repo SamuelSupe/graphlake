@@ -385,6 +385,10 @@ impl<'a> MatchPlan<'a> {
     }
 
     fn join_expressions(&self, from: &str) -> String {
+        self.join_expressions_filtered(from, "")
+    }
+
+    fn join_expressions_filtered(&self, from: &str, seed_where: &str) -> String {
         let mut joins = self.expression_joins.borrow_mut();
         let from = if from.is_empty() && !joins.is_empty() {
             " FROM (SELECT 1) AS __graphlake_expression_input"
@@ -400,8 +404,10 @@ impl<'a> MatchPlan<'a> {
                     .iter()
                     .any(|(_, value)| value.contains(&alias))
             });
+            let seed_from = if depends_on_join { &result } else { from };
             let sql = joins[index].sql(
-                if depends_on_join { &result } else { from },
+                seed_from,
+                seed_where,
                 &mut self.expression_calls.borrow_mut(),
             );
             result.push_str(&sql);
@@ -810,6 +816,7 @@ impl<'a> MatchPlan<'a> {
                 let mut sql = "CASE".to_owned();
                 let operand = operand.as_deref().map(render).transpose()?;
                 let count = whens.len() + usize::from(default.is_some());
+                check_case_width(count)?;
                 let target = clauses::Value::inferred(self, expression, aliases);
                 let render_value = |value: &Expr| -> Result<String> {
                     Ok(self.shape_value(value, aliases, &target, render(value)?))
@@ -823,19 +830,15 @@ impl<'a> MatchPlan<'a> {
                         test
                     };
                     values.push(render_value(value)?);
-                    sql.push_str(&format!(
-                        " WHEN {test} THEN {}",
-                        variant_arm(count, index, &values[index])
-                    ));
+                    append_expression(&mut sql, format_args!(" WHEN {test} THEN "))?;
+                    variant_arm(&mut sql, count, index, &values[index])?;
                 }
                 if let Some(default) = default {
                     values.push(render_value(default)?);
-                    sql.push_str(&format!(
-                        " ELSE {}",
-                        variant_arm(count, whens.len(), &values[whens.len()])
-                    ));
+                    append_expression(&mut sql, format_args!(" ELSE "))?;
+                    variant_arm(&mut sql, count, whens.len(), &values[whens.len()])?;
                 }
-                Ok(typed_case(&sql, &values))
+                typed_case(&sql, &values)
             }
             ExprKind::HasLabels { base, labels } => {
                 let binding = self
@@ -1299,23 +1302,27 @@ impl<'a> MatchPlan<'a> {
                     return Ok(format!("arrow_cast({count}, 'UInt64')"));
                 }
                 if function == "coalesce" && !distinct && !args.is_empty() {
+                    check_case_width(args.len())?;
                     let mut sql = "CASE".to_owned();
                     let target = clauses::Value::inferred(self, expression, aliases);
                     let mut values = Vec::with_capacity(args.len());
                     for (index, arg) in args.iter().enumerate() {
                         let value = self.shape_value(arg, aliases, &target, render(arg)?);
-                        let arm = variant_arm(args.len(), index, &value);
                         if index + 1 == args.len() {
                             if index == 0 {
                                 return Ok(value);
                             }
-                            sql.push_str(&format!(" ELSE {arm}"));
+                            append_expression(&mut sql, format_args!(" ELSE "))?;
                         } else {
-                            sql.push_str(&format!(" WHEN {value} IS NOT NULL THEN {arm}"));
+                            append_expression(
+                                &mut sql,
+                                format_args!(" WHEN {value} IS NOT NULL THEN "),
+                            )?;
                         }
+                        variant_arm(&mut sql, args.len(), index, &value)?;
                         values.push(value);
                     }
-                    return Ok(typed_case(&sql, &values));
+                    return typed_case(&sql, &values);
                 }
                 ensure!(
                     matches!(
@@ -1949,26 +1956,57 @@ pub(crate) fn extremum(value: &str, key: &str, maximum: bool) -> String {
     format!("first_value({value} ORDER BY {key} {direction}) FILTER (WHERE {value} IS NOT NULL)")
 }
 
-fn typed_case(sql: &str, values: &[String]) -> String {
-    // CASE simplification can remove inactive branches before a surrounding
-    // lambda is planned. Keep their types in a record of typed nulls.
-    let types = values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| format!("'branch_{index}', CASE WHEN FALSE THEN {value} END"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("__graphlake_cypher_case({sql} END, named_struct({types}))")
+fn check_case_width(count: usize) -> Result<()> {
+    // Every arm emits all variant fields, including the inactive ones.
+    ensure!(
+        count.saturating_mul(count).saturating_mul(16) <= MAX_EXPRESSION_SQL_BYTES,
+        "Cypher expression exceeds the generated SQL size limit"
+    );
+    Ok(())
 }
 
-fn variant_arm(count: usize, chosen: usize, value: &str) -> String {
-    let fields = (0..count)
-        .map(|index| {
-            let slot = if index == chosen { value } else { "NULL" };
-            format!("'branch_{index}', {slot}")
-        })
-        .collect::<Vec<_>>();
-    format!("named_struct({})", fields.join(", "))
+fn append_expression(sql: &mut String, args: std::fmt::Arguments<'_>) -> Result<()> {
+    struct Bounded<'a>(&'a mut String);
+    impl std::fmt::Write for Bounded<'_> {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            if value.len() > MAX_EXPRESSION_SQL_BYTES - self.0.len() {
+                return Err(std::fmt::Error);
+            }
+            self.0.push_str(value);
+            Ok(())
+        }
+    }
+    std::fmt::write(&mut Bounded(sql), args)
+        .map_err(|_| anyhow::anyhow!("Cypher expression exceeds the generated SQL size limit"))
+}
+
+fn typed_case(case: &str, values: &[String]) -> Result<String> {
+    // CASE simplification can remove inactive branches before a surrounding
+    // lambda is planned. Keep their types in a record of typed nulls.
+    let mut sql = String::new();
+    append_expression(
+        &mut sql,
+        format_args!("__graphlake_cypher_case({case} END, named_struct("),
+    )?;
+    for (index, value) in values.iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        append_expression(
+            &mut sql,
+            format_args!("{separator}'branch_{index}', CASE WHEN FALSE THEN {value} END"),
+        )?;
+    }
+    append_expression(&mut sql, format_args!("))"))?;
+    Ok(sql)
+}
+
+fn variant_arm(sql: &mut String, count: usize, chosen: usize, value: &str) -> Result<()> {
+    append_expression(sql, format_args!("named_struct("))?;
+    for index in 0..count {
+        let separator = if index == 0 { "" } else { ", " };
+        let slot = if index == chosen { value } else { "NULL" };
+        append_expression(sql, format_args!("{separator}'branch_{index}', {slot}"))?;
+    }
+    append_expression(sql, format_args!(")"))
 }
 
 fn cypher_compare(left: &str, operator: &str, right: &str) -> String {
@@ -2012,7 +2050,6 @@ fn start_terms(
             .map(|value| cypher_compare(&field, "=", value))
             .collect::<Vec<_>>();
         terms.push(disjoin(&values));
-        bound_keys.insert(key.0.clone());
         return;
     }
     let ExprKind::Comparison { first, rest } = &expression.kind else {

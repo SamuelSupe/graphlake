@@ -187,7 +187,7 @@ pub(crate) async fn open(
     let store = storage.map(super::storage::open).transpose()?;
     // Keep metadata probes small. Streaming remote files can amortize the
     // range requests, within the decoder's memory budget.
-    let range_size = if store.is_some() && mode != ReadMode::Probe {
+    let range_size = if mode != ReadMode::Probe {
         match pool.memory_limit() {
             MemoryLimit::Finite(limit) => (limit / 16).clamp(64 * 1024, 1024 * 1024) as u64,
             _ => 1024 * 1024,

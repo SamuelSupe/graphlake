@@ -525,10 +525,9 @@ impl Auth {
                 return None;
             }
             let session = &sessions.tokens[&token];
-            let update = self.shared.is_some()
-                && touch
-                && now.duration_since(session.last_used).unwrap_or_default()
-                    >= Duration::from_secs(5);
+            let idle_age = now.duration_since(session.last_used).unwrap_or_default();
+            let update = (self.shared.is_some() && touch && idle_age >= Duration::from_secs(5))
+                .then_some(idle_age >= IDLE - Duration::from_secs(60));
             (session.principal.clone(), update)
         };
         if let Principal::User { name, .. } = &principal {
@@ -538,9 +537,13 @@ impl Auth {
                 return None;
             }
         }
-        if update {
+        if let Some(wait) = update {
             let auth = self.clone();
-            match tokio::spawn(async move { auth.apply(SessionChange::Touch(token)).await }).await {
+            match tokio::spawn(
+                async move { auth.apply(SessionChange::Touch { token, wait }).await },
+            )
+            .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(error))
                     if error.status.is_server_error()
@@ -624,8 +627,18 @@ impl Auth {
 
     async fn apply(&self, change: SessionChange) -> super::ApiResult<()> {
         if let Some(shared) = &self.shared {
-            let touch = matches!(change, SessionChange::Touch(_));
-            let mut revision = shared.revision.lock().await;
+            let touch = matches!(change, SessionChange::Touch { .. });
+            let mut revision = if matches!(change, SessionChange::Touch { wait: false, .. }) {
+                // A future request can refresh the timestamp before idle expiry.
+                // Under contention, keep the write lock available for login and logout.
+                match shared.revision.try_lock() {
+                    Ok(revision) => revision,
+                    Err(_) if !shared.write_uncertain.load(Ordering::Acquire) => return Ok(()),
+                    Err(_) => return Err(super::cluster::control::unavailable()),
+                }
+            } else {
+                shared.revision.lock().await
+            };
             let previous = if let Some(previous) = *revision {
                 previous
             } else {
@@ -691,14 +704,14 @@ impl Auth {
 }
 
 enum SessionChange {
-    Touch(Token),
+    Touch { token: Token, wait: bool },
     Replace(Option<Token>, Option<(Token, Principal)>),
 }
 
 impl SessionChange {
     fn apply(self, sessions: &mut Sessions) -> super::ApiResult<bool> {
         match self {
-            Self::Touch(token) => {
+            Self::Touch { token, .. } => {
                 let now = SystemTime::now();
                 if !sessions.check(token, now, false) {
                     return Err(Error::new(

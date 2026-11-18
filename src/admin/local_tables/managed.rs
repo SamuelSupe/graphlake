@@ -3,7 +3,7 @@ mod files;
 mod gc;
 mod metadata;
 mod sync;
-pub(super) use sync::WorkspaceVersion;
+pub(super) use sync::{ScheduleCache, WorkspaceVersion};
 
 use std::{
     collections::{BTreeMap, BTreeSet},

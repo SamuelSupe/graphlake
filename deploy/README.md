@@ -6,14 +6,14 @@
 
 ## 构建与安装
 
-Linux 安装包以 Debian 12（glibc 2.36）为兼容基线，提供 ARM64 和 x86_64 两种架构。构建时在 Debian 12 安装 Rust、C/C++ 工具链、LLD 和 Node.js 24，在仓库根目录运行 `RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.3 dist`。输出文件名包含发行标签、源归档 SHA-256 的前 12 位和架构。可设置 `GRAPHLAKE_BUILD_TARGET` 指定 `aarch64-unknown-linux-gnu` 或 `x86_64-unknown-linux-gnu`，交叉构建使用对应 Rust 目标和 Debian 12 的目标链接器及系统库。可用 `GRAPHLAKE_WEB_DIST` 复用同一份前端产物。打包会拒绝要求高于 glibc 2.36 的二进制。
+Linux 安装包以 Debian 12（glibc 2.36）为兼容基线，提供 ARM64 和 x86_64 两种架构。构建时在 Debian 12 安装 Rust、C/C++ 工具链、LLD 和 Node.js 24，在仓库根目录运行 `RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.4 dist`。输出文件名包含发行标签、源归档 SHA-256 的前 12 位和架构。可设置 `GRAPHLAKE_BUILD_TARGET` 指定 `aarch64-unknown-linux-gnu` 或 `x86_64-unknown-linux-gnu`，交叉构建使用对应 Rust 目标和 Debian 12 的目标链接器及系统库。可用 `GRAPHLAKE_WEB_DIST` 复用同一份前端产物。打包会拒绝要求高于 glibc 2.36 的二进制。
 
 包内含两个 Rust 可执行文件、构建后的网页、systemd 单元和 `BUILD-INFO`。构建信息记录基础提交、完整工作树源归档的摘要、目标、打包环境的工具链以及产物哈希。两个二进制的 `--version` 与 HTTP `/healthz` 的 `build` 字段带同一个构建标识。带未提交改动的构建也会附上对应源码归档。复用 `GRAPHLAKE_BIN_DIR` 时，打包会校验二进制的目标架构和构建标识，并在 `binary_origin` 标记为 `prebuilt`。
 
 在目标机执行以下命令。已有 `graphlake` 系统用户时跳过 `useradd`。`dist` 中的包应先通过受信任渠道传输，校验文件用于检查传输完整性。
 
 ```sh
-release=v1.1.3-SOURCE_SHA12
+release=v1.1.4-SOURCE_SHA12
 artifact=graphlake-$release-linux-$(uname -m)
 sha256sum -c "$artifact.tar.gz.sha256"
 sudo useradd --system --user-group --home-dir /var/lib/graphlake --shell /usr/sbin/nologin graphlake
@@ -106,7 +106,7 @@ finally:
 
 Bolt 5.1–5.4 支持直连、自动提交、显式只读事务和托管只读事务。事务固定开始时的发布版本。首次读取时为每个 PostgreSQL 来源建立可重复读快照，并记录使用的 Parquet 对象版本。事务内重新读取已替换的 Parquet 会失败。显式事务支持 PostgreSQL 和 Parquet，其他连接器继续使用自动提交。事务超时和连接空闲超时限制快照保留时间。Bolt 的 NOOP 不延长等待 PULL 的时限。显式事务按 PULL 流式读取。客户端保留未消费的结果并再次发出 RUN 时，服务会先将旧结果的剩余记录溢写到临时文件，每个并存结果最多 64 MiB。Gremlin 支持 WebSocket、SASL PLAIN、GraphSON 3、GraphBinary 1.0，以及两种编码下受支持的只读脚本和字节码。使用 `gremlinpython` 时可选 `GraphBinarySerializersV1()`。
 
-Bolt 按 `PULL` 传输结果，Gremlin 以状态 206 传输中间批次，每批最多 128 条、约 2 MiB。单条记录保留编码预算。两种驱动返回原生节点、边和路径，定点小数及超出有符号 64 位的整数使用字符串。Gremlin 路径的步骤标签和标量保真以当前遍历引擎的路径表示为限。任意 Groovy、字节码策略、动态脚本绑定和 Bolt 集群路由仍超出当前范围。Bolt 和 Gremlin 在完成时返回 `model_revision`。
+Bolt 按 `PULL` 传输结果，Gremlin 以状态 206 传输中间批次，每批最多 128 条、约 2 MiB。单条驱动记录的编码预算为 1 MiB。Bolt 为并发结果暂存每个结果最多 64 MiB，单进程共享 1 GiB 暂存预算。两种驱动返回原生节点、边和路径，定点小数及超出有符号 64 位的整数使用字符串。图元素标识中的二进制业务键使用小写十六进制表示。Gremlin 路径的步骤标签和标量保真以当前遍历引擎的路径表示为限。任意 Groovy、字节码策略、动态脚本绑定和 Bolt 集群路由仍超出当前范围。Bolt 和 Gremlin 在完成时返回 `model_revision`。
 
 单机操作审计追加到 `.graphlake-auth/audit.jsonl`，未认证事件追加到 `.graphlake-auth/audit-anonymous.jsonl`。两个日志分别在约 32 MiB 轮转并各保留一个 `.previous`，长期留存可采集这两组文件。HA 操作审计输出到服务日志。每行记录时间、主体、协议、操作、模型和状态，省略令牌、查询文本、参数与结果内容。部署时可由宿主机收集日志，备份包含该目录。
 

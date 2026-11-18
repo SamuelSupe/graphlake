@@ -116,6 +116,7 @@ impl Remote {
         let mut candidates = BTreeMap::from([(encoded, start)]);
         let mut node_batches = Vec::new();
         let mut edge_batches = Vec::new();
+        let mut edge_rows = 0usize;
         for depth in 0..=request.max_hops {
             let mut frontier = Vec::new();
             let entries = candidates.into_iter().collect::<Vec<_>>();
@@ -152,12 +153,15 @@ impl Remote {
                     retain(batch, selected, &budget, &mut node_batches)?;
                 }
             }
-            if frontier.is_empty() {
-                break;
-            }
-            if self.scan_after.is_some_and(|limit| frontier.len() >= limit) {
+            if self
+                .scan_after
+                .is_some_and(|limit| seen.len() >= limit || edge_rows >= limit)
+            {
                 self.stats.frontier_scan_fallback();
                 return Ok(None);
+            }
+            if frontier.is_empty() {
+                break;
             }
             candidates = BTreeMap::new();
             for chunk in frontier.chunks(batch_size(self.key.len())) {
@@ -174,6 +178,11 @@ impl Remote {
                     Arc::clone(&context),
                 )?;
                 while let Some(batch) = rows.try_next().await? {
+                    edge_rows = edge_rows.saturating_add(batch.num_rows());
+                    if self.scan_after.is_some_and(|limit| edge_rows >= limit) {
+                        self.stats.frontier_scan_fallback();
+                        return Ok(None);
+                    }
                     let width = self.key.len();
                     let selected = discover(
                         &batch,

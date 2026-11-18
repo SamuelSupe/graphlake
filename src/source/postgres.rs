@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -48,18 +48,51 @@ pub(crate) struct Snapshot {
     driver: JoinHandle<()>,
     tls: MakeRustlsConnect,
     next_cursor: AtomicU64,
+    interrupted: AtomicBool,
     stats: Arc<ReadStats>,
     pub(crate) version: String,
     #[cfg(feature = "admin")]
     pub(crate) exploration_snapshot: Option<String>,
 }
 
+struct ActiveRequest<'a> {
+    interrupted: &'a AtomicBool,
+    active: bool,
+}
+
+impl ActiveRequest<'_> {
+    fn finish(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ActiveRequest<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.interrupted.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Snapshot {
+    fn active_request(&self) -> ActiveRequest<'_> {
+        ActiveRequest {
+            interrupted: &self.interrupted,
+            active: true,
+        }
+    }
+
+    async fn request<F: std::future::Future>(&self, future: F) -> F::Output {
+        let mut request = self.active_request();
+        let output = future.await;
+        request.finish();
+        output
+    }
+
     #[cfg(feature = "admin")]
     pub(crate) async fn recovery_target_empty(&self) -> Result<bool> {
         Ok(self
-            .client
-            .query_one(
+            .request(self.client.query_one(
                 "SELECT NOT EXISTS (
                 SELECT 1 FROM pg_namespace
                 WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN ('public', 'information_schema')
@@ -76,7 +109,7 @@ impl Snapshot {
                 SELECT 1 FROM pg_foreign_server
             )",
                 &[],
-            )
+            ))
             .await?
             .try_get(0)?)
     }
@@ -92,7 +125,7 @@ impl Snapshot {
 
     async fn relation_is_local(&self, quoted_relation: &str, exclude_rls: bool) -> Result<bool> {
         self.stats.request();
-        Ok(self.client.query_one(
+        Ok(self.request(self.client.query_one(
             "WITH RECURSIVE relations(oid) AS (
                 SELECT $1::text::regclass::oid
                 UNION
@@ -102,7 +135,7 @@ impl Snapshot {
             SELECT COALESCE(bool_and(tbl.relkind IN ('r', 'p', 'm') AND (NOT $2 OR NOT tbl.relrowsecurity)), false)
             FROM relations JOIN pg_class AS tbl USING (oid)",
             &[&quoted_relation, &exclude_rls],
-        ).await?.try_get(0)?)
+        )).await?.try_get(0)?)
     }
 
     #[cfg(feature = "admin")]
@@ -117,21 +150,19 @@ impl Snapshot {
             self.relation_is_local(&relation, true).await?,
             "expected a local table without row-level security"
         );
-        self.client
-            .batch_execute(
-                "SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO, MDY';
+        self.request(self.client.batch_execute(
+            "SET LOCAL TimeZone = 'UTC'; SET LOCAL DateStyle = 'ISO, MDY';
              SET LOCAL IntervalStyle = 'postgres'; SET LOCAL extra_float_digits = 3;
              SET LOCAL bytea_output = 'hex'; SET LOCAL client_encoding = 'UTF8';",
-            )
-            .await?;
+        ))
+        .await?;
         let columns = self
-            .client
-            .query(
+            .request(self.client.query(
                 "SELECT attname::text, format_type(atttypid, atttypmod)
              FROM pg_attribute WHERE attrelid = $1::text::regclass AND attnum > 0
              AND NOT attisdropped ORDER BY attnum",
                 &[&relation],
-            )
+            ))
             .await?
             .iter()
             .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
@@ -143,6 +174,7 @@ impl Snapshot {
             SELECT row_to_json(t)::text COLLATE "C" FROM {relation} AS t ORDER BY 1
         ) TO STDOUT"#
         );
+        let mut request = self.active_request();
         let stream = self.client.copy_out(&sql).await?;
         futures::pin_mut!(stream);
         let mut hash = Sha256::new();
@@ -151,6 +183,7 @@ impl Snapshot {
         while let Some(chunk) = stream.try_next().await? {
             hash.update(chunk);
         }
+        request.finish();
         Ok(hash
             .finalize()
             .iter()
@@ -177,13 +210,12 @@ impl Snapshot {
         }
         self.stats.request();
         let columns = self
-            .client
-            .query(
+            .request(self.client.query(
                 "SELECT attname::text, atttypid::text, atttypmod FROM pg_catalog.pg_attribute
              WHERE attrelid = $1::text::regclass AND attnum > 0 AND NOT attisdropped
                AND has_column_privilege(attrelid, attnum, 'SELECT') ORDER BY attnum",
                 &[&relation],
-            )
+            ))
             .await?;
         let fields = columns
             .iter()
@@ -214,8 +246,7 @@ impl Snapshot {
         );
         self.stats.request();
         let row = self
-            .client
-            .query_one(&sql, &[])
+            .request(self.client.query_one(&sql, &[]))
             .await
             .with_context(|| format!("fingerprinting PostgreSQL relation {relation}"))?;
         let summary = [row.get::<_, String>(0), row.get(1), row.get(2)];
@@ -226,7 +257,7 @@ impl Snapshot {
     #[cfg(feature = "admin")]
     async fn tracked_relation_version(&self, relation: &str) -> Result<Option<String>> {
         self.stats.request();
-        let eligible = self
+        let eligible = self.request(self
             .client
             .query_one(
                 "SELECT EXISTS (
@@ -236,7 +267,7 @@ impl Snapshot {
                 GROUP BY n.oid HAVING count(*) = 2
             )",
                 &[],
-            )
+            ))
             .await?
             .get::<_, bool>(0);
         if !eligible {
@@ -245,7 +276,7 @@ impl Snapshot {
         self.stats.request();
         // Include catalog state so replacing, rewriting or changing the table,
         // disabling/reinstalling the trigger, and changing visible columns invalidate the token.
-        Ok(self.client.query_opt(
+        Ok(self.request(self.client.query_opt(
             "SELECT jsonb_build_array(
                 pg_postmaster_start_time(), inet_server_addr(), inet_server_port(),
                 current_database(), current_user, c.oid, c.relfilenode,
@@ -268,27 +299,27 @@ impl Snapshot {
                  AND t.tgtype = 60 AND t.tgqual IS NULL AND t.tgnargs = 0
                  AND p.oid = to_regprocedure('graphlake_tracking.record_relation_change()')",
             &[&relation],
-        ).await?.map(|row| row.get(0)))
+        )).await?.map(|row| row.get(0)))
     }
 
     #[cfg(feature = "admin")]
     pub(crate) async fn browse(&self, schema: Option<&str>) -> Result<Vec<String>> {
-        let rows =
-            if let Some(schema) = schema {
-                self.client.query(
+        let rows = if let Some(schema) = schema {
+            self.request(self.client.query(
                 "SELECT table_name::text FROM information_schema.tables WHERE table_schema = $1
-                 ORDER BY table_name LIMIT 2001", &[&schema],
-            ).await?
-            } else {
-                self.client
-                    .query(
-                        "SELECT DISTINCT table_schema::text FROM information_schema.tables
+                 ORDER BY table_name LIMIT 2001",
+                &[&schema],
+            ))
+            .await?
+        } else {
+            self.request(self.client.query(
+                "SELECT DISTINCT table_schema::text FROM information_schema.tables
                  WHERE table_schema NOT IN ('pg_catalog','information_schema')
                  ORDER BY 1 LIMIT 2001",
-                        &[],
-                    )
-                    .await?
-            };
+                &[],
+            ))
+            .await?
+        };
         Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 
@@ -299,7 +330,7 @@ impl Snapshot {
         table: &str,
     ) -> Result<Vec<(String, String, bool)>> {
         let sql = format!("SELECT * FROM {}.{} LIMIT 0", ident(schema), ident(table));
-        let statement = self.client.prepare(&sql).await?;
+        let statement = self.request(self.client.prepare(&sql)).await?;
         Ok(statement
             .columns()
             .iter()
@@ -355,6 +386,7 @@ impl Snapshot {
             tls,
             stats,
             next_cursor: AtomicU64::new(0),
+            interrupted: AtomicBool::new(false),
             version: String::new(),
             #[cfg(feature = "admin")]
             exploration_snapshot: None,
@@ -362,16 +394,15 @@ impl Snapshot {
         let timeout_ms = timeout.as_millis().clamp(1, i32::MAX as u128);
         snapshot.stats.request();
         snapshot
-            .client
-            .batch_execute(&format!(
+            .request(snapshot.client.batch_execute(&format!(
                 "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
              SET LOCAL statement_timeout = {timeout_ms};
              SET LOCAL search_path = pg_catalog;"
-            ))
+            )))
             .await
             .context("starting PostgreSQL read-only snapshot")?;
         snapshot.stats.request();
-        let row = snapshot
+        let row = snapshot.request(snapshot
             .client
             .query_one(
                 if cfg!(feature = "admin") {
@@ -382,7 +413,7 @@ impl Snapshot {
                     "SELECT pg_current_snapshot()::text"
                 },
                 &[],
-            )
+            ))
             .await
             .context("pinning PostgreSQL snapshot")?;
         snapshot.version = row.try_get(0)?;
@@ -406,8 +437,7 @@ impl Snapshot {
         let sql = format!("SELECT {} FROM {relation} LIMIT 0", selected.join(", "));
         self.stats.request();
         let stmt = self
-            .client
-            .prepare(&sql)
+            .request(self.client.prepare(&sql))
             .await
             .map_err(|error| {
                 if let Some(db) = error.as_db_error()
@@ -458,7 +488,9 @@ impl Snapshot {
 impl Drop for Snapshot {
     fn drop(&mut self) {
         // Closing the socket alone may leave a backend computing until its next write.
-        if let Ok(handle) = Handle::try_current() {
+        if self.interrupted.load(Ordering::Relaxed)
+            && let Ok(handle) = Handle::try_current()
+        {
             let token = self.client.cancel_token();
             let tls = self.tls.clone();
             handle.spawn(async move {
@@ -611,14 +643,13 @@ impl PgTable {
                 self.snapshot.stats.request();
                 let row = self
                     .snapshot
-                    .client
-                    .query_one(
+                    .request(self.snapshot.client.query_one(
                         &format!(
                             "SELECT {function}({input}) FROM {} WHERE {condition}",
                             self.relation
                         ),
                         &[],
-                    )
+                    ))
                     .await?;
                 let schema = Arc::new(Schema::new(vec![Field::new("aggregate", data_type, true)]));
                 let batch = to_batch(schema, &[row])?;
@@ -638,11 +669,10 @@ impl PgTable {
             .join(", ");
         self.snapshot.stats.request();
         self.snapshot
-            .client
-            .query(
+            .request(self.snapshot.client.query(
                 &format!("SELECT {columns} FROM {} LIMIT 0", self.relation),
                 &[],
-            )
+            ))
             .await?;
         Ok(())
     }
@@ -696,15 +726,14 @@ impl PgTable {
         self.snapshot.stats.request();
         let rows = self
             .snapshot
-            .client
-            .query(
+            .request(self.snapshot.client.query(
                 "SELECT a.attname::text, n.nspname::text, c.collname::text
              FROM pg_catalog.pg_attribute a
              JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation
              JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace
              WHERE a.attrelid = $1::text::regclass AND a.attnum > 0 AND NOT a.attisdropped",
                 &[&self.relation],
-            )
+            ))
             .await?;
         rows.iter()
             .map(|row| {
@@ -734,8 +763,7 @@ impl PgTable {
         self.snapshot.stats.request();
         Ok(self
             .snapshot
-            .client
-            .query_one(
+            .request(self.snapshot.client.query_one(
                 "SELECT EXISTS (
                 SELECT FROM pg_catalog.pg_index AS idx
                 JOIN pg_catalog.pg_class AS tbl ON tbl.oid = idx.indrelid
@@ -750,7 +778,7 @@ impl PgTable {
                     )
             )",
                 &[&self.relation, &keys],
-            )
+            ))
             .await?
             .try_get(0)?)
     }
@@ -873,9 +901,9 @@ impl PartitionStream for PgPartition {
             }
             let limit_sql = limit.map(|value| format!(" LIMIT {value}")).unwrap_or_default();
             snapshot.stats.request();
-            snapshot.client.batch_execute(&format!(
+            snapshot.request(snapshot.client.batch_execute(&format!(
                 "DECLARE {cursor} NO SCROLL CURSOR FOR SELECT {columns} FROM {relation}{filter}{order}{limit_sql}"
-            )).await.map_err(external)?;
+            ))).await.map_err(external)?;
             // A Bolt transaction can keep the PostgreSQL snapshot alive after
             // DISCARD, LIMIT or a dropped result stream.
             let mut close = CursorCleanup { snapshot: Some(snapshot.clone()), name: cursor.clone() };
@@ -891,6 +919,7 @@ impl PartitionStream for PgPartition {
                 let size = remaining.min(batch_size);
                 snapshot.stats.request();
                 let statement = format!("FETCH FORWARD {size} FROM {cursor}");
+                let mut request = snapshot.active_request();
                 let result = snapshot.client.query_raw(statement.as_str(), std::iter::empty::<&str>())
                     .await.map_err(external)?;
                 futures::pin_mut!(result);
@@ -903,6 +932,7 @@ impl PartitionStream for PgPartition {
                     }
                     rows.push(row);
                 }
+                request.finish();
                 if rows.is_empty() {
                     break;
                 }
@@ -921,7 +951,7 @@ impl PartitionStream for PgPartition {
                 remaining -= n;
             }
             snapshot.stats.request();
-            snapshot.client.batch_execute(&format!("CLOSE {cursor}")).await.map_err(external)?;
+            snapshot.request(snapshot.client.batch_execute(&format!("CLOSE {cursor}"))).await.map_err(external)?;
             close.snapshot = None;
         };
         Box::pin(RecordBatchStreamAdapter::new(
@@ -945,7 +975,7 @@ impl Drop for CursorCleanup {
             runtime.spawn(async move {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2),
-                    snapshot.client.batch_execute(&format!("CLOSE {name}")),
+                    snapshot.request(snapshot.client.batch_execute(&format!("CLOSE {name}"))),
                 )
                 .await;
             });

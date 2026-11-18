@@ -522,7 +522,7 @@ impl Traversers<'_> {
                 productive.push(step.clone());
             }
         }
-        let limit = if emit.is_some() {
+        let limit = if emit.is_some() || matches!(end, Some(("until", _, _))) {
             let mut offset = 0_u64;
             while let Some(step) = tail.next_if(|step| step.name == "skip" && step.args.len() == 1)
             {
@@ -575,6 +575,7 @@ impl Traversers<'_> {
                 let predicate = parse_chain(&traversal, "__")?;
                 ensure!(!predicate.is_empty(), "until() requires a predicate");
                 if emit.is_none()
+                    && limit.is_none()
                     && simple_check(&predicate)
                     && self.try_recursive_repeat(&body, &predicate, !before, depth)?
                 {
@@ -612,6 +613,7 @@ impl Traversers<'_> {
         let seed = self.fresh("work");
         let seen = self.fresh("until");
         let tracked = if emit.is_some()
+            || limit.is_some()
             || matches!(end, LoopEnd::Times(_))
             || !self.order.is_empty()
             || traversal_contains(steps, depth + 1, |name| name == "order")?
@@ -807,7 +809,7 @@ impl Traversers<'_> {
             (None, None, None)
         };
         if limit.is_some() {
-            let (iteration, position) = tracked.as_ref().expect("emitting loop is ordered");
+            let (iteration, position) = tracked.as_ref().expect("limited loop is ordered");
             // The outer limit consumes this order, so only discard later rows.
             checked = format!(
                 "SELECT v.* FROM ({checked}) AS v ORDER BY {}, {}",

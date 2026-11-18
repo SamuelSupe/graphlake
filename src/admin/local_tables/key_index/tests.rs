@@ -49,6 +49,7 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
     let interrupted = Prepared {
         snapshot,
         staged: Vec::new(),
+        anchor_part: None,
     };
     let file = stage(root.path(), 6)?;
     let mut conn = open(&anchor, true, &current)?;
@@ -61,7 +62,7 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
         &keys,
         &current,
     )?;
-    let result = overlay::publish(&anchor, &file, false, &interrupted, &current, || {
+    let result = overlay::publish(&anchor, &file, &interrupted, &current, || {
         set_generation(&tx, interrupted.snapshot.generation)?;
         tx.commit()?;
         current.options.cancellation.cancel();
@@ -97,5 +98,63 @@ async fn index_ahead_of_manifest_is_rebuilt_before_retry() -> Result<()> {
     drop(file);
     root.close()?;
     assert!(!index.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_incremental_load_reclaims_the_single_file_anchor() -> Result<()> {
+    use crate::source::parquet_snapshot::MAX_DELETED;
+
+    let root = tempfile::tempdir()?;
+    let anchor = root.path().join("copy.parquet");
+    let keys = vec!["id".to_owned()];
+    let admission = Arc::new(Admission::new(EngineLimits::default())?);
+    let scope = QueryScope::new(QueryOptions::default(), &admission).await?;
+    let count = MAX_DELETED + 1;
+    let write = |file: &NamedTempFile, version, rows| -> Result<()> {
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int64Array::from_iter_values(0..rows)) as _),
+            (
+                "version",
+                Arc::new(Int64Array::from_value(version, rows as usize)) as _,
+            ),
+        ])?;
+        let mut writer = ArrowWriter::try_new(file.reopen()?, batch.schema(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    };
+    let base = super::super::load::staging_file(root.path())?;
+    write(&base, 5, count as i64 + 1)?;
+    base.persist(&anchor)?;
+    let delta = super::super::load::staging_file(root.path())?;
+    write(&delta, 6, count as i64)?;
+    let watermark = ScalarValue::Int64(Some(6));
+    assert_eq!(
+        incremental(
+            &anchor,
+            true,
+            None,
+            &delta,
+            &keys,
+            "version",
+            &watermark,
+            Uuid::new_v4(),
+            &scope
+        )?,
+        Some(count as u64 + 1)
+    );
+    let snapshot = Snapshot::read(&anchor)?.context("missing committed snapshot")?;
+    assert_eq!(snapshot.parts[0].rows, 1);
+    assert_eq!(checkpoint(snapshot.indexed.as_ref().unwrap())?, watermark);
+    let data =
+        ParquetRecordBatchReaderBuilder::try_new(File::open(snapshot.parts[0].path(&anchor))?)?
+            .build()?
+            .next()
+            .context("missing retained row")??;
+    assert_eq!(
+        ScalarValue::try_from_array(data.column(0), 0)?,
+        ScalarValue::Int64(Some(count as i64))
+    );
     Ok(())
 }

@@ -292,7 +292,7 @@ pub(super) async fn call(
                     "list_models 不接受参数",
                 ));
             }
-            Ok(Json(scope(app, principal, config)?).into_response())
+            Ok(Json(scope(app, principal, config).await?).into_response())
         }
         "get_schema" => {
             let arg: SchemaArg = parse(args)?;
@@ -397,8 +397,10 @@ pub(super) async fn call(
             let yaml = match arg.yaml {
                 Some(yaml) => yaml,
                 None => {
-                    let model = app.models.lock().unwrap().get(&arg.model)?;
-                    model.yaml
+                    let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
+                    let id = arg.model.clone();
+                    app.read_models(move |models| Ok(models.get(&id)?.yaml))
+                        .await?
                 }
             };
             Ok(models::validate(
@@ -467,14 +469,26 @@ pub(super) async fn call(
     }
 }
 
-pub(super) fn scope(app: &App, principal: &Principal, config: &Config) -> ApiResult<Value> {
-    let summaries = app.models.lock().unwrap().list(|id| {
-        let edit = config.modeling
-            && (role(app, principal, id, Role::Modeler)
-                || role(app, principal, id, Role::Publisher));
-        let query = config.query && access::query_allowed(app, principal, id);
-        (edit || query).then_some(!edit)
-    })?;
+pub(super) async fn scope(
+    app: &std::sync::Arc<App>,
+    principal: &Principal,
+    config: &Config,
+) -> ApiResult<Value> {
+    let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
+    let access = app.clone();
+    let owner = principal.clone();
+    let (modeling, query) = (config.modeling, config.query);
+    let summaries = app
+        .read_models(move |models| {
+            models.list(|id| {
+                let edit = modeling
+                    && (role(&access, &owner, id, Role::Modeler)
+                        || role(&access, &owner, id, Role::Publisher));
+                let query = query && access::query_allowed(&access, &owner, id);
+                (edit || query).then_some(!edit)
+            })
+        })
+        .await?;
     let targets = app
         .users
         .grants(principal)

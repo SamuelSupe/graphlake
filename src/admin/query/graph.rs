@@ -2,11 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     Catalog,
-    arrow::{
-        array::{Array, ArrayRef, RecordBatch, StructArray},
-        compute::cast,
-        datatypes::DataType,
-    },
+    arrow::array::{Array, ArrayRef, RecordBatch, StructArray},
     catalog::Endpoint,
     engine::query_graph::{GraphColumn, GraphOutput},
 };
@@ -481,7 +477,7 @@ pub(super) fn result_pages(graph: Fragment) -> (Vec<Fragment>, bool) {
 }
 
 pub(in crate::admin) fn text_key(array: &dyn Array, row: usize) -> Option<String> {
-    let value = cast(array.slice(row, 1).as_ref(), &DataType::Utf8).ok()?;
+    let value = crate::engine::key_text(&array.slice(row, 1)).ok()?;
     let value = value
         .as_any()
         .downcast_ref::<crate::arrow::array::StringArray>()?;

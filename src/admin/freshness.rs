@@ -61,14 +61,14 @@ pub(super) fn generations(inputs: &[Observation]) -> BTreeMap<String, Option<Str
 }
 
 pub(super) async fn observe(app: &App, catalog: &Catalog) -> Vec<Observation> {
-    let definitions = {
+    let definitions = crate::blocking(|| {
         let store = app.local_tables.store.lock().unwrap();
         store
             .tables
             .values()
             .map(|t| (store.path(t), t.clone()))
             .collect::<BTreeMap<_, _>>()
-    };
+    });
     use futures::{StreamExt, stream};
 
     let locations = models::physical_tables(catalog)

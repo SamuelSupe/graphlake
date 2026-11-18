@@ -424,6 +424,17 @@ edges:
             "{types}"
         );
     }
+
+    let mut result = engine
+        .query(
+            Language::Cypher,
+            "MATCH p=shortestPath((a:N {id:1})-[:E|F*0..4]->(b:N {id:3}))
+             WHERE none(r IN relationships(p) WHERE r.id < 1 OR r.id >= 4)
+             RETURN length(p) AS hops",
+            Default::default(),
+        )
+        .await?;
+    assert_eq!(rows(&mut result).await?, [json!({"hops":2})]);
     Ok(())
 }
 
@@ -549,6 +560,12 @@ async fn cypher_correlated_call_reads_keys_and_columns_and_reuses_batches_postgr
          CREATE TABLE {schema}.nodes (id bigint PRIMARY KEY, payload text);
          CREATE TABLE {schema}.edges (id bigint PRIMARY KEY, src bigint, dst bigint);
          CREATE INDEX ON {schema}.edges (src);
+         CREATE TABLE {schema}.broad_nodes (id bigint PRIMARY KEY);
+         CREATE TABLE {schema}.broad_edges (id bigint PRIMARY KEY, src bigint, dst bigint);
+         INSERT INTO {schema}.broad_nodes SELECT i FROM generate_series(1,6000) i;
+         INSERT INTO {schema}.broad_edges SELECT i,i,i%6000+1 FROM generate_series(1,6000) i;
+         ANALYZE {schema}.broad_nodes;
+         ANALYZE {schema}.broad_edges;
          INSERT INTO {schema}.nodes SELECT i, repeat('x', 2048) FROM generate_series(1,4096) i;
          INSERT INTO {schema}.edges SELECT i,i,i+1 FROM generate_series(1,4095) i;
          INSERT INTO {schema}.nodes SELECT i, repeat('x', 2048) FROM generate_series(10000,30000) i;
@@ -594,6 +611,7 @@ sources:
   remote: {{type: postgres, dsn_env: GRAPHLAKE_TEST_POSTGRES}}
 nodes:
   Node: {{source: pg.{schema}.nodes, key: [id], properties: [payload]}}
+  Broad: {{source: pg.{schema}.broad_nodes, key: [id]}}
   Mapped:
     key: [id]
     properties: [payload]
@@ -603,6 +621,7 @@ nodes:
         columns: {{id: uid, payload: text_b}}
   Name: {{source: pg.{schema}.names, key: [tenant,id]}}
 edges:
+  BroadNext: {{source: pg.{schema}.broad_edges, key: [id], from: {{node: Broad, columns: [src]}}, to: {{node: Broad, columns: [dst]}}}}
   Next:
     source: pg.{schema}.edges
     key: [id]
@@ -667,6 +686,36 @@ edges:
         .await
         .expect_err("conflicting records for a matched key");
         assert!(format!("{conflict:#}").contains("conflicting records for Mapped"));
+
+        let mut broad = engine.query(
+            Language::Cypher,
+            "MATCH (a:Broad) WITH a ORDER BY a.id
+             CALL (a) { MATCH (a)-[:BroadNext]->(b:Broad) RETURN b.id AS target }
+             RETURN count(*) AS n, min(target) AS lo, max(target) AS hi",
+            QueryOptions { batch_size: 1024, ..options.clone() },
+        ).await?;
+        assert_eq!(rows(&mut broad).await?, [json!({"n":6000,"lo":1,"hi":6000})]);
+        let reads = broad.metrics().reads;
+        assert!(reads.requests < 55, "{reads:?}");
+        eprintln!("CALL 6,000 distinct starting vertices: {} PostgreSQL requests", reads.requests);
+
+        let mut nested = engine
+            .query(
+                Language::Cypher,
+                "MATCH (a:Broad) WITH a ORDER BY a.id
+                 CALL (a) {
+                     MATCH (a)-[:BroadNext]->(b:Broad)
+                     CALL (b) { MATCH (b)-[:BroadNext]->(c:Broad) RETURN c.id AS target }
+                     RETURN target
+                 }
+                 RETURN count(*) AS n, min(target) AS lo, max(target) AS hi",
+                QueryOptions { batch_size: 1024, ..options.clone() },
+            )
+            .await?;
+        assert_eq!(rows(&mut nested).await?, [json!({"n":6000,"lo":1,"hi":6000})]);
+        let reads = nested.metrics().reads;
+        assert!(reads.requests < 105, "{reads:?}");
+        eprintln!("Nested CALL for 6,000 starting vertices: {} PostgreSQL requests", reads.requests);
 
         let source = "MATCH (a:Node {id:1}) UNWIND range(1,64) AS i WITH a,i%2 AS k
             CALL (a,k) { MATCH (a)-[:Next]->()-[:Next]->(b) RETURN b.id+k AS child }";
@@ -1068,6 +1117,10 @@ async fn gremlin_branches_and_until_operate_on_each_traverser() -> Result<()> {
             vec![json!(3), json!(3)],
         ),
         (
+            "g.V([1,1],[1,3]).hasLabel('Account').until(__.has('id',3)).repeat(__.identity()).values('id').limit(1)",
+            vec![json!(3)],
+        ),
+        (
             "g.V([1,3]).hasLabel('Account').until(__.has('id',3)).repeat(__.out()).values('id')",
             vec![json!(3)],
         ),
@@ -1105,6 +1158,100 @@ async fn gremlin_branches_and_until_operate_on_each_traverser() -> Result<()> {
         rows(&mut result).await
     }.await;
     assert!(format!("{:#}", cyclic.expect_err("unbounded repeat")).contains("256 iterations"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn binary_business_keys_round_trip_in_cypher_paths() -> Result<()> {
+    let query = "MATCH p=(a:Vertex)-[:Link*2..2]->(b:Vertex)
+                 RETURN elementId(a) AS start, elementId(b) AS finish, length(p) AS hops";
+    let dir = tempfile::tempdir()?;
+    let connection = rusqlite::Connection::open(dir.path().join("binary.db"))?;
+    connection.execute_batch(
+        "CREATE TABLE vertices (id BLOB PRIMARY KEY);
+        INSERT INTO vertices VALUES (X'AA'), (X'BB'), (X'CC');
+        CREATE TABLE links (id BLOB PRIMARY KEY, src BLOB, dst BLOB);
+        INSERT INTO links VALUES (X'F1',X'AA',X'BB'), (X'F2',X'BB',X'CC');",
+    )?;
+    let path = dir.path().join("graph.yaml");
+    std::fs::write(
+        &path,
+        r#"
+graph: binary_keys
+sources:
+  db: {type: sqlite, path: binary.db}
+nodes:
+  Vertex: {source: db.vertices, key: [id]}
+edges:
+  Link: {source: db.links, key: [id], from: {node: Vertex, columns: [src]}, to: {node: Vertex, columns: [dst]}}
+"#,
+    )?;
+    let engine = Engine::new(Catalog::load(&path)?)?;
+    let mut result = engine
+        .query(Language::Cypher, query, Default::default())
+        .await?;
+    assert_eq!(
+        rows(&mut result).await?,
+        [json!({"start":"Vertex[aa]", "finish":"Vertex[cc]", "hops":2})]
+    );
+
+    use graphlake::arrow::array::FixedSizeBinaryArray;
+    use parquet::{
+        arrow::{ArrowWriter, arrow_writer::ArrowWriterOptions},
+        schema::{parser::parse_message_type, types::SchemaDescriptor},
+    };
+    let write_uuids = |table: &str, columns: &[(&str, &[u8])]| -> Result<()> {
+        let schema = columns
+            .iter()
+            .map(|(name, _)| format!("REQUIRED FIXED_LEN_BYTE_ARRAY (16) {name} (UUID);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let schema = parse_message_type(&format!("message {table} {{ {schema} }}"))?;
+        let batch = RecordBatch::try_from_iter(
+            columns
+                .iter()
+                .map(|(name, bytes)| {
+                    let values =
+                        FixedSizeBinaryArray::try_from_iter(bytes.iter().map(|b| [*b; 16]))?;
+                    Ok((*name, Arc::new(values) as _))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        let mut writer = ArrowWriter::try_new_with_options(
+            std::fs::File::create(dir.path().join(format!("{table}.parquet")))?,
+            batch.schema(),
+            ArrowWriterOptions::new().with_parquet_schema(SchemaDescriptor::new(Arc::new(schema))),
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(())
+    };
+    write_uuids("vertices", &[("id", &[0xAA, 0xBB, 0xCC])])?;
+    write_uuids(
+        "links",
+        &[
+            ("id", &[0xF1, 0xF2]),
+            ("src", &[0xAA, 0xBB]),
+            ("dst", &[0xBB, 0xCC]),
+        ],
+    )?;
+    let catalog = std::fs::read_to_string(&path)?.replace(
+        "{type: sqlite, path: binary.db}",
+        "{type: parquet, tables: {vertices: [vertices.parquet], links: [links.parquet]}}",
+    );
+    std::fs::write(&path, catalog)?;
+    let engine = Engine::new(Catalog::load(path)?)?;
+    let mut result = engine
+        .query(Language::Cypher, query, Default::default())
+        .await?;
+    assert_eq!(
+        rows(&mut result).await?,
+        [json!({
+            "start": format!("Vertex[{}]", "aa".repeat(16)),
+            "finish": format!("Vertex[{}]", "cc".repeat(16)),
+            "hops": 2,
+        })]
+    );
     Ok(())
 }
 
@@ -1611,6 +1758,25 @@ async fn cypher_undirected_and_shortest_paths_keep_parallel_edge_identity() -> R
         "MATCH p=allShortestPaths((a:Account {tenant:1,id:1})-[:Transfer*2..3]->(b:Account {tenant:1,id:2}))
          RETURN length(p) AS hops, count(*) AS paths", Default::default()).await?;
     assert_eq!(rows(&mut answer).await?, [json!({"hops":2,"paths":2})]);
+
+    let mut answer = engine.query(Language::Cypher,
+        "MATCH p=shortestPath((a:Account {tenant:1,id:1})-[:Transfer*1..3]->(b:Account {tenant:1,id:3}))
+         WHERE all(r IN relationships(p) WHERE r.id >= 11)
+         RETURN length(p) AS hops", Default::default()).await?;
+    assert_eq!(rows(&mut answer).await?, [json!({"hops":2})]);
+    let mut answer = engine.query(Language::Cypher,
+        "MATCH p=shortestPath((a:Account {tenant:1,id:1})-[:Transfer*1..3]->(b:Account {tenant:1,id:1}))
+         WHERE none(r IN relationships(p) WHERE r.id < 14)
+         RETURN length(p) AS hops", Default::default()).await?;
+    assert_eq!(rows(&mut answer).await?, [json!({"hops":1})]);
+    let mut answer = engine.query(Language::Cypher,
+        "MATCH p=allShortestPaths((a:Account {tenant:1,id:1})-[:Transfer*1..3]->(b:Account {tenant:1,id:2}))
+         WHERE any(r IN relationships(p) WHERE EXISTS {
+             MATCH (x:Account)-[t:Transfer]->(:Account)
+             WHERE t.tenant = r.tenant AND t.id = r.id AND x.id = 1 AND t.id = 11
+         })
+         RETURN length(p) AS hops, count(p) AS paths", Default::default()).await?;
+    assert_eq!(rows(&mut answer).await?, [json!({"hops":1,"paths":1})]);
     Ok(())
 }
 

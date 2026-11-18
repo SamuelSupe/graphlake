@@ -323,12 +323,6 @@ fn prepare_run(
     table.history.insert(0, run.clone());
     table.history.truncate(20);
     table.next_run_at_ms = None;
-    if reconciled && !table.schedule_paused {
-        table.next_reconcile_at_ms = table
-            .config
-            .reconcile_interval_seconds
-            .map(|s| now() + s * 1000);
-    }
     Ok(run)
 }
 
@@ -360,7 +354,17 @@ fn start(app: &Arc<App>, key: String, mode: Option<Mode>, scheduled: bool) -> Ap
             cancellation: cancel.clone(),
             ..app.options.clone()
         };
-        let result = load::run(&table, &path, mode, options, &app.admission).await;
+        use futures::FutureExt;
+        let result = std::panic::AssertUnwindSafe(async {
+            let anchor = path.clone();
+            let limit = options.spill_bytes;
+            tokio::task::spawn_blocking(move || overlay::check_retired_space(&anchor, limit))
+                .await??;
+            load::run(&table, &path, mode, options, &app.admission).await
+        })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("local-table load panicked")));
         if result.is_ok() {
             crate::blocking(|| load::clean_parts(&path));
         }
@@ -399,6 +403,12 @@ fn record_result(
             current.observation_finished_at_ms = run.finished_at_ms;
             if run.reconciled {
                 current.reconciled_at_ms = Some(run.started_at_ms);
+                if !current.schedule_paused {
+                    current.next_reconcile_at_ms = current
+                        .config
+                        .reconcile_interval_seconds
+                        .map(|s| run.started_at_ms + s * 1000);
+                }
             }
         }
         Err(error) => {
@@ -415,6 +425,7 @@ fn record_result(
                         | "主键不能包含空值"
                         | "来源包含重复主键；请修正来源后重试"
                         | "增量字段不能包含空值"
+                        | "本地副本旧分区等待查询释放，已超过保留空间预算"
                 ) {
                     message
                 } else if message.contains("deadline exceeded") {
@@ -433,6 +444,7 @@ fn record_result(
 }
 
 pub(super) async fn watch(app: Weak<App>) {
+    let mut managed_schedule = managed::ScheduleCache::default();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let Some(app) = app.upgrade() else { return };
@@ -445,7 +457,7 @@ pub(super) async fn watch(app: Weak<App>) {
             }
         }
         if let Some(backend) = managed::backend(&app) {
-            backend.tick(&app).await;
+            backend.tick(&app, &mut managed_schedule).await;
         }
         if app.local_tables.store.lock().unwrap().flush().is_err() {
             continue;
@@ -457,7 +469,15 @@ pub(super) async fn watch(app: Weak<App>) {
             .unwrap()
             .tables
             .iter()
-            .filter(|(_, table)| !table.managed)
+            .filter(|(_, table)| {
+                !table.managed
+                    && table.history.first().is_none_or(|run| {
+                        !matches!(run.status.as_str(), "failed" | "cancelled")
+                            || run
+                                .finished_at_ms
+                                .is_none_or(|last| now().saturating_sub(last) >= 30_000)
+                    })
+            })
             .filter_map(|(key, table)| {
                 [table.next_run_at_ms, table.next_reconcile_at_ms]
                     .into_iter()

@@ -34,35 +34,13 @@ use futures::TryStreamExt;
 use super::{super::encode_equivalence, Files, Store};
 
 pub(super) fn finish(store: Arc<Store>, files: Files, ty: &DataType) -> Result<ScalarValue> {
-    // Accumulator::evaluate is synchronous, even when called from a current-thread runtime.
-    static RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
-        std::sync::OnceLock::new();
-    let runtime = RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-        })
-        .as_ref()
-        .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-    let (send, receive) = std::sync::mpsc::sync_channel(1);
-    let worker = store.clone();
-    let ty_owned = ty.clone();
-    runtime.spawn(async move {
-        let result = tokio::select! {
-            result = ordered_winners(&worker, files, &ty_owned) => result,
-            _ = worker.cancellation.cancelled() => Err(DataFusionError::Execution("query cancelled".into())),
-            _ = tokio::time::sleep_until(worker.deadline) => Err(DataFusionError::Execution("query deadline exceeded".into())),
-        };
-        let _ = send.send(result);
-    });
-    let wait = || {
-        receive.recv().map_err(|_| {
-            DataFusionError::Execution("distinct collect spill worker stopped".into())
-        })?
+    let output = if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| handle.block_on(complete(&store, files, ty)))?
+    } else {
+        finish_on_fallback(store.clone(), files, ty.clone())?
     };
-    let output = crate::blocking(wait)?;
     let budget = MemoryConsumer::new("materializing the distinct collect list")
         .register(&store.runtime.memory_pool);
     let copy = if ty.is_nested() || matches!(ty, DataType::Dictionary(..)) {
@@ -79,6 +57,36 @@ pub(super) fn finish(store: Arc<Store>, files: Files, ty: &DataType) -> Result<S
     Ok(ScalarValue::List(Arc::new(
         SingleRowListArrayBuilder::new(values).build_list_array(),
     )))
+}
+
+fn finish_on_fallback(store: Arc<Store>, files: Files, ty: DataType) -> Result<Output> {
+    // Accumulator::evaluate is synchronous even in a single-threaded runtime.
+    static RUNTIME: std::sync::OnceLock<std::io::Result<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    let runtime = RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    runtime.spawn(async move {
+        let _ = send.send(complete(&store, files, &ty).await);
+    });
+    receive
+        .recv()
+        .map_err(|_| DataFusionError::Execution("distinct collect spill worker stopped".into()))?
+}
+
+async fn complete(store: &Store, files: Files, ty: &DataType) -> Result<Output> {
+    tokio::select! {
+        result = ordered_winners(store, files, ty) => result,
+        _ = store.cancellation.cancelled() => Err(DataFusionError::Execution("query cancelled".into())),
+        _ = tokio::time::sleep_until(store.deadline) => Err(DataFusionError::Execution("query deadline exceeded".into())),
+    }
 }
 
 struct Output {

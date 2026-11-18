@@ -30,6 +30,13 @@ mod postgres;
 
 const MAX_NEIGHBORS: usize = 4096;
 
+#[derive(Clone, Copy)]
+pub(super) enum LookupMode {
+    Schema,
+    Batch { bounded: bool },
+    Set,
+}
+
 /// Keep complete entity records when an expression can observe their full
 /// contents. Named property reads in a scalar query only need those fields.
 pub(in crate::cypher) fn scalar_projection(
@@ -383,14 +390,12 @@ impl Lookup {
         &self,
         context: &SessionContext,
         scope: &QueryScope,
-        schema_only: bool,
-        bounded: bool,
+        mode: LookupMode,
     ) -> Result<Vec<MemoryReservation>> {
         let mut budgets = Vec::new();
-        let mut frames = if schema_only {
-            BTreeMap::new()
-        } else {
-            self.frames(context, scope, bounded, &mut budgets).await?
+        let mut frames = match mode {
+            LookupMode::Schema => BTreeMap::new(),
+            _ => self.frames(context, scope, mode, &mut budgets).await?,
         };
         for (label, aliases) in &self.aliases {
             let base = context.table(TableReference::bare(label.as_str())).await?;
@@ -415,7 +420,7 @@ impl Lookup {
         &self,
         context: &SessionContext,
         scope: &QueryScope,
-        bounded: bool,
+        mode: LookupMode,
         budgets: &mut Vec<MemoryReservation>,
     ) -> Result<BTreeMap<String, DataFrame>> {
         let seed = graph_frame(context, &self.seed_sql).await?;
@@ -437,7 +442,14 @@ impl Lookup {
         {
             return Ok(BTreeMap::new());
         }
-        let mut frontier = Frontier::load(context, scope, seed, MAX_NEIGHBORS, budgets).await?;
+        let set_join = matches!(mode, LookupMode::Set);
+        let mut frontier = match keys(seed.clone(), scope, MAX_NEIGHBORS).await? {
+            Some(keys) => Frontier::Inline(keys),
+            // Large CALLs already have the modeled equality join. A batched
+            // key view can reread the source for each key batch.
+            None if set_join => return Ok(BTreeMap::new()),
+            None => Frontier::spillable(context, scope, seed, budgets).await?,
+        };
         let remote = if let Frontier::Inline(starts) = &frontier
             && self.remote_frontier
         {
@@ -449,7 +461,7 @@ impl Lookup {
             self.node_alias.clone(),
             frontier.restrict(context, scope, start, &self.columns)?,
         )]);
-        if bounded
+        if matches!(mode, LookupMode::Batch { bounded: true })
             && let Some(starts) = &remote
             && let Some(filters) = self.postgres_filters(context, scope, starts).await?
         {
@@ -537,19 +549,6 @@ enum Frontier {
 }
 
 impl Frontier {
-    async fn load(
-        context: &SessionContext,
-        scope: &QueryScope,
-        frame: DataFrame,
-        cap: usize,
-        budgets: &mut Vec<MemoryReservation>,
-    ) -> Result<Self> {
-        match keys(frame.clone(), scope, cap).await? {
-            Some(keys) => Ok(Self::Inline(keys)),
-            None => Self::spillable(context, scope, frame, budgets).await,
-        }
-    }
-
     async fn spillable(
         context: &SessionContext,
         scope: &QueryScope,

@@ -42,6 +42,8 @@ impl Drop for Cancel {
     }
 }
 
+static CONNECT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 impl Driver {
     pub(super) async fn open(
         source: &Source,
@@ -60,16 +62,23 @@ impl Driver {
         let password = std::env::var(password_env)
             .with_context(|| format!("missing credential in {password_env}"))?;
         let (connect_string, user) = (connect_string.clone(), user.clone());
-        let connection = tokio::task::spawn_blocking(move || -> Result<_> {
-            let connection = Connection::connect(user, password, connect_string)
-                .context("connecting to Oracle")?;
-            connection.set_call_timeout(Some(timeout))?;
-            connection.execute("ALTER SESSION SET TIME_ZONE='+00:00'", &[])?;
-            connection.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,'", &[])?;
-            connection.execute("SET TRANSACTION READ ONLY", &[])?;
-            Ok(connection)
+        let connection = tokio::time::timeout(timeout, async move {
+            let permit = CONNECT_SLOTS.acquire().await?;
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                // An in-flight OCI connect cannot be cancelled by dropping its waiter.
+                let _permit = permit;
+                let connection = Connection::connect(user, password, connect_string)
+                    .context("connecting to Oracle")?;
+                connection.set_call_timeout(Some(timeout))?;
+                connection.execute("ALTER SESSION SET TIME_ZONE='+00:00'", &[])?;
+                connection.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,'", &[])?;
+                connection.execute("SET TRANSACTION READ ONLY", &[])?;
+                Ok(connection)
+            })
+            .await?
         })
-        .await??;
+        .await
+        .context("Oracle connection timed out")??;
         Ok(Self {
             connection: Arc::new(connection),
             cancelled: CancellationToken::new(),

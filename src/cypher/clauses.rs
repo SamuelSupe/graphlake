@@ -387,7 +387,12 @@ pub(super) struct ExpressionJoin {
 }
 
 impl ExpressionJoin {
-    pub(super) fn sql(&mut self, from: &str, calls: &mut Vec<super::apply::Apply>) -> String {
+    pub(super) fn sql(
+        &mut self,
+        from: &str,
+        seed_where: &str,
+        calls: &mut Vec<super::apply::Apply>,
+    ) -> String {
         let captures = self
             .captures
             .iter()
@@ -422,7 +427,7 @@ impl ExpressionJoin {
                 .map(|(name, value, _)| format!("first_value({value}) AS {}", ident(name)))
                 .collect::<Vec<_>>();
             format!(
-                "SELECT {}{from} GROUP BY {}",
+                "SELECT {}{from}{seed_where} GROUP BY {}",
                 projection.join(", "),
                 keys.join(", ")
             )
@@ -1861,6 +1866,16 @@ fn render_match_input(
         .shortest_ranking
         .as_ref()
         .is_some_and(|rank| rank.consume_predicate);
+    // Capture path predicates over joined endpoints and valid path rows. The
+    // predicate itself can depend on the expression joins being planned here.
+    let seed_where = if consume_predicate
+        && right.expression_joins.borrow().is_empty()
+        && !right.predicates.is_empty()
+    {
+        format!(" WHERE {}", right.predicates.join(" AND "))
+    } else {
+        String::new()
+    };
     if consume_predicate && let Some(predicate) = &pattern.where_clause {
         right.predicates.push(right.expr(predicate)?);
     }
@@ -1875,7 +1890,7 @@ fn render_match_input(
     let mut right_sql = format!(
         "SELECT {}{}{}",
         selected.join(", "),
-        right.join_expressions(&right.from()),
+        right.join_expressions_filtered(&right.from(), &seed_where),
         if right.predicates.is_empty() {
             String::new()
         } else {

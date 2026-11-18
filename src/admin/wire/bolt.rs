@@ -376,7 +376,8 @@ impl BoltBackend for Backend {
             managed,
             deadline,
         }));
-        target.audit(&self.app, "begin", "ok", 200);
+        drop(sessions);
+        crate::blocking(|| target.audit(&self.app, "begin", "ok", 200));
         Ok(handle)
     }
 
@@ -422,28 +423,38 @@ impl Backend {
         transaction: &TransactionHandle,
         commit: bool,
     ) -> Result<(), BoltError> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.get_mut(handle).ok_or_else(closed)?;
-        let tx = session
-            .transaction
-            .take()
-            .filter(|tx| &tx.handle == transaction)
-            .ok_or_else(transaction_error)?;
-        let target = session.target(&self.app)?;
+        let (tx, target) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let session = sessions.get_mut(handle).ok_or_else(closed)?;
+            if !session
+                .transaction
+                .as_ref()
+                .is_some_and(|tx| &tx.handle == transaction)
+            {
+                return Err(transaction_error());
+            }
+            let target = session.target(&self.app)?;
+            (
+                session.transaction.take().ok_or_else(transaction_error)?,
+                target,
+            )
+        };
         if commit && Instant::now() >= tx.deadline {
-            target.audit(&self.app, "commit", "error", 504);
+            crate::blocking(|| target.audit(&self.app, "commit", "error", 504));
             return Err(query_error(Error::new(
                 axum::http::StatusCode::GATEWAY_TIMEOUT,
                 "timeout",
                 "Read transaction expired",
             )));
         }
-        target.audit(
-            &self.app,
-            if commit { "commit" } else { "rollback" },
-            "ok",
-            200,
-        );
+        crate::blocking(|| {
+            target.audit(
+                &self.app,
+                if commit { "commit" } else { "rollback" },
+                "ok",
+                200,
+            )
+        });
         Ok(())
     }
 }
@@ -500,6 +511,7 @@ impl RecordStream for Rows {
 
 struct TransactionResult {
     data: BufReader<File>,
+    _spill: tokio::sync::OwnedSemaphorePermit,
     rows: u64,
     summary: BoltDict,
     deadline: Instant,
@@ -519,7 +531,20 @@ impl TransactionResult {
         mut remaining: u64,
         deadline: Instant,
     ) -> Result<Self, BoltError> {
-        let mut writer = BufWriter::new(File::from_std(tempfile::tempfile()?));
+        let spool = &result
+            .app
+            .wire
+            .as_ref()
+            .expect("Bolt configured")
+            .bolt_spill;
+        let spool = Arc::clone(spool);
+        let mut spill = Arc::clone(&spool)
+            .try_acquire_many_owned(0)
+            .map_err(|_| query_error(super::result_limit()))?;
+        let file = tokio::task::spawn_blocking(tempfile::tempfile)
+            .await
+            .map_err(|_| query_error(Error::storage()))??;
+        let mut writer = BufWriter::new(File::from_std(file));
         let mut encoded = bytes::BytesMut::new();
         let mut rows = 0;
         while let Some(values) = result.next().await.map_err(query_error)? {
@@ -529,6 +554,11 @@ impl TransactionResult {
             remaining = remaining
                 .checked_sub(u64::from(len) + 4)
                 .ok_or_else(|| query_error(super::result_limit()))?;
+            spill.merge(
+                Arc::clone(&spool)
+                    .try_acquire_many_owned(len + 4)
+                    .map_err(|_| query_error(super::result_limit()))?,
+            );
             writer.write_u32(len).await?;
             writer.write_all(&encoded).await?;
             rows += 1;
@@ -538,6 +568,7 @@ impl TransactionResult {
         data.rewind().await?;
         Ok(Self {
             data: BufReader::new(data),
+            _spill: spill,
             rows,
             summary: result.summary(),
             deadline,

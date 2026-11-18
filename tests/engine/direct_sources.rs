@@ -148,7 +148,7 @@ async fn duckdb_reads_exact_values_from_a_read_only_file_and_keeps_materialized_
 async fn mongodb_native_reads_nested_fields_exact_keys_and_detects_type_drift() -> Result<()> {
     use mongodb::{
         Client,
-        bson::{Document, doc},
+        bson::{Binary, Document, doc, oid::ObjectId, spec::BinarySubtype},
     };
     let client = Client::with_uri_str(std::env::var("GRAPHLAKE_TEST_MONGODB_DSN")?).await?;
     let name = format!("graphlake_{}", uuid::Uuid::new_v4().simple());
@@ -163,6 +163,43 @@ async fn mongodb_native_reads_nested_fields_exact_keys_and_detects_type_drift() 
         let engine = Engine::new(catalog)?;
         let mut result = engine.query(Language::Sql, "SELECT _id, \"profile.name\", tags FROM \"Account\" ORDER BY _id", QueryOptions { batch_size: 1, memory_bytes: 16 * 1024 * 1024, partitions: 1, ..Default::default() }).await?;
         assert_eq!(rows(&mut result).await?, vec![serde_json::json!({"_id":9007199254740993i64,"profile.name":"alice","tags":"[\"a\",\"b\"]"}), serde_json::json!({"_id":9007199254740994i64,"profile.name":"bob","tags":"[]"})]);
+
+        let key = |byte| Binary { subtype: BinarySubtype::Generic, bytes: vec![byte, 0] };
+        let [start, middle, finish] = [0xAA, 0xBB, 0xCC].map(key);
+        let [first, second] = [ObjectId::from_bytes([0xFD; 12]), ObjectId::from_bytes([0xFE; 12])];
+        database.collection::<Document>("vertices").insert_many([
+            doc! {"_id": &start, "name": "start"},
+            doc! {"_id": &middle, "name": "middle"},
+            doc! {"_id": &finish, "name": "finish"},
+        ]).await?;
+        database.collection::<Document>("links").insert_many([
+            doc! {"_id": first, "src": start, "dst": &middle},
+            doc! {"_id": second, "src": middle, "dst": finish},
+        ]).await?;
+        let catalog: Catalog = serde_saphyr::from_str(&format!(r#"
+graph: mongo_paths
+sources:
+  db: {{type: mongodb_native, dsn_env: GRAPHLAKE_TEST_MONGODB_DSN}}
+nodes:
+  Vertex: {{source: db.{name}.vertices, key: [_id], properties: [name]}}
+edges:
+  Link:
+    source: db.{name}.links
+    key: [_id]
+    from: {{node: Vertex, columns: [src]}}
+    to: {{node: Vertex, columns: [dst]}}
+"#))?;
+        let engine = Engine::new(catalog)?;
+        for relationship in [":Link", ""] {
+            let mut result = engine.query(Language::Cypher, &format!(
+                "MATCH p=(a:Vertex {{name:'start'}})-[{relationship}*2]->(b:Vertex)
+                 RETURN b.name AS destination, [e IN relationships(p) | e._id] AS ids"
+            ), Default::default()).await?;
+            assert_eq!(rows(&mut result).await?, [
+                serde_json::json!({"destination":"finish", "ids":[first.to_hex(), second.to_hex()]})
+            ]);
+        }
+
         database.collection::<Document>("drift").insert_many([doc!{"id":1i64,"value":1i64}, doc!{"id":2i64,"value":"changed"}]).await?;
         let catalog: Catalog = serde_saphyr::from_str(&format!("graph: drift\nsources:\n  db: {{type: mongodb_native, dsn_env: GRAPHLAKE_TEST_MONGODB_DSN, schema_sample_size: 1}}\nnodes:\n  Item: {{source: db.{name}.drift, key: [id], properties: [value]}}\n"))?;
         let drift = Engine::new(catalog)?;

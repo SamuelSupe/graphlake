@@ -34,12 +34,12 @@ struct Records {
 // Arc rows have a fixed width. Spill sorted runs and keep one current row per run
 // during the merge, even when one source vertex owns most of a shard's edges.
 const RUN_ROWS: usize = 8192;
-const RUN_FAN_IN: usize = 64;
+const RUN_FAN_IN: usize = 8;
 type ArcRun = Arc<dyn datafusion::execution::spill_file::SpillFile>;
 
 struct ArcRuns {
     rows: Vec<ArcEntry>,
-    runs: Vec<ArcRun>,
+    runs: Vec<(usize, ArcRun)>,
     budget: datafusion::execution::memory_pool::MemoryReservation,
 }
 
@@ -57,7 +57,7 @@ impl ArcRuns {
         self.budget.try_grow(std::mem::size_of::<ArcEntry>() * 2)?;
         self.rows.push(arc);
         if self.rows.len() == RUN_ROWS {
-            self.spill(scope)?;
+            crate::blocking(|| self.spill(scope))?;
         }
         Ok(())
     }
@@ -79,9 +79,20 @@ impl ArcRuns {
             .map_err(|err| err.into_error())?
             .finish()?;
         scope.reads.snapshot_spill(file.size().unwrap_or_default());
-        self.runs.push(file);
         self.rows = Vec::new();
         self.budget.free();
+        self.runs.push((0, file));
+        // Compact while ingesting, since each spill handle owns an open file.
+        // Combining equal-sized runs keeps rewrite amplification logarithmic.
+        while let Some(start) = self.runs.len().checked_sub(RUN_FAN_IN) {
+            let level = self.runs[start].0;
+            if self.runs.last().is_some_and(|(last, _)| *last != level) {
+                break;
+            }
+            let files = self.runs.drain(start..).map(|(_, file)| file).collect();
+            let merged = self.merge_run(files, scope)?;
+            self.runs.push((level + 1, merged));
+        }
         Ok(())
     }
 
@@ -118,23 +129,27 @@ impl ArcRuns {
         send: tokio::sync::mpsc::Sender<Vec<ArcEntry>>,
     ) -> Result<()> {
         self.spill(scope)?;
-        while self.runs.len() > RUN_FAN_IN {
-            let mut previous = std::mem::take(&mut self.runs).into_iter();
+        let mut runs: Vec<_> = std::mem::take(&mut self.runs)
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect();
+        while runs.len() > RUN_FAN_IN {
+            let mut previous = std::mem::take(&mut runs).into_iter();
             loop {
                 let group: Vec<_> = previous.by_ref().take(RUN_FAN_IN).collect();
                 if group.is_empty() {
                     break;
                 }
                 if group.len() == 1 {
-                    self.runs.extend(group);
+                    runs.extend(group);
                     break;
                 }
-                self.runs.push(self.merge_run(group, scope)?);
+                runs.push(self.merge_run(group, scope)?);
             }
         }
         let budget = self.budget.new_empty();
-        budget.try_grow(self.runs.len() * (4096 + 128))?;
-        let mut merge = ArcRunMerge::new(&self.runs)?;
+        budget.try_grow(runs.len() * (4096 + 128))?;
+        let mut merge = ArcRunMerge::new(&runs)?;
         let mut batch = Vec::with_capacity((BLOCK_BYTES - 4) / 36);
         while let Some(arc) = merge.next()? {
             batch.push(arc);
@@ -408,7 +423,23 @@ fn text(columns: &[ArrayRef], row: usize) -> Result<Vec<String>> {
         .map(|array| {
             let value = ScalarValue::try_from_array(array, row)?;
             ensure!(!value.is_null(), "CSR business key cannot be null");
-            Ok(value.to_string())
+            if matches!(
+                value,
+                ScalarValue::Binary(_)
+                    | ScalarValue::BinaryView(_)
+                    | ScalarValue::LargeBinary(_)
+                    | ScalarValue::FixedSizeBinary(_, _)
+            ) {
+                let text = crate::engine::key_text(&array.slice(row, 1))?;
+                Ok(text
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    .expect("business key text")
+                    .value(0)
+                    .to_owned())
+            } else {
+                Ok(value.to_string())
+            }
         })
         .collect()
 }
@@ -892,13 +923,15 @@ async fn snapshot_rows(
     // The data written to the sorter can share large source allocations. Stage
     // once, with compression, so joins and the merge never hold memory together.
     let mut input = Buffer::new_compressed(&scope.runtime.memory_pool, &scope.runtime.disk_manager);
+    let batch_size = context.state().config().batch_size();
     while let Some(batch) = source
         .try_next()
         .await
         .with_context(|| format!("reading CSR properties for {label}"))?
     {
         scope.check()?;
-        input.push(batch)?;
+        // A join may emit a batch larger than the sorter can reserve at once.
+        input.push_chunks(batch, batch_size)?;
     }
     drop(source);
     let (table, reservation) = input.finish(sorted_schema, &scope.reads)?;
@@ -1184,5 +1217,45 @@ impl SnapshotWriter {
             }
         }
         Ok(self.blocks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn compaction_bounds_open_runs_and_preserves_sorted_rows() -> Result<()> {
+        let admission = Arc::new(crate::engine::Admission::new(
+            crate::EngineLimits::default(),
+        )?);
+        let scope = QueryScope::new(crate::QueryOptions::default(), &admission).await?;
+        let mut runs = ArcRuns::new(&scope);
+        let count = (RUN_FAN_IN * RUN_FAN_IN + 3) as u64;
+        for id in (0..count).rev() {
+            runs.push(
+                ArcEntry {
+                    from: id % 2,
+                    to: id,
+                    edge: id,
+                    kind: 0,
+                    reverse: false,
+                },
+                &scope,
+            )?;
+            runs.spill(&scope)?;
+            assert!(runs.runs.len() <= 2 * RUN_FAN_IN);
+        }
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        let reader = tokio::task::spawn_blocking(move || runs.read_runs(&scope, send));
+        let mut sorted = Vec::new();
+        while let Some(batch) = receive.recv().await {
+            sorted.extend(batch.iter().map(arc_order));
+        }
+        reader.await??;
+        let mut expected = (0..count).map(|id| (id % 2, id, id)).collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(sorted, expected);
+        Ok(())
     }
 }

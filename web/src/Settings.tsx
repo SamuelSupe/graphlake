@@ -130,16 +130,10 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
 
   const readOnly = !snapshot?.file || locked || busy;
   const editableTab = tab === 'telemetry';
-  return <main className="workbench">
+  return <main className="workbench framed-workspace runtime-workspace">
     <header className="workspace-header">
       <div className="workspace-title"><h1>{t('运行配置')}</h1></div>
-      <div className="workspace-context">
-        {(dirty.current || mcpDirty) && <span className="dirty"><i />{t('未保存')}</span>}
-        {editableTab && snapshot && <>
-        <button className="button compact" type="button" disabled={busy} onClick={reloadConfig}>{t('重新加载配置')}</button>
-        <button className="button primary compact" type="submit" form="runtime-settings" disabled={readOnly || !dirty.current}>{busy ? t('正在保存…') : t('保存配置')}</button>
-        </>}
-      </div>
+      {(dirty.current || mcpDirty) && <span className="dirty"><i />{t('未保存')}</span>}
     </header>
     <div className="workspace-tabs settings-tabs" role="tablist" aria-label={t('运行配置分类')}>
       {tabs.map(([key, label, compactLabel], index) => <button key={key} id={tabButton(key)} type="button" role="tab"
@@ -231,6 +225,10 @@ export default function Settings({ models, locked, onDirty, openModel, initialTa
             </button>
           </fieldset>
           </details>
+        </div>
+        <div className="telemetry-actions">
+          <button className="button" type="button" disabled={busy} onClick={reloadConfig}>{t('重新加载配置')}</button>
+          <button className="button primary" type="submit" disabled={readOnly || !dirty.current}>{busy ? t('正在保存…') : t('保存配置')}</button>
         </div>
       </div></section>
     </form>}

@@ -161,11 +161,9 @@
   .sync-source-line > span:first-child { inline-size: 100%; }
   .sync-source-line code { flex: 1; }
   .local-table-facts { margin-inline: 14px; }
-  .local-table-actions { padding: 10px 14px; flex-wrap: wrap; gap: 0; }
-  .local-table-actions > div { inline-size: 100%; display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; }
-  .local-table-actions .button { min-block-size: 42px; padding-inline: 6px; justify-content: center; }
-  .sync-more { margin-inline-start: auto; }
-  .sync-more summary { min-block-size: 40px; }
+  .local-table-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; padding: 10px 14px; gap: 4px 8px; }
+  .local-table-actions > div { display: contents; }
+  .local-table-actions .button, .sync-more summary { min-block-size: 44px; padding-inline: 6px; justify-content: center; white-space: normal; }
   .sync-run-error { margin-inline: 14px; }
   .sync-retained { padding-inline: 14px; }
 }

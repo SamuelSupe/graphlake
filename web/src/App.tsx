@@ -13,6 +13,7 @@ import type { Point } from './modelCanvasGeometry';
 import { documentOf, emptyModel, modelOf } from './model';
 import { Modal, NameDialog } from './ui';
 import { ConsoleNavigation } from './ConsoleNavigation';
+import { ModelWorkspaceHeader } from './ModelWorkspaceHeader';
 import { Models, type DirectoryState } from './Models';
 import type { SettingsTab } from './Settings';
 import './styles.css';
@@ -279,8 +280,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
               changed={reloadModels} created={key => navigate(modelPath(key), true)} />
             </Suspense>
           : <main className="workbench workspace-query">
-              <header className="workspace-header"><div className="workspace-title"><h1>{summary!.name}</h1></div>
-                <button className="button compact" onClick={() => navigate('/query')}>{t('查询模型列表')}</button></header>
+              <ModelWorkspaceHeader workspace={t('查询')} name={summary!.name} back={() => navigate('/query')} />
               <Query id={model} actor={actor} revision={summary!.active_revision!} draftPending={false}
                 refresh={reloadModels} visible={show} canExport={canExport(model)} />
             </main>}

@@ -51,7 +51,7 @@ export function Access({ models, locked }: { models: ModelSummary[]; locked: boo
     setGroupEdit(undefined);
     setAttempt(value => value + 1);
   }
-  return <main className="workbench">
+  return <main className="workbench framed-workspace access-workspace">
     <header className="workspace-header">
       <div className="workspace-title"><h1>{t('权限管理')}</h1></div>
       <div className="workspace-context">

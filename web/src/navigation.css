@@ -82,8 +82,11 @@
     width: 18px; height: 2px; inset: auto auto 1px calc(50% - 9px); border-radius: 2px;
   }
 
-  .app-rail[data-collapsed] .rail-nav { grid-row: 1; grid-column: 2; padding-inline-end: var(--gutter); }
-  .rail-nav > .rail-menu-trigger { gap: 7px; max-inline-size: min(54vw, 14rem); min-block-size: 44px; }
+  .app-rail[data-collapsed] { grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; padding-inline: var(--gutter); }
+  .app-rail[data-collapsed] .rail-brand { padding-inline: 0; }
+  .app-rail[data-collapsed] .rail-brand span { font-size: clamp(1.1rem, 5.5vw, 1.38rem); }
+  .app-rail[data-collapsed] .rail-nav { grid-row: 1; grid-column: 2; justify-self: end; max-inline-size: 100%; }
+  .rail-nav > .rail-menu-trigger { gap: 7px; max-inline-size: 100%; min-block-size: 44px; }
   .rail-menu-trigger > svg { flex: none; }
   .rail-menu-trigger > span { min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; }
   .rail-menu[popover]:popover-open {

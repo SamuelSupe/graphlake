@@ -162,7 +162,7 @@ export default function Overview({ active, openModel, openSettings }: Props) {
     if (job?.state === 'unavailable') issues.push(['backups', t('{0}状态不可读', name)]);
     else if (job?.state === 'recorded' && !job.result.ok) issues.push(['backups', t('{0}失败', name)]);
   }
-  return <main className="workbench overview">
+  return <main className="workbench framed-workspace overview">
     <header className="workspace-header">
       <div className="workspace-title"><h1>{t('平台概览')}</h1></div>
       <div className="workspace-context">

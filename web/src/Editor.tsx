@@ -1,7 +1,7 @@
 import { diagnosticText, t } from './locale.ts';
 import type { useMutations } from './Mutations';
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, Waypoints, X } from 'lucide-react';
+import { Braces, Box, Database, GitCommitHorizontal, History, List, Pencil, Plus, RefreshCw, Save, ShieldCheck, Upload, Waypoints, X } from 'lucide-react';
 import { api, ApiError, errorText, type BusinessStatus, type Column, type ImpactReport, type ModelSummary, type SavedModel, type Validation, type ValidationSite } from './api';
 import { BusinessImpact, impactLabels, type ImpactTarget } from './BusinessImpact';
 import { BusinessTasks } from './BusinessTasks';
@@ -22,6 +22,7 @@ import { ModelYamlEditor } from './ModelYamlEditor';
 import { useModelDraft } from './useModelDraft';
 import { setupIssue } from './modelWorkflow';
 import { Modal, NameDialog, StatusLabel } from './ui';
+import { ModelWorkspaceHeader } from './ModelWorkspaceHeader';
 import { WorkspaceTools } from './WorkspaceTools';
 
 export type Workspace = 'graph' | 'catalogs' | 'query';
@@ -488,34 +489,13 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const dirtyLabel = workspace !== 'query' && dirty && <span className="dirty"><i />{t('未保存')}</span>;
 
   return <main className={'workbench editor workspace-' + workspace}>
-    {workspace === 'catalogs' ? <header className="workspace-header catalog-header">
-      <div className="catalog-header-nav">
-        <button className="catalog-back" type="button" aria-label={title + ' · ' + t('返回模型列表')} title={t('返回模型列表')} onClick={close}>
-          <ArrowLeft size={16} aria-hidden="true" />{title}
-        </button>
-        {modelSwitcher}
-      </div>
-      <div className="catalog-heading-row">
-        <div className="catalog-heading-info">
-          <h1>{modelName}</h1>
-          {(version || dirtyLabel) && <div className="catalog-model-status">{version}{dirtyLabel}</div>}
-        </div>
-        {model && allow.configure && allow.edit && <button className="button primary catalog-add" type="button"
-          disabled={!!busy} aria-haspopup="dialog" onClick={openSource}><Plus size={16} aria-hidden="true" />{t('添加数据源')}</button>}
-      </div>
-    </header> : <header className="workspace-header model-workspace-header">
-      <div className="workspace-title">
-        <button className="icon-button" aria-label={t('返回模型列表')} title={t('返回模型列表')} onClick={close}><ArrowLeft size={17} aria-hidden="true" /></button>
-        <div className="model-heading"><span>{title}</span><h1>{modelName}</h1></div>
-      </div>
-      <div className="workspace-context">
-        {dirtyLabel}
-        {modelSwitcher}
-        {workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" aria-label={t('编辑模型名称')}
-          disabled={busy || !!yamlError} onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} /></button>}
-        {version}
-      </div>
-    </header>}
+    <ModelWorkspaceHeader workspace={title} name={modelName} back={close} switcher={modelSwitcher}
+      rename={workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" type="button"
+        aria-label={t('编辑模型名称')} title={t('编辑模型名称')} disabled={busy || !!yamlError}
+        onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} aria-hidden="true" /></button>}
+      status={(version || dirtyLabel) && <>{version}{dirtyLabel}</>}
+      action={workspace === 'catalogs' && model && allow.configure && allow.edit && <button className="button primary catalog-add" type="button"
+        disabled={!!busy} aria-haspopup="dialog" onClick={openSource}><Plus size={16} aria-hidden="true" />{t('添加数据源')}</button>} />
     {saved?.archive_error && <p className="notice error" role="alert">{diagnosticText(saved.archive_error)}{' '}
       <button className="button compact" onClick={() => setModal('versions')}>{t('查看版本历史')}</button>
     </p>}

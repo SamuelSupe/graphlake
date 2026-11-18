@@ -931,7 +931,8 @@ button.graph-edge:hover, .graph-edge[aria-pressed="true"] { color: var(--accent)
 .telemetry-summary .settings-fields, .telemetry-export > .settings-fields { border: 0; padding: 0; }
 .telemetry-summary legend, .telemetry-export > .settings-fields > legend { padding: 0 0 10px; }
 .telemetry-export > .settings-fields > legend { font-size: 1rem; }
-.settings-feedback { margin: 16px var(--gutter) 0; }
+.telemetry-actions > .notice { flex: 1 0 100%; margin: 0; }
+.runtime-workspace button[aria-disabled="true"] { cursor: progress; opacity: .6; }
 .settings-health { display: grid; grid-template-columns: minmax(0, 2fr) minmax(17rem, 1fr); align-items: start; gap: 20px; }
 .recovery-console { display: grid; gap: 14px; max-width: 55rem; padding: 24px var(--gutter); margin-inline: auto; }
 .recovery-heading, .recovery-token-form, .recovery-verdict { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }

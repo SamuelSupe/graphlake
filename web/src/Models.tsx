@@ -1,6 +1,6 @@
 import { diagnosticText, t } from './locale.ts';
 import { useLayoutEffect, useRef, useState } from 'react';
-import { Activity, ArrowRight, Box, CircleAlert, Database, GitFork, LayoutGrid, List, Network, Plus, RefreshCw, Search, Terminal, Upload } from 'lucide-react';
+import { Activity, ArrowRight, Box, CircleAlert, Database, GitFork, LayoutGrid, List, LoaderCircle, Network, Plus, RefreshCw, Search, Terminal, Upload } from 'lucide-react';
 import type { ModelSummary } from './api';
 import { AppLink, modelPath } from './AppLink';
 import type { Workspace } from './Editor';
@@ -28,10 +28,10 @@ function matches(model: ModelSummary, filter: Filter) {
   return true;
 }
 
-export function Models({ models, error, importError, workspace, navigate, canQuery, memory, health, create, importModel, retry, administrator }: {
+export function Models({ models, error, refreshing, importError, workspace, navigate, canQuery, memory, health, create, importModel, retry, administrator }: {
   health: () => void;
   memory: DirectoryState;
-  administrator: boolean; models?: ModelSummary[]; error: string; importError: string; workspace: Workspace;
+  administrator: boolean; models?: ModelSummary[]; error: string; refreshing: boolean; importError: string; workspace: Workspace;
   canQuery: (id: string) => boolean;
   navigate: (path: string) => void; create: () => void;
   importModel: (file: File) => void; retry: () => void;
@@ -42,6 +42,7 @@ export function Models({ models, error, importError, workspace, navigate, canQue
   const [filter, updateFilter] = useState<Filter>(memory.filter);
   const setFilter = (value: Filter) => { memory.filter = value; updateFilter(value); };
   const searchInput = useRef<HTMLInputElement>(null);
+  const refreshButton = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => {
     if (!models || !memory.returnFocus) return;
     document.getElementById(memory.returnFocus)?.focus({ preventScroll: true });
@@ -58,7 +59,7 @@ export function Models({ models, error, importError, workspace, navigate, canQue
   const activeFilter = workspace === 'query' ? 'all' : filter;
   const filtered = available?.filter(model => matches(model, activeFilter)
     && (model.name.toLowerCase().includes(needle) || model.id.toLowerCase().includes(needle))) ?? [];
-  const statusFilters = filters.map(item => ({ ...item, count: error ? undefined : available?.filter(model => matches(model, item.key)).length }));
+  const statusFilters = filters.map(item => ({ ...item, count: available?.filter(model => matches(model, item.key)).length }));
   const narrowed = !!needle || activeFilter !== 'all';
   const { title, description } = workspaces[workspace];
 
@@ -90,7 +91,7 @@ export function Models({ models, error, importError, workspace, navigate, canQue
       <dl className="directory-metrics" aria-label={t('可见模型的结构汇总')}>
         {metrics.map(({ label, Icon, value }) => <div key={label}>
           <dt><Icon size={16} aria-hidden="true" />{label}</dt>
-          <dd>{error || value === undefined ? '—' : value.toLocaleString()}</dd>
+          <dd>{value === undefined ? '—' : value.toLocaleString()}</dd>
         </div>)}
       </dl>
     </header>
@@ -104,7 +105,10 @@ export function Models({ models, error, importError, workspace, navigate, canQue
             onChange={event => setFilter(event.target.value as Filter)}>
             {statusFilters.map(({ key, label, count }) => <option key={key} value={key}>{label}{count !== undefined && ` (${count})`}</option>)}
           </select>}
-          <button className="button refresh-models" aria-label={t('刷新模型列表')} title={t('刷新模型列表')} onClick={retry}><RefreshCw size={17} aria-hidden="true" /></button>
+          <button className="button refresh-models" ref={refreshButton} aria-disabled={refreshing} aria-label={refreshing ? t('正在刷新…') : t('刷新模型列表')}
+            title={refreshing ? t('正在刷新…') : t('刷新模型列表')} onClick={() => { if (!refreshing) retry(); }}>
+            {refreshing ? <LoaderCircle size={17} aria-hidden="true" /> : <RefreshCw size={17} aria-hidden="true" />}
+          </button>
         </div>
         <div className="library-views" role="group" aria-label={t('目录视图')}>
           {([{ mode: 'cards', label: t('卡片视图'), Icon: LayoutGrid }, { mode: 'table', label: t('列表视图'), Icon: List }] as const)
@@ -121,8 +125,9 @@ export function Models({ models, error, importError, workspace, navigate, canQue
         </div>
       </div>}
       {importError && <p className="notice error listing-notice" role="alert">{importError}</p>}
-      {error ? <div className="directory-empty panel-table" role="alert"><CircleAlert size={28} aria-hidden="true" />
-        <h2>{t('暂时无法读取模型')}</h2><p>{error}</p><button className="button" onClick={retry}>{t('重新加载')}</button>
+      {error && models && <p className="notice error listing-notice" role="alert">{t('刷新失败，当前显示上次读取的目录。{0}', error)}</p>}
+      {error && !models ? <div className="directory-empty panel-table" role="alert"><CircleAlert size={28} aria-hidden="true" />
+        <h2>{t('暂时无法读取模型')}</h2><p>{error}</p><button className="button" disabled={refreshing} onClick={() => { refreshButton.current?.focus(); retry(); }}>{t('重新加载')}</button>
       </div> : !models ? <div className="directory-empty panel-table" role="status">{t('正在读取模型…')}</div>
         : !filtered.length ? <div className="directory-empty panel-table">
           {narrowed ? <Search size={28} aria-hidden="true" /> : <Network size={32} aria-hidden="true" />}
@@ -157,7 +162,7 @@ export function Models({ models, error, importError, workspace, navigate, canQue
             </div></td>
           </tr>)}</tbody>
         </table></div>}
-      {available && !error && <div className="directory-footer"><span role="status">{t('显示 {0} / {1} 个模型', filtered.length, available.length)}</span>
+      {available && <div className="directory-footer"><span role="status">{refreshing ? t('正在刷新…') : t('显示 {0} / {1} 个模型', filtered.length, available.length)}</span>
         <div className="actions">
           {narrowed && filtered.length > 0 && <button className="text-button" onClick={resetFilters}>{t('清除筛选')}</button>}
           {workspace === 'graph' && administrator && <button className="text-button" onClick={health}><Activity size={16} aria-hidden="true" />{t('运行健康')}</button>}

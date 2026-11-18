@@ -2,7 +2,7 @@ import { t } from './locale.ts';
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Bot, Database, LayoutDashboard, LogOut, Network, Settings2, ShieldCheck, Terminal, UserRound } from 'lucide-react';
-import { api, errorText, type ModelSummary, type SavedModel } from './api';
+import { api, ApiError, errorText, type ModelSummary, type SavedModel } from './api';
 import { AuthGate, type Session } from './Auth';
 import { LanguageSelect } from './LanguageSelect';
 import { Access, type Grants } from './Access';
@@ -65,6 +65,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   const [imported, setImported] = useState<{ yaml: string; name: string }>();
   const [importError, setImportError] = useState('');
   const [models, setModels] = useState<ModelSummary[]>();
+  const [refreshingModels, setRefreshingModels] = useState(true);
   const [error, setError] = useState('');
   const [logoutError, setLogoutError] = useState('');
   const [loggingOut, setLoggingOut] = useState(false);
@@ -80,23 +81,31 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   const reloadModels = useCallback(() => retry(value => value + 1), []);
 
   useEffect(() => {
-    if (locked) return;
-    const controller = new AbortController();
-    setError('');
-    api<ModelSummary[]>('/models', { signal: controller.signal }).then(setModels, cause => {
-      if (!controller.signal.aborted) setError(errorText(cause));
-    });
-    return () => controller.abort();
-  }, [attempt, locked]);
-
-  useEffect(() => {
-    if (locked) return;
+    if (locked) {
+      setModels(undefined);
+      setError('');
+      setRefreshingModels(true);
+      return;
+    }
     const controller = new AbortController();
     const options = { signal: controller.signal };
-    if (!administrator) api<Grants>('/my-roles', options).then(value => {
-      setGrants(value); setPermissionError('');
+    setRefreshingModels(true);
+    const listing = api<ModelSummary[]>('/models', options).then(value => {
+      if (!controller.signal.aborted) { setModels(value); setError(''); }
+    }, cause => {
+      if (controller.signal.aborted) return;
+      const status = cause instanceof ApiError ? cause.status : undefined;
+      const temporary = cause instanceof TypeError || status === 408 || status === 429 || (status ?? 0) >= 500;
+      if (!temporary) setModels(undefined);
+      setError(errorText(cause));
+    });
+    const roles = !administrator && api<Grants>('/my-roles', options).then(value => {
+      if (!controller.signal.aborted) { setGrants(value); setPermissionError(''); }
     }, cause => {
       if (!controller.signal.aborted) setPermissionError(errorText(cause));
+    });
+    Promise.all([listing, roles]).then(() => {
+      if (!controller.signal.aborted) setRefreshingModels(false);
     });
     api<{ mutation_receipts: boolean }>('/options', options).then(value => setReceipts(value.mutation_receipts), () => {});
     return () => controller.abort();
@@ -162,6 +171,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   const canUseQuery = administrator || Object.values(grants ?? {}).some(roles => roles.includes('query'));
   const workspace = location.workspace === 'graph' && !hasModelAccess && canUseQuery ? 'query' : location.workspace;
   const workspaceModels = availableModels?.filter(model => workspace === 'query' ? canQuery(model.id) : canReadModel(model.id));
+  const directoryModels = id && !administrator && workspaceModels ? [] : workspaceModels;
   currentWorkspace.current = workspace;
   const mutations = useMutations(actor, receipts, model => {
     setRecovered(model);
@@ -296,7 +306,9 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
         openServiceSettings={administrator ? () => { setSettingsTab('mcp'); navigate('/settings'); } : undefined} />
     </Suspense>}
     {!overviewPage && !accessPage && !settingsPage && !aiPage && !newModel && (!id || !canReadModel(id) && !canQuery(id)) &&
-      <Models key={workspace} memory={directory.current[workspace]} models={id && !administrator && grants ? [] : workspaceModels} error={permissionError || error}
+      <Models key={workspace} memory={directory.current[workspace]}
+        models={permissionError || locked ? undefined : directoryModels}
+        error={permissionError || error} refreshing={refreshingModels}
         importError={workspace === 'graph' ? importError : ''} retry={reloadModels} workspace={workspace}
         administrator={administrator} canQuery={canQuery} health={() => { setSettingsTab('health'); navigate('/settings'); }}
         navigate={navigate}

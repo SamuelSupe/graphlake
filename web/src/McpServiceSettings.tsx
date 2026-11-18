@@ -2,6 +2,7 @@ import { t } from './locale.ts';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { api, ApiError, errorText } from './api';
 import type { McpConfig, McpSnapshot } from './mcp';
+import { useSettingsRead } from './useSettingsRead';
 
 function editableSnapshot(snapshot: McpSnapshot): McpSnapshot {
   const { config } = snapshot;
@@ -19,21 +20,14 @@ export default function McpServiceSettings({ locked, visible, onDirty }: {
   const [error, setError] = useState('');
   const [conflict, setConflict] = useState(false);
   const [message, setMessage] = useState('');
-  const [attempt, reload] = useState(0);
   const errorRef = useRef<HTMLDivElement>(null);
   const dirty = !!(snapshot && config && (Object.keys(config) as (keyof McpConfig)[]).some(key => config[key] !== snapshot.config[key]));
 
-  useEffect(() => {
-    if (locked || !visible || snapshot) return;
-    const controller = new AbortController();
-    api<McpSnapshot>('/mcp/settings', { signal: controller.signal }).then(value => {
-      if (!controller.signal.aborted) {
-        const editable = editableSnapshot(value);
-        setSnapshot(editable); setConfig(editable.config); setError('');
-      }
-    }, cause => { if (!controller.signal.aborted) setError(errorText(cause)); });
-    return () => controller.abort();
-  }, [locked, visible, snapshot, attempt]);
+  const { loading, reload } = useSettingsRead<McpSnapshot>('/mcp/settings', !locked && (visible || !!snapshot), !snapshot, value => {
+    const editable = editableSnapshot(value);
+    setSnapshot(editable); setConfig(editable.config); setError(''); setConflict(false);
+  }, setError);
+  const blocked = locked || busy || loading;
   useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
 
   function change<K extends keyof McpConfig>(key: K, value: McpConfig[K]) {
@@ -43,7 +37,7 @@ export default function McpServiceSettings({ locked, visible, onDirty }: {
   }
   async function save(event: FormEvent) {
     event.preventDefault();
-    if (!snapshot || !config || busy || locked || !dirty || conflict) return;
+    if (!snapshot || !config || blocked || !dirty || conflict) return;
     setBusy(true); setError(''); setMessage('');
     try {
       const next = await api<McpSnapshot>('/mcp/settings', {
@@ -54,21 +48,23 @@ export default function McpServiceSettings({ locked, visible, onDirty }: {
     } catch (cause) {
       const changed = cause instanceof ApiError && cause.code === 'mcp_conflict';
       setConflict(changed);
-      setError(changed ? t('配置已被其他页面更新。你的修改仍保留，请先重新加载最新配置再编辑。') : errorText(cause));
+      setError(changed ? '' : errorText(cause));
       requestAnimationFrame(() => errorRef.current?.focus());
     } finally { setBusy(false); }
   }
   function refresh() {
-    setSnapshot(undefined); setConfig(undefined); setConflict(false); setMessage(''); setError(''); reload(value => value + 1);
+    if (blocked) return;
+    setMessage('');
+    void reload();
   }
   return <>
       {!snapshot || !config ? <section className="settings-card">
-        {error ? <><p className="notice error" role="alert">{error}</p><button type="button" className="button" disabled={locked} onClick={refresh}>{t('重试读取 MCP 配置')}</button></>
+        {error ? <><p className="notice error" role="alert">{error}</p><button type="button" className="button" disabled={blocked} onClick={refresh}>{loading ? t('正在刷新…') : t('重试读取 MCP 配置')}</button></>
           : <p role="status">{t('正在读取 MCP 配置…')}</p>}
       </section> : <>
-        <form className="settings-card mcp-form" method="post" action="/api/v1/mcp/settings" aria-labelledby="mcp-title" onSubmit={save} aria-busy={busy}>
+        <form className="settings-card mcp-form" method="post" action="/api/v1/mcp/settings" aria-labelledby="mcp-title" onSubmit={save} aria-busy={busy || loading}>
           <div><h2 id="mcp-title">{t('MCP 服务')}</h2><p className="settings-hint">{t('查询和建模可独立启停，保存后生效。各服务按用户的模型权限提供工具。')}</p></div>
-          <fieldset className="settings-fields" disabled={locked || busy}>
+          <fieldset className="settings-fields" disabled={blocked}>
             <legend>{t('查询 MCP')}</legend>
             <div className="mcp-capability">
               <input id="mcp-query" type="checkbox" name="query" checked={config.query} aria-describedby="mcp-query-help" onChange={event => change('query', event.target.checked)} />
@@ -80,7 +76,7 @@ export default function McpServiceSettings({ locked, visible, onDirty }: {
             </div>
             {config.timeout_ms > snapshot.server_timeout_ms && <p className="settings-hint">{t('受服务上限限制，实际超时为 {0} 毫秒。', snapshot.server_timeout_ms)}</p>}
           </fieldset>
-          <fieldset className="settings-fields" disabled={locked || busy}>
+          <fieldset className="settings-fields" disabled={blocked}>
             <legend>{t('建模 MCP')}</legend>
             <div className="mcp-capability">
               <input id="mcp-modeling" type="checkbox" name="modeling" checked={config.modeling} aria-describedby="mcp-modeling-help" onChange={event => change('modeling', event.target.checked)} />
@@ -91,11 +87,18 @@ export default function McpServiceSettings({ locked, visible, onDirty }: {
               <div><label htmlFor="mcp-publish">{t('允许发布模型')}</label><p id="mcp-publish-help" className="settings-hint">{t('需先启用建模，并授予独立的发布角色。发布会切换后续查询使用的版本；关闭时可在图模型页面人工发布。')}</p></div>
             </div>
           </fieldset>
-          {error && <div ref={errorRef} tabIndex={-1} className="notice error" role="alert"><p>{error}</p>{conflict && <button type="button" className="button" disabled={locked || busy} onClick={refresh}>{t('放弃修改并重新加载')}</button>}</div>}
+          {(conflict || error) && <div ref={errorRef} tabIndex={-1} className="notice error" role="alert">
+            {conflict && <p>{t('配置已被其他页面更新。你的修改仍保留，请先重新加载最新配置再编辑。')}</p>}
+            {error && <p>{error}</p>}
+          </div>}
           {message && <p className="notice" role="status">{message}</p>}
           <div className="settings-actions">
-            <button type="submit" className="button primary" disabled={locked || busy || !dirty || conflict}>{busy ? t('正在保存…') : t('保存 MCP 配置')}</button>
-            {!conflict && <button type="button" className="button" disabled={locked || busy} onClick={dirty ? () => { setConfig(snapshot.config); setMessage(''); setError(''); } : refresh}>{dirty ? t('撤销修改') : t('重新加载')}</button>}
+            <button type="submit" className="button primary" disabled={blocked || !dirty || conflict}>{busy ? t('正在保存…') : t('保存 MCP 配置')}</button>
+            <button type="button" className="button" aria-disabled={blocked} onClick={() => {
+              if (blocked) return;
+              if (!dirty || conflict) refresh();
+              else { setConfig(snapshot.config); setMessage(''); setError(''); }
+            }}>{loading ? t('正在刷新…') : conflict ? t('放弃修改并重新加载') : dirty ? t('撤销修改') : t('重新加载')}</button>
           </div>
         </form>
       </>}

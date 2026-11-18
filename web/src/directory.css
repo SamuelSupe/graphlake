@@ -122,3 +122,8 @@
 @media (pointer: coarse) {
   .library-views button { min-inline-size: 44px; min-block-size: 40px; }
 }
+.refresh-models[aria-disabled="true"] { cursor: progress; color: var(--muted); }
+@media (prefers-reduced-motion: no-preference) {
+  .refresh-models[aria-disabled="true"] svg { animation: directory-refresh 1s linear infinite; }
+  @keyframes directory-refresh { to { transform: rotate(1turn); } }
+}

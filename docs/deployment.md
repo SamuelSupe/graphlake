@@ -1,13 +1,13 @@
 # Deploy GraphLake
 
-The v1.1.2 release provides Linux packages for `aarch64` (ARM64) and `x86_64` (AMD64). Debian 12 with systemd is the installation baseline. For each host, keep the architecture-specific archive, its SHA-256 file, and the `BUILD-INFO` stored inside the archive.
+The v1.1.3 release provides Linux packages for `aarch64` (ARM64) and `x86_64` (AMD64). Debian 12 with systemd is the installation baseline. For each host, keep the architecture-specific archive, its SHA-256 file, and the `BUILD-INFO` stored inside the archive.
 
 ## Standalone service
 
-Download both files for the host architecture from the [v1.1.2 release](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.2). Run the commands below in the download directory. Set `artifact` to the actual archive filename without `.tar.gz`.
+Download both files for the host architecture from the [v1.1.3 release](https://github.com/SamuelSupe/graphlake/releases/tag/v1.1.3). Run the commands below in the download directory. Set `artifact` to the actual archive filename without `.tar.gz`.
 
 ```sh
-artifact=graphlake-v1.1.2-SOURCE_SHA12-linux-$(uname -m)
+artifact=graphlake-v1.1.3-SOURCE_SHA12-linux-$(uname -m)
 sha256sum -c "$artifact.tar.gz.sha256"
 release_dir="/opt/graphlake/releases/${artifact#graphlake-}"
 
@@ -81,7 +81,7 @@ docker compose -f tests/production-compose.yml down -v
 On Debian 12, install Rust 1.95 or later, a native C/C++ toolchain, binutils, LLD, Git, and Node.js 24. From a clean checkout, run:
 
 ```sh
-RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.2 dist
+RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.3 dist
 ```
 
 Run this on each target architecture or provide the corresponding cross linker and Rust target, then set `GRAPHLAKE_BUILD_TARGET` to `aarch64-unknown-linux-gnu` or `x86_64-unknown-linux-gnu`. The script checks the architecture, embedded source version, and glibc baseline and writes an accompanying source archive and checksums.

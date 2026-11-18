@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v1.1.3
+
+- Stream eligible CSV and JSON Lines previews after validating business keys for the pinned source version. Revalidate when the file version changes.
+- Estimate nested array allocations from the relevant slices so shared Arrow buffers do not exhaust the query budget. Keep rejecting expansions that exceed the budget.
+- Read CSR identities in vertex order for distributed PageRank and weakly connected components, and index large blocks for component representative lookups.
+- Limit Coordinator storage probes to one in flight per process, including after a probe timeout.
+- Add an opt-in OpenDAL backend for cluster S3 storage and harden managed snapshot history and recovery.
+- Edit graph models in YAML and on the canvas with bidirectional synchronization. Improve business task and fixed scenario editing.
 
 - Keep driver traffic off the etcd leadership confirmation path, and reclaim eligible managed local snapshots even when a refresh retires another generation.
 - Reuse graph and connection state across reads, bound slow downloads and automatic retries, and preserve indexed local refreshes for batches larger than 1,024 rows.

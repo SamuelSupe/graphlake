@@ -25,6 +25,7 @@ const Settings = lazy(() => import('./Settings'));
 const AI = lazy(() => import('./AI'));
 const Overview = lazy(() => import('./Overview'));
 const RecoveryConsole = lazy(() => import('./RecoveryConsole'));
+const AddSource = lazy(() => import('./AddSource').then(module => ({ default: module.AddSource })));
 const Editor = lazy(() => import('./Editor'));
 
 const nav = [
@@ -61,6 +62,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
     return id ? [id] : [];
   });
   const [draft, setDraft] = useState<SavedModel>();
+  const [sourceDraft, setSourceDraft] = useState('');
   const [creating, setCreating] = useState(false);
   const [imported, setImported] = useState<{ yaml: string; name: string }>();
   const [importError, setImportError] = useState('');
@@ -274,7 +276,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
             </Suspense>
           : <main className="workbench workspace-query">
               {summary?.active_revision && !summary.archive_error ? <>
-                <ModelWorkspaceHeader workspace={t('查询')} name={summary.name} back={() => navigate('/query')} />
+                <ModelWorkspaceHeader workspace={t('查询')} name={summary.name} modelId={model} revision={summary.active_revision} back={() => navigate('/query')} />
                 <Query id={model} actor={actor} revision={summary.active_revision} draftPending={false}
                   refresh={reloadModels} visible={show} canExport={canExport(model)} />
               </> : <div className="directory-empty empty">
@@ -310,10 +312,20 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
         models={permissionError || locked ? undefined : directoryModels}
         error={permissionError || error} refreshing={refreshingModels}
         importError={workspace === 'graph' ? importError : ''} retry={reloadModels} workspace={workspace}
-        administrator={administrator} canQuery={canQuery} health={() => { setSettingsTab('health'); navigate('/settings'); }}
+        administrator={administrator} canQuery={canQuery} canRead={canReadModel} health={() => { setSettingsTab('health'); navigate('/settings'); }}
         navigate={navigate}
-        create={() => setCreating(true)} importModel={file => void importModel(file)} />}
+        create={() => setCreating(true)} connect={() => setSourceDraft('graph-' + crypto.getRandomValues(new Uint32Array(2)).join('-'))}
+        importModel={file => void importModel(file)} />}
     </div>
+    {sourceDraft && administrator && !locked && <Suspense fallback={<p className="empty" role="status">{t('正在打开连接器…')}</p>}>
+      <AddSource modelId={sourceDraft} close={() => setSourceDraft('')} submit={(name, source) => {
+        const doc = documentOf(emptyModel(name));
+        doc.setIn(['sources', name], source);
+        setDraft({ id: sourceDraft, yaml: doc.toString(), revision: '', active_revision: null, status: 'unchecked' });
+        setSourceDraft('');
+        navigate('/new');
+      }} />
+    </Suspense>}
     {logoutError && <p className="notice error auth-logout-error" role="alert">{logoutError}</p>}
     {confirmLogout && !locked && <Modal layout="center" title={t('退出登录')} close={() => setConfirmLogout(false)}>
       <div className="dialog-form">

@@ -24,7 +24,7 @@ type Expansion = {
 };
 type SearchScope = { anchor: GraphElement; filter: NeighborFilter; cursor: string; key: string };
 type QueryContinuation = { snapshot: string; next: number; prefix?: string; loaded?: QueryGraphPage };
-type CanvasState = { elements: GraphElement[]; selected?: string; camera: Camera; overrides: Map<string, Point>;
+type CanvasState = { elements: GraphElement[]; selected?: string; camera: Camera; autoFit: boolean; overrides: Map<string, Point>;
   expansions: Map<string, Expansion>; focused: boolean; searchScope?: SearchScope; layout: Layout;
   search: string; searchResult?: CrossSearch };
 export type GraphExplorerHandle = { append: (result: QueryResult) => string | undefined };
@@ -63,6 +63,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
   const [selected, setSelected] = useState<string>();
   const [layout, setLayout] = useState<Layout>('radial');
   const [camera, setCamera] = useState<Camera>({ x: 0, y: 0, zoom: 1 });
+  const autoFit = useRef(true);
   const [overrides, setOverrides] = useState(new Map<string, Point>());
   const [pending, setPending] = useState<{ id: string; neighbors: boolean }>();
   const [addedFrom, setAddedFrom] = useState<QueryResult['sources']>([]);
@@ -167,6 +168,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       const bounds = element.getBoundingClientRect();
       const x = event.clientX - bounds.left - bounds.width / 2;
       const y = event.clientY - bounds.top - bounds.height / 2;
+      autoFit.current = false;
       setCamera(previous => {
         const zoom = clampZoom(previous.zoom * Math.exp(-Math.max(-180, Math.min(180, event.deltaY)) * .002));
         const ratio = zoom / previous.zoom;
@@ -186,6 +188,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       top = Math.min(top, y); bottom = Math.max(bottom, y);
     }
     const zoom = Math.min(1.3, Math.max(minZoom, Math.min((width - 26) / (right - left + 150), (height - 26) / (bottom - top + 135))));
+    autoFit.current = true;
     setCamera({ x: -(left + right) * zoom / 2, y: -(top + bottom) * zoom / 2, zoom });
   }
 
@@ -194,7 +197,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       [id, useOverrides ? overrides.get(id) ?? position : position])));
   }
 
-  const hasSized = useRef(false);
+  const lastViewport = useRef<{ width: number; height: number } | null>(null);
   useEffect(() => {
     const element = surface.current;
     if (!element) return;
@@ -206,11 +209,16 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     return () => observer.disconnect();
   }, []);
 
-  // A details pane or a tab switch can resize the surface without changing the camera.
+  // Refit an automatically fitted graph on window resize. Keep the camera when
+  // opening details, changing tabs, or after deliberate pan/zoom actions.
   useEffect(() => {
-    if (!size.width || !size.height || hasSized.current) return;
-    hasSized.current = true;
-    fitVisible(false);
+    if (!size.width || !size.height) return;
+    const viewport = { width: window.innerWidth, height: window.innerHeight };
+    const previous = lastViewport.current;
+    lastViewport.current = viewport;
+    if (!previous || autoFit.current && (previous.width !== viewport.width || previous.height !== viewport.height)) {
+      fitVisible(true);
+    }
   }, [size.width, size.height]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function applyPage(result: GraphExploration, filter?: NeighborFilter, batchMode = false, canvas = elements) {
@@ -220,7 +228,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     }
     const merged = mergePage(batchMode ? [result.selected] : canvas, result.selected, result.graph.elements);
     if (batchMode) {
-      if (!original) setOriginal({ elements, selected, camera, overrides, expansions, focused, searchScope, layout, search, searchResult });
+      if (!original) setOriginal({ elements, selected, camera, autoFit: autoFit.current, overrides, expansions, focused, searchScope, layout, search, searchResult });
       changeCanvas(merged.elements);
       setSelected(result.selected.id);
       setFocused(true);
@@ -398,6 +406,7 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     if (!original) return;
     searchRequest.current?.abort();
     setElements(original.elements); setSelected(original.selected); setCamera(original.camera);
+    autoFit.current = original.autoFit;
     setOverrides(original.overrides); setExpansions(original.expansions); setFocused(original.focused);
     setSearchScope(original.searchScope); setLayout(original.layout); setOriginal(undefined);
     setSearch(original.search); setSearchResult(original.searchResult); setSearchError(undefined);
@@ -502,7 +511,10 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       const { vertex, point, camera } = active;
       if (vertex && point) {
         setOverrides(previous => new Map(previous).set(vertex, { x: point.x + dx / camera.zoom, y: point.y + dy / camera.zoom }));
-      } else setCamera({ ...camera, x: camera.x + dx, y: camera.y + dy });
+      } else {
+        autoFit.current = false;
+        setCamera({ ...camera, x: camera.x + dx, y: camera.y + dy });
+      }
     };
     if (!frame.current) frame.current = requestAnimationFrame(flushMotion);
   }
@@ -532,7 +544,10 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     if (!targetMatch) return;
     const position = overrides.get(targetMatch) ?? placement.get(targetMatch)
       ?? curves.find(curve => curve.id === targetMatch)?.label;
-    if (position) setCamera({ zoom: 1, x: -position.x, y: -position.y });
+    if (position) {
+      autoFit.current = false;
+      setCamera({ zoom: 1, x: -position.x, y: -position.y });
+    }
     setTargetMatch(undefined);
   }, [targetMatch, overrides, placement, curves]);
   const { width: viewportWidth, height: viewportHeight } = size;
@@ -576,9 +591,9 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
       }}>{Object.entries(layoutNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}</select></label>
       {layout === 'force' && graph.vertices.length > forceVertexLimit && <span className="muted small">{t('节点较多，使用径向布局')}</span>}
       <div className="explorer-zoom">
-        <button className="icon-button" aria-label={t('缩小结果图')} disabled={camera.zoom <= minZoom} onClick={() => setCamera(value => ({ ...value, zoom: clampZoom(value.zoom / 1.25) }))}><Minus size={16} /></button>
+        <button className="icon-button" aria-label={t('缩小结果图')} disabled={camera.zoom <= minZoom} onClick={() => { autoFit.current = false; setCamera(value => ({ ...value, zoom: clampZoom(value.zoom / 1.25) })); }}><Minus size={16} /></button>
         <output aria-label={t('当前缩放')}>{Number((camera.zoom * 100).toFixed(camera.zoom < .1 ? 1 : 0))}%</output>
-        <button className="icon-button" aria-label={t('放大结果图')} disabled={camera.zoom >= 4} onClick={() => setCamera(value => ({ ...value, zoom: clampZoom(value.zoom * 1.25) }))}><Plus size={16} /></button>
+        <button className="icon-button" aria-label={t('放大结果图')} disabled={camera.zoom >= 4} onClick={() => { autoFit.current = false; setCamera(value => ({ ...value, zoom: clampZoom(value.zoom * 1.25) })); }}><Plus size={16} /></button>
         <button className="icon-button" aria-label={t('适配结果图')} title={t('适配结果图')} onClick={() => fitVisible(true)}><Maximize size={15} /></button>
       </div>
       <button className="button compact" onClick={() => { setOverrides(new Map()); fitVisible(false); }}><RotateCcw size={14} />{t('重置视图')}</button>

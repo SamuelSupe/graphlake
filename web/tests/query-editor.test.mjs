@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { queryLimitErrors, queryParameterError } from '../src/queryParameters.ts';
-import { schemaCompletions } from '../src/queryCompletions.ts';
+import { schemaCompletions, typeSampleQuery } from '../src/queryCompletions.ts';
 
 test('model completion includes business keys and safely quotes identifiers for each dialect', () => {
   const schema = { graph: 'demo', nodes: { 'User name': { key: ['tenant_id', 'id'], properties: ['display"name'] } },
@@ -13,6 +13,11 @@ test('model completion includes business keys and safely quotes identifiers for 
   assert.equal(fields.filter(item => item.label === 'id').length, 1);
   assert.ok(fields.some(item => item.label === 'tenant_id'));
   assert.deepEqual(schemaCompletions(undefined, 'cypher'), []);
+});
+
+test('type samples quote model names and bound relationship paths and node results', () => {
+  assert.equal(typeSampleQuery('nodes', 'Account'), 'MATCH (n:Account) RETURN n LIMIT 25');
+  assert.equal(typeSampleQuery('edges', 'paid` by'), 'MATCH p = ()-[:`paid`` by`]->() RETURN p LIMIT 25');
 });
 
 test('Cypher parameter input accepts optional objects and enforces the API byte limit', () => {

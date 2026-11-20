@@ -2,6 +2,7 @@ import { locale, t } from './locale.ts';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Code2, Download, GitFork, Network, Play, Square, Table2 } from 'lucide-react';
 import type { GraphSelection } from './GraphCanvas';
+import { typeSampleQuery } from './queryCompletions';
 import { queryLimitErrors, queryParameterError } from './queryParameters';
 import { GraphExplorer, type GraphExplorerHandle } from './GraphExplorer';
 import { api, ApiError, downloadFile, errorText, request, type FreshnessPolicy, type GraphSchema, type QueryResult } from './api';
@@ -304,10 +305,15 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
     return false;
   }
 
-  async function run(operation: 'query' | 'export' = 'query', mode: QueryMode = 'replace') {
-    if (active.current || pending || operation === 'export' && !canExport || operation === 'query' && mode !== 'replay' && !canRun) return;
-    if (operation === 'query' && mode !== 'replay' && !validateParameters()) return;
+  async function run(operation: 'query' | 'export' = 'query', mode: QueryMode = 'replace', sample?: string) {
+    const usesEditor = operation === 'query' && mode !== 'replay' && sample === undefined;
+    if (active.current || pending || operation === 'export' && !canExport || usesEditor && !canRun) return;
+    if (usesEditor && !validateParameters()) return;
     let statement = operation === 'export' ? result?.statement : mode === 'replay' ? canvas?.statement : statementFromEditor();
+    if (sample !== undefined) {
+      if (!statement || !timeoutValid || !agesValid) return;
+      statement = { ...statement, language: 'cypher', query: sample, parameters_json: undefined };
+    }
     if (!statement || statement.model_revision !== revision && !(mode === 'replay' && statement.csr_generation)) return;
     const requestId = crypto.randomUUID();
     const controller = new AbortController();
@@ -461,6 +467,8 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
         <span>{page.elapsed_ms} ms</span>
         <code className="result-metrics" title={page.model_revision}>{t('版本 {0}', page.model_revision.slice(0, 10))}</code>
       </div>}
+      {result?.statement && (result.statement.query !== query || result.statement.language !== language) &&
+        <details className="result-statement"><summary>{t('查看本次执行的语句')} · {result.statement.language}</summary><pre>{result.statement.query}</pre></details>}
       <div className="result-bar">
       <div className="result-tabs" role="tablist" aria-label={t('查询结果视图')}>
         {views.map(({ key, label, compactLabel, Icon }, index) => <button key={key} id={id + '-result-tab-' + key}
@@ -500,6 +508,10 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
             {'from' in selectedType && <p>{selectedType.from.node} → {selectedType.to.node}</p>}
             <p>{t('业务键 ')}<code>{selectedType.key.join(' · ') || '—'}</code></p>
             <p>{t('属性 ')}<code>{selectedType.properties.join(' · ') || '—'}</code></p>
+            <button className="button compact" disabled={!!running || !!pending || !timeoutValid || !agesValid}
+              onClick={() => void run('query', 'replace', typeSampleQuery(schemaSelection.section, schemaSelection.name))}>
+              <Play size={14} aria-hidden="true" />{schemaSelection.section === 'nodes' ? t('查看节点样例') : t('查看关系样例')}
+            </button>
           </aside>}
         </div> : shownSchema?.error ? <div className="empty" role="alert">{shownSchema.error}<button className="button" onClick={() => {
           if (shownSchema.stale) refresh();

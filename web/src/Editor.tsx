@@ -57,6 +57,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const [checked, setChecked] = useState<{ yaml: string; result: Validation }>();
   const [locating, setLocating] = useState<ValidationTarget>();
   const [removing, setRemoving] = useState<Selection>();
+  const [catalogSearch, setCatalogSearch] = useState('');
   const [catalogSelection, setCatalogSelection] = useState<string>();
   const [browsing, setBrowsing] = useState<string>();
   const [localTables, setLocalTables] = useState(false);
@@ -68,7 +69,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const [loading, setLoading] = useState(!initial);
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [notice, setNotice] = useState<{ text: string; error?: boolean; location?: ValidationSite; yaml?: string }>();
+  const [notice, setNotice] = useState<{ text: string; error?: boolean; location?: ValidationSite; yaml?: string; published?: string }>();
   const [reload, setReload] = useState(0);
   const [activating, setActivating] = useState(false);
   const [tableColumns, setTableColumns] = useState(new Map<string, { signature: string; columns: Column[] }>());
@@ -238,6 +239,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       setNotice({ text: t('草稿已保存') });
       changed();
       if (first) created(id);
+      return response;
     } catch (cause) {
       setNotice({ text: errorText(cause), error: true, location: cause instanceof ApiError ? cause.location : undefined, yaml });
     } finally { setSaving(false); }
@@ -277,13 +279,15 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       setBusinessRefresh(value => value + 1);
       setModal(undefined);
       changed();
-      setNotice({ text: action === 'unpublish' ? t('模型已下线，草稿和历史版本已保留')
+      setNotice({ published: action === 'publish' ? response.active_revision ?? undefined : undefined,
+        text: action === 'publish' && response.active_revision ? t('服务端已确认发布，生效版本 {0}。', response.active_revision.slice(0, 14))
+        : action === 'unpublish' ? t('模型已下线，草稿和历史版本已保留')
         : action === 'restore' ? t('已恢复版本归档 {0}', revision?.slice(0, 10))
         : (action === 'publish' ? t('已发布版本 ') : t('已回退至版本 ')) + revision?.slice(0, 10) });
     } catch (cause) {
       if (action === 'restore') throw cause;
       if (!preview) setModal(undefined);
-      setNotice({ text: errorText(cause), error: true, location: action === 'publish' && cause instanceof ApiError ? cause.location : undefined, yaml });
+      setNotice({ text: action === 'publish' ? t('草稿已保存。{0}', errorText(cause)) : errorText(cause), error: true, location: action === 'publish' && cause instanceof ApiError ? cause.location : undefined, yaml });
       if (action === 'publish') changed();
       if (preview) {
         setLastImpact(undefined);
@@ -298,6 +302,18 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     setImpactTarget({ action, revision, active_revision: saved.active_revision });
     if (action !== 'rollback') setLastImpact(undefined);
     setModal('business-impact');
+  }
+
+  async function publishChanges(review: boolean) {
+    if (!allow.publish || !saved?.active_revision || busy) return;
+    const candidate = dirty ? await save() : saved;
+    if (!candidate) return;
+    if (candidate.active_revision !== saved.active_revision) {
+      setNotice({ text: t('草稿已保存，但生效版本已变化。请重新预览后发布。'), error: true });
+      return;
+    }
+    if (review) previewImpact('publish', candidate.revision);
+    else await activate(candidate.revision, 'publish');
   }
 
   async function saveSuite(revision: string | null, content: string) {
@@ -388,6 +404,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   }
   const canPublish = allow.publish && Boolean(model && saved?.revision && !dirty && !busy
     && (saved.revision !== saved.active_revision || business?.active === 'stale'));
+  const canApply = canPublish || Boolean(saved?.active_revision && dirty && model && !incomplete && allow.edit && allow.publish && !busy);
   const draftImpact = !dirty && lastImpact?.revision === savedRevision && lastImpact?.active_revision === activeRevision
     && lastImpact?.suite_revision === business?.suite_revision ? lastImpact : undefined;
   const businessStatus = canReviewImpact && (business?.required || Boolean(model?.tasks.length) || draftImpact) && <div className="business-status" role="status">
@@ -440,6 +457,10 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const notices = <>
     {currentNotice && !currentNotice.location && <div className={'notice editor-notice' + (currentNotice.error ? ' error' : '')} role={currentNotice.error ? 'alert' : 'status'}>
       {currentNotice.text}
+      {currentNotice.published && currentNotice.published === saved?.active_revision && workspace !== 'query' && <>
+        {allow.query && <button className="text-button" onClick={() => goTo('query')}>{t('查询生效版本')}</button>}
+        <button className="text-button" onClick={() => setModal('versions')}>{t('查看版本历史')}</button>
+      </>}
       {currentNotice.error && saved?.revision && <button className="text-button" onClick={refresh}>{t('重新加载')}</button>}
     </div>}
     {(currentNotice?.location || validation?.error) && <div className="notice error editor-notice">
@@ -484,16 +505,28 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       {otherModels.map(other => <option value={other.id} key={other.id}>{other.name} · {other.id}</option>)}
     </select>
   </label>;
-  const version = saved && (workspace !== 'query' || !saved.active_revision || saved.archive_error) &&
-    <code className="version-chip" title={saved.active_revision ?? undefined}>{saved.archive_error ? t('版本存储异常') : saved.active_revision ? t('生效 {0}', saved.active_revision.slice(0, 10)) : t('未发布')}</code>;
+  const draftPending = !!saved?.active_revision && saved.revision !== saved.active_revision;
   const dirtyLabel = workspace !== 'query' && dirty && <span className="dirty"><i />{t('未保存')}</span>;
 
+  const publishAction = saved && allow.publish && <button type="button"
+    className={workspace === 'graph' ? 'tool-button tool-primary' : 'button primary compact'} disabled={!canApply}
+    title={incomplete?.message || t('发布此模型草稿中的全部更改')}
+    onClick={() => saved.active_revision ? void publishChanges(false) : previewImpact('publish')}>
+    {workspace === 'graph' && <Upload size={16} aria-hidden="true" />}
+    {activating ? t('正在发布…') : !saved.active_revision ? t('预览并发布') : dirty ? t('保存并发布') : t('发布草稿')}
+  </button>;
+  const reviewAction = allow.publish && saved?.active_revision && <button type="button" className="tool-button"
+    disabled={!canApply} onClick={() => void publishChanges(true)}><Upload size={16} aria-hidden="true" />
+    {dirty ? t('保存并预览') : t('预览并发布')}
+  </button>;
+
   return <main className={'workbench editor workspace-' + workspace}>
-    <ModelWorkspaceHeader workspace={title} name={modelName} back={close} switcher={modelSwitcher}
+    <ModelWorkspaceHeader workspace={title} name={modelName} modelId={saved?.revision ? id : undefined} revision={saved?.active_revision} archiveError={!!saved?.archive_error} back={close} switcher={modelSwitcher}
+      navigation={{ current: workspace, catalogs: allow.configure, query: allow.query, goTo }}
       rename={workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" type="button"
         aria-label={t('编辑模型名称')} title={t('编辑模型名称')} disabled={busy || !!yamlError}
         onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} aria-hidden="true" /></button>}
-      status={(version || dirtyLabel) && <>{version}{dirtyLabel}</>}
+      status={dirtyLabel || (workspace !== 'query' && draftPending && <span className="dirty"><i />{t('草稿待发布')}</span>)}
       action={workspace === 'catalogs' && model && allow.configure && allow.edit && <button className="button primary catalog-add" type="button"
         disabled={!!busy} aria-haspopup="dialog" onClick={openSource}><Plus size={16} aria-hidden="true" />{t('添加数据源')}</button>} />
     {saved?.archive_error && <p className="notice error" role="alert">{diagnosticText(saved.archive_error)}{' '}
@@ -504,9 +537,10 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       <div className="catalog-controls">
         {allow.configure && <button className="button compact" disabled={!saved.revision} onClick={() => setLocalTables(true)}>{t('本地表与同步')}</button>}
         <button className="button compact" disabled={!dirty || busy || !!incomplete} title={incomplete?.message} onClick={() => void save()}>{saving ? t('保存中…') : t('保存草稿')}</button>
-        <button className="button primary compact" disabled={!canPublish} onClick={() => previewImpact('publish')}>{t('预览并发布')}</button>
+        {publishAction}
         {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span role="status"><StatusLabel status={status} text={statusText} /></span>}
         <WorkspaceTools>
+          {reviewAction}
           <button type="button" className="tool-button" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>
           <button type="button" className="tool-button" disabled={busy} onClick={() => void validate(true)}><ShieldCheck size={16} aria-hidden="true" />{t('校验数据')}</button>
           <button type="button" className="tool-button" onClick={openYaml}><Braces size={16} aria-hidden="true" />{t('查看 YAML')}</button>
@@ -516,13 +550,13 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         </WorkspaceTools>
       </div>
       {businessStatus}
-      <Catalogs model={model} selected={catalogSelection} configure={name => {
+      <Catalogs model={model} search={catalogSearch} setSearch={setCatalogSearch} selected={catalogSelection} configure={name => {
         inspectorInvoker.current = document.activeElement as HTMLElement;
         setCatalogSelection(name);
-      }} browse={setBrowsing} />
+      }} browse={setBrowsing} openMapping={selection => locate({ selection, control: 'mapping', caption: t('数据映射') })} />
     </div>}
     {allow.query && saved?.active_revision && !saved.archive_error && <div className="query-shell" hidden={workspace !== 'query'}>
-      <Query canExport={allow.export} id={id} actor={actor} revision={saved.active_revision} draftPending={dirty || saved.revision !== saved.active_revision}
+      <Query canExport={allow.export} id={id} actor={actor} revision={saved.active_revision} draftPending={dirty || draftPending}
         refresh={refresh} editSchema={allow.edit ? () => goTo('graph') : undefined} visible={active && workspace === 'query'} />
     </div>}
     {workspace === 'query' && saved && !saved.active_revision && !saved.archive_error && <div className="empty">
@@ -546,9 +580,8 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
                 onClick={() => void save()}><Save size={16} aria-hidden="true" />{saving ? t('保存中…') : t('保存草稿')}</button>}
             {showingYaml && allow.edit && <button className="tool-button" disabled={busy || !!yamlError}
               onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>}
-            {allow.publish && (showingYaml || saved.active_revision || !allow.edit) && <button className="tool-button tool-primary" disabled={!canPublish} onClick={() => previewImpact('publish')}>
-              <Upload size={16} aria-hidden="true" />{activating ? t('正在切换…') : t('预览并发布')}
-            </button>}
+            {(showingYaml || saved.active_revision || !allow.edit) && publishAction}
+            <button type="button" className="tool-button" disabled={!saved.revision || activating} onClick={() => setModal('versions')}><History size={16} aria-hidden="true" />{t('版本历史')}</button>
             {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span className="draft-status graph-status" role="status"><StatusLabel status={status} text={statusText} /></span>}
             <WorkspaceTools key={showingYaml ? 'yaml' : 'canvas'}>
               {!showingYaml && allow.configure && <button type="button" className="tool-button" onClick={() => initial ? openSource() : goTo('catalogs')}>
@@ -556,7 +589,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
               </button>}
               {!showingYaml && allow.edit && <button type="button" className="tool-button" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>}
               {allow.edit && <button type="button" className="tool-button" disabled={busy || !!yamlError} onClick={() => void validate(true)}><ShieldCheck size={16} aria-hidden="true" />{t('校验数据')}</button>}
-              <button type="button" className="tool-button" disabled={!saved.revision || activating} onClick={() => setModal('versions')}><History size={16} aria-hidden="true" />{t('版本历史')}</button>
+              {reviewAction}
               {canReviewImpact && model && <button type="button" className="tool-button" disabled={busy} onClick={() => setModal('business-tasks')}>
                 <ShieldCheck size={16} aria-hidden="true" />{t('业务任务')}
               </button>}
@@ -575,7 +608,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
         : model && <div className="graph-body">
           <div className="graph-toolbar" role="group" aria-label={t('画布工具')}>
             {allow.edit && <>
-              <button ref={addNodeButton} className="tool-button" disabled={busy} onClick={() => setModal('nodes')}><Plus size={16} aria-hidden="true" />{t('添加节点')}</button>
+              <button ref={addNodeButton} className="tool-button add-node-button" disabled={busy} onClick={() => setModal('nodes')}><Plus size={16} aria-hidden="true" />{t('添加节点')}</button>
               <button type="button" className="tool-button" disabled={!canConnect} aria-pressed={!!connecting}
                 onClick={() => setConnection(connecting ? undefined : {})}><Waypoints size={16} aria-hidden="true" />{t('连线建边')}</button>
             </>}

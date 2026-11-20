@@ -4,11 +4,21 @@ import type { GraphSchema } from './api';
 export type Dialect = 'cypher' | 'sql' | 'gremlin';
 export type QueryCompletion = { label: string; type: string; detail?: string; apply?: string };
 
+function cypherIdentifier(name: string) {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : '`' + name.replaceAll('`', '``') + '`';
+}
+
+export function typeSampleQuery(section: 'nodes' | 'edges', name: string) {
+  const label = cypherIdentifier(name);
+  return section === 'nodes' ? `MATCH (n:${label}) RETURN n LIMIT 25`
+    : `MATCH p = ()-[:${label}]->() RETURN p LIMIT 25`;
+}
+
 export function schemaCompletions(schema: GraphSchema | undefined, language: Dialect): QueryCompletion[] {
   if (!schema) return [];
   const identifier = (name: string) => language === 'sql' ? '"' + name.replaceAll('"', '""') + '"'
     : language === 'gremlin' ? "'" + name.replaceAll('\\', '\\\\').replaceAll("'", "\\'") + "'"
-      : /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : '`' + name.replaceAll('`', '``') + '`';
+      : cypherIdentifier(name);
   const options: QueryCompletion[] = [];
   const properties = new Map<string, string[]>();
   for (const [types, kind] of [[schema.nodes, t('节点')], [schema.edges, t('边')]] as const) {

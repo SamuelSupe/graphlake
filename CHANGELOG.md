@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.6
+
+- Explore the built-in order relationship example, connect a first data source directly, or import a model from the empty model library.
+- Save and publish changes directly from an existing model, or preview business impact before publishing. Review server-confirmed release and rollback records with a per-operation model and YAML diff.
+- Find source mappings by node or relationship type and navigate directly to the corresponding canvas mapping. Preserve the source search when returning to the data-source workspace.
+- Run node and relationship samples from the published schema while preserving the editor's current query and language. Display the actual executed statement with the results.
+- Use a more compact, flat console design and direct model workspace navigation on phones. Automatically fit query graphs to window changes while preserving manual pan and zoom.
+
 ## v1.1.5
 
 - Redesign the console around the GraphLake blue palette. Align page titles, actions and dialogs across the model editor, data sources, query workspace and administration pages on desktop and narrow screens.

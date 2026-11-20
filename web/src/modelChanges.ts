@@ -1,3 +1,4 @@
+import type { VersionHistory } from './api';
 import { t } from './locale.ts';
 import { stringify } from 'yaml';
 import { documentOf, record } from './model.ts';
@@ -30,4 +31,20 @@ export function modelChanges(before: string, after: string): ModelChange[] {
       section: t('模型'), name: key === 'graph' ? t('名称') : fieldNames[key] ?? key, fields: [] });
   }
   return changes;
+}
+
+export const versionsPerPage = 5;
+export type Archive = { yaml: string } | { error: string; repair?: string };
+
+export function releaseRows(history: VersionHistory | undefined, start: number, archives: Map<string, Archive>) {
+  return history?.versions.slice(start, start + versionsPerPage).map((entry, offset) => {
+    const previous = history.versions[start + offset + 1];
+    const before = previous ? archives.get(previous.revision) : { yaml: '{}' };
+    const after = archives.get(entry.revision);
+    let changes: ModelChange[] | undefined;
+    if (before && 'yaml' in before && after && 'yaml' in after) {
+      try { changes = modelChanges(before.yaml, after.yaml); } catch { /* The raw revision comparison is still available. */ }
+    }
+    return { entry, previous, before, after, changes, index: start + offset };
+  }) ?? [];
 }

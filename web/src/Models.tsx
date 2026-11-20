@@ -1,10 +1,12 @@
 import { diagnosticText, t } from './locale.ts';
-import { useLayoutEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useLayoutEffect, useRef, useState } from 'react';
 import { Activity, ArrowRight, Box, CircleAlert, Database, GitFork, LayoutGrid, List, LoaderCircle, Network, Plus, RefreshCw, Search, Terminal, Upload } from 'lucide-react';
 import type { ModelSummary } from './api';
 import { AppLink, modelPath } from './AppLink';
 import type { Workspace } from './Editor';
 import { Mark, StatusLabel } from './ui';
+
+const FirstModel = lazy(() => import('./FirstModel'));
 
 const workspaces = {
   graph: { title: t('图模型'), description: t('连接数据，构建关系，发布后即可查询。') },
@@ -28,12 +30,13 @@ function matches(model: ModelSummary, filter: Filter) {
   return true;
 }
 
-export function Models({ models, error, refreshing, importError, workspace, navigate, canQuery, memory, health, create, importModel, retry, administrator }: {
+export function Models({ models, error, refreshing, importError, workspace, navigate, canQuery, canRead, memory, health, create, connect, importModel, retry, administrator }: {
   health: () => void;
   memory: DirectoryState;
   administrator: boolean; models?: ModelSummary[]; error: string; refreshing: boolean; importError: string; workspace: Workspace;
-  canQuery: (id: string) => boolean;
+  canQuery: (id: string) => boolean; canRead: (id: string) => boolean;
   navigate: (path: string) => void; create: () => void;
+  connect: () => void;
   importModel: (file: File) => void; retry: () => void;
 }) {
   const [view, setView] = useState(memory.view ?? 'cards');
@@ -75,6 +78,37 @@ export function Models({ models, error, refreshing, importError, workspace, navi
     { label: t('节点标签'), Icon: Box, value: available?.reduce((sum, model) => sum + model.nodes, 0) },
     { label: t('边类型'), Icon: GitFork, value: available?.reduce((sum, model) => sum + model.edges, 0) },
   ];
+
+  if (administrator && workspace === 'graph' && models?.length === 0 && !error) {
+    return <Suspense fallback={<main className="workbench" role="status">{t('正在读取模型…')}</main>}>
+      <FirstModel create={create} connect={connect} importModel={importModel} importError={importError}
+        health={health} retry={retry} refreshing={refreshing} />
+    </Suspense>;
+  }
+
+  if (!error && available?.length === 0 && (workspace === 'query' || workspace === 'catalogs' && administrator)) {
+    const catalogs = workspace === 'catalogs';
+    const Icon = catalogs ? Database : Terminal;
+    const readable = models?.filter(model => canRead(model.id)) ?? [];
+    const canOpenModel = administrator || readable.length > 0;
+    const onlyModel = readable.length === 1 ? readable[0] : undefined;
+    return <main className="workbench model-directory">
+      <header className="first-heading"><h1>{title}</h1></header>
+      <section className="directory-start">
+        <span className="model-icon"><Icon size={24} aria-hidden="true" /></span>
+        <h2>{catalogs ? t('连接第一个数据源') : t('暂无可查询的模型')}</h2>
+        <p>{catalogs ? t('选择数据库或文件，连接将保存在新的模型草稿中。')
+          : readable.some(model => model.archive_error) ? t('生效版本无法读取，可打开图模型检查版本状态。')
+          : canOpenModel ? t('发布模型后，就能查看真实的节点和关系。') : t('获得已发布模型的查询权限后，可在这里运行查询。')}</p>
+        <div className="actions">
+          {canOpenModel && (catalogs ? <button className="button primary" onClick={connect}>{t('选择连接器')}</button>
+            : <AppLink className="button primary" href={onlyModel ? modelPath(onlyModel.id) : '/'} navigate={follow}>
+              {onlyModel ? t('打开 {0}', onlyModel.name) : t('前往图模型')}<ArrowRight size={15} aria-hidden="true" /></AppLink>)}
+          <button className="text-button" disabled={refreshing} onClick={retry}><RefreshCw size={15} aria-hidden="true" />{t('刷新模型列表')}</button>
+        </div>
+      </section>
+    </main>;
+  }
 
   return <main className="workbench model-directory">
     <header className="directory-cover">

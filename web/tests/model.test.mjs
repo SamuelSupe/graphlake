@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setupIssue } from '../src/modelWorkflow.ts';
-import { modelChanges } from '../src/modelChanges.ts';
+import { modelChanges, releaseRows, versionsPerPage } from '../src/modelChanges.ts';
 import { editScenarioField, joinSuite, scenarioDocument, splitSuite } from '../src/taskSuite.ts';
-import { addEdgeType, appendMappingInput, documentOf, modelIdPattern, modelOf, removeGraphType, rename, validationTargets } from '../src/model.ts';
+import { addEdgeType, appendMappingInput, documentOf, mappedTypes, modelIdPattern, modelOf, removeGraphType, rename, validationTargets } from '../src/model.ts';
 
 test('editing one business scenario preserves exact JSON in untouched fixture tables and cases', () => {
   const raw = '{"tables":{"security.alert":{"rows":[{"big":9223372036854775807,"score":-0.0}]}},"cases":[{"id":"first"},{"id":"second","expected":{"observed_at_ms":9007199254740993}}]}';
@@ -62,6 +62,7 @@ test('visual edits preserve advanced YAML and update both edge endpoints', () =>
   ].join('\n');
   const doc = documentOf(yaml);
   const before = modelOf(yaml);
+  assert.deepEqual(mappedTypes(before, 'ledger'), [{ section: 'nodes', name: 'Account' }, { section: 'edges', name: 'Transfer' }]);
   doc.setIn(['nodes', 'Account', 'properties'], ['name', 'status']);
   rename(doc, before, 'nodes', 'Account', 'CustomerAccount');
   const updated = doc.toString();
@@ -236,4 +237,21 @@ edges: {Transfer: {from: {node: Account}, to: {node: Account}}}`;
     ['changed', 'Data Sources', 'lake'], ['changed', 'Node', 'Account'], ['removed', 'Edge', 'Transfer'],
   ]);
   assert.deepEqual(changes[1].fields, ['Properties']);
+});
+
+test('release history compares each event with its predecessor across pages and repeated revisions', () => {
+  const versions = ['a', 'b', 'a', 'b', 'a', 'b'].map(revision => ({ revision }));
+  const archives = new Map([
+    ['a', { yaml: 'edges: {}' }],
+    ['b', { yaml: 'edges: { PaidBy: {} }' }],
+  ]);
+  const rows = releaseRows({ versions }, 0, archives);
+  assert.equal(rows.length, versionsPerPage);
+  assert.deepEqual(rows.map(row => row.changes.map(change => [change.kind, change.name])), [
+    [['removed', 'PaidBy']], [['added', 'PaidBy']], [['removed', 'PaidBy']],
+    [['added', 'PaidBy']], [['removed', 'PaidBy']],
+  ]);
+  assert.equal(releaseRows({ versions }, versionsPerPage, archives)[0].changes[0].kind, 'added');
+  archives.set('b', { error: 'Archive unavailable' });
+  assert.equal(releaseRows({ versions }, 0, archives)[0].changes, undefined);
 });

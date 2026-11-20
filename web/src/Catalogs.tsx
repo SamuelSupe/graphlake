@@ -1,21 +1,33 @@
 import { t } from './locale.ts';
-import { useId, useRef, useState } from 'react';
-import { ChevronRight, Database, FolderOpen, Search, Settings2 } from 'lucide-react';
+import { useId, useMemo, useRef, useState } from 'react';
+import { Box, ChevronRight, Database, GitFork, FolderOpen, Search, Settings2 } from 'lucide-react';
+import type { GraphSelection } from './GraphCanvas';
 import { ConnectorIcon } from './ConnectorIcon';
 import { connectorChoices, connectorDetails } from './connectors';
-import { record, sourceLabel, sourceUsers, text, type Model } from './model';
+import { record, mappedTypes, sourceLabel, text, type Model } from './model';
 
-export function Catalogs({ model, selected, configure, browse }: {
+export function Catalogs({ model, search, setSearch, selected, configure, browse, openMapping }: {
   model: Model;
+  search: string;
+  setSearch: (value: string) => void;
   selected?: string;
   configure: (name: string) => void;
   browse: (name: string) => void;
+  openMapping: (selection: GraphSelection) => void;
 }) {
   const searchInput = useRef<HTMLInputElement>(null);
-  const [search, setSearch] = useState('');
   const query = search.trim().toLowerCase();
-  const sources = Object.entries(model.sources);
-  const matches = sources.filter(([name, source]) => `${name} ${sourceLabel(text(source.type))}`.toLowerCase().includes(query));
+  const sources = useMemo(() => Object.entries(model.sources).map(([name, source]) => ({
+    name, source, types: mappedTypes(model, name),
+  })), [model]);
+  const matches = sources.filter(({ name, source, types }) => [name, sourceLabel(text(source.type)), ...types.map(type => type.name)]
+    .some(value => value.toLowerCase().includes(query)));
+  function typeLink(type: GraphSelection) {
+    const Icon = type.section === 'nodes' ? Box : GitFork;
+    return <button key={type.section + ':' + type.name} className="mapping-link" onClick={() => openMapping(type)}
+      aria-label={type.section === 'nodes' ? t('查看节点 {0} 的映射', type.name) : t('查看边 {0} 的映射', type.name)}>
+      <Icon size={14} aria-hidden="true" />{type.name}</button>;
+  }
   return <section className="listing catalog-list" aria-label={t('已配置的数据源')}>
     <div className="catalog-section-heading">
       <div>
@@ -24,17 +36,22 @@ export function Catalogs({ model, selected, configure, browse }: {
       </div>
       {!!sources.length && <search className="catalog-search" aria-label={t('查找已配置的数据源')}>
         <label className="search"><Search size={17} aria-hidden="true" /><span className="sr-only">{t('搜索已配置的数据源')}</span>
-          <input ref={searchInput} type="search" placeholder={t('搜索名称或连接器类型')} value={search} onChange={event => setSearch(event.target.value)} /></label>
+          <input ref={searchInput} type="search" placeholder={t('搜索数据源、连接器或映射类型')} value={search} onChange={event => setSearch(event.target.value)} /></label>
         <span className="muted small" role="status">{matches.length} / {sources.length}{t(' 个数据源')}</span>
       </search>}
     </div>
     {matches.length ? <div className="catalog-sources">
-      {matches.map(([name, source]) => {
-        const uses = sourceUsers(model, name).length;
+      {matches.map(({ name, source, types }) => {
+        const displayed = query && types.length > 3
+          ? [...types.filter(type => type.name.toLowerCase().includes(query)), ...types.filter(type => !type.name.toLowerCase().includes(query))]
+          : types;
         return <article className="source-card" key={name} data-selected={selected === name || undefined}>
           <header><ConnectorIcon type={text(source.type)} provider={text(record(source.storage).provider)} />
             <div><h3>{name}</h3><span className="muted small">{sourceLabel(text(source.type))}</span></div></header>
-          <p className="muted small">{uses ? t('用于 {0} 个节点或边类型', uses) : t('尚未用于节点或边类型')}</p>
+          {types.length ? <div className="source-mappings"><small>{t('映射类型')}</small>
+            <div>{displayed.slice(0, 3).map(typeLink)}</div>
+            {types.length > 3 && <details><summary>{t('另有 {0} 个类型', types.length - 3)}</summary><div>{displayed.slice(3).map(typeLink)}</div></details>}
+          </div> : <p className="muted small">{t('尚未用于节点或边类型')}</p>}
           <footer>
             <button className="button compact" aria-haspopup="dialog" onClick={() => configure(name)}>
               <Settings2 size={15} aria-hidden="true" />{t('配置')}<span className="sr-only"> {name}</span></button>

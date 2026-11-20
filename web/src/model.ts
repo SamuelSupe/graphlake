@@ -78,7 +78,7 @@ export function sourceLabel(value: unknown) {
 function sourceMappings(model: Model, source: string) {
   const prefix = source + '.';
   return (['nodes', 'edges'] as const).flatMap(section => Object.entries(model[section]).flatMap(([name, item]) => {
-    const tables: { path: (string | number)[]; table: string }[] = [];
+    const tables: { path: [typeof section, string, ...(string | number)[]]; table: string }[] = [];
     const input = (table: unknown, path: (string | number)[]) => {
       if (typeof table === 'string' && table.startsWith(prefix)) tables.push({ path: [section, name, ...path], table });
     };
@@ -86,6 +86,14 @@ function sourceMappings(model: Model, source: string) {
     if (Array.isArray(item.inputs)) item.inputs.forEach((entry, index) => input(record(entry).table, ['inputs', index, 'table']));
     return tables;
   }));
+}
+
+export function mappedTypes(model: Model, source: string) {
+  const types = new Map<string, { section: 'nodes' | 'edges'; name: string }>();
+  for (const { path: [section, name] } of sourceMappings(model, source)) {
+    types.set(section + ':' + name, { section, name });
+  }
+  return [...types.values()];
 }
 
 export function sourceUsers(model: Model, source: string) {

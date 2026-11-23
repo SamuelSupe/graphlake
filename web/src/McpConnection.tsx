@@ -1,6 +1,6 @@
 import { t } from './locale.ts';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { CheckCircle2, Copy, Eye, PlugZap } from 'lucide-react';
+import { Check, CheckCircle2, Copy, Eye, PlugZap } from 'lucide-react';
 import { errorText } from './api';
 import McpScope from './McpScope';
 import { inspectMcp, mcpServiceLabels, mcpServices, type McpAccess, type McpInspection, type McpService } from './mcp';
@@ -19,13 +19,16 @@ export default function McpConnection({ snapshot, locked, tokenUpdate }: {
       <h3 id="mcp-connect-title">{t('添加到 Agent')}</h3>
     </div>
     <div className="mcp-step-body">
-      {visibleServices.length > 1 && <fieldset className="settings-fields">
-        <legend>{t('选择 MCP 服务')}</legend>
-        <div className="settings-actions">{visibleServices.map(key => {
+      {visibleServices.length > 1 && <fieldset className="mcp-service-fieldset">
+        <legend className="sr-only">{t('选择 MCP 服务')}</legend>
+        <div className="mcp-service-cards">{visibleServices.map(key => {
           const { enabled } = snapshot.services[key];
-          return <label key={key} className="settings-toggle">
+          return <label key={key} className={'mcp-service-card' + (service === key ? ' is-selected' : '')}>
             <input type="radio" name="mcp-service" checked={service === key} onChange={() => select(key)} />
-            {mcpServiceLabels[key]}{!enabled && t('（未启用）')}
+            <span className="mcp-service-label"><strong>{mcpServiceLabels[key]}</strong>
+              <code>/mcp/{key}</code>
+            </span>
+            <span className={'release-label ' + (enabled ? 'published' : '')}><i aria-hidden="true" />{enabled ? t('已启用') : t('未启用')}</span>
           </label>;
         })}</div>
       </fieldset>}
@@ -46,14 +49,18 @@ function Connection({ service, endpoint, revision, blocked, tokenUpdate }: {
   const [progress, setProgress] = useState('');
   const [result, setResult] = useState<McpInspection>();
   const [error, setError] = useState('');
+  const [copiedKey, setCopiedKey] = useState<'' | 'endpoint' | 'snippet'>('');
   const [copyStatus, setCopyStatus] = useState('');
   const [copyError, setCopyError] = useState('');
+  const copyTimer = useRef<number | undefined>(undefined);
   const active = useRef<AbortController | undefined>(undefined);
   const feedback = useRef<HTMLDivElement>(null);
   const name = 'graphlake-' + service;
   const snippet = JSON.stringify({
     mcpServers: { [name]: { url: endpoint, headers: { Authorization: 'Bearer <PERSONAL_AI_TOKEN>' } } },
   }, null, 2);
+
+  useEffect(() => () => window.clearTimeout(copyTimer.current), []);
 
   useEffect(() => {
     setToken('');
@@ -68,12 +75,15 @@ function Connection({ service, endpoint, revision, blocked, tokenUpdate }: {
     };
   }, [blocked, tokenUpdate, revision]);
 
-  async function copy(value: string, message: string) {
+  async function copy(kind: 'endpoint' | 'snippet', value: string, message: string) {
     setCopyError('');
     setCopyStatus('');
     try {
       await navigator.clipboard.writeText(value);
+      setCopiedKey(kind);
       setCopyStatus(message);
+      window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopiedKey(''), 2200);
     } catch {
       setCopyError(t('无法访问剪贴板，请选中文本手动复制。'));
     }
@@ -126,24 +136,29 @@ function Connection({ service, endpoint, revision, blocked, tokenUpdate }: {
         <strong>{t('MCP 地址')}</strong>
         <div className="mcp-address">
           <code>{endpoint}</code>
-          <button type="button" className="button" onClick={() => void copy(endpoint, t('MCP 地址已复制。'))}>
-            <Copy size={15} aria-hidden="true" />{t('复制地址')}
+          <button type="button" className={'button' + (copiedKey === 'endpoint' ? ' copied' : '')} onClick={() => void copy('endpoint', endpoint, t('MCP 地址已复制。'))}>
+            {copiedKey === 'endpoint' ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
+            {copiedKey === 'endpoint' ? t('已复制') : t('复制地址')}
           </button>
         </div>
       </div>
       <details className="mcp-details">
         <summary>{t('使用 JSON 配置')}</summary>
         <div className="settings-stack">
-          <pre className="mcp-snippet" tabIndex={0} aria-label={t('客户端 JSON 配置')}><code>{snippet}</code></pre>
-          <p className="settings-hint">{t('在 Agent 的配置中，将 ')}<code>&lt;PERSONAL_AI_TOKEN&gt;</code>{t(' 替换为你的令牌。')}</p>
-          <div className="settings-actions">
-            <button type="button" className="button" onClick={() => void copy(snippet, t('JSON 配置已复制。'))}>
-              <Copy size={15} aria-hidden="true" />{t('复制配置')}
-            </button>
+          <div className="code-snippet-box">
+            <div className="code-snippet-bar">
+              <span>JSON</span>
+              <button type="button" className={'button compact' + (copiedKey === 'snippet' ? ' copied' : '')} onClick={() => void copy('snippet', snippet, t('JSON 配置已复制。'))}>
+                {copiedKey === 'snippet' ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+                {copiedKey === 'snippet' ? t('已复制') : t('复制配置')}
+              </button>
+            </div>
+            <pre className="mcp-snippet" tabIndex={0} aria-label={t('客户端 JSON 配置')}><code>{snippet}</code></pre>
           </div>
+          <p className="settings-hint">{t('在 Agent 的配置中，将 ')}<code>&lt;PERSONAL_AI_TOKEN&gt;</code>{t(' 替换为你的令牌。')}</p>
         </div>
       </details>
-      {copyStatus && <p className="settings-hint" role="status">{copyStatus}</p>}
+      <span className="sr-only" role="status">{copyStatus}</span>
       {copyError && <p className="notice error" role="alert">{copyError}</p>}
       <details className="mcp-details mcp-diagnostics">
         <summary>{t('验证连接')}<span>{t('可选')}</span></summary>

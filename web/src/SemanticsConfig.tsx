@@ -76,8 +76,10 @@ export function SemanticsConfig({ id, item, path, edit, invalid, edge }: {
         {!columns.includes(field) && <button type="button" className="button compact"
           onClick={() => set(['properties', field], '')}>{t('移除字段说明')}</button>}
       </fieldset>}
-      <fieldset className="form-fields mapping-options">
-        <legend>{t('证据字段')}</legend>
+      <details className="form-disclosure" open={semantics.evidence != null || undefined}>
+        <summary>{t('证据字段（高级）')}</summary>
+        <fieldset className="form-fields mapping-options">
+        <legend className="sr-only">{t('证据字段')}</legend>
         {semantics.evidence == null ? <button type="button" className="button compact"
           onClick={() => edit(doc => doc.setIn([...root, 'evidence'], { source_system: '', record_key: [], observed_at: '' }))}>{t('配置证据字段')}</button> : <>
           {([['source_system', t('来源系统字段')], ['observed_at', t('观测时间字段')], ['source_version', t('来源版本字段（可选）')]] as const).map(([key, label]) => {
@@ -106,7 +108,8 @@ export function SemanticsConfig({ id, item, path, edit, invalid, edge }: {
             onClick={() => set(['evidence', 'record_key'], [...recordKey, ''])}>{t('添加记录键字段')}</button>
           <button type="button" className="button compact" onClick={() => set(['evidence'], '')}>{t('移除证据配置')}</button>
         </>}
-      </fieldset>
+        </fieldset>
+      </details>
     </div>
   </details>;
 }

@@ -92,7 +92,7 @@ export function pointOn(points: Curve, t: number): Point {
   ) as Point;
 }
 
-export function edgeCurve(a: Point, b: Point, height: number, lane: number, loop: boolean, reverse = false, targetRadius = nodeRadius): Curve {
+export function edgeCurve(a: Point, b: Point, height: number, lane: number, loop: boolean, reverse = false, targetRadius = nodeRadius, bendOverride?: number): Curve {
   if (loop) {
     const [x, y] = a;
     const spread = 52 + Math.min(lane, 8) * 11;
@@ -103,7 +103,7 @@ export function edgeCurve(a: Point, b: Point, height: number, lane: number, loop
   const dy = b[1] - a[1];
   const length = Math.hypot(dx, dy) || 1;
   const unit: Point = [dx / length, dy / length];
-  const bend = lane === 0 ? 0 : Math.min(90, Math.ceil(lane / 2) * 33) * (lane % 2 === 0 ? -1 : 1) * (reverse ? -1 : 1);
+  const bend = bendOverride ?? (lane === 0 ? 0 : Math.min(90, Math.ceil(lane / 2) * 33) * (lane % 2 === 0 ? -1 : 1) * (reverse ? -1 : 1));
   const normal: Point = [-unit[1] * bend, unit[0] * bend];
   const startRadius = Math.min(nodeRadius, length / 3);
   const endRadius = Math.min(targetRadius, length / 3);

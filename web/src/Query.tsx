@@ -1,6 +1,6 @@
 import { locale, t } from './locale.ts';
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
-import { Code2, Download, GitFork, Network, Play, Square, Table2 } from 'lucide-react';
+import { Braces, Check, Code2, Copy, Download, Filter, GitFork, Network, Play, SlidersHorizontal, Square, Table2 } from 'lucide-react';
 import type { GraphSelection } from './GraphCanvas';
 import { typeSampleQuery } from './queryCompletions';
 import { queryLimitErrors, queryParameterError } from './queryParameters';
@@ -9,6 +9,7 @@ import { api, ApiError, downloadFile, errorText, request, type FreshnessPolicy, 
 
 const QueryEditor = lazy(() => import('./QueryEditor'));
 const QueryScope = lazy(() => import('./QueryScope'));
+const QueryAdvanced = lazy(() => import('./QueryAdvanced'));
 const GraphCanvas = lazy(() => import('./GraphCanvas'));
 
 type Dialect = 'cypher' | 'sql' | 'gremlin';
@@ -65,9 +66,35 @@ const historyKey = (id: string) => 'graphlake-query-history-v1:' + id;
 function readHistory(id: string): HistoryItem[] {
   try { return JSON.parse(localStorage.getItem(historyKey(id)) ?? '[]'); } catch { return []; }
 }
+const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 function RawResponse({ page }: { page: QueryResult }) {
   const json = useMemo(() => JSON.stringify(page, null, 2), [page]);
-  return <pre className="raw-result" aria-label={t('原始 JSON 响应')} tabIndex={0}>{json}</pre>;
+  const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState('');
+  const timer = useRef<number>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  async function copyJson() {
+    try {
+      await navigator.clipboard.writeText(json);
+      setCopyError('');
+      setCopied(true);
+      window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => setCopied(false), 2200);
+    } catch {
+      setCopyError(t('无法访问剪贴板，请手动选中复制。'));
+    }
+  }
+  return <div className="raw-result-box">
+    <div className="code-snippet-bar">
+      <span>JSON</span>
+      <button type="button" className={'button compact' + (copied ? ' copied' : '')} onClick={() => void copyJson()}>
+        {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+        {copied ? t('已复制') : t('复制 JSON')}
+      </button>
+    </div>
+    {copyError && <p className="inline-error query-notice" role="alert">{copyError}</p>}
+    <pre className="raw-result" aria-label={t('原始 JSON 响应')} tabIndex={0}>{json}</pre>
+  </div>;
 }
 const savedKey = (id: string) => 'graphlake-saved-queries-v1:' + id;
 
@@ -97,6 +124,8 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const revealResult = useRef(false);
   const [graphOptions, setGraphOptions] = useState('');
   const [editingScope, setEditingScope] = useState(false);
+  const [editingAdvanced, setEditingAdvanced] = useState(false);
+  const [parametersOpen, setParametersOpen] = useState(false);
   const [captureResult, setCaptureResult] = useState(false);
   const [freshness, setFreshness] = useState<FreshnessPolicy>({});
   const [parameterRequired, setParameterRequired] = useState(false);
@@ -118,19 +147,22 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const [stopping, setStopping] = useState(false);
   const active = useRef<{ id: string; controller: AbortController } | null>(null);
   const composer = useRef<HTMLDivElement>(null);
-  const optionsPanel = useRef<HTMLDetailsElement>(null);
   const parameterInput = useRef<HTMLTextAreaElement>(null);
   const limitErrors = queryLimitErrors(timeout, freshness);
   const timeoutValid = !limitErrors.timeout;
   const agesValid = !limitErrors.max_observation_age_seconds && !limitErrors.max_reconciliation_age_seconds;
-  const hasFreshness = ageFields.some(([key]) => freshness[key] !== undefined) || language === 'cypher' && freshness.require_current_csr;
+  const hasFreshness = ageFields.some(([key]) => freshness[key] !== undefined) || language === 'cypher' && !!freshness.require_current_csr;
+  const advancedCount = (timeout ? 1 : 0) + (canExport && captureResult ? 1 : 0) + (generation ? 1 : 0)
+    + (freshness.max_observation_age_seconds !== undefined ? 1 : 0)
+    + (freshness.max_reconciliation_age_seconds !== undefined ? 1 : 0)
+    + (language === 'cypher' && freshness.require_current_csr ? 1 : 0);
   const canRun = !!query.trim() && timeoutValid && agesValid && (!parameterRequired || language !== 'cypher' || !!parameters.trim());
   const statementFromEditor = (): Statement => ({
     model_revision: revision, language, query,
     parameters_json: language === 'cypher' && parameters.trim() ? parameters : undefined,
     graph_options: generation ? undefined : graphOptions.trim() || undefined, capture_result: canExport && captureResult,
     csr_generation: language === 'cypher' ? generation : undefined,
-    freshness: { ...freshness, require_current_csr: language === 'cypher' ? freshness.require_current_csr : undefined },
+    freshness: hasFreshness ? { ...freshness, require_current_csr: language === 'cypher' ? freshness.require_current_csr : undefined } : undefined,
     timeout_ms: timeout ? Number(timeout) : undefined,
   });
 
@@ -198,11 +230,13 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
     setLoadNotice(statement.model_revision !== revision ? t('已载入历史语句。再次运行将使用当前生效版本。') : '');
     requestAnimationFrame(() => {
       const missingParameters = statement.language === 'cypher' && needsParameters && !statement.parameters_json;
-      if (missingParameters && optionsPanel.current) optionsPanel.current.open = true;
-      const input = missingParameters ? parameterInput.current
-        : composer.current?.querySelector<HTMLElement>('[contenteditable="true"], textarea');
-      input?.focus({ preventScroll: true });
-      input?.scrollIntoView({ block: 'center' });
+      if (missingParameters) setParametersOpen(true);
+      requestAnimationFrame(() => {
+        const input = missingParameters ? parameterInput.current
+          : composer.current?.querySelector<HTMLElement>('[contenteditable="true"], textarea');
+        input?.focus({ preventScroll: true });
+        input?.scrollIntoView({ block: 'center' });
+      });
     });
   }
 
@@ -300,8 +334,8 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   function validateParameters() {
     if (language !== 'cypher' || !parameterProblem) return true;
     setParametersTouched(true);
-    if (optionsPanel.current) optionsPanel.current.open = true;
-    parameterInput.current?.focus();
+    setParametersOpen(true);
+    requestAnimationFrame(() => parameterInput.current?.focus());
     return false;
   }
 
@@ -396,13 +430,44 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
   const page = result?.page;
   const shownSchema = schema?.revision === revision ? schema : undefined;
   const selectedType = schemaSelection && shownSchema?.data?.[schemaSelection.section][schemaSelection.name];
+  const starters = useMemo(() => {
+    const data = shownSchema?.data;
+    if (!data) return [];
+    const items: { label: string; query: string }[] = [];
+    for (const name of Object.keys(data.edges).slice(0, 2)) {
+      items.push({ label: t('查看 {0} 关系样例', name), query: typeSampleQuery('edges', name) });
+    }
+    for (const name of Object.keys(data.nodes)) {
+      if (items.length >= 3) break;
+      items.push({ label: t('查看 {0} 节点样例', name), query: typeSampleQuery('nodes', name) });
+    }
+    return items;
+  }, [shownSchema?.data]);
+  function runStarter(sample: string) {
+    if (query === defaults[language]) {
+      setLanguage('cypher');
+      setQueries(old => ({ ...old, cypher: sample }));
+      setParameterRequired(false);
+    }
+    void run('query', 'replace', sample);
+  }
+  const starterChips = starters.length > 0 && <div className="query-starters" role="group" aria-label={t('快速试一试')}>
+    <span className="query-starters-label">{t('快速试一试')}</span>
+    <div className="query-starter-list">
+      {starters.map(starter => <button key={starter.query} type="button" className="button compact query-starter"
+        disabled={!!running || !!pending || !timeoutValid || !agesValid}
+        onClick={() => runStarter(starter.query)}>
+        <Play size={13} aria-hidden="true" />{starter.label}
+      </button>)}
+    </div>
+  </div>;
 
   return <section className="query-workspace" aria-label={t('只读查询')}>
     <div className="query-input-column">
       <div className="query-composer" ref={composer}>
         <div className="query-toolbar">
           {running ? <button className="button" disabled={stopping} onClick={() => void stop()}><Square size={16} />{stopping ? t('正在取消…') : t('取消查询')}</button>
-            : <button className="button primary" disabled={!canRun || !!pending} onClick={() => void run()}><Play size={16} />{t('运行查询')}</button>}
+            : <button className="button primary" disabled={!canRun || !!pending} onClick={() => void run()}><Play size={16} />{t('运行查询')}<kbd className="kbd-on-primary" aria-hidden="true">{isMac ? '⌘↵' : 'Ctrl↵'}</kbd></button>}
           {canvas && <button className="button compact" disabled={!!running || !!pending || !canRun || canvas.page.model_revision !== revision}
             onClick={() => void run('query', 'append')}>{t('运行并追加到画布')}</button>}
           <label><span className="sr-only">{t('查询语言')}</span><select value={language} disabled={!!running} onChange={event => { setLanguage(event.target.value as Dialect); setSnapshot(undefined); }}>
@@ -417,43 +482,41 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
         </Suspense>
         <div className="query-settings">
           <div className="query-disclosures">
-            <button className="button compact scope-button" disabled={!!generation || !!running} onClick={() => setEditingScope(true)}>{t('查询范围')}{graphOptions.trim() && !generation ? t(' · 已设置') : ''}
+            {language === 'cypher' && <button type="button" className={'button compact query-pill' + (parametersOpen || parameters.trim() || parameterRequired ? ' is-active' : '')}
+              aria-expanded={parametersOpen || parameterRequired}
+              onClick={() => setParametersOpen(open => !open)}>
+              <Braces size={14} aria-hidden="true" />{t('Cypher 参数')}{parameters.trim() ? ' · JSON' : ''}
+            </button>}
+            <button type="button" className={'button compact query-pill' + (graphOptions.trim() && !generation ? ' is-active' : '')}
+              disabled={!!generation || !!running} onClick={() => setEditingScope(true)}>
+              <Filter size={14} aria-hidden="true" />{t('查询范围')}{graphOptions.trim() && !generation ? t(' · 已设置') : ''}
             </button>
-            <details ref={optionsPanel} className="query-details query-parameters" open={parameterRequired && language === 'cypher' || !timeoutValid || undefined}>
-              <summary>{t('查询选项')}{(timeout || captureResult || generation || hasFreshness || language === 'cypher' && parameters.trim()) ? t(' · 已设置') : ''}</summary>
-              <div className="query-options-grid">
-                {language === 'cypher' && <div className="form-fields">
-                  <label>{t('Cypher 参数（JSON）')}<textarea ref={parameterInput} value={parameters} onChange={event => setParameters(event.target.value)}
-                    onBlur={() => setParametersTouched(true)} placeholder="{}" spellCheck={false} rows={3} className="mono"
-                    aria-invalid={showParameterError || undefined} aria-describedby={showParameterError ? id + '-parameter-error' : parameterRequired && !parameters.trim() ? id + '-query-parameters-hint' : undefined} /></label>
-                  {/* Reserve the message height before blur so a pointer's next target stays put. */}
-                  {parameterProblem && <span className="inline-error" id={id + '-parameter-error'} role="status"
-                    style={{ visibility: showParameterError ? 'visible' : 'hidden' }}>{parameterProblem}</span>}
-                </div>}
-                <div className="form-fields execution-options">
-                <label className="query-timeout">{t('超时（毫秒）')}<input type="number" min={1} max={60_000} step={1} value={timeout}
-                  disabled={!!running} aria-invalid={!timeoutValid} aria-describedby={timeoutValid ? undefined : id + '-query-timeout-error'} placeholder={defaultTimeout ? String(defaultTimeout) : t('服务器默认')}
-                  onChange={event => setTimeoutText(event.target.value)} /></label>
-                {canExport && <label className="check-label"><input type="checkbox" checked={captureResult}
-                  onChange={event => setCaptureResult(event.target.checked)} />{t('保留完整结果')}</label>}
-                {ageFields.map(([key, label]) => <label key={key}>{label}<input type="number" min={1} max={2592000}
-                  placeholder={t('模型默认')} value={freshness[key] ?? ''} aria-invalid={limitErrors[key] || undefined}
-                  aria-describedby={limitErrors[key] ? id + '-freshness-error' : undefined}
-                  onChange={event => { const age = event.target.value ? event.target.valueAsNumber : undefined; setFreshness(old => ({ ...old, [key]: age })); }} /></label>)}
-                {language === 'cypher' && <label className="check-label"><input type="checkbox" checked={!!freshness.require_current_csr} onChange={event => setFreshness(old => ({...old, require_current_csr: event.target.checked}))} />{t('要求 CSR 与当前副本一致')}</label>}
-                {recoverable && language === 'cypher' && (generation
-                  ? <button className="button compact" disabled={!!running} onClick={() => setSnapshot(undefined)}>{t('切换至实时来源')}</button>
-                  : <button className="button compact" disabled={!!running} onClick={() => void selectSnapshot()}>{t('使用已发布 CSR')}</button>)}
-                </div>
-              </div>
-            </details>
+            <button type="button" className={'button compact query-pill' + (advancedCount > 0 || !timeoutValid || !agesValid ? ' is-active' : '')}
+              disabled={!!running} onClick={() => setEditingAdvanced(true)}>
+              <SlidersHorizontal size={14} aria-hidden="true" />{t('高级选项')}
+              {advancedCount > 0 && <span className="tab-count">{advancedCount}</span>}
+            </button>
           </div>
+          {language === 'cypher' && (parametersOpen || parameterRequired || showParameterError) && <div className="query-param-drawer form-fields">
+            <label>{t('Cypher 参数（JSON）')}<textarea ref={parameterInput} value={parameters} onChange={event => setParameters(event.target.value)}
+              onBlur={() => setParametersTouched(true)} placeholder="{}" spellCheck={false} rows={3} className="mono"
+              aria-invalid={showParameterError || undefined} aria-describedby={showParameterError ? id + '-parameter-error' : parameterRequired && !parameters.trim() ? id + '-query-parameters-hint' : undefined} /></label>
+            {parameterProblem && <span className="inline-error" id={id + '-parameter-error'} role="status"
+              style={{ visibility: showParameterError ? 'visible' : 'hidden' }}>{parameterProblem}</span>}
+          </div>}
         </div>
         {!agesValid && <p className="inline-error query-notice" id={id + '-freshness-error'} role="alert">{t('来源观察和全量对账的最大年龄须为 1 至 2592000 秒的整数。')}</p>}
         {parameterRequired && language === 'cypher' && !parameters.trim() && <p className="notice query-notice" id={id + '-query-parameters-hint'} role="status">{t('此查询需要参数。填写 Cypher 参数后即可运行。')}</p>}
         {loadNotice && <p className="notice query-notice" role="status">{loadNotice}</p>}
       </div>
       {visible && editingScope && <Suspense><QueryScope value={graphOptions} save={setGraphOptions} close={() => setEditingScope(false)} /></Suspense>}
+      {visible && editingAdvanced && <Suspense><QueryAdvanced
+        language={language} timeout={timeout} defaultTimeout={defaultTimeout}
+        canExport={canExport} captureResult={captureResult} freshness={freshness}
+        recoverable={recoverable} generation={generation} running={!!running}
+        onSelectSnapshot={selectSnapshot} onClearSnapshot={() => setSnapshot(undefined)}
+        apply={next => { setTimeoutText(next.timeout); setCaptureResult(next.captureResult); setFreshness(next.freshness); }}
+        close={() => setEditingAdvanced(false)} /></Suspense>}
       {error && <div className="notice error query-notice" role="alert">{error.message}{error.stale && <button className="text-button" onClick={refresh}>{t('重新加载模型')}</button>}</div>}
       {pending && !running && <div className="notice query-notice" role="status">{t('检测到未确认的查询。')}
         <button className="text-button" onClick={() => void recover()}>{t('找回原查询')}</button>
@@ -528,9 +591,8 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
             timeout={canvas.statement?.timeout_ms} busy={!!running || !!pending} reload={refresh}
             rerun={canvas.statement ? () => void run('query', 'replay') : undefined} />
         </div>}
-        {view === 'graph' && !canvas && <p className="empty">{page
-          ? page.graph.truncated ? t('图元素超过预览上限，请缩小查询范围。') : t('当前结果没有可绘制的图元素。')
-          : t('运行查询后可在这里查看图元素。')}</p>}
+        {view === 'graph' && !canvas && (page ? <p className="empty">{page.graph.truncated ? t('图元素超过预览上限，请缩小查询范围。') : t('当前结果没有可绘制的图元素。')}</p>
+          : <div className="empty empty-with-starters"><p>{t('运行查询后可在这里查看图元素。')}</p>{starterChips}</div>)}
         {view === 'table' && (page ? <>
           <div className="table-scroll" role="region" aria-label={t('查询结果表格')} tabIndex={0}><table>
             <thead><tr>{page.columns.map((column, index) => <th scope="col" key={index}>{column.name}<small>{column.data_type}</small></th>)}</tr></thead>
@@ -538,7 +600,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
               <code className={cell === null ? 'null-cell' : ''}>{cell ?? 'null'}</code></td>)}</tr>)}</tbody>
           </table></div>
           {!page.rows.length && <p className="empty">{t('查询未返回行')}</p>}
-        </> : <p className="empty">{t('运行查询后可在这里查看结果。')}</p>)}
+        </> : <div className="empty empty-with-starters"><p>{t('运行查询后可在这里查看结果。')}</p>{starterChips}</div>)}
         {view === 'raw' && (page ? <RawResponse page={page} />
           : <p className="empty">{t('运行查询后可在这里查看原始响应。')}</p>)}
       </div>
@@ -563,10 +625,7 @@ export function Query({ id, actor, revision, draftPending, refresh, editSchema, 
         event.preventDefault();
         if (!templateName.trim() || !query.trim()) return;
         if (!timeoutValid || !agesValid) {
-          if (optionsPanel.current) {
-            optionsPanel.current.open = true;
-            optionsPanel.current.querySelector<HTMLInputElement>('input:invalid, input[aria-invalid="true"]')?.focus();
-          }
+          setEditingAdvanced(true);
           return;
         }
         if (keepParameters && !validateParameters()) return;

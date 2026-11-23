@@ -15,12 +15,13 @@ export function ModelWorkspaceHeader({ workspace, name, modelId, revision, archi
   rename?: ReactNode;
   status?: ReactNode;
   action?: ReactNode;
-  navigation?: { current: Workspace; catalogs: boolean; query: boolean; goTo: (workspace: Workspace) => void };
+  navigation?: { current: Workspace; catalogs: boolean; query: boolean; sourceCount?: number; goTo: (workspace: Workspace) => void };
 }) {
-  return <header className="workspace-header model-workspace-header">
+  const showTabs = Boolean(modelId && navigation && (navigation.catalogs || navigation.query));
+  return <header className={'workspace-header model-workspace-header' + (showTabs ? ' has-section-tabs' : '')}>
     <div className="model-header-nav">
       <div className="model-breadcrumb"><button className="model-back" type="button" aria-label={workspace + ' · ' + t('返回模型列表')} title={t('返回模型列表')} onClick={back}>
-        <ArrowLeft size={16} aria-hidden="true" />{workspace}
+        <ArrowLeft size={15} aria-hidden="true" />{workspace}
       </button>
         {modelId && modelId !== name && <><span aria-hidden="true">/</span><code>{modelId}</code></>}
       </div>
@@ -39,15 +40,16 @@ export function ModelWorkspaceHeader({ workspace, name, modelId, revision, archi
       </div>
       {action}
     </div>
-    {modelId && navigation && (navigation.catalogs || navigation.query) && <nav className="model-section-nav" aria-label={t('模型工作区')}>
-      <AppLink className="model-section-link" href={modelPath(modelId)} navigate={() => navigation.goTo('graph')} aria-current={navigation.current === 'graph' ? 'page' : undefined}>
-        <Network size={16} aria-hidden="true" />{t('图模型')}
+    {showTabs && navigation && <nav className="model-section-nav" aria-label={t('模型工作区')}>
+      <AppLink className="model-section-link" href={modelPath(modelId!)} navigate={() => navigation.goTo('graph')} aria-current={navigation.current === 'graph' ? 'page' : undefined}>
+        <Network size={15} aria-hidden="true" /><span>{t('图模型')}</span>
       </AppLink>
-      {navigation.catalogs && <AppLink className="model-section-link" href={modelPath(modelId, 'catalogs')} navigate={() => navigation.goTo('catalogs')} aria-current={navigation.current === 'catalogs' ? 'page' : undefined}>
-        <Database size={16} aria-hidden="true" />{t('数据源')}
+      {navigation.catalogs && <AppLink className="model-section-link" href={modelPath(modelId!, 'catalogs')} navigate={() => navigation.goTo('catalogs')} aria-current={navigation.current === 'catalogs' ? 'page' : undefined}>
+        <Database size={15} aria-hidden="true" /><span>{t('数据源')}</span>
+        {navigation.sourceCount !== undefined && <span className="tab-count">{navigation.sourceCount}</span>}
       </AppLink>}
-      {navigation.query && <AppLink className="model-section-link" href={modelPath(modelId, 'query')} navigate={() => navigation.goTo('query')} aria-current={navigation.current === 'query' ? 'page' : undefined}>
-        <Terminal size={16} aria-hidden="true" />{t('查询')}
+      {navigation.query && <AppLink className="model-section-link" href={modelPath(modelId!, 'query')} navigate={() => navigation.goTo('query')} aria-current={navigation.current === 'query' ? 'page' : undefined}>
+        <Terminal size={15} aria-hidden="true" /><span>{t('查询')}</span>
       </AppLink>}
     </nav>}
   </header>;

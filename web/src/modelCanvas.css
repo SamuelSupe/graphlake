@@ -1,28 +1,35 @@
 .canvas-panel:has(> .canvas-frame) { display: flex; flex-direction: column; }
 .canvas-frame { position: relative; flex: 1; min-block-size: 0; }
 .canvas-viewport:focus-visible { outline-offset: -2px; }
+
 .canvas-instructions {
   display: flex;
   flex: none;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 2px 12px;
-  min-block-size: 30px;
-  padding: 3px 12px;
+  gap: 4px 12px;
+  min-block-size: 32px;
+  padding: 4px 12px;
   border-block-end: 1px solid var(--line);
-  background: var(--surface);
+  background: var(--surface-hover);
   color: var(--muted);
-  font-size: .8125rem;
+  font-size: .78rem;
 }
 .canvas-instructions > p { display: flex; align-items: center; gap: 6px; min-inline-size: 0; overflow-wrap: anywhere; }
 .canvas-instructions svg { flex: none; }
-.canvas-instructions[data-active] { background: var(--tint); color: var(--accent-hover); }
-.canvas-instructions .text-button { min-block-size: 26px; font-size: .8125rem; }
+.canvas-instructions[data-active] {
+  background: var(--tint);
+  border-block-end-color: var(--accent-line);
+  color: var(--accent);
+  font-weight: 600;
+}
+.canvas-instructions .text-button { min-block-size: 24px; font-size: .78rem; padding: 2px 8px; }
+
 .graph-vertex { position: absolute; z-index: 1; }
-.graph-vertex:focus-within, .graph-vertex:hover, .graph-vertex[data-moving] { z-index: 2; }
+.graph-vertex:focus-within, .graph-vertex:hover, .graph-vertex[data-moving] { z-index: 3; }
 .graph-vertex > .graph-node { inset: 0 auto auto 0; }
-.graph-vertex .node-dot { display: grid; place-items: center; color: #fff; }
+.graph-vertex .node-dot { display: grid; place-items: center; color: #ffffff; }
 .graph-node[data-movable] {
   cursor: grab;
   touch-action: none;
@@ -31,27 +38,50 @@
 }
 .graph-node[data-movable]:active, .graph-vertex[data-moving] .graph-node { cursor: grabbing; }
 .graph-stage .graph-edge[data-label-below] { transform: translateX(-50%); }
+
 .graph-port {
   position: absolute;
-  inset: 0 auto auto 20px;
+  inset: 0 auto auto 21px;
   display: grid;
   place-items: center;
-  inline-size: 26px;
-  block-size: 26px;
+  inline-size: 24px;
+  block-size: 24px;
   padding: 0;
   transform: translateY(-50%);
-  border: 1px solid var(--control-line);
+  border: 1.5px solid var(--line-strong);
   border-radius: 50%;
   background: var(--surface);
-  color: var(--accent-hover);
+  color: var(--accent);
+  box-shadow: var(--shadow-xs);
+  transition: transform 130ms var(--ease), border-color 130ms var(--ease), background-color 130ms var(--ease), color 130ms var(--ease), box-shadow 130ms var(--ease);
 }
-.graph-port:hover, .graph-port:focus-visible { border-color: var(--accent); background: var(--tint); }
-.graph-vertex[data-link-source] .node-dot { box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px #a2bcff; }
-.graph-vertex[data-link-target] .node-dot { box-shadow: 0 0 0 2px var(--accent), 0 0 0 5px #d4e2ff; }
+.graph-port:hover, .graph-port:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+  transform: translateY(-50%) scale(1.1);
+  box-shadow: 0 3px 10px -2px rgba(37, 99, 235, 0.45);
+}
+
+.graph-vertex[data-link-source] .node-dot { box-shadow: 0 0 0 2.5px var(--accent), 0 0 0 7px var(--node-halo); }
+.graph-vertex[data-link-target] .node-dot { box-shadow: 0 0 0 2.5px var(--lake), 0 0 0 7px var(--lake-tint); }
 .graph-stage[data-placing] { cursor: crosshair; }
 .graph-stage[data-linking] .graph-node { cursor: crosshair; }
-.graph-toolbar .tool-button[aria-pressed="true"] { color: var(--accent-hover); background: var(--tint); border-color: #a7bdf2; }
+
+.graph-toolbar .tool-button[aria-pressed="true"] {
+  color: var(--accent);
+  background: var(--tint);
+  border-color: var(--accent-line);
+}
+
+/* Sleek Docked Bottom Control Bar — Zero Node Overlap */
+.canvas-panel > .canvas-controls {
+  padding: 5px 12px;
+  background: var(--surface-hover);
+  border-block-start: 1px solid var(--line);
+}
+
 @media (pointer: coarse) {
   .canvas-controls :is(button, select) { min-block-size: 44px; min-inline-size: 44px; }
-  .graph-port { inset-inline-start: 24px; inline-size: 44px; block-size: 44px; }
+  .graph-port { inset-inline-start: 24px; inline-size: 42px; block-size: 42px; }
 }

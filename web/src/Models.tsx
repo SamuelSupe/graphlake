@@ -1,5 +1,5 @@
 import { diagnosticText, t } from './locale.ts';
-import { lazy, Suspense, useLayoutEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Activity, ArrowRight, Box, CircleAlert, Database, GitFork, LayoutGrid, List, LoaderCircle, Network, Plus, RefreshCw, Search, Terminal, Upload } from 'lucide-react';
 import type { ModelSummary } from './api';
 import { AppLink, modelPath } from './AppLink';
@@ -45,12 +45,35 @@ export function Models({ models, error, refreshing, importError, workspace, navi
   const [filter, updateFilter] = useState<Filter>(memory.filter);
   const setFilter = (value: Filter) => { memory.filter = value; updateFilter(value); };
   const searchInput = useRef<HTMLInputElement>(null);
+  const ignoreNextSlash = useRef(false);
   const refreshButton = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => {
     if (!models || !memory.returnFocus) return;
     document.getElementById(memory.returnFocus)?.focus({ preventScroll: true });
     delete memory.returnFocus;
   }, [memory, models]);
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (document.querySelector('dialog[open]')) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.matches('input, textarea, select') || target.isContentEditable)) return;
+      if (!searchInput.current) return;
+      event.preventDefault();
+      ignoreNextSlash.current = true;
+      searchInput.current.focus();
+      searchInput.current.select();
+    }
+    function onKeyUp(event: KeyboardEvent) {
+      if (event.key === '/') ignoreNextSlash.current = false;
+    }
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, []);
 
   function follow(path: string) {
     memory.returnFocus = document.activeElement?.id;
@@ -132,32 +155,51 @@ export function Models({ models, error, refreshing, importError, workspace, navi
     <section className="model-library" aria-labelledby="library-heading">
       <div className="library-heading">
         <h2 id="library-heading">{t('模型目录')}</h2>
+        {workspace !== 'query' && <div className="model-filters" role="group" aria-label={t('按模型状态筛选')}>
+          {statusFilters.map(item => <button key={item.key} aria-pressed={activeFilter === item.key}
+            onClick={() => setFilter(item.key)}>{item.label}
+            {item.count !== undefined && <span>{item.count}</span>}
+          </button>)}
+        </div>}
         <div className="directory-search">
-          <label className="search"><Search size={17} aria-hidden="true" /><input ref={searchInput} type="search"
-            aria-label={t('搜索模型名称或标识')} placeholder={t('搜索模型名称或标识')} value={search} onChange={event => setSearch(event.target.value)} /></label>
+          <label className="search"><Search size={16} aria-hidden="true" /><input ref={searchInput} type="search"
+            aria-label={t('搜索模型名称或标识')} placeholder={t('搜索模型名称或标识')} value={search}
+            onBeforeInput={event => {
+              if (ignoreNextSlash.current && event.data === '/') {
+                event.preventDefault();
+                ignoreNextSlash.current = false;
+              }
+            }}
+            onChange={event => {
+              if (ignoreNextSlash.current && event.target.value === '/' && !search) {
+                ignoreNextSlash.current = false;
+                return;
+              }
+              ignoreNextSlash.current = false;
+              setSearch(event.target.value);
+            }}
+            onKeyDown={event => {
+              ignoreNextSlash.current = false;
+              if (event.key === 'Escape') {
+                if (search) setSearch('');
+                else event.currentTarget.blur();
+              }
+            }} />{!search && <kbd className="search-kbd" aria-hidden="true">/</kbd>}</label>
           {workspace !== 'query' && <select className="compact-model-filter" aria-label={t('按模型状态筛选')} value={activeFilter}
             onChange={event => setFilter(event.target.value as Filter)}>
             {statusFilters.map(({ key, label, count }) => <option key={key} value={key}>{label}{count !== undefined && ` (${count})`}</option>)}
           </select>}
           <button className="button refresh-models" ref={refreshButton} aria-disabled={refreshing} aria-label={refreshing ? t('正在刷新…') : t('刷新模型列表')}
             title={refreshing ? t('正在刷新…') : t('刷新模型列表')} onClick={() => { if (!refreshing) retry(); }}>
-            {refreshing ? <LoaderCircle size={17} aria-hidden="true" /> : <RefreshCw size={17} aria-hidden="true" />}
+            {refreshing ? <LoaderCircle size={16} aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}
           </button>
         </div>
         <div className="library-views" role="group" aria-label={t('目录视图')}>
           {([{ mode: 'cards', label: t('卡片视图'), Icon: LayoutGrid }, { mode: 'table', label: t('列表视图'), Icon: List }] as const)
             .map(({ mode, label, Icon }) => <button type="button" key={mode} aria-label={label} title={label} aria-pressed={mode === view}
-              onClick={() => { memory.view = mode; setView(mode); }}><Icon size={16} aria-hidden="true" /></button>)}
+              onClick={() => { memory.view = mode; setView(mode); }}><Icon size={15} aria-hidden="true" /></button>)}
         </div>
       </div>
-      {workspace !== 'query' && <div className="directory-tools">
-        <div className="model-filters" role="group" aria-label={t('按模型状态筛选')}>
-          {statusFilters.map(item => <button key={item.key} aria-pressed={activeFilter === item.key}
-            onClick={() => setFilter(item.key)}>{item.label}
-            {item.count !== undefined && <span>{item.count}</span>}
-          </button>)}
-        </div>
-      </div>}
       {importError && <p className="notice error listing-notice" role="alert">{importError}</p>}
       {error && models && <p className="notice error listing-notice" role="alert">{t('刷新失败，当前显示上次读取的目录。{0}', error)}</p>}
       {error && !models ? <div className="directory-empty panel-table" role="alert"><CircleAlert size={28} aria-hidden="true" />

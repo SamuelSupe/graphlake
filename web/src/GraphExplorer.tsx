@@ -8,7 +8,7 @@ import { NeighborControls } from './NeighborControls';
 import { appendGraph, combineVersions, focusNeighborhood, graphLabel, graphType, maxElements, mergePage, removeElement, searchCanvas, visibleGraphElements } from './graphExploration';
 import { edgeCurve, edgeLanes, forceVertexLimit, packPaths, positions, scene, type Layout, type Point } from './graphLayout';
 
-const tones = ['var(--accent)', '#317d93', '#6a5ca1', '#375f9e', '#447258', '#a06630'];
+const tones = ['#2563eb', '#0d9488', '#6366f1', '#d97706', '#059669', '#db2777'];
 const layoutNames = { radial: t('径向布局'), layered: t('分层布局'), force: t('力导向布局') } as const;
 const minZoom = .005;
 const clampZoom = (value: number) => Math.max(minZoom, Math.min(4, value));
@@ -32,9 +32,12 @@ export type GraphExplorerHandle = { append: (result: QueryResult) => string | un
 const EdgePaths = memo(function EdgePaths({ edges, dense, selected, matched, arrow }: {
   edges: EdgeGeometry[]; dense: boolean; selected?: string; matched: ReadonlySet<string>; arrow: string;
 }) {
-  if (!dense) return edges.map(({ id, element, path }) => <path key={id} d={path}
-    className={!element ? 'path-step' : selected === id || matched.has(id) ? 'selected' : undefined}
-    markerEnd={element?.directed === false ? undefined : 'url(#' + arrow + ')'} />);
+  if (!dense) return edges.map(({ id, element, path }) => {
+    const highlighted = !!element && (selected === id || matched.has(id));
+    return <path key={id} d={path}
+      className={!element ? 'path-step' : highlighted ? 'selected' : undefined}
+      markerEnd={element?.directed === false ? undefined : 'url(#' + (highlighted ? arrow + '-selected' : arrow) + ')'} />;
+  });
   const normal: string[] = [], highlighted: string[] = [], steps: string[] = [];
   for (const { id, element, path } of edges) {
     if (id === selected) continue;
@@ -45,7 +48,7 @@ const EdgePaths = memo(function EdgePaths({ edges, dense, selected, matched, arr
     {packPaths(normal).map((path, i) => <path key={'normal:' + i} d={path} />)}
     {packPaths(steps).map((path, i) => <path key={'step:' + i} className="path-step" d={path} />)}
     {packPaths(highlighted).map((path, i) => <path key={'match:' + i} className="selected" d={path} />)}
-    {active && <path d={active.path} className="selected" markerEnd={active.element?.directed === false ? undefined : 'url(#' + arrow + ')'} />}
+    {active && <path d={active.path} className="selected" markerEnd={active.element?.directed === false ? undefined : 'url(#' + arrow + '-selected)'} />}
   </>;
 });
 
@@ -578,7 +581,14 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
   const transform = 'translate(' + camera.x + 'px,' + camera.y + 'px) scale(' + camera.zoom + ')';
   const nodes = visibleElements.filter(element => element.kind === 'node').length;
   const edges = visibleElements.length - nodes;
-  return <section className="graph-explorer" aria-label={t('结果图探索')}>
+  return <section className="graph-explorer" aria-label={t('结果图探索')} onKeyDown={event => {
+    if (event.key !== 'Escape' || !selected || document.querySelector('dialog[open]')) return;
+    const target = event.target as HTMLElement | null;
+    if (target && (target.matches('input, textarea, select') || target.isContentEditable)) return;
+    event.preventDefault();
+    setSelected(undefined);
+    detailsInvoker.current?.focus();
+  }}>
     <div className="explorer-toolbar">
       <span className="explorer-count" aria-live="polite">{nodes}{t(' 个节点 · {0} 条边', edges)}
         {visibleElements.length < elements.length && t(' · 已隐藏 {0} 个元素', (elements.length - visibleElements.length))}</span>
@@ -607,52 +617,54 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
           onClick={() => showBatch(viewingBatch, viewingBatch.cursor)}>{t('下一批')}</button>
       </div>}
     </div>
-    {elements.length > 0 && <GraphLegend elements={elements} schema={schema} hidden={hiddenTypes} labels={displayLabels} color={color}
-      toggle={type => {
-        const next = new Set(hiddenTypes);
-        if (!next.delete(type)) next.add(type);
-        if (selected && !visibleGraphElements(elements, next).some(element => element.id === selected)) setSelected(undefined);
-        changeVisibility(next);
-      }} setLabel={(type, field) => {
-        setDisplayLabels(old => {
-          const next = new Map(old);
-          if (field !== undefined) next.set(type, field);
-          else next.delete(type);
-          return next;
-        });
-      }} reset={() => {
-        changeVisibility(new Set());
-        setDisplayLabels(new Map());
-      }} />}
-    {elements.length > 0 && <div className="explorer-search">
-      <div className="explorer-search-controls">
-        <input type="search" aria-label={t('搜索画布属性')} placeholder={t('搜索业务键、标签或属性')} value={search} maxLength={256}
-          onChange={event => {
-            searchRequest.current?.abort();
-            setSearchResult(undefined);
-            setSearchError(undefined);
-            setSearch(event.target.value);
-          }} />
-        {searchScope && <button className="button compact" disabled={!search.trim() || searching || isStale || !!rerunReason}
-          onClick={() => void searchBatches()}>{searching ? t('正在搜索…') : t('搜索全部批次')}</button>}
-        {deferredSearch.trim() && <span className="muted small" role="status">
-          {crossSearch ? t('{0} 个跨批匹配', crossSearch.total) : t('{0} 个匹配', matches.length)}
-        </span>}
+    {elements.length > 0 && <div className="explorer-subbar">
+      <div className="explorer-search">
+        <div className="explorer-search-controls">
+          <input type="search" aria-label={t('搜索画布属性')} placeholder={t('搜索业务键、标签或属性')} value={search} maxLength={256}
+            onChange={event => {
+              searchRequest.current?.abort();
+              setSearchResult(undefined);
+              setSearchError(undefined);
+              setSearch(event.target.value);
+            }} />
+          {searchScope && <button className="button compact" disabled={!search.trim() || searching || isStale || !!rerunReason}
+            onClick={() => void searchBatches()}>{searching ? t('正在搜索…') : t('搜索全部批次')}</button>}
+          {deferredSearch.trim() && <span className="muted small" role="status">
+            {crossSearch ? t('{0} 个跨批匹配', crossSearch.total) : t('{0} 个匹配', matches.length)}
+          </span>}
+        </div>
+        {searchError && <p role="alert" className="inline-error small">{searchError}</p>}
+        {crossSearch && crossSearch.matches.length > 0
+          ? <GraphSearchMatches key={crossSearch.query + ':' + crossSearch.offset} matches={crossSearch.matches} locate={locateAcrossBatches}
+            label={match => {
+              const loaded = elementsById.get(match.id);
+              return loaded ? labelFor(loaded) : match.label;
+            }} />
+          : !crossSearch && matches.length > 0 && <GraphSearchMatches key={deferredSearch} matches={matches} locate={locate} label={labelFor} />}
+        {crossSearch && crossSearch.total > 100 && <div className="explorer-search-controls">
+          <button className="button compact" disabled={searching || crossSearch.offset === 0}
+            onClick={() => void searchBatches(crossSearch.offset - 100)}>{t('上一组匹配')}</button>
+          <button className="button compact" disabled={searching || crossSearch.offset + 100 >= crossSearch.total}
+            onClick={() => void searchBatches(crossSearch.offset + 100)}>{t('下一组匹配')}</button>
+        </div>}
       </div>
-      {searchError && <p role="alert" className="inline-error small">{searchError}</p>}
-      {crossSearch && crossSearch.matches.length > 0
-        ? <GraphSearchMatches key={crossSearch.query + ':' + crossSearch.offset} matches={crossSearch.matches} locate={locateAcrossBatches}
-          label={match => {
-            const loaded = elementsById.get(match.id);
-            return loaded ? labelFor(loaded) : match.label;
-          }} />
-        : !crossSearch && matches.length > 0 && <GraphSearchMatches key={deferredSearch} matches={matches} locate={locate} label={labelFor} />}
-      {crossSearch && crossSearch.total > 100 && <div className="explorer-search-controls">
-        <button className="button compact" disabled={searching || crossSearch.offset === 0}
-          onClick={() => void searchBatches(crossSearch.offset - 100)}>{t('上一组匹配')}</button>
-        <button className="button compact" disabled={searching || crossSearch.offset + 100 >= crossSearch.total}
-          onClick={() => void searchBatches(crossSearch.offset + 100)}>{t('下一组匹配')}</button>
-      </div>}
+      <GraphLegend elements={elements} schema={schema} hidden={hiddenTypes} labels={displayLabels} color={color}
+        toggle={type => {
+          const next = new Set(hiddenTypes);
+          if (!next.delete(type)) next.add(type);
+          if (selected && !visibleGraphElements(elements, next).some(element => element.id === selected)) setSelected(undefined);
+          changeVisibility(next);
+        }} setLabel={(type, field) => {
+          setDisplayLabels(old => {
+            const next = new Map(old);
+            if (field !== undefined) next.set(type, field);
+            else next.delete(type);
+            return next;
+          });
+        }} reset={() => {
+          changeVisibility(new Set());
+          setDisplayLabels(new Map());
+        }} />
     </div>}
     {help && <p className="explorer-help">{t('使用缩放按钮调整视图，桌面也可用滚轮。拖动空白处平移，拖动节点可调整位置。选择节点或边查看属性，选择节点后可展开一跳邻居。')}</p>}
     {visibleCurves.some(curve => !curve.element) && <p className="explorer-help">{t('虚线表示路径中相邻的节点。查询结果中未包含它们之间的边。')}</p>}
@@ -680,11 +692,19 @@ export function GraphExplorer({ id, page, schema, activeRevision, timeout, busy,
     <div className="explorer-body">
       <div className="explorer-surface" ref={surface} aria-label={t('结果画布')} onPointerDown={event => {
         if (event.target === event.currentTarget || event.target === svg.current) begin(event);
-      }} onPointerMove={move} onPointerUp={end} onPointerCancel={end} onLostPointerCapture={end}>
+      }} onPointerMove={move} onPointerUp={end} onPointerCancel={end} onLostPointerCapture={end} onClick={event => {
+        if (suppressClick.current) return;
+        if (selected && (event.target === event.currentTarget || event.target === svg.current)) setSelected(undefined);
+      }}>
         <svg ref={svg} className="explorer-lines" aria-hidden="true">
-          <defs><marker id={arrow} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--graph-line)" />
-          </marker></defs>
+          <defs>
+            <marker id={arrow} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--graph-line)" />
+            </marker>
+            <marker id={arrow + '-selected'} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)" />
+            </marker>
+          </defs>
           <g transform={'translate(' + (viewportWidth / 2 + camera.x) + ' ' + (viewportHeight / 2 + camera.y) + ') scale(' + camera.zoom + ')'}>
             <EdgePaths edges={visibleCurves} dense={dense} selected={selected} matched={matched} arrow={arrow} />
           </g>

@@ -2,6 +2,7 @@ import { locale, t } from './locale.ts';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChartNoAxesCombined, Table2 } from 'lucide-react';
 import { maxSampleGapMs, trendsInWindow, type ChartPoint, type RuntimeSample } from './overviewSeries';
+import { useTheme } from './theme';
 import { Modal } from './ui';
 
 const format = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
@@ -9,15 +10,18 @@ const clock = new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digi
 
 function TrendPlot({ points }: { points: ChartPoint[] }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const theme = useTheme();
   useEffect(() => {
     const canvas = ref.current;
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
     const first = points[0].at;
     const style = getComputedStyle(canvas);
-    const colors = [style.getPropertyValue('--accent').trim(), '#a04e17'];
-    const muted = style.getPropertyValue('--muted').trim();
-    const grid = style.getPropertyValue('--line').trim();
+    const accent = style.getPropertyValue('--accent').trim() || '#2563eb';
+    const colors = [accent, '#d97706'];
+    const muted = style.getPropertyValue('--muted').trim() || '#64748b';
+    const grid = style.getPropertyValue('--line').trim() || '#e2e8f0';
+    const surface = style.getPropertyValue('--surface').trim() || '#ffffff';
     const last = points[points.length - 1].at;
     const max = Math.max(2, Math.ceil(Math.max(...points.flatMap(({ values }) => values ?? [0])) / 2) * 2);
     function draw(width: number, height: number) {
@@ -27,25 +31,55 @@ function TrendPlot({ points }: { points: ChartPoint[] }) {
       canvas.height = Math.round(height * ratio);
       ctx.scale(ratio, ratio);
       ctx.fillStyle = muted;
-      ctx.font = '11px system-ui, sans-serif';
-      const left = ctx.measureText(format.format(max)).width + 10;
-      const right = width - 7;
-      const top = 10;
-      const bottom = height - 9;
+      ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+      const left = ctx.measureText(format.format(max)).width + 12;
+      const right = width - 8;
+      const top = 12;
+      const bottom = height - 10;
       const y = (value: number) => bottom - value / max * (bottom - top);
       const x = (at: number) => first === last ? (left + right) / 2 : left + (at - first) / (last - first) * (right - left);
       ctx.textBaseline = 'middle';
+      ctx.lineWidth = 1;
       for (const tick of [0, max / 2, max]) {
+        ctx.fillStyle = muted;
         ctx.fillText(format.format(tick), 0, y(tick));
         ctx.strokeStyle = grid;
+        ctx.setLineDash(tick === 0 ? [] : [3, 3]);
         ctx.beginPath();
         ctx.moveTo(left, y(tick));
         ctx.lineTo(right, y(tick));
         ctx.stroke();
       }
+      // Subtle vertical area fill for the primary series.
+      const fill = ctx.createLinearGradient(0, top, 0, bottom);
+      fill.addColorStop(0, theme === 'dark' ? 'rgba(59, 130, 246, 0.28)' : 'rgba(37, 99, 235, 0.16)');
+      fill.addColorStop(1, theme === 'dark' ? 'rgba(59, 130, 246, 0.0)' : 'rgba(37, 99, 235, 0.0)');
+      let segment: ChartPoint[] = [];
+      const flushArea = () => {
+        if (segment.length >= 2) {
+          ctx.fillStyle = fill;
+          ctx.beginPath();
+          ctx.moveTo(x(segment[0].at), bottom);
+          for (const pt of segment) ctx.lineTo(x(pt.at), y(pt.values![0]));
+          ctx.lineTo(x(segment[segment.length - 1].at), bottom);
+          ctx.closePath();
+          ctx.fill();
+        }
+        segment = [];
+      };
+      points.forEach((pt, i) => {
+        if (!pt.values) { flushArea(); return; }
+        const previous = points[i - 1];
+        if (segment.length && (!previous?.values || pt.at - previous.at > maxSampleGapMs)) flushArea();
+        segment.push(pt);
+      });
+      flushArea();
+
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
       colors.forEach((color, series) => {
         ctx.strokeStyle = ctx.fillStyle = color;
-        ctx.lineWidth = 2;
+        ctx.lineWidth = series === 0 ? 2.25 : 1.85;
         ctx.setLineDash(series === 0 ? [] : [5, 4]);
         ctx.beginPath();
         points.forEach(({ at, values }, i) => {
@@ -55,11 +89,16 @@ function TrendPlot({ points }: { points: ChartPoint[] }) {
           else ctx.moveTo(x(at), y(values[series]));
         });
         ctx.stroke();
+        ctx.setLineDash([]);
         for (const { at, values } of points) {
           if (!values) continue;
           ctx.beginPath();
-          ctx.arc(x(at), y(values[series]), series === 0 ? 3 : 2, 0, Math.PI * 2);
+          ctx.arc(x(at), y(values[series]), series === 0 ? 3.25 : 2.5, 0, Math.PI * 2);
+          ctx.fillStyle = color;
           ctx.fill();
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = surface;
+          ctx.stroke();
         }
       });
     }
@@ -67,7 +106,7 @@ function TrendPlot({ points }: { points: ChartPoint[] }) {
     const observer = new ResizeObserver(([entry]) => draw(entry.contentRect.width, entry.contentRect.height));
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [points]);
+  }, [points, theme]);
   return <canvas className="trend-plot" ref={ref} aria-hidden="true" />;
 }
 

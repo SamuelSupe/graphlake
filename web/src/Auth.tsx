@@ -5,6 +5,7 @@ import { clearPendingQueries } from './Query';
 import { clearPendingMutations } from './Mutations';
 import { BrandLogo, WorkspaceLocked } from './ui';
 import { LanguageSelect } from './LanguageSelect';
+import { ThemeToggle } from './ThemeToggle';
 
 export type Session = { authenticated: boolean; enabled: boolean; username: string | null; administrator: boolean; subject?: string | null; authorization?: string | null; proxy_sign_in?: boolean };
 
@@ -47,8 +48,8 @@ function Login({ expired, username, proxySignIn, signedIn }: { expired: boolean;
   return <main className="auth-page">
     <section className="auth-card" aria-labelledby="login-heading">
       <div className="auth-card-heading">
-        <div className="auth-brand"><BrandLogo size={40} />GraphLake</div>
-        <LanguageSelect />
+        <div className="auth-brand"><BrandLogo size={36} />GraphLake</div>
+        <div className="auth-card-controls"><LanguageSelect /><ThemeToggle compact /></div>
       </div>
       <h1 id="login-heading">{expired ? t('会话已过期') : t('登录管理后台')}</h1>
       {expired && <p className="muted">{t('重新登录后可继续编辑本页草稿。')}</p>}
@@ -126,7 +127,7 @@ export function AuthGate({ workspace }: {
   }
 
   if (!session) return <main className="auth-page"><section className="auth-card">
-    <div className="auth-card-heading"><LanguageSelect /></div>
+    <div className="auth-card-heading"><div className="auth-brand"><BrandLogo size={36} />GraphLake</div><div className="auth-card-controls"><LanguageSelect /><ThemeToggle compact /></div></div>
     {error ? <><p role="alert">{error}</p><button className="button" onClick={() => {
       setError(''); setAttempt(value => value + 1);
     }}>{t('重试')}</button></> : <p role="status">{t('正在检查登录状态…')}</p>}

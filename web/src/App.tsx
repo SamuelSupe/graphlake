@@ -1,10 +1,12 @@
 import { t } from './locale.ts';
+import './theme';
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Bot, Database, LayoutDashboard, LogOut, Network, Settings2, ShieldCheck, Terminal, UserRound } from 'lucide-react';
+import { Bot, LayoutDashboard, LogOut, Network, Settings2, ShieldCheck, Terminal, UserRound } from 'lucide-react';
 import { api, ApiError, errorText, type ModelSummary, type SavedModel } from './api';
 import { AuthGate, type Session } from './Auth';
 import { LanguageSelect } from './LanguageSelect';
+import { ThemeToggle } from './ThemeToggle';
 import { Access, type Grants } from './Access';
 import { Query } from './Query';
 import { AppLink, modelPath } from './AppLink';
@@ -28,11 +30,11 @@ const RecoveryConsole = lazy(() => import('./RecoveryConsole'));
 const AddSource = lazy(() => import('./AddSource').then(module => ({ default: module.AddSource })));
 const Editor = lazy(() => import('./Editor'));
 
-const nav = [
-  { key: 'graph', label: t('图模型'), Icon: Network },
-  { key: 'catalogs', label: t('数据源'), Icon: Database },
-  { key: 'query', label: t('查询'), Icon: Terminal },
-] as const;
+const workspaceLabels: Record<Workspace, string> = {
+  graph: t('图模型'),
+  catalogs: t('数据源'),
+  query: t('查询'),
+};
 
 const isOverview = (path: string) => /^\/overview\/?$/.test(path);
 
@@ -182,7 +184,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   });
   useLayoutEffect(() => { window.scrollTo(0, ['/', '/catalogs', '/query'].includes(path) ? directory.current[workspace].scroll : 0); }, [path, workspace]);
   const pageTitle = overviewPage ? t('平台概览') : aiPage ? 'AI' : settingsPage ? t('运行配置') : accessPage ? t('权限管理')
-    : nav.find(item => item.key === workspace)!.label;
+    : workspaceLabels[workspace];
   const selectedName = id && availableModels?.find(model => model.id === id)?.name;
   useEffect(() => {
     if (!locked) document.title = [selectedName, pageTitle, 'GraphLake'].filter(Boolean).join(' · ');
@@ -199,12 +201,6 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
     } catch (cause) { setImportError(errorText(cause)); }
   }
 
-  function workspaceHref(next: Workspace) {
-    if (newModel && next === 'graph') return '/new';
-    if (id && (next === 'query' ? canQuery(id) : canReadModel(id))) return modelPath(id, next);
-    return next === 'graph' ? '/' : '/' + next;
-  }
-
   async function signOut() {
     if (!logout) return;
     setConfirmLogout(false);
@@ -215,7 +211,10 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
   }
 
   const account = <div className="rail-items rail-account">
-    <LanguageSelect />
+    <div className="rail-preferences">
+      <LanguageSelect />
+      <ThemeToggle compact />
+    </div>
     <div className="rail-identity">
       <UserRound size={20} aria-hidden="true" />
       <div className="rail-identity-text">
@@ -230,19 +229,21 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
     </button>}
   </div>;
 
+  const primaryNav = hasModelAccess
+    ? { href: '/', label: t('图模型'), Icon: Network }
+    : canUseQuery ? { href: '/query', label: t('查询'), Icon: Terminal } : undefined;
+  const inModelsArea = !overviewPage && !accessPage && !settingsPage && !aiPage;
+
   return <div className="app-shell">
     <a className="skip-link" href="#workspace-content">{t('跳转到工作区')}</a>
-    <ConsoleNavigation page={pageTitle} home={() => navigate('/')} account={account}>
+    <ConsoleNavigation page={pageTitle} home={() => navigate(primaryNav?.href ?? '/')} account={account}>
       <span className="rail-section">{t('工作区')}</span>
       {administrator && <AppLink className="rail-link" href="/overview" navigate={navigate} aria-current={overviewPage ? 'page' : undefined}>
         <LayoutDashboard size={20} aria-hidden="true" /><span>{t('平台概览')}</span>
       </AppLink>}
-      {nav.filter(({ key }) => key === 'query' ? canUseQuery : key === 'catalogs' ? administrator : hasModelAccess)
-      .map(({ key, label, Icon }) =>
-        <AppLink key={key} className="rail-link" href={workspaceHref(key)} navigate={navigate}
-          aria-current={!overviewPage && !accessPage && !settingsPage && !aiPage && workspace === key ? 'page' : undefined}>
-          <Icon size={20} aria-hidden="true" /><span>{label}</span>
-        </AppLink>)}
+      {primaryNav && <AppLink className="rail-link" href={primaryNav.href} navigate={navigate} aria-current={inModelsArea ? 'page' : undefined}>
+        <primaryNav.Icon size={20} aria-hidden="true" /><span>{primaryNav.label}</span>
+      </AppLink>}
       <AppLink className="rail-link" href="/ai" navigate={navigate} aria-current={aiPage ? 'page' : undefined}>
         <Bot size={20} aria-hidden="true" /><span>AI</span>
       </AppLink>
@@ -270,7 +271,7 @@ function App({ logout, locked, identity }: { logout?: () => Promise<void>; locke
             <Editor id={model} active={show} onDirty={onDirty} workspace={show ? page : 'query'} models={workspaceModels ?? []}
               allow={{ configure: administrator, edit: modelers, publish: publishers, query: canQuery(model), export: canExport(model) }}
               actor={actor} mutations={mutations} recovered={recovered?.id === model ? recovered : undefined} canvasLayouts={canvasLayouts.current}
-              close={() => navigate(page === 'graph' ? '/' : '/' + page)} goTo={next => navigate(modelPath(model, next))}
+              close={() => navigate(hasModelAccess ? '/' : '/query')} goTo={next => navigate(modelPath(model, next))}
               changeModel={key => navigate(modelPath(key, page))}
               changed={reloadModels} created={key => navigate(modelPath(key), true)} />
             </Suspense>

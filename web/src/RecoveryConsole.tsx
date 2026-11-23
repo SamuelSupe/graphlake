@@ -4,6 +4,7 @@ import { ArrowLeft, ShieldCheck } from 'lucide-react';
 import { errorText } from './api';
 import { BrandLogo, Modal } from './ui';
 import { LanguageSelect } from './LanguageSelect';
+import { ThemeToggle } from './ThemeToggle';
 import RecoveryImport from './RecoveryImport';
 import { recovery, type Gate, type RecoveryPointCheck, type RecoveryStatus, type RestoreStatus } from './recoveryApi';
 
@@ -131,6 +132,7 @@ export default function RecoveryConsole() {
       <BrandLogo size={40} />
       <div><h1>{restore ? t('灾备恢复') : t('灾备恢复验收')}</h1><p className="muted">{window.location.host}</p></div>
       <LanguageSelect />
+      <ThemeToggle compact />
       {canCutOver && <a href="/settings" className="button compact"><ArrowLeft size={15} aria-hidden="true" />{t('返回管理后台')}</a>}
     </header>
     <section className="settings-card">

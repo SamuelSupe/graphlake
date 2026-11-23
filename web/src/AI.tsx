@@ -1,5 +1,5 @@
 import { t } from './locale.ts';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, Copy } from 'lucide-react';
 import { api, errorText } from './api';
 import AiToken from './AiToken';
@@ -21,6 +21,8 @@ export default function AI({ locked, authEnabled, openServiceSettings }: {
   const [tokenUpdate, setTokenUpdate] = useState<{ value: string }>();
   const [copied, setCopied] = useState('');
   const [copyError, setCopyError] = useState('');
+  const copyTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(copyTimer.current), []);
   const changed = useCallback(() => reload(value => value + 1), []);
   useEffect(() => {
     if (locked) { setTokenUpdate(undefined); return; }
@@ -37,8 +39,12 @@ export default function AI({ locked, authEnabled, openServiceSettings }: {
 
   async function copyExample(title: string, prompt: string) {
     setCopyError('');
-    try { await navigator.clipboard.writeText(prompt); setCopied(title); }
-    catch { setCopyError(t('无法访问剪贴板，请选中示例文字手动复制。')); }
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopied(title);
+      window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(''), 2200);
+    } catch { setCopyError(t('无法访问剪贴板，请选中示例文字手动复制。')); }
   }
 
   return <main className="workbench framed-workspace ai-workspace">
@@ -63,7 +69,7 @@ export default function AI({ locked, authEnabled, openServiceSettings }: {
             <div className="mcp-step-body"><p className="settings-hint">{availableExamples.length ? t('连接成功后，试着把下面的指令发给 Agent。') : serviceOff ? t('服务启用后，这里会显示你可用的示例。') : t('暂无可用的查询或建模示例，可在下方「我的权限」查看当前能力。')}</p>
               <div className="mcp-examples">{availableExamples.map(example => <div className="mcp-example" key={example.title}>
                 <div><h4>{example.title}</h4><p>{example.prompt}</p></div>
-                <button type="button" className="button compact" aria-label={t('复制{0}示例', example.title)} onClick={() => void copyExample(example.title, example.prompt)}>{copied === example.title ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}{copied === example.title ? t('已复制') : t('复制')}</button>
+                <button type="button" className={'button compact' + (copied === example.title ? ' copied' : '')} aria-label={t('复制{0}示例', example.title)} onClick={() => void copyExample(example.title, example.prompt)}>{copied === example.title ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}{copied === example.title ? t('已复制') : t('复制')}</button>
               </div>)}</div>
               <span className="sr-only" role="status">{copied && t('{0}示例已复制', copied)}</span>
               {copyError && <p className="notice error" role="alert">{copyError}</p>}

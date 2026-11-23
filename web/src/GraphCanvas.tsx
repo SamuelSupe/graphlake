@@ -4,6 +4,7 @@ import { Box, Minus, Move, Plus, RotateCcw, Waypoints, X } from 'lucide-react';
 import { CanvasVertex } from './CanvasVertex';
 import { endpoint, type Model, type Selection } from './model';
 import { canvasColumns, connectedNodeOrder, edgeCurve, pinOf, placeNodes, pointOf, pointOn, type CanvasLayout, type Curve, type Point } from './modelCanvasGeometry';
+import { useTheme } from './theme';
 import './modelCanvas.css';
 
 export type GraphSelection = Selection & { section: 'nodes' | 'edges' };
@@ -19,23 +20,25 @@ type Editing = {
   pick: (node: string) => void;
   cancel: () => void;
 };
-const tones = ['var(--accent)', '#317d93', '#6a5ca1', '#a06630', '#447258'];
+const tones = ['#2563eb', '#0d9488', '#6366f1', '#d97706', '#059669', '#db2777'];
 
 function drawCurve(context: CanvasRenderingContext2D, points: Curve, color: string, weight: number, preview = false) {
   const [from, c1, c2, to] = points;
   context.strokeStyle = context.fillStyle = color;
   context.lineWidth = weight;
+  context.lineCap = 'round';
   context.setLineDash(preview ? [6, 4] : []);
   context.beginPath();
   context.moveTo(...from);
   context.bezierCurveTo(...c1, ...c2, ...to);
   context.stroke();
-  const tip = pointOn(points, .66);
-  const before = pointOn(points, .63);
+  context.setLineDash([]);
+  const tip = pointOn(points, .74);
+  const before = pointOn(points, .71);
   const angle = Math.atan2(tip[1] - before[1], tip[0] - before[0]);
   context.beginPath();
   context.moveTo(...tip);
-  for (const delta of [-.54, .54]) context.lineTo(tip[0] - 10 * Math.cos(angle + delta), tip[1] - 10 * Math.sin(angle + delta));
+  for (const delta of [-.48, .48]) context.lineTo(tip[0] - 9.5 * Math.cos(angle + delta), tip[1] - 9.5 * Math.sin(angle + delta));
   context.closePath();
   context.fill();
 }
@@ -43,13 +46,14 @@ function drawCurve(context: CanvasRenderingContext2D, points: Curve, color: stri
 export default function GraphCanvas({ model, selected, select, editing, viewState }: {
   model: Pick<Model, 'nodes' | 'edges'>;
   selected?: Selection;
-  select?: (selection: GraphSelection) => void;
+  select?: (selection?: GraphSelection) => void;
   editing?: Editing;
   viewState?: RefObject<CanvasView | undefined>;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const stage = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
+  const theme = useTheme();
   const [layout, setLayout] = useState<CanvasLayout>(() => viewState?.current?.layout ?? 'spread');
   const [zoom, setZoom] = useState(() => viewState?.current?.zoom ?? 1);
   const [size, setSize] = useState({ width: 600, height: 600 });
@@ -111,6 +115,12 @@ export default function GraphCanvas({ model, selected, select, editing, viewStat
   }, [order, width, height, columns, layout, positions, movePreview]);
 
   const { lanes, curves } = useMemo(() => {
+    const pairTotals = new Map<string, number>();
+    for (const { from, to } of links) {
+      if (!points.has(from) || !points.has(to) || from === to) continue;
+      const pair = JSON.stringify([from, to].sort());
+      pairTotals.set(pair, (pairTotals.get(pair) ?? 0) + 1);
+    }
     const lanes = new Map<string, number>();
     const curves: { name: string; points: Curve; labelBelow: boolean; style: { left: number; top: number } }[] = [];
     for (const { name, from, to } of links) {
@@ -121,13 +131,40 @@ export default function GraphCanvas({ model, selected, select, editing, viewStat
       const lane = lanes.get(pair) ?? 0;
       lanes.set(pair, lane + 1);
       const loop = from === to;
-      const curve = edgeCurve(a, b, height, lane, loop, from > to);
-      const labelBelow = loop && a[1] <= height / 2;
-      const [x, y] = pointOn(curve, .47);
-      curves.push({ name, points: curve, labelBelow, style: { left: x, top: labelBelow ? y + 5 : y - 5 } });
+      const total = loop ? 1 : pairTotals.get(pair) ?? 1;
+      let bendOverride: number | undefined;
+      let outward = 1;
+      if (!loop && total > 1) {
+        const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy) || 1;
+        const midX = (a[0] + b[0]) / 2, midY = (a[1] + b[1]) / 2;
+        outward = (-dy / len) * (midX - width / 2) + (dx / len) * (midY - height / 2) >= 0 ? 1 : -1;
+        bendOverride = total === 2
+          ? (lane === 0 ? 0 : outward * 90)
+          : (lane === 0 ? 0 : Math.min(108, Math.ceil(lane / 2) * 68) * (lane % 2 === 1 ? outward : -outward));
+      }
+      const curve = edgeCurve(a, b, height, lane, loop, from > to, undefined, bendOverride);
+      const chordMidY = (a[1] + b[1]) / 2;
+      const curveMidY = pointOn(curve, .5)[1];
+      let labelBelow = loop && a[1] <= height / 2;
+      let pos = .47;
+      if (!loop && total === 2) {
+        pos = lane === 0 ? .33 : .54;
+        if (Math.abs(b[0] - a[0]) > Math.abs(b[1] - a[1])) {
+          const outer = edgeCurve(a, b, height, 1, false, from > to, undefined, outward * 90);
+          const outerDown = pointOn(outer, .5)[1] > chordMidY;
+          labelBelow = lane === 0 ? !outerDown : outerDown;
+        } else {
+          labelBelow = lane === 1;
+        }
+      } else if (!loop && total > 2) {
+        pos = .32 + (lane / (total - 1)) * .28;
+        labelBelow = curveMidY > chordMidY + 8;
+      }
+      const [x, y] = pointOn(curve, pos);
+      curves.push({ name, points: curve, labelBelow, style: { left: x, top: labelBelow ? y + 6 : y - 6 } });
     }
     return { lanes, curves };
-  }, [links, points, height]);
+  }, [links, points, width, height]);
   const from = connection?.from;
   const origin = from === undefined ? undefined : points.get(from);
   const target = previewTarget === undefined ? undefined : points.get(previewTarget);
@@ -157,7 +194,7 @@ export default function GraphCanvas({ model, selected, select, editing, viewStat
       drawCurve(context, curve.points, current ? accent : line, current ? 2.3 : 1.6);
     }
     if (preview) drawCurve(context, preview, accent, 2, true);
-  }, [width, height, curves, selectedEdge, preview]);
+  }, [width, height, curves, selectedEdge, preview, theme]);
 
   function stagePoint(x: number, y: number): Point {
     const rect = stage.current?.getBoundingClientRect();
@@ -182,9 +219,9 @@ export default function GraphCanvas({ model, selected, select, editing, viewStat
     : t('拖动节点调整布局，点节点旁的「＋」开始连线。');
   return <section className={'canvas-panel' + (editing ? ' canvas-editable' : '')} aria-label={t('模型画布')}
     onKeyDown={event => {
-      if (event.key === 'Escape' && placing) { event.stopPropagation(); setPlaceNode(undefined); }
+      if (event.key === 'Escape' && placing) { event.preventDefault(); event.stopPropagation(); setPlaceNode(undefined); }
     }}>
-    {editing && names.length > 0 && <div className="canvas-instructions" data-active={!!(connection || placing) || undefined}>
+    {editing && names.length > 0 && (connection || placing || (enabled && selectedNode)) && <div className="canvas-instructions" data-active={!!(connection || placing) || undefined}>
       <p role="status">{connection && <Waypoints size={15} aria-hidden="true" />}{instructions}</p>
       {connection ? <button type="button" className="text-button" onClick={editing.cancel}><X size={14} aria-hidden="true" />{t('取消连线')}</button>
         : enabled && selectedNode && <button type="button" className="text-button" aria-pressed={!!placing}
@@ -194,12 +231,19 @@ export default function GraphCanvas({ model, selected, select, editing, viewStat
     </div>}
     <span id={hint} className="sr-only">{t('可拖动，或按方向键移动节点。')}</span>
     <span className="sr-only" role="status">{moveMessage}</span>
-    <div className="canvas-frame"><div className="canvas-viewport" ref={viewport} tabIndex={0} role="region" aria-label={t('画布滚动区')}>
+    <div className="canvas-frame"><div className="canvas-viewport" ref={viewport} tabIndex={0} role="region" aria-label={t('画布滚动区')}
+      onClick={event => {
+        if (event.target === event.currentTarget && !placing && !connection && selected && select) select(undefined);
+      }}>
       {names.length ? <div ref={stage} className="graph-stage" style={{ width, height, zoom }} data-placing={!!placing || undefined} data-linking={!!connection || undefined}
         onClick={event => {
-          if (!placing || event.target !== event.currentTarget) return;
-          commit(placing, stagePoint(event.clientX, event.clientY));
-          setPlaceNode(undefined);
+          if (event.target !== event.currentTarget) return;
+          if (placing) {
+            commit(placing, stagePoint(event.clientX, event.clientY));
+            setPlaceNode(undefined);
+          } else if (!connection && selected && select) {
+            select(undefined);
+          }
         }}
         onPointerMove={event => {
           if (!from || event.pointerType === 'touch') return;

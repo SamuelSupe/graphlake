@@ -66,6 +66,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const [businessRefresh, setBusinessRefresh] = useState(0);
   const [lastImpact, setLastImpact] = useState<ImpactReport>();
   const [impactTarget, setImpactTarget] = useState<ImpactTarget>();
+  const [rollbackTarget, setRollbackTarget] = useState<string>();
   const [loading, setLoading] = useState(!initial);
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -77,6 +78,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const inspectorInvoker = useRef<HTMLElement | null>(null);
   const addNodeButton = useRef<HTMLButtonElement>(null);
   const canvasView = useRef<CanvasView>(undefined);
+  const saveAction = useRef<() => Promise<unknown>>(null);
 
   useEffect(() => {
     if (positions.size) canvasLayouts.set(id, positions);
@@ -244,6 +246,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       setNotice({ text: errorText(cause), error: true, location: cause instanceof ApiError ? cause.location : undefined, yaml });
     } finally { setSaving(false); }
   }
+  saveAction.current = save;
 
   async function validate(checkData = false) {
     if (busy || !allow.edit || !inspectCurrent().model) return;
@@ -305,10 +308,10 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   }
 
   async function publishChanges(review: boolean) {
-    if (!allow.publish || !saved?.active_revision || busy) return;
+    if (!allow.publish || !saved || busy) return;
     const candidate = dirty ? await save() : saved;
-    if (!candidate) return;
-    if (candidate.active_revision !== saved.active_revision) {
+    if (!candidate?.revision) return;
+    if (saved.active_revision && candidate.active_revision !== saved.active_revision) {
       setNotice({ text: t('草稿已保存，但生效版本已变化。请重新预览后发布。'), error: true });
       return;
     }
@@ -346,7 +349,6 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
 
   const listSection = modal === 'nodes-list' ? 'nodes' : modal === 'edges-list' ? 'edges' : undefined;
   const otherModels = models.filter(other => other.id !== id && (workspace !== 'query' || other.active_revision && !other.archive_error));
-  const title = { graph: t('图模型'), catalogs: t('数据源'), query: t('查询') }[workspace];
   const busy = mutations.pending || saving || checking || activating;
   const nodeNames = Object.keys(model?.nodes ?? {});
   const canConnect = active && allow.edit && !busy && workspace === 'graph' && !showingYaml && !modal && !!nodeNames.length;
@@ -367,6 +369,27 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     window.addEventListener('keydown', cancel);
     return () => window.removeEventListener('keydown', cancel);
   }, [connecting]);
+  useEffect(() => {
+    if (!active || workspace === 'query') return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.defaultPrevented || modal || localTables || browsing || removing || document.querySelector('dialog[open]')) return;
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        if (allow.edit && dirty && !busy && !yamlError) void saveAction.current?.();
+        return;
+      }
+      if (event.key === 'Escape' && workspace === 'graph' && !showingYaml && selected && !connecting) {
+        if (CSS.supports('selector(:popover-open)') && document.querySelector(':popover-open')) return;
+        const target = event.target as HTMLElement | null;
+        if (target && (target.matches('input, textarea, select') || target.isContentEditable)) return;
+        event.preventDefault();
+        setSelection(undefined);
+        inspectorInvoker.current?.focus();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [active, workspace, modal, localTables, browsing, removing, allow.edit, dirty, busy, yamlError, showingYaml, selected, connecting]);
 
   function pickEndpoint(name: string) {
     if (!connecting) return;
@@ -404,10 +427,11 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   }
   const canPublish = allow.publish && Boolean(model && saved?.revision && !dirty && !busy
     && (saved.revision !== saved.active_revision || business?.active === 'stale'));
-  const canApply = canPublish || Boolean(saved?.active_revision && dirty && model && !incomplete && allow.edit && allow.publish && !busy);
+  const canApply = canPublish || Boolean(saved && dirty && model && !incomplete && allow.edit && allow.publish && !busy);
+  const hasBusinessGate = Boolean(business?.required || model?.tasks.length);
   const draftImpact = !dirty && lastImpact?.revision === savedRevision && lastImpact?.active_revision === activeRevision
     && lastImpact?.suite_revision === business?.suite_revision ? lastImpact : undefined;
-  const businessStatus = canReviewImpact && (business?.required || Boolean(model?.tasks.length) || draftImpact) && <div className="business-status" role="status">
+  const businessStatus = canReviewImpact && (hasBusinessGate || draftImpact) && <div className="business-status" role="status">
     <StatusLabel status={draftImpact?.status === 'passed' ? 'passed' : draftImpact && draftImpact.status !== 'not_required' ? 'failed' : 'unchecked'}
       text={draftImpact ? t('草稿业务预览 · {0}', impactLabels[draftImpact.status])
         : dirty ? t('草稿业务校验 · 保存后可预览')
@@ -441,6 +465,11 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
     setLocating(undefined);
   }, [locating, workspace, inspectorKey]);
   const currentNotice = notice?.yaml === undefined || notice.yaml === yaml ? notice : undefined;
+  useEffect(() => {
+    if (!currentNotice || currentNotice.error || currentNotice.published || currentNotice.location) return;
+    const timer = window.setTimeout(() => setNotice(old => old === currentNotice ? undefined : old), 3500);
+    return () => window.clearTimeout(timer);
+  }, [currentNotice]);
   const issue = currentNotice?.location ?? validation?.location;
   const targets = model && issue ? validationTargets(model, issue) : [];
   const invalid = new Set(targets.filter(target => target.selection.section === inspectorSelection?.section
@@ -456,12 +485,15 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const dependencies = removing?.section === 'nodes' && model ? incidentEdgeTypes(model, removing.name) : [];
   const notices = <>
     {currentNotice && !currentNotice.location && <div className={'notice editor-notice' + (currentNotice.error ? ' error' : '')} role={currentNotice.error ? 'alert' : 'status'}>
-      {currentNotice.text}
-      {currentNotice.published && currentNotice.published === saved?.active_revision && workspace !== 'query' && <>
-        {allow.query && <button className="text-button" onClick={() => goTo('query')}>{t('查询生效版本')}</button>}
-        <button className="text-button" onClick={() => setModal('versions')}>{t('查看版本历史')}</button>
-      </>}
-      {currentNotice.error && saved?.revision && <button className="text-button" onClick={refresh}>{t('重新加载')}</button>}
+      <span className="editor-notice-text">
+        {currentNotice.text}
+        {currentNotice.published && currentNotice.published === saved?.active_revision && workspace !== 'query' && <>
+          {allow.query && <button className="text-button" onClick={() => goTo('query')}>{t('查询生效版本')}</button>}
+          <button className="text-button" onClick={() => setModal('versions')}>{t('查看版本历史')}</button>
+        </>}
+        {currentNotice.error && saved?.revision && <button className="text-button" onClick={refresh}>{t('重新加载')}</button>}
+      </span>
+      <button type="button" className="icon-button notice-dismiss" aria-label={t('关闭提示')} onClick={() => setNotice(undefined)}><X size={15} aria-hidden="true" /></button>
     </div>}
     {(currentNotice?.location || validation?.error) && <div className="notice error editor-notice">
       <span id={id + '-model-validation-error'} role="alert">{diagnosticText(errorMessage ?? '')}</span>
@@ -511,18 +543,18 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
   const publishAction = saved && allow.publish && <button type="button"
     className={workspace === 'graph' ? 'tool-button tool-primary' : 'button primary compact'} disabled={!canApply}
     title={incomplete?.message || t('发布此模型草稿中的全部更改')}
-    onClick={() => saved.active_revision ? void publishChanges(false) : previewImpact('publish')}>
+    onClick={() => void publishChanges(hasBusinessGate)}>
     {workspace === 'graph' && <Upload size={16} aria-hidden="true" />}
-    {activating ? t('正在发布…') : !saved.active_revision ? t('预览并发布') : dirty ? t('保存并发布') : t('发布草稿')}
+    {activating ? t('正在发布…') : !saved.active_revision ? (hasBusinessGate ? t('预览并发布') : t('发布模型')) : dirty ? t('保存并发布') : t('发布草稿')}
   </button>;
-  const reviewAction = allow.publish && saved?.active_revision && <button type="button" className="tool-button"
+  const reviewAction = allow.publish && hasBusinessGate && <button type="button" className="tool-button"
     disabled={!canApply} onClick={() => void publishChanges(true)}><Upload size={16} aria-hidden="true" />
     {dirty ? t('保存并预览') : t('预览并发布')}
   </button>;
 
   return <main className={'workbench editor workspace-' + workspace}>
-    <ModelWorkspaceHeader workspace={title} name={modelName} modelId={saved?.revision ? id : undefined} revision={saved?.active_revision} archiveError={!!saved?.archive_error} back={close} switcher={modelSwitcher}
-      navigation={{ current: workspace, catalogs: allow.configure, query: allow.query, goTo }}
+    <ModelWorkspaceHeader workspace={t('图模型')} name={modelName} modelId={saved?.revision ? id : undefined} revision={saved?.active_revision} archiveError={!!saved?.archive_error} back={close} switcher={modelSwitcher}
+      navigation={{ current: workspace, catalogs: allow.configure, query: allow.query, sourceCount: model ? Object.keys(model.sources).length : undefined, goTo }}
       rename={workspace === 'graph' && preview.model && allow.edit && <button className="icon-button" type="button"
         aria-label={t('编辑模型名称')} title={t('编辑模型名称')} disabled={busy || !!yamlError}
         onClick={() => { if (inspectCurrent().model) setModal('title'); }}><Pencil size={15} aria-hidden="true" /></button>}
@@ -545,7 +577,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
           <button type="button" className="tool-button" disabled={busy} onClick={() => void validate(true)}><ShieldCheck size={16} aria-hidden="true" />{t('校验数据')}</button>
           <button type="button" className="tool-button" onClick={openYaml}><Braces size={16} aria-hidden="true" />{t('查看 YAML')}</button>
           <button type="button" className="tool-button" disabled={busy || !saved.revision} onClick={refresh}><RefreshCw size={16} aria-hidden="true" />{t('重新加载')}</button>
-          {canReviewImpact && <button type="button" className="tool-button" disabled={busy || dirty || !saved.revision}
+          {canReviewImpact && hasBusinessGate && <button type="button" className="tool-button" disabled={busy || dirty || !saved.revision}
                 onClick={() => previewImpact('check')}><ShieldCheck size={16} aria-hidden="true" />{t('校验业务场景')}</button>}
         </WorkspaceTools>
       </div>
@@ -584,22 +616,25 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
             <button type="button" className="tool-button" disabled={!saved.revision || activating} onClick={() => setModal('versions')}><History size={16} aria-hidden="true" />{t('版本历史')}</button>
             {status !== 'unchecked' && (!validation?.error || status === 'passed') && <span className="draft-status graph-status" role="status"><StatusLabel status={status} text={statusText} /></span>}
             <WorkspaceTools key={showingYaml ? 'yaml' : 'canvas'}>
-              {!showingYaml && allow.configure && <button type="button" className="tool-button" onClick={() => initial ? openSource() : goTo('catalogs')}>
-                <Database size={16} aria-hidden="true" />{initial ? t('添加数据源') : t('数据源')}
+              {!showingYaml && allow.configure && initial && <button type="button" className="tool-button" onClick={openSource}>
+                <Database size={16} aria-hidden="true" />{t('添加数据源')}
               </button>}
               {!showingYaml && allow.edit && <button type="button" className="tool-button" disabled={busy} onClick={() => void validate()}><ShieldCheck size={16} aria-hidden="true" />{checking ? t('正在校验…') : t('校验结构')}</button>}
               {allow.edit && <button type="button" className="tool-button" disabled={busy || !!yamlError} onClick={() => void validate(true)}><ShieldCheck size={16} aria-hidden="true" />{t('校验数据')}</button>}
               {reviewAction}
-              {canReviewImpact && model && <button type="button" className="tool-button" disabled={busy} onClick={() => setModal('business-tasks')}>
-                <ShieldCheck size={16} aria-hidden="true" />{t('业务任务')}
-              </button>}
-              {canReviewImpact && <button type="button" className="tool-button" disabled={busy || dirty || !saved.revision}
-                onClick={() => previewImpact('check')}><ShieldCheck size={16} aria-hidden="true" />{t('校验业务场景')}</button>}
+              {canReviewImpact && model && <>
+                <hr className="tools-divider" />
+                <button type="button" className="tool-button" disabled={busy} onClick={() => setModal('business-tasks')}>
+                  <ShieldCheck size={16} aria-hidden="true" />{t('业务任务')}
+                </button>
+                {hasBusinessGate && <button type="button" className="tool-button" disabled={busy || dirty || !saved.revision}
+                  onClick={() => previewImpact('check')}><ShieldCheck size={16} aria-hidden="true" />{t('校验业务场景')}</button>}
+              </>}
             </WorkspaceTools>
           </div>
         </div>
-        {!showingYaml && model && !saved.active_revision && allow.edit && <ModelSetup configure={allow.configure} publishAllowed={allow.publish} model={model} issue={incomplete} dirty={dirty} busy={!!busy} canPublish={canPublish}
-          add={section => section === 'sources' ? openSource() : setModal(section)} select={setSelection} save={() => void save()} publish={() => previewImpact('publish')} />}
+        {!showingYaml && model && !saved.active_revision && allow.edit && <ModelSetup configure={allow.configure} publishAllowed={allow.publish} requirePreview={hasBusinessGate} model={model} issue={incomplete} dirty={dirty} busy={!!busy} canPublish={canPublish}
+          add={section => section === 'sources' ? openSource() : setModal(section)} select={setSelection} save={() => void save()} publish={() => void publishChanges(hasBusinessGate)} />}
         {(showingYaml || saved.active_revision) && incomplete && <p className="notice">{incomplete.message}</p>}
         {businessStatus}
         {notices}
@@ -619,7 +654,7 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
           </div>
           <Suspense fallback={<div className="canvas-panel"><p className="empty" role="status">{t('正在打开画布…')}</p></div>}>
           <GraphCanvas model={model} selected={selected} viewState={canvasView} select={next => {
-            inspectorInvoker.current = document.activeElement as HTMLElement;
+            if (next) inspectorInvoker.current = document.activeElement as HTMLElement;
             setSelection(next);
           }} editing={allow.edit ? {
             enabled: canConnect,
@@ -691,7 +726,20 @@ export default function Editor({ id, initial, active, onDirty, close, created, c
       archiveError={saved.archive_error}
       restore={allow.publish ? (revision, backup) => activate(revision, 'restore', backup) : undefined}
       offline={allow.publish && saved.active_revision ? () => setModal('unpublish') : undefined}
-      rollback={allow.publish ? revision => previewImpact('rollback', revision) : undefined} />}
+      rollback={allow.publish ? revision => hasBusinessGate ? previewImpact('rollback', revision) : setRollbackTarget(revision) : undefined} />}
+    {rollbackTarget && <Modal layout="center" title={t('确认回退版本')} close={() => setRollbackTarget(undefined)}>
+      <div className="dialog-form">
+        <p>{t('将生效版本回退至 {0}？工作草稿中的修改会保留。', rollbackTarget.slice(0, 14))}</p>
+        <div className="dialog-actions">
+          <button type="button" className="button" data-initial-focus onClick={() => setRollbackTarget(undefined)}>{t('取消')}</button>
+          <button type="button" className="button primary" disabled={activating} onClick={() => {
+            const target = rollbackTarget;
+            setRollbackTarget(undefined);
+            void activate(target, 'rollback');
+          }}>{activating ? t('正在回退…') : t('确认回退')}</button>
+        </div>
+      </div>
+    </Modal>}
     {modal === 'business-tasks' && model && <BusinessTasks id={id} selected={model.tasks}
       toggle={allow.edit ? (task, enabled) => edit(doc => {
         const next = enabled ? [...model.tasks, task] : model.tasks.filter(value => value !== task);

@@ -30,6 +30,10 @@ pub(super) const BUILT_INS: &[&str] = &[
     "concat_ws",
     "array_repeat",
     "array_resize",
+    "array_concat",
+    "array_cat",
+    "list_concat",
+    "list_cat",
     "range",
     "generate_series",
 ];
@@ -112,6 +116,10 @@ impl ScalarUDFImpl for CheckedFunction {
         self.function.return_field_from_args(args)
     }
 
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        self.function.coerce_types(arg_types)
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         self.check()?;
         let rows = args.number_rows;
@@ -172,7 +180,7 @@ fn integer(value: &ColumnarValue, row: usize) -> Option<i64> {
 
 // List slices share their child buffers. Follow the offsets before estimating
 // the bytes copied into an output, including nested lists and structs.
-fn slice_bytes(array: &dyn Array) -> Result<usize> {
+pub(crate) fn slice_bytes(array: &dyn Array) -> Result<usize> {
     if let Some(width) = array.data_type().primitive_width() {
         return Ok(array.len().saturating_mul(width));
     }
@@ -368,6 +376,13 @@ fn row_bytes(name: &str, args: &[ColumnarValue], row: usize) -> Result<usize> {
                 .transpose()?
                 .unwrap_or(8);
             value_bytes(&args[0], row)?.saturating_add(count().saturating_mul(fill))
+        }
+        "array_concat" | "array_cat" | "list_concat" | "list_cat" => {
+            let mut total = 0usize;
+            for arg in args {
+                total = total.saturating_add(value_bytes(arg, row)?);
+            }
+            total
         }
         "range" | "generate_series" | "__graphlake_cypher_range" => {
             range_bytes(args, row, name != "range")?

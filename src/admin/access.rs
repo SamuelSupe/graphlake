@@ -290,7 +290,10 @@ impl Policy {
             if app.shutdown.is_cancelled() {
                 return;
             }
-            app.access.refresh();
+            let _ = tokio::task::spawn_blocking(move || {
+                app.access.refresh();
+            })
+            .await;
         }
     }
 

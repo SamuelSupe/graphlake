@@ -448,6 +448,57 @@ impl Models {
         Ok((revision, yaml, catalog))
     }
 
+    pub(super) fn published_auto_refresh_csr(&self) -> ApiResult<Vec<(String, String, Catalog)>> {
+        let mut models = Vec::new();
+        for id in self.managed_ids()? {
+            let Ok((revision, _, catalog)) = self.published_catalog(&id) else {
+                continue;
+            };
+            if catalog.freshness.auto_refresh_csr {
+                models.push((id, revision, catalog));
+            }
+        }
+        Ok(models)
+    }
+
+    pub(super) fn inherit_caches(&mut self, previous: &Models, unchanged: impl Fn(&str) -> bool) {
+        let carried: Vec<CachedEngine> = {
+            let old = previous.engines.lock().unwrap();
+            old.iter()
+                .filter_map(|entry| {
+                    let rel = format!(".graphlake-{}.{}.yaml", entry.id, entry.revision);
+                    if !unchanged(&rel) {
+                        return None;
+                    }
+                    let path = self.archive_path(&entry.id, &entry.revision).ok()?;
+                    let stamp = metadata(&path).ok()?.as_ref().and_then(ArchiveStamp::new)?;
+                    Some(CachedEngine {
+                        id: entry.id.clone(),
+                        revision: entry.revision.clone(),
+                        archive: stamp,
+                        yaml: Arc::clone(&entry.yaml),
+                        engine: entry.engine.clone(),
+                    })
+                })
+                .collect()
+        };
+        if !carried.is_empty() {
+            let mut engines = self.engines.lock().unwrap();
+            for entry in carried {
+                if engines
+                    .iter()
+                    .any(|existing| existing.id == entry.id && existing.revision == entry.revision)
+                {
+                    continue;
+                }
+                if engines.len() >= 32 {
+                    engines.pop_front();
+                }
+                engines.push_back(entry);
+            }
+        }
+    }
+
     pub(super) fn list(&self, permits: impl Fn(&str) -> Option<bool>) -> ApiResult<Vec<Summary>> {
         let mut result = Vec::new();
         for id in self.managed_ids()? {
@@ -646,7 +697,7 @@ impl Models {
         if let Some(archive) = stamp {
             let mut engines = self.engines.lock().unwrap();
             engines.retain(|entry| entry.id != id || entry.revision != revision);
-            if engines.len() == 4 {
+            if engines.len() == 32 {
                 engines.pop_front();
             }
             engines.push_back(CachedEngine {
@@ -990,12 +1041,17 @@ pub(super) async fn validate(
     Json(draft): Json<CheckDraft>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let path = {
-        super::users::check(&app, &principal, &draft.id, super::users::Role::Modeler)?;
-        let models = app.models.lock().unwrap();
-        models.check_modeler_input(&draft.id, &draft.yaml, &principal)?;
-        models.source_path(&draft.id)?
-    };
+    super::users::check(&app, &principal, &draft.id, super::users::Role::Modeler)?;
+    let files = app.models.lock().unwrap().read_files();
+    let draft_id = draft.id.clone();
+    let draft_yaml = draft.yaml.clone();
+    let principal_check = principal.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        files.check_modeler_input(&draft_id, &draft_yaml, &principal_check)?;
+        files.source_path(&draft_id)
+    })
+    .await
+    .map_err(|_| Error::storage())??;
     let result = inspect(
         &draft.yaml,
         &path,
@@ -1156,6 +1212,43 @@ mod tests {
         );
         drop(reader);
         assert!(!dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn inherit_caches_preserves_unchanged_engines_across_ha_swap() -> anyhow::Result<()> {
+        let dir1 = Arc::new(tempfile::tempdir()?);
+        let dir2 = Arc::new(tempfile::tempdir()?);
+        let sources = tempfile::tempdir()?;
+        let data = sources.path().join("nodes.jsonl");
+        fs::write(&data, "{\"id\":1}\n")?;
+        let yaml = format!(
+            "graph: cache-test\nsources:\n  s:\n    type: parquet\n    tables:\n      nodes: [\"{}\"]\nnodes:\n  N:\n    source: s.nodes\n    key: [id]\n",
+            data.display()
+        );
+        let rev = revision(&yaml);
+        let rel = format!(".graphlake-m.{rev}.yaml");
+        fs::write(dir1.path().join("m.yaml"), &yaml)?;
+        fs::write(dir1.path().join(&rel), &yaml)?;
+        fs::write(dir2.path().join("m.yaml"), &yaml)?;
+        fs::write(dir2.path().join(&rel), &yaml)?;
+
+        let m1 = Models::in_snapshot(dir1, sources.path().to_path_buf());
+        let admission = Arc::new(crate::engine::Admission::new(
+            crate::EngineLimits::default(),
+        )?);
+        let _ = m1
+            .cached_engine("m", &rev, &admission)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(m1.engines.lock().unwrap().len(), 1);
+
+        let mut m2 = Models::in_snapshot(dir2, sources.path().to_path_buf());
+        m2.inherit_caches(&m1, |file| file == rel);
+        assert_eq!(m2.engines.lock().unwrap().len(), 1);
+        let (cached_yaml, _) = m2
+            .cached_engine("m", &rev, &admission)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(cached_yaml, yaml);
         Ok(())
     }
 }

@@ -39,6 +39,7 @@ pub(crate) struct Snapshot {
     stats: Arc<ReadStats>,
     pub(crate) version: String,
     transactional: bool,
+    server_uuid: Option<String>,
 }
 
 impl Snapshot {
@@ -146,10 +147,18 @@ impl Snapshot {
                 .await
                 .context("initializing read connection")?;
         }
+        let server_uuid = conn
+            .query_first::<Option<String>, _>("SELECT @@server_uuid")
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|id| !id.is_empty());
         Ok(Self {
             conn: Some(conn),
             stats,
             transactional,
+            server_uuid,
             version: format!("session-{}", uuid::Uuid::new_v4()),
         })
     }
@@ -304,7 +313,11 @@ impl Snapshot {
             stats: self.stats.clone(),
         };
         if self.transactional && stream && (proven || raw_table) {
-            let conn = OwnedConnection(self.conn.take());
+            let conn = OwnedConnection {
+                conn: self.conn.take(),
+                transactional: self.transactional,
+                server_uuid: self.server_uuid.clone(),
+            };
             let provider = super::snapshot::stream_once(schema, move |context| {
                 let schema = query.schema.clone();
                 Box::pin(RecordBatchStreamAdapter::new(
@@ -312,14 +325,14 @@ impl Snapshot {
                     async_stream::try_stream! {
                         let mut conn = conn;
                         let mut batches = query.batches(
-                            conn.0.as_mut().expect("owned read connection"),
+                            conn.conn.as_mut().expect("owned read connection"),
                             context.runtime_env().memory_pool.clone(),
                         );
                         while let Some(batch) = batches.try_next().await.map_err(external)? {
                             yield batch;
                         }
                         drop(batches);
-                        conn.0.take().expect("owned read connection").disconnect().await
+                        conn.conn.take().expect("owned read connection").disconnect().await
                             .map_err(|error| DataFusionError::External(error.into()))?;
                     },
                 ))
@@ -332,16 +345,20 @@ impl Snapshot {
             super::snapshot::Buffer::new(&runtime.memory_pool, Some(&runtime.disk_manager));
         // Dropping an active result normally drains it before disconnecting.
         // Own the connection for the scan so conversion errors and cancellation kill it.
-        let mut owned = OwnedConnection(self.conn.take());
+        let mut owned = OwnedConnection {
+            conn: self.conn.take(),
+            transactional: self.transactional,
+            server_uuid: self.server_uuid.clone(),
+        };
         let mut batches = query.batches(
-            owned.0.as_mut().expect("owned read connection"),
+            owned.conn.as_mut().expect("owned read connection"),
             runtime.memory_pool.clone(),
         );
         while let Some(batch) = batches.try_next().await? {
             snapshot.push(batch)?;
         }
         drop(batches);
-        self.conn = owned.0.take();
+        self.conn = owned.conn.take();
         let (table, budget) = snapshot.finish(schema, &self.stats)?;
         Ok((table, budget, proven))
     }
@@ -410,23 +427,47 @@ impl Scan {
     }
 }
 
-struct OwnedConnection(Option<Conn>);
+struct OwnedConnection {
+    conn: Option<Conn>,
+    transactional: bool,
+    server_uuid: Option<String>,
+}
 
 impl Drop for OwnedConnection {
     fn drop(&mut self) {
-        let Some(conn) = self.0.take() else { return };
+        let Some(conn) = self.conn.take() else { return };
+        let transactional = self.transactional;
+        let expected_uuid = self.server_uuid.take();
         // mysql_async normally drains unread rows on drop. Terminate this
-        // dedicated connection through the same account before closing it.
+        // dedicated connection through the same account before closing it,
+        // after confirming server identity when available so proxies or multi-FE
+        // clusters do not kill an unrelated session on another backend.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let id = conn.id();
-                let options = conn.opts().clone();
-                let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                    let mut cancel = Conn::new(options).await?;
-                    cancel.query_drop(format!("KILL CONNECTION {id}")).await?;
-                    cancel.disconnect().await
-                })
-                .await;
+                if expected_uuid.is_some() || transactional {
+                    let id = conn.id();
+                    let options = conn.opts().clone();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                        let mut cancel = Conn::new(options).await?;
+                        let same_server = match &expected_uuid {
+                            Some(expected) => {
+                                let actual = cancel
+                                    .query_first::<Option<String>, _>("SELECT @@server_uuid")
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .flatten();
+                                actual.as_deref() == Some(expected.as_str())
+                            }
+                            None => true,
+                        };
+                        if same_server {
+                            cancel.query_drop(format!("KILL CONNECTION {id}")).await?;
+                        }
+                        cancel.disconnect().await
+                    })
+                    .await;
+                }
                 let _ = tokio::time::timeout(Duration::from_secs(1), conn.disconnect()).await;
             });
         }
@@ -522,7 +563,7 @@ fn field(
 ) -> Result<Field> {
     let unsigned = declared
         .split_ascii_whitespace()
-        .any(|part| part == "unsigned" || part == "zerofill");
+        .any(|part| part.eq_ignore_ascii_case("unsigned") || part.eq_ignore_ascii_case("zerofill"));
     let normalized = kind.to_ascii_lowercase();
     let kind = normalized.split('(').next().unwrap_or(&normalized);
     let data_type = match (kind, unsigned) {
@@ -651,4 +692,30 @@ fn to_batch(schema: SchemaRef, rows: &mut [Row]) -> Result<RecordBatch> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_detects_uppercase_unsigned_and_zerofill() -> Result<()> {
+        assert_eq!(
+            field("a", "BIGINT", "BIGINT(20) UNSIGNED", None, None)?.data_type(),
+            &DataType::UInt64
+        );
+        assert_eq!(
+            field("b", "INT", "INT(11) UNSIGNED ZEROFILL", None, None)?.data_type(),
+            &DataType::UInt32
+        );
+        assert_eq!(
+            field("c", "TINYINT", "TINYINT(3) ZEROFILL", None, None)?.data_type(),
+            &DataType::UInt8
+        );
+        assert_eq!(
+            field("d", "BIGINT", "BIGINT(20)", None, None)?.data_type(),
+            &DataType::Int64
+        );
+        Ok(())
+    }
 }

@@ -335,8 +335,12 @@ impl Graph {
                 }
             }
         }
-        for neighbors in &mut adjacency {
+        for (i, neighbors) in adjacency.iter_mut().enumerate() {
             neighbors.sort_unstable_by_key(|neighbor| (neighbor.vertex, neighbor.edge));
+            if i.is_multiple_of(2048) {
+                scope.check()?;
+                tokio::task::yield_now().await;
+            }
         }
         if !routes {
             indexes.clear();

@@ -37,12 +37,39 @@ impl Drop for Cancel {
     fn drop(&mut self) {
         if self.armed {
             self.token.cancel();
-            let _ = self.connection.break_execution();
+            let connection = Arc::clone(&self.connection);
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(move || {
+                    let _ = connection.break_execution();
+                });
+            } else {
+                let _ = connection.break_execution();
+            }
         }
     }
 }
 
-static CONNECT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static CONNECT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+
+fn host_connect_slots(connect_string: &str) -> Arc<tokio::sync::Semaphore> {
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+    static PER_HOST: OnceLock<Mutex<VecDeque<(String, Arc<tokio::sync::Semaphore>)>>> =
+        OnceLock::new();
+    let mut hosts = PER_HOST.get_or_init(Mutex::default).lock().unwrap();
+    if let Some(pos) = hosts.iter().position(|(key, _)| key == connect_string) {
+        let entry = hosts.remove(pos).expect("located Oracle host semaphore");
+        let sem = Arc::clone(&entry.1);
+        hosts.push_front(entry);
+        return sem;
+    }
+    let sem = Arc::new(tokio::sync::Semaphore::new(4));
+    if hosts.len() >= 64 {
+        hosts.pop_back();
+    }
+    hosts.push_front((connect_string.to_owned(), Arc::clone(&sem)));
+    sem
+}
 
 impl Driver {
     pub(super) async fn open(
@@ -62,11 +89,13 @@ impl Driver {
         let password = std::env::var(password_env)
             .with_context(|| format!("missing credential in {password_env}"))?;
         let (connect_string, user) = (connect_string.clone(), user.clone());
+        let host_slots = host_connect_slots(&connect_string);
         let connection = tokio::time::timeout(timeout, async move {
+            let host_permit = host_slots.acquire_owned().await?;
             let permit = CONNECT_SLOTS.acquire().await?;
             tokio::task::spawn_blocking(move || -> Result<_> {
                 // An in-flight OCI connect cannot be cancelled by dropping its waiter.
-                let _permit = permit;
+                let (_host_permit, _permit) = (host_permit, permit);
                 let connection = Connection::connect(user, password, connect_string)
                     .context("connecting to Oracle")?;
                 connection.set_call_timeout(Some(timeout))?;

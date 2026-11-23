@@ -64,6 +64,7 @@ struct App {
     work: Arc<Semaphore>,
     admission: Arc<crate::engine::Admission>,
     probe_admission: Arc<crate::engine::Admission>,
+    impact_admission: Arc<crate::engine::Admission>,
     exploration_admission: Arc<crate::engine::Admission>,
     query_waiters: Semaphore,
     export_waiters: Semaphore,
@@ -258,7 +259,7 @@ pub async fn serve_clustered_with_status(
         .map(Arc::new);
     let metadata_dir = ha_cache
         .as_ref()
-        .map_or(catalog_dir.as_path(), |dir| dir.path());
+        .map_or_else(|| catalog_dir.clone(), |dir| dir.path().to_path_buf());
     let assets_dir = assets_dir
         .canonicalize()
         .context("opening assets directory")?;
@@ -307,153 +308,176 @@ pub async fn serve_clustered_with_status(
             }
             listener = Some(TcpListener::bind(bound).await?);
         }
-        let ha = match ha::Ha::open(leader.clone(), probe, metadata_dir).await {
+        let ha = match ha::Ha::open(leader.clone(), probe, &metadata_dir).await {
             Ok(ha) => ha,
             Err(error) => {
                 leader.release().await;
                 return Err(error);
             }
         };
-        ha::credentials(&ha.leader, &catalog_dir, metadata_dir).await?;
         Some(ha)
     } else {
         None
     };
-    // A standby must not expose a listener before obtaining etcd leadership.
-    let listener = match listener {
-        Some(listener) => listener,
-        None => TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?,
-    };
-    let cookie_port = match &public_url {
-        Some(url) => url.port_or_known_default().unwrap_or(443),
-        None => listener.local_addr()?.port(),
-    };
-    let auth = Arc::new(
-        auth::Auth::load(
-            metadata_dir,
-            cookie_port,
-            insecure_dev,
-            public_url.is_some(),
-            ha.as_ref().map(|ha| ha.leader.clone()),
-        )
-        .await?,
-    );
-    let users = users::Users::load(&catalog_dir, ha.as_ref()).await?;
-    let origin = match public_url {
-        Some(url) => url.origin().ascii_serialization(),
-        None => {
-            let addr = listener.local_addr()?;
-            if addr.port() == 80 {
-                format!("http://{}", addr.ip())
-            } else {
-                format!("http://{addr}")
+    let ha_leader = ha.as_ref().map(|ha| ha.leader.clone());
+    let init = async {
+        if let Some(ha) = &ha {
+            ha::credentials(&ha.leader, &catalog_dir, &metadata_dir).await?;
+        }
+        // A standby must not expose a listener before obtaining etcd leadership.
+        let listener = match listener {
+            Some(listener) => listener,
+            None => TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?,
+        };
+        let cookie_port = match &public_url {
+            Some(url) => url.port_or_known_default().unwrap_or(443),
+            None => listener.local_addr()?.port(),
+        };
+        let auth = Arc::new(
+            auth::Auth::load(
+                &metadata_dir,
+                cookie_port,
+                insecure_dev,
+                public_url.is_some(),
+                ha.as_ref().map(|ha| ha.leader.clone()),
+            )
+            .await?,
+        );
+        let users = users::Users::load(&catalog_dir, ha.as_ref()).await?;
+        let origin = match public_url {
+            Some(url) => url.origin().ascii_serialization(),
+            None => {
+                let addr = listener.local_addr()?;
+                if addr.port() == 80 {
+                    format!("http://{}", addr.ip())
+                } else {
+                    format!("http://{addr}")
+                }
             }
+        };
+        let authority = origin.split_once("://").unwrap().1.to_owned();
+        let access = access::Policy::load(
+            &metadata_dir,
+            driver_model
+                .as_deref()
+                .map(|model| (model, driver_token_env.as_str())),
+            coordinator_failover,
+        )?;
+        let models = match &ha_cache {
+            Some(snapshot) => models::Models::in_snapshot(Arc::clone(snapshot), catalog_dir),
+            None => models::Models::new(catalog_dir),
+        };
+        if ha.is_none() {
+            models
+                .adopt_existing()
+                .map_err(|error| anyhow::anyhow!("adopting existing models: {}", error.message))?;
+        }
+        let (_, failed_models) = models
+            .check_published()
+            .map_err(|error| anyhow::anyhow!("checking published models: {}", error.message))?;
+        for (id, error) in failed_models {
+            eprintln!("GraphLake model {id} unavailable: {error}");
+        }
+        let wire = driver_model
+            .map(|id| wire::Access::load(&models, id))
+            .transpose()?;
+        let bolt = match bolt_port {
+            Some(port) => {
+                Some(TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?)
+            }
+            None => None,
+        };
+        let explorations = cluster
+            .as_ref()
+            .map_or_else(query::Sessions::default, |cluster| {
+                query::Sessions::with_cursor_key(cluster.cursor_key())
+            });
+        let local_tables =
+            local_tables::LocalTables::open(models.source_directory().to_owned(), managed_tables)?;
+        let exploration_slots = (query_slots + 1).min(4);
+        let query_memory = cluster
+            .as_ref()
+            .map_or(QueryOptions::default().memory_bytes, |cluster| {
+                cluster.max_coordinator_query_bytes()
+            });
+        let app = Arc::new(App {
+            auth,
+            users,
+            access,
+            assets,
+            models: Mutex::new(models),
+            local_tables,
+            work: Arc::new(Semaphore::new(query_slots)),
+            admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
+                max_queries: query_slots,
+                memory_bytes: query_slots
+                    .saturating_mul(query_memory)
+                    .min(crate::EngineLimits::default().memory_bytes),
+                spill_bytes: query_slots as u64 * QueryOptions::default().spill_bytes,
+            })?),
+            probe_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
+                max_queries: 2,
+                memory_bytes: 2 * ops::MODEL_PROBE_MEMORY_BYTES,
+                spill_bytes: 0,
+            })?),
+            impact_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
+                max_queries: 4,
+                memory_bytes: 4 * 64 * 1024 * 1024,
+                spill_bytes: 256 * 1024 * 1024,
+            })?),
+            exploration_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
+                max_queries: exploration_slots,
+                memory_bytes: exploration_slots * QueryOptions::default().memory_bytes,
+                spill_bytes: exploration_slots as u64 * QueryOptions::default().spill_bytes,
+            })?),
+            query_waiters: Semaphore::new(16),
+            export_waiters: Semaphore::new(4),
+            explore_work: Semaphore::new(8),
+            explore_producers: Arc::new(Semaphore::new(2)),
+            explore_recovery: Arc::new(Semaphore::new(2)),
+            explorations: Mutex::new(explorations),
+            metadata_work: Semaphore::new(4),
+            schema_work: Semaphore::new(1),
+            model_probes: Semaphore::new(2),
+            export_work: Arc::new(Semaphore::new(1)),
+            download_work: Arc::new(Semaphore::new(2)),
+            download_owners: Arc::default(),
+            download_waiters: Semaphore::new(4),
+            downloads: Mutex::default(),
+            results: Mutex::default(),
+            active: Mutex::default(),
+            options: QueryOptions {
+                timeout: Duration::from_millis(timeout_ms),
+                cancellation: shutdown.clone(),
+                ..Default::default()
+            },
+            authority,
+            origin: origin.clone(),
+            shutdown: shutdown.clone(),
+            metrics: ops::Metrics::new(query_slots),
+            readiness: Arc::new(Semaphore::new(1)),
+            manual_backup_dir: ha
+                .as_ref()
+                .and_then(|_| std::env::var_os("GRAPHLAKE_MANUAL_BACKUP_DIR").map(PathBuf::from)),
+            backup_work: Arc::new(Semaphore::new(1)),
+            wire,
+            cluster,
+            ha,
+            _ha_bootstrap: ha_cache,
+            ha_ready: std::sync::atomic::AtomicBool::new(false),
+        });
+        Ok::<_, anyhow::Error>((listener, bolt, origin, app))
+    }
+    .await;
+    let (listener, bolt, origin, app) = match init {
+        Ok(ready) => ready,
+        Err(error) => {
+            if let Some(leader) = ha_leader {
+                leader.release().await;
+            }
+            return Err(error);
         }
     };
-    let authority = origin.split_once("://").unwrap().1.to_owned();
-    let access = access::Policy::load(
-        metadata_dir,
-        driver_model
-            .as_deref()
-            .map(|model| (model, driver_token_env.as_str())),
-        coordinator_failover,
-    )?;
-    let models = match &ha_cache {
-        Some(snapshot) => models::Models::in_snapshot(Arc::clone(snapshot), catalog_dir),
-        None => models::Models::new(catalog_dir),
-    };
-    if ha.is_none() {
-        models
-            .adopt_existing()
-            .map_err(|error| anyhow::anyhow!("adopting existing models: {}", error.message))?;
-    }
-    let (_, failed_models) = models
-        .check_published()
-        .map_err(|error| anyhow::anyhow!("checking published models: {}", error.message))?;
-    for (id, error) in failed_models {
-        eprintln!("GraphLake model {id} unavailable: {error}");
-    }
-    let wire = driver_model
-        .map(|id| wire::Access::load(&models, id))
-        .transpose()?;
-    let bolt = match bolt_port {
-        Some(port) => Some(TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?),
-        None => None,
-    };
-    let explorations = cluster
-        .as_ref()
-        .map_or_else(query::Sessions::default, |cluster| {
-            query::Sessions::with_cursor_key(cluster.cursor_key())
-        });
-    let local_tables =
-        local_tables::LocalTables::open(models.source_directory().to_owned(), managed_tables)?;
-    let exploration_slots = (query_slots + 1).min(4);
-    let query_memory = cluster
-        .as_ref()
-        .map_or(QueryOptions::default().memory_bytes, |cluster| {
-            cluster.max_coordinator_query_bytes()
-        });
-    let app = Arc::new(App {
-        auth,
-        users,
-        access,
-        assets,
-        models: Mutex::new(models),
-        local_tables,
-        work: Arc::new(Semaphore::new(query_slots)),
-        admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
-            max_queries: query_slots,
-            memory_bytes: query_slots
-                .saturating_mul(query_memory)
-                .min(crate::EngineLimits::default().memory_bytes),
-            spill_bytes: query_slots as u64 * QueryOptions::default().spill_bytes,
-        })?),
-        probe_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
-            max_queries: 2,
-            memory_bytes: 2 * ops::MODEL_PROBE_MEMORY_BYTES,
-            spill_bytes: 0,
-        })?),
-        exploration_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
-            max_queries: exploration_slots,
-            memory_bytes: exploration_slots * QueryOptions::default().memory_bytes,
-            spill_bytes: exploration_slots as u64 * QueryOptions::default().spill_bytes,
-        })?),
-        query_waiters: Semaphore::new(16),
-        export_waiters: Semaphore::new(4),
-        explore_work: Semaphore::new(8),
-        explore_producers: Arc::new(Semaphore::new(2)),
-        explore_recovery: Arc::new(Semaphore::new(2)),
-        explorations: Mutex::new(explorations),
-        metadata_work: Semaphore::new(4),
-        schema_work: Semaphore::new(1),
-        model_probes: Semaphore::new(2),
-        export_work: Arc::new(Semaphore::new(1)),
-        download_work: Arc::new(Semaphore::new(2)),
-        download_owners: Arc::default(),
-        download_waiters: Semaphore::new(4),
-        downloads: Mutex::default(),
-        results: Mutex::default(),
-        active: Mutex::default(),
-        options: QueryOptions {
-            timeout: Duration::from_millis(timeout_ms),
-            cancellation: shutdown.clone(),
-            ..Default::default()
-        },
-        authority,
-        origin: origin.clone(),
-        shutdown: shutdown.clone(),
-        metrics: ops::Metrics::new(query_slots),
-        readiness: Arc::new(Semaphore::new(1)),
-        manual_backup_dir: ha
-            .as_ref()
-            .and_then(|_| std::env::var_os("GRAPHLAKE_MANUAL_BACKUP_DIR").map(PathBuf::from)),
-        backup_work: Arc::new(Semaphore::new(1)),
-        wire,
-        cluster,
-        ha,
-        _ha_bootstrap: ha_cache,
-        ha_ready: std::sync::atomic::AtomicBool::new(false),
-    });
     if let Some(cluster) = &app.cluster {
         cluster.start_cleanup(shutdown.clone(), Arc::downgrade(&app));
     }

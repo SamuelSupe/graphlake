@@ -1,10 +1,4 @@
-use std::{
-    fs::File,
-    io::{Read, Seek},
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use datafusion::execution::memory_pool::MemoryConsumer;
@@ -13,6 +7,7 @@ use object_store::{
     aws::{AmazonS3Builder, S3CopyIfNotExists},
     path::Path as Key,
 };
+use tokio::{fs::File, io::AsyncReadExt};
 
 use crate::engine::QueryScope;
 
@@ -49,8 +44,8 @@ impl Target {
     }
 
     pub(super) async fn publish(&self, path: &Path, scope: &QueryScope) -> Result<()> {
-        let mut file = File::open(path)?;
-        let size = file.metadata()?.len();
+        let mut file = File::open(path).await?;
+        let size = file.metadata().await?.len();
         const PART: usize = 5 * 1024 * 1024;
         ensure!(
             size <= 5 * 1024 * 1024 * 1024,
@@ -61,7 +56,7 @@ impl Target {
         if size <= PART as u64 {
             budget.try_grow(size as usize)?;
             let mut data = Vec::with_capacity(size as usize);
-            file.read_to_end(&mut data)?;
+            file.read_to_end(&mut data).await?;
             scope
                 .run(async {
                     self.store
@@ -86,11 +81,13 @@ impl Target {
         let result = scope
             .run(async {
                 stage.upload = Some(self.store.put_multipart(&stage.key).await?);
-                while file.stream_position()? < size {
+                let mut offset = 0u64;
+                while offset < size {
                     scope.check()?;
-                    let mut part =
-                        vec![0; (size - file.stream_position()?).min(PART as u64) as usize];
-                    file.read_exact(&mut part)?;
+                    let len = (size - offset).min(PART as u64) as usize;
+                    let mut part = vec![0; len];
+                    file.read_exact(&mut part).await?;
+                    offset += len as u64;
                     stage
                         .upload
                         .as_mut()

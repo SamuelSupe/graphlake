@@ -390,11 +390,17 @@ async fn mutate_inner(
             ));
         }
         let state = ha.leader.load_catalog(&receipt.generation).await?;
-        let temp = tempfile::tempdir().map_err(|_| Error::storage())?;
-        restore(temp.path(), &state)?;
-        let model = models::Models::new(temp.path().to_owned()).ha_model(id, receipt.validated)?;
+        let id_owned = id.to_owned();
+        let validated = receipt.validated;
+        let model = tokio::task::spawn_blocking(move || {
+            let temp = tempfile::tempdir().map_err(|_| Error::storage())?;
+            restore(temp.path(), &state)?;
+            models::Models::new(temp.path().to_owned()).ha_model(&id_owned, validated)
+        })
+        .await
+        .map_err(|_| Error::storage())??;
         return Ok((
-            StatusCode::from_u16(receipt.status).unwrap(),
+            StatusCode::from_u16(receipt.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             models::model_response(model),
         )
             .into_response());
@@ -442,8 +448,19 @@ async fn mutate_inner(
     let (status, model) = tokio::time::timeout_at(deadline, prepared)
         .await
         .map_err(|_| control::timeout())??;
-    let state = capture(candidate.path())?;
-    let generation = if state.files == base.files {
+    let previous = app.models.lock().unwrap().read_files();
+    let capture_dir = candidate.path().to_owned();
+    let (state, same_files, models) = tokio::task::spawn_blocking(move || -> ApiResult<_> {
+        let state = capture(&capture_dir)?;
+        let same_files = state.files == base.files;
+        models.inherit_caches(&previous, |rel| {
+            base.files.get(rel).is_some() && base.files.get(rel) == state.files.get(rel)
+        });
+        Ok((state, same_files, models))
+    })
+    .await
+    .map_err(|_| Error::storage())??;
+    let generation = if same_files {
         pointer.0.clone()
     } else {
         tokio::time::timeout_at(deadline, ha.leader.store_catalog(&state, Some(&pointer.0)))
@@ -659,14 +676,19 @@ pub(super) async fn credentials(leader: &Leadership, seed: &Path, local: &Path) 
         Some((policy, _)) => policy,
         None => {
             let path = seed.join("service-accounts.json");
-            if let Ok(meta) = fs::symlink_metadata(&path) {
-                super::auth::private_permissions(&meta, true)?;
-            }
-            let policy = models::read_file(&path, 256 * 1024)
-                .map_err(|e| anyhow::anyhow!(e.message))?
-                .unwrap_or_else(|| "{}".into());
-            super::access::Policy::validate_config(&policy)
-                .map_err(|e| anyhow::anyhow!(e.message))?;
+            let policy = tokio::task::spawn_blocking(move || -> Result<String> {
+                if let Ok(meta) = fs::symlink_metadata(&path) {
+                    super::auth::private_permissions(&meta, true)?;
+                }
+                let policy = models::read_file(&path, 256 * 1024)
+                    .map_err(|e| anyhow::anyhow!(e.message))?
+                    .unwrap_or_else(|| "{}".into());
+                super::access::Policy::validate_config(&policy)
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
+                Ok(policy)
+            })
+            .await
+            .context("reading service-accounts policy")??;
             ensure!(
                 leader
                     .commit("policy", 0, &policy, None::<(Uuid, &())>)
@@ -678,8 +700,13 @@ pub(super) async fn credentials(leader: &Leadership, seed: &Path, local: &Path) 
             policy
         }
     };
-    models::atomic_write(&dir.join("service-accounts.json"), policy.as_bytes(), true)
-        .map_err(|e| anyhow::anyhow!(e.message))?;
+    let policy_path = dir.join("service-accounts.json");
+    tokio::task::spawn_blocking(move || {
+        models::atomic_write(&policy_path, policy.as_bytes(), true)
+            .map_err(|e| anyhow::anyhow!(e.message))
+    })
+    .await
+    .context("writing service-accounts policy")??;
     Ok(())
 }
 

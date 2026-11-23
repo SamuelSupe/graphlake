@@ -3,7 +3,7 @@ mod frontier;
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 use datafusion::{
     arrow::{
         array::{
@@ -45,7 +45,7 @@ use crate::catalog::ident;
 
 pub(crate) struct Snapshot {
     client: Client,
-    driver: JoinHandle<()>,
+    driver: Option<JoinHandle<()>>,
     tls: MakeRustlsConnect,
     next_cursor: AtomicU64,
     interrupted: AtomicBool,
@@ -357,22 +357,50 @@ impl Snapshot {
         if config.get_ssl_mode() == SslMode::Prefer {
             config.ssl_mode(SslMode::Require);
         }
-        let mut roots = rustls::RootCertStore::empty();
-        if config.get_ssl_mode() != SslMode::Disable {
-            roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-            ensure!(
-                !roots.is_empty(),
-                "no trusted PostgreSQL TLS roots in the system certificate store"
-            );
-        }
-        let tls = MakeRustlsConnect::new(
-            rustls::ClientConfig::builder_with_provider(
-                rustls::crypto::ring::default_provider().into(),
-            )
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        );
+        let tls = if config.get_ssl_mode() != SslMode::Disable {
+            static VERIFIED_TLS: tokio::sync::OnceCell<MakeRustlsConnect> =
+                tokio::sync::OnceCell::const_new();
+            VERIFIED_TLS
+                .get_or_try_init(|| async {
+                    tokio::task::spawn_blocking(|| -> Result<MakeRustlsConnect> {
+                        let mut roots = rustls::RootCertStore::empty();
+                        roots.add_parsable_certificates(
+                            rustls_native_certs::load_native_certs().certs,
+                        );
+                        ensure!(
+                            !roots.is_empty(),
+                            "no trusted PostgreSQL TLS roots in the system certificate store"
+                        );
+                        Ok(MakeRustlsConnect::new(
+                            rustls::ClientConfig::builder_with_provider(
+                                rustls::crypto::ring::default_provider().into(),
+                            )
+                            .with_safe_default_protocol_versions()?
+                            .with_root_certificates(roots)
+                            .with_no_client_auth(),
+                        ))
+                    })
+                    .await
+                    .context("loading PostgreSQL TLS roots")?
+                })
+                .await?
+                .clone()
+        } else {
+            static PLAIN_TLS: OnceLock<MakeRustlsConnect> = OnceLock::new();
+            if let Some(tls) = PLAIN_TLS.get() {
+                tls.clone()
+            } else {
+                let built = MakeRustlsConnect::new(
+                    rustls::ClientConfig::builder_with_provider(
+                        rustls::crypto::ring::default_provider().into(),
+                    )
+                    .with_safe_default_protocol_versions()?
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+                );
+                PLAIN_TLS.get_or_init(|| built).clone()
+            }
+        };
         let (client, connection) = tokio::time::timeout(timeout, config.connect(tls.clone()))
             .await
             .context("PostgreSQL connection timed out")?
@@ -382,7 +410,7 @@ impl Snapshot {
         });
         let mut snapshot = Self {
             client,
-            driver,
+            driver: Some(driver),
             tls,
             stats,
             next_cursor: AtomicU64::new(0),
@@ -488,16 +516,36 @@ impl Snapshot {
 impl Drop for Snapshot {
     fn drop(&mut self) {
         // Closing the socket alone may leave a backend computing until its next write.
-        if self.interrupted.load(Ordering::Relaxed)
-            && let Ok(handle) = Handle::try_current()
-        {
-            let token = self.client.cancel_token();
-            let tls = self.tls.clone();
-            handle.spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(2), token.cancel_query(tls)).await;
-            });
+        let interrupted = self.interrupted.swap(false, Ordering::AcqRel);
+        if interrupted {
+            if let Ok(handle) = Handle::try_current() {
+                let token = self.client.cancel_token();
+                let tls = self.tls.clone();
+                handle.spawn(async move {
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(2), token.cancel_query(tls)).await;
+                });
+            }
+            if let Some(driver) = self.driver.take() {
+                driver.abort();
+            }
+        } else if let Some(driver) = self.driver.take() {
+            if let Ok(handle) = Handle::try_current() {
+                // Allow the driver to send PostgreSQL's Terminate message once `self.client`
+                // drops immediately after this Drop impl returns, aborting only if it hangs.
+                let abort = driver.abort_handle();
+                handle.spawn(async move {
+                    if tokio::time::timeout(Duration::from_millis(500), driver)
+                        .await
+                        .is_err()
+                    {
+                        abort.abort();
+                    }
+                });
+            } else {
+                driver.abort();
+            }
         }
-        self.driver.abort();
     }
 }
 
@@ -530,8 +578,6 @@ impl std::fmt::Debug for PgTable {
 impl PgTable {
     #[cfg(feature = "admin")]
     pub(crate) fn watermark(&self, column: &str, checkpoint: &ScalarValue) -> Self {
-        use chrono::Datelike;
-
         let Some(index) = self.schema.index_of(column).ok() else {
             return self.clone();
         };
@@ -968,28 +1014,75 @@ struct CursorCleanup {
 
 impl Drop for CursorCleanup {
     fn drop(&mut self) {
-        if let Some(snapshot) = self.snapshot.take()
-            && let Ok(runtime) = Handle::try_current()
-        {
-            let name = std::mem::take(&mut self.name);
-            runtime.spawn(async move {
+        let Some(snapshot) = self.snapshot.take() else {
+            return;
+        };
+        let Ok(runtime) = Handle::try_current() else {
+            return;
+        };
+        let shared = Arc::strong_count(&snapshot) > 1;
+        if !shared {
+            // We are the last owner: drop immediately so Snapshot::drop sends cancel_query
+            // (if interrupted) without a 2-second CLOSE delay behind an uncancelled FETCH.
+            drop(snapshot);
+            return;
+        }
+        let name = std::mem::take(&mut self.name);
+        let interrupted = snapshot.interrupted.swap(false, Ordering::AcqRel);
+        let cancel = interrupted.then(|| (snapshot.client.cancel_token(), snapshot.tls.clone()));
+        let weak = Arc::downgrade(&snapshot);
+        drop(snapshot);
+        runtime.spawn(async move {
+            if let Some((token, tls)) = cancel {
+                let _ = tokio::time::timeout(Duration::from_secs(2), token.cancel_query(tls)).await;
+            }
+            if let Some(snapshot) = weak.upgrade() {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2),
                     snapshot.request(snapshot.client.batch_execute(&format!("CLOSE {name}"))),
                 )
                 .await;
-            });
-        }
+            }
+        });
     }
 }
 
 // PostgreSQL and Arrow share the ordering and NULL semantics of these scalar types.
 fn key_operand(name: &str, ty: &Type) -> Option<String> {
     match *ty {
-        Type::BOOL | Type::INT2 | Type::INT4 | Type::INT8 => Some(name.to_owned()),
+        Type::BOOL
+        | Type::INT2
+        | Type::INT4
+        | Type::INT8
+        | Type::DATE
+        | Type::TIMESTAMP
+        | Type::TIMESTAMPTZ
+        | Type::NUMERIC => Some(name.to_owned()),
         Type::TEXT | Type::VARCHAR => Some(format!("({name} COLLATE \"C\")")),
         Type::UUID => Some(format!("({name}::text COLLATE \"C\")")),
         _ => None,
+    }
+}
+
+fn format_decimal(value: i128, scale: i8) -> Option<String> {
+    if scale < 0 {
+        return None;
+    }
+    if scale == 0 {
+        return Some(value.to_string());
+    }
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let prefix = if negative { "-" } else { "" };
+    if digits.len() <= scale {
+        Some(format!(
+            "{prefix}0.{}{digits}",
+            "0".repeat(scale - digits.len())
+        ))
+    } else {
+        let split = digits.len() - scale;
+        Some(format!("{prefix}{}.{}", &digits[..split], &digits[split..]))
     }
 }
 
@@ -1016,6 +1109,27 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
             Expr::Literal(ScalarValue::Int32(Some(value)), _) => Some(value.to_string()),
             Expr::Literal(ScalarValue::Int64(Some(value)), _) => Some(value.to_string()),
             Expr::Literal(ScalarValue::Boolean(Some(value)), _) => Some(value.to_string()),
+            Expr::Literal(ScalarValue::Date32(Some(days)), _) => {
+                Some(format!("(DATE '1970-01-01' + {days})"))
+            }
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), tz), _) => {
+                let date = DateTime::from_timestamp_micros(*value)
+                    .filter(|date| (1..=9999).contains(&date.year()))?;
+                if tz.is_some() {
+                    Some(format!(
+                        "TIMESTAMPTZ '{}+00:00'",
+                        date.format("%Y-%m-%d %H:%M:%S%.6f")
+                    ))
+                } else {
+                    Some(format!(
+                        "TIMESTAMP '{}'",
+                        date.format("%Y-%m-%d %H:%M:%S%.6f")
+                    ))
+                }
+            }
+            Expr::Literal(ScalarValue::Decimal128(Some(value), _, scale), _) => {
+                format_decimal(*value, *scale).map(|lit| format!("{lit}::numeric"))
+            }
             Expr::Literal(
                 ScalarValue::Utf8(Some(value))
                 | ScalarValue::Utf8View(Some(value))
@@ -1292,4 +1406,74 @@ fn to_batch(schema: SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
         arrays,
         &RecordBatchOptions::new().with_row_count(Some(rows.len())),
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::prelude::{col, lit};
+
+    #[test]
+    fn predicate_pushes_down_date_timestamp_and_decimal() {
+        let schema = Schema::new(vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new(
+                "tz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("amt", DataType::Decimal128(10, 2), true),
+        ]);
+        let types = [
+            Type::DATE,
+            Type::TIMESTAMP,
+            Type::TIMESTAMPTZ,
+            Type::NUMERIC,
+        ];
+
+        let date_sql = predicate(
+            &col("d").gt_eq(lit(ScalarValue::Date32(Some(19723)))),
+            &schema,
+            &types,
+        )
+        .unwrap();
+        assert!(date_sql.contains("DATE '1970-01-01' + 19723"), "{date_sql}");
+
+        let ts_sql = predicate(
+            &col("ts").lt(lit(ScalarValue::TimestampMicrosecond(
+                Some(1_704_067_200_000_000),
+                None,
+            ))),
+            &schema,
+            &types,
+        )
+        .unwrap();
+        assert!(
+            ts_sql.contains("TIMESTAMP '2024-01-01 00:00:00.000000'"),
+            "{ts_sql}"
+        );
+
+        let tz_sql = predicate(
+            &col("tz").eq(lit(ScalarValue::TimestampMicrosecond(
+                Some(1_704_067_200_000_000),
+                Some("UTC".into()),
+            ))),
+            &schema,
+            &types,
+        )
+        .unwrap();
+        assert!(
+            tz_sql.contains("TIMESTAMPTZ '2024-01-01 00:00:00.000000+00:00'"),
+            "{tz_sql}"
+        );
+
+        let dec_sql = predicate(
+            &col("amt").eq(lit(ScalarValue::Decimal128(Some(-5), 10, 2))),
+            &schema,
+            &types,
+        )
+        .unwrap();
+        assert!(dec_sql.contains("-0.05::numeric"), "{dec_sql}");
+    }
 }

@@ -325,6 +325,14 @@ impl Distributed {
                             || response.status() == StatusCode::CONFLICT =>
                     {
                         if response.status() == StatusCode::CONFLICT {
+                            let code = response
+                                .json::<serde_json::Value>()
+                                .await
+                                .ok()
+                                .and_then(|body| body["code"].as_str().map(str::to_owned));
+                            if code.as_deref() == Some("cancelled") {
+                                anyhow::bail!("query cancelled");
+                            }
                             self.unavailable.lock().unwrap().insert(worker.clone());
                         }
                     }
@@ -490,22 +498,27 @@ pub(super) async fn run_task(
         .await
     };
     let monitor = async {
+        let mut errors = 0u8;
         loop {
             tokio::time::sleep(super::WAIT).await;
-            if !worker
-                .shared
-                .metadata
-                .get(request.id)
-                .await
-                .is_ok_and(|saved| {
-                    saved.is_some_and(|saved| {
-                        saved.job.attempt == request.attempt
-                            && matches!(saved.job.state, JobState::Running)
-                    })
-                })
-            {
-                cancellation.cancel();
-                break;
+            match worker.shared.metadata.get(request.id).await {
+                Ok(Some(saved))
+                    if saved.job.attempt == request.attempt
+                        && matches!(saved.job.state, JobState::Running) =>
+                {
+                    errors = 0;
+                }
+                Ok(_) => {
+                    cancellation.cancel();
+                    break;
+                }
+                Err(_) => {
+                    errors += 1;
+                    if errors >= 6 {
+                        cancellation.cancel();
+                        break;
+                    }
+                }
             }
         }
     };

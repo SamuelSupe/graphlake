@@ -225,6 +225,12 @@ impl Store {
                         table.observation_finished_at_ms = run.finished_at_ms;
                         if run.mode == Mode::Full || run.reconciled {
                             table.reconciled_at_ms = Some(run.started_at_ms);
+                            if !table.schedule_paused {
+                                table.next_reconcile_at_ms = table
+                                    .config
+                                    .reconcile_interval_seconds
+                                    .map(|seconds| run.started_at_ms + seconds * 1000);
+                            }
                         }
                     }
                 }

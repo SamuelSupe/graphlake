@@ -47,6 +47,9 @@ pub(super) fn merge(
         .position(|column| column.path().parts() == [key]);
     let Some(leaf) = leaf else { return Ok(None) };
     let projection = ProjectionMask::leaves(old.parquet_schema(), [leaf]);
+    let key_memory =
+        datafusion::execution::memory_pool::MemoryConsumer::new("local table row-group keys")
+            .register(&scope.runtime.memory_pool);
     let mut keys = Vec::new();
     for batch in reader(&delta, &new, scope)?
         .with_projection(projection.clone())
@@ -54,7 +57,9 @@ pub(super) fn merge(
     {
         scope.check()?;
         let key_array = cast(batch?.column(0), &DataType::Int64)?;
-        keys.extend_from_slice(integers(key_array.as_ref())?.values());
+        let slice = integers(key_array.as_ref())?.values();
+        key_memory.try_grow(slice.len().saturating_mul(std::mem::size_of::<i64>()))?;
+        keys.extend_from_slice(slice);
     }
     keys.sort_unstable();
 

@@ -170,13 +170,15 @@ fn step(
     // Weighted reservoir sampling needs one pass and no per-node alias tables.
     let mut total = 0.0;
     let mut selected = None;
+    let check_explore = (options.explore_bias - 1.0).abs() > 0.0;
     for (i, neighbor) in graph.adjacency[current].iter().enumerate() {
         let bias = match previous {
             Some(previous) if previous == neighbor.vertex => options.return_bias,
             Some(previous)
-                if !graph.adjacency[previous]
-                    .binary_search_by_key(&neighbor.vertex, |arc| arc.vertex)
-                    .is_ok() =>
+                if check_explore
+                    && graph.adjacency[previous]
+                        .binary_search_by_key(&neighbor.vertex, |arc| arc.vertex)
+                        .is_err() =>
             {
                 options.explore_bias
             }

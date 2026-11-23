@@ -671,6 +671,14 @@ impl Traversers<'_> {
                 merged.len() <= 128,
                 "repeat() has more than 128 traverser kinds"
             );
+            ensure!(
+                merged.iter().all(|kind| kind.depth() <= 16)
+                    && merged
+                        .iter()
+                        .fold(0usize, |acc, kind| acc.saturating_add(kind.node_count()))
+                        <= 2048,
+                "repeat() traverser type exceeds nesting limit"
+            );
             kinds = merged;
             tags = merged_tags;
         };

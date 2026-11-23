@@ -1077,7 +1077,15 @@ impl SnapshotWriter {
             let mut count = (batch.num_rows() - offset).min(128);
             let slice = loop {
                 let slice = batch.slice(offset, count);
-                if self.writer.get_ref().len() + batch.get_array_memory_size() < BLOCK_BYTES / 2 {
+                let slice_bytes: usize = slice
+                    .columns()
+                    .iter()
+                    .map(|col| {
+                        crate::engine::slice_bytes(col.as_ref())
+                            .unwrap_or_else(|_| col.get_array_memory_size())
+                    })
+                    .sum();
+                if self.writer.get_ref().len() + slice_bytes < BLOCK_BYTES / 2 {
                     break slice;
                 }
                 let mut probe = Self::writer(&self.schema)?;

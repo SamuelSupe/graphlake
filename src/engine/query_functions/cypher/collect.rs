@@ -366,9 +366,7 @@ impl Accumulator for CollectAccumulator {
             let bytes = values
                 .iter()
                 .map(|array| {
-                    array
-                        .to_data()
-                        .get_slice_memory_size()
+                    crate::engine::query::allocation::slice_bytes(array.as_ref())
                         .unwrap_or_else(|_| array.get_array_memory_size())
                 })
                 .sum::<usize>();

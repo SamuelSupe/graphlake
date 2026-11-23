@@ -822,6 +822,44 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_clique_refinement_and_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 20 cliques of 10 nodes each (200 nodes) connected in a sparse ring.
+        let cliques = 20usize;
+        let size = 10usize;
+        let mut b = GraphDataBuilder::new(cliques * size);
+        for c in 0..cliques {
+            let base = c * size;
+            for i in 0..size {
+                for j in (i + 1)..size {
+                    b.add_edge(base + i, base + j, 1.0).unwrap();
+                }
+            }
+            let next_base = ((c + 1) % cliques) * size;
+            b.add_edge(base, next_base, 0.25).unwrap();
+        }
+        let graph = b.build().unwrap();
+        let leiden = Leiden::new(LeidenConfig {
+            seed: Some(42),
+            ..Default::default()
+        });
+        let out = leiden.run(&graph).unwrap();
+        assert_eq!(out.partition.num_communities(), cliques);
+        assert!(
+            out.quality > 0.85,
+            "expected high modularity, got {}",
+            out.quality
+        );
+
+        // Verify cooperative cancellation triggers promptly inside refinement/local moves.
+        let checks = AtomicUsize::new(0);
+        let cancelled =
+            leiden.run_interruptible(&graph, &|| checks.fetch_add(1, Ordering::Relaxed) >= 2);
+        assert!(matches!(cancelled, Err(crate::LeidenError::Cancelled)));
+    }
+
+    #[test]
     fn test_ring_of_cliques() {
         let mut b = GraphDataBuilder::new(12);
 

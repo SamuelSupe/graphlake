@@ -260,7 +260,7 @@ async fn load(
         context
             .register_parquet(
                 "incoming",
-                delta.path().to_str().unwrap(),
+                delta.path().to_str().context("non-UTF-8 staging path")?,
                 ParquetReadOptions::default(),
             )
             .await?;
@@ -373,10 +373,10 @@ async fn load(
     };
     if let Some((column, next)) = &candidate
         && checkpoint.is_some()
-        && deleted.is_none()
         && loaded > 0
         && delta_bytes <= overlay::MAX_DELTA_BYTES
     {
+        let deleted_column = deleted.as_ref().and(config.deleted_column.as_deref());
         match tokio::task::block_in_place(|| {
             key_index::incremental(
                 path,
@@ -386,6 +386,7 @@ async fn load(
                 &config.key_columns,
                 column,
                 next,
+                deleted_column,
                 run_id,
                 scope,
             )
@@ -455,7 +456,9 @@ async fn load(
                     overlay::prepare(&anchor, previous, staged, &key, &worker_scope)
                 })
                 .await??
-                    && overlay::publish(path, &delta, &next, scope, || Ok(()))?
+                    && crate::blocking(|| {
+                        overlay::publish(path, Some(&delta), &next, scope, || Ok(()))
+                    })?
                 {
                     return Ok((loaded, next.snapshot.rows()));
                 }
@@ -547,12 +550,15 @@ async fn load(
         })?;
         return Ok((loaded, total));
     }
-    output.as_file().sync_all()?;
-    scope.check()?;
-    // The checkpoint is MAX(watermark) in this same file. A restart can never
-    // advance a separate checkpoint past the data that was atomically installed.
-    output.persist(path)?;
-    File::open(root)?.sync_all()?;
+    crate::blocking(|| -> Result<()> {
+        output.as_file().sync_all()?;
+        scope.check()?;
+        // The checkpoint is MAX(watermark) in this same file. A restart can never
+        // advance a separate checkpoint past the data that was atomically installed.
+        output.persist(path)?;
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })?;
     Ok((loaded, total))
 }
 
@@ -692,18 +698,52 @@ async fn any(context: &SessionContext, sql: &str) -> Result<bool> {
 
 async fn write(frame: DataFrame, file: File, scope: &QueryScope) -> Result<u64> {
     let mut stream = frame.execute_stream().await?;
-    let mut writer = ArrowWriter::try_new(file, stream.schema(), Some(writer_properties()))?;
-    let mut count = 0;
-    while let Some(batch) = stream.try_next().await? {
-        scope.check()?;
-        count += batch.num_rows() as u64;
-        writer.write(&batch)?;
-        if writer.memory_size() > scope.options.memory_bytes / 8 {
-            writer.flush()?;
+    let schema = stream.schema();
+    let flush_limit = scope.options.memory_bytes / 8;
+    let (send, mut receive) =
+        tokio::sync::mpsc::channel::<datafusion::arrow::array::RecordBatch>(2);
+    let cancelled = scope.options.cancellation.clone();
+    let deadline = scope.deadline;
+    let task = tokio::task::spawn_blocking(move || -> Result<u64> {
+        let mut writer = ArrowWriter::try_new(file, schema, Some(writer_properties()))?;
+        let mut count = 0;
+        while let Some(batch) = receive.blocking_recv() {
+            ensure!(!cancelled.is_cancelled(), "query cancelled");
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "query deadline exceeded"
+            );
+            count += batch.num_rows() as u64;
+            writer.write(&batch)?;
+            if writer.memory_size() > flush_limit {
+                writer.flush()?;
+            }
+        }
+        writer.close()?;
+        Ok(count)
+    });
+    let mut stream_err = None;
+    loop {
+        match stream.try_next().await {
+            Ok(Some(batch)) => {
+                scope.check()?;
+                if send.send(batch).await.is_err() {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                stream_err = Some(error);
+                break;
+            }
         }
     }
-    writer.close()?;
-    Ok(count)
+    drop(send);
+    let written = task.await?;
+    if let Some(error) = stream_err {
+        return Err(error.into());
+    }
+    written
 }
 
 pub(super) fn writer_properties() -> WriterProperties {

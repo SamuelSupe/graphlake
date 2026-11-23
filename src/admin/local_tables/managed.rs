@@ -149,6 +149,12 @@ impl Selection {
         self.lease.take();
         Ok(pins)
     }
+
+    pub async fn release(mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.managed.release(&lease).await;
+        }
+    }
 }
 
 impl Drop for Selection {

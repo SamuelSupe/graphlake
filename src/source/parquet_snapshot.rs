@@ -138,12 +138,34 @@ pub(crate) fn parts_dir(path: &Path) -> PathBuf {
     path.with_extension("parts")
 }
 
+pub(crate) fn locks_dir(anchor: &Path) -> PathBuf {
+    anchor.with_extension("locks")
+}
+
 pub(crate) fn reader_lock(anchor: &Path) -> PathBuf {
     anchor.with_extension("readers.lock")
 }
 
+pub(crate) fn generation_lock(anchor: &Path, generation: Uuid) -> PathBuf {
+    locks_dir(anchor).join(format!("gen-{generation}.lock"))
+}
+
 pub(crate) fn pin(anchor: &Path) -> Result<Option<std::sync::Arc<File>>> {
     match File::open(reader_lock(anchor)) {
+        Ok(file) => {
+            file.lock_shared()?;
+            Ok(Some(std::sync::Arc::new(file)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn pin_generation(
+    anchor: &Path,
+    generation: Uuid,
+) -> Result<Option<std::sync::Arc<File>>> {
+    match File::open(generation_lock(anchor, generation)) {
         Ok(file) => {
             file.lock_shared()?;
             Ok(Some(std::sync::Arc::new(file)))

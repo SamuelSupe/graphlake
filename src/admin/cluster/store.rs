@@ -417,6 +417,7 @@ pub(in crate::admin) struct Objects {
     bucket: Option<String>,
     pub(super) prefix: Key,
     pub(super) csr_manifests: Arc<std::sync::Mutex<super::csr::ManifestCache>>,
+    uploaded_models: Arc<std::sync::Mutex<std::collections::VecDeque<(String, String)>>>,
 }
 
 impl Objects {
@@ -452,6 +453,7 @@ impl Objects {
                 .map(str::to_owned),
             prefix: prefix.join("graphlake-v1").join(cluster),
             csr_manifests: Default::default(),
+            uploaded_models: Default::default(),
         })
     }
 
@@ -563,14 +565,52 @@ impl Objects {
         }
     }
 
-    pub async fn model(&self, model: &str, revision: &str, yaml: String) -> Result<()> {
-        let key = self
-            .prefix
+    fn model_key(&self, model: &str, revision: &str) -> Key {
+        self.prefix
             .clone()
             .join("models")
             .join(model)
-            .join(revision);
-        self.put_immutable(&key, yaml.into_bytes()).await
+            .join(revision)
+    }
+
+    fn is_model_cached(&self, model: &str, revision: &str) -> bool {
+        let mut cache = self.uploaded_models.lock().unwrap();
+        if let Some(pos) = cache.iter().position(|(m, r)| m == model && r == revision) {
+            let entry = cache.remove(pos).unwrap();
+            cache.push_back(entry);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remember_model(&self, model: &str, revision: &str) {
+        let mut cache = self.uploaded_models.lock().unwrap();
+        cache.retain(|(m, r)| !(m == model && r == revision));
+        if cache.len() >= 256 {
+            cache.pop_front();
+        }
+        cache.push_back((model.to_owned(), revision.to_owned()));
+    }
+
+    pub async fn ensure_model(&self, model: &str, revision: &str, yaml: String) -> Result<()> {
+        if self.is_model_cached(model, revision) {
+            return Ok(());
+        }
+        let key = self.model_key(model, revision);
+        self.put_immutable(&key, yaml.into_bytes()).await?;
+        self.remember_model(model, revision);
+        Ok(())
+    }
+
+    pub async fn model(&self, model: &str, revision: &str, yaml: String) -> Result<()> {
+        let key = self.model_key(model, revision);
+        if self.is_model_cached(model, revision) && self.exists(&key).await? {
+            return Ok(());
+        }
+        self.put_immutable(&key, yaml.into_bytes()).await?;
+        self.remember_model(model, revision);
+        Ok(())
     }
 
     pub async fn read_model(&self, model: &str, revision: &str) -> Result<String> {
@@ -600,9 +640,20 @@ impl Objects {
     }
 
     pub async fn get_json<T: DeserializeOwned>(&self, key: &Key, limit: u64) -> Result<T> {
+        let (value, _) = self.get_json_with_size(key, limit).await?;
+        Ok(value)
+    }
+
+    pub async fn get_json_with_size<T: DeserializeOwned>(
+        &self,
+        key: &Key,
+        limit: u64,
+    ) -> Result<(T, u64)> {
         let result = self.get(key).await?;
         ensure!(result.meta.size <= limit, "cluster object is too large");
-        Ok(serde_json::from_slice(&result.bytes().await?)?)
+        let bytes = result.bytes().await?;
+        let len = bytes.len() as u64;
+        Ok((serde_json::from_slice(&bytes)?, len))
     }
 
     pub async fn head(&self, key: &Key) -> Result<()> {

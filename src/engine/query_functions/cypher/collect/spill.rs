@@ -43,7 +43,11 @@ pub(super) fn finish(store: Arc<Store>, files: Files, ty: &DataType) -> Result<S
     };
     let budget = MemoryConsumer::new("materializing the distinct collect list")
         .register(&store.runtime.memory_pool);
-    let copy = if ty.is_nested() || matches!(ty, DataType::Dictionary(..)) {
+    let copy = if ty.is_nested()
+        || matches!(
+            ty,
+            DataType::Dictionary(..) | DataType::Utf8View | DataType::BinaryView
+        ) {
         2
     } else {
         1
@@ -52,7 +56,7 @@ pub(super) fn finish(store: Arc<Store>, files: Files, ty: &DataType) -> Result<S
     let values = if output.rows == 0 {
         new_empty_array(ty)
     } else {
-        crate::blocking(|| build_values(output.reader()?, ty, output.rows, output.bytes))?
+        crate::blocking(|| build_values(output.reader()?, ty, output.rows, output.bytes, &store))?
     };
     Ok(ScalarValue::List(Arc::new(
         SingleRowListArrayBuilder::new(values).build_list_array(),
@@ -228,12 +232,9 @@ async fn spool(
                     "distinct collect list exceeds Arrow list capacity".into(),
                 )
             })?;
-        bytes = bytes.saturating_add(
-            batch
-                .column(columns.len() - 1)
-                .to_data()
-                .get_slice_memory_size()?,
-        );
+        bytes = bytes.saturating_add(crate::engine::query::allocation::slice_bytes(
+            batch.column(columns.len() - 1).as_ref(),
+        )?);
         crate::blocking(|| writer.write(&batch))?;
     }
     crate::blocking(|| {
@@ -412,16 +413,28 @@ impl PartitionStream for SavedWinners {
     }
 }
 
+fn check_store(store: &Store) -> Result<()> {
+    if store.cancellation.is_cancelled() {
+        return Err(DataFusionError::Execution("query cancelled".into()));
+    }
+    if tokio::time::Instant::now() >= store.deadline {
+        return Err(DataFusionError::Execution("query deadline exceeded".into()));
+    }
+    Ok(())
+}
+
 fn build_values(
     reader: StreamReader<std::io::BufReader<File>>,
     ty: &DataType,
     rows: usize,
     bytes: usize,
+    store: &Store,
 ) -> Result<ArrayRef> {
     macro_rules! bytes {
         ($builder:ident, $scalar:ident) => {{
             let mut builder = $builder::with_capacity(rows, bytes);
             for batch in reader {
+                check_store(store)?;
                 let batch = batch?;
                 for i in 0..batch.num_rows() {
                     let ScalarValue::$scalar(Some(value)) =
@@ -453,8 +466,17 @@ fn build_values(
         DataType::LargeUtf8 => bytes!(LargeStringBuilder, LargeUtf8),
         DataType::Binary => bytes!(BytesBuilder, Binary),
         DataType::LargeBinary => bytes!(LargeBinaryBuilder, LargeBinary),
-        ty if ty.is_nested() || matches!(ty, DataType::Dictionary(..)) => {
-            let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+        ty if ty.is_nested()
+            || matches!(
+                ty,
+                DataType::Dictionary(..) | DataType::Utf8View | DataType::BinaryView
+            ) =>
+        {
+            let mut batches = Vec::new();
+            for batch in reader {
+                check_store(store)?;
+                batches.push(batch?);
+            }
             let values = batches
                 .iter()
                 .map(|b| b.column(0).as_ref())
@@ -463,11 +485,16 @@ fn build_values(
         }
         _ => {
             let mut error = None;
-            let mut reader = reader.flat_map(|batch| match batch {
-                Ok(batch) => (0..batch.num_rows())
-                    .map(move |row| ScalarValue::try_from_array(batch.column(0), row))
-                    .collect(),
-                Err(err) => vec![Err(err.into())],
+            let mut reader = reader.flat_map(|batch| {
+                if let Err(err) = check_store(store) {
+                    return vec![Err(err)];
+                }
+                match batch {
+                    Ok(batch) => (0..batch.num_rows())
+                        .map(move |row| ScalarValue::try_from_array(batch.column(0), row))
+                        .collect(),
+                    Err(err) => vec![Err(err.into())],
+                }
             });
             let values = std::iter::from_fn(|| match reader.next()? {
                 Ok(value) => Some(value),

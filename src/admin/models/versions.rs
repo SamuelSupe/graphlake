@@ -628,7 +628,7 @@ pub(crate) async fn publish(
     let validation = async {
         inspect(&model.yaml, &path, &app.options, true, &app, &id).await?;
         impact
-            .run(app.options.clone())
+            .run(app.options.clone(), &app.impact_admission)
             .await?
             .require_pass(request.preview.as_ref())
     }
@@ -688,7 +688,7 @@ pub(crate) async fn rollback(
     })?;
     inspect(&yaml, &path, &app.options, true, &app, &id).await?;
     let impact = impact
-        .run(app.options.clone())
+        .run(app.options.clone(), &app.impact_admission)
         .await?
         .require_pass(request.preview.as_ref())?;
     let _policy = app.users.writes.lock().await;
@@ -763,7 +763,7 @@ impl Models {
                 let (model, impact) = self.draft_impact(id, &request)?;
                 inspect(&model.yaml, &self.source_path(id)?, options, true, app, id).await?;
                 let impact = impact
-                    .run(options.clone())
+                    .run(options.clone(), &app.impact_admission)
                     .await?
                     .require_pass(request.preview.as_ref())?;
                 let mut model = self.activate(model, request, Action::Publish, impact)?;
@@ -776,7 +776,7 @@ impl Models {
                 let (yaml, impact) = self.rollback_impact(id, &request)?;
                 inspect(&yaml, &self.source_path(id)?, options, true, app, id).await?;
                 let impact = impact
-                    .run(options.clone())
+                    .run(options.clone(), &app.impact_admission)
                     .await?
                     .require_pass(request.preview.as_ref())?;
                 self.activate(self.get(id)?, request, Action::Rollback, impact)?

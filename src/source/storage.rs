@@ -16,7 +16,12 @@ use object_store::{
 use crate::StorageConfig;
 use sha2::{Digest, Sha256};
 
-type Connection = ([u8; 32], Instant, Arc<dyn ObjectStore>);
+type Connection = (
+    [u8; 32],
+    Option<tokio::runtime::Id>,
+    Instant,
+    Arc<dyn ObjectStore>,
+);
 
 fn cached(
     config: &[u8],
@@ -38,22 +43,36 @@ fn cached(
         }
     }
     let fingerprint: [u8; 32] = fingerprint.finalize().into();
-    let mut connections = CONNECTIONS.get_or_init(Mutex::default).lock().unwrap();
-    connections.retain(|(_, opened, _)| opened.elapsed() < Duration::from_secs(300));
-    if let Some(index) = connections
-        .iter()
-        .position(|(key, _, _)| key == &fingerprint)
+    let runtime = tokio::runtime::Handle::try_current().ok().map(|h| h.id());
     {
-        let entry = connections.remove(index).expect("located S3 connection");
-        let store = entry.2.clone();
-        connections.push_back(entry);
-        return Ok(store);
+        let mut connections = CONNECTIONS.get_or_init(Mutex::default).lock().unwrap();
+        connections.retain(|(_, _, opened, _)| opened.elapsed() < Duration::from_secs(300));
+        if let Some(index) = connections
+            .iter()
+            .position(|(key, rt, _, _)| key == &fingerprint && *rt == runtime)
+        {
+            let entry = connections.remove(index).expect("located S3 connection");
+            let store = entry.3.clone();
+            connections.push_back(entry);
+            return Ok(store);
+        }
     }
     let store = connect()?;
+    let mut connections = CONNECTIONS.get_or_init(Mutex::default).lock().unwrap();
+    connections.retain(|(_, _, opened, _)| opened.elapsed() < Duration::from_secs(300));
+    if let Some(index) = connections
+        .iter()
+        .position(|(key, rt, _, _)| key == &fingerprint && *rt == runtime)
+    {
+        let entry = connections.remove(index).expect("located S3 connection");
+        let existing = entry.3.clone();
+        connections.push_back(entry);
+        return Ok(existing);
+    }
     if connections.len() == 32 {
         connections.pop_front();
     }
-    connections.push_back((fingerprint, Instant::now(), store.clone()));
+    connections.push_back((fingerprint, runtime, Instant::now(), store.clone()));
     Ok(store)
 }
 
@@ -319,6 +338,32 @@ mod tests {
         assert!(Arc::ptr_eq(&old, &open()?));
         std::fs::write(file.path(), b"other")?;
         assert!(!Arc::ptr_eq(&old, &open()?));
+        Ok(())
+    }
+
+    #[test]
+    fn cached_clients_are_isolated_by_tokio_runtime_id() -> Result<()> {
+        let key = b"runtime_isolation_fixture";
+        let open = || {
+            cached(
+                key,
+                |_| false,
+                || Ok(Arc::new(object_store::memory::InMemory::new())),
+            )
+        };
+        let rt1 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let first = rt1.block_on(async { open() })?;
+        let first_again = rt1.block_on(async { open() })?;
+        assert!(Arc::ptr_eq(&first, &first_again));
+        drop(rt1);
+
+        let rt2 = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let second = rt2.block_on(async { open() })?;
+        assert!(!Arc::ptr_eq(&first, &second));
         Ok(())
     }
 }

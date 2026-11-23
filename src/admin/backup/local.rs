@@ -90,6 +90,11 @@ fn pin(path: &Path) -> Result<Option<Pinned>> {
         file = open(path)?;
         snapshot = Snapshot::read_file(&mut file)?;
     }
+    if let Some(head) = &snapshot
+        && let Some(gen_lease) = parquet_snapshot::pin_generation(path, head.generation)?
+    {
+        lease = Some(gen_lease);
+    }
     file.rewind()?;
     Ok(Some(Pinned {
         file,
@@ -539,8 +544,14 @@ fn parquet(
         "local Parquet row count does not match manifest"
     );
     if let Some(schema) = schema {
+        let actual = metadata.schema();
         ensure!(
-            schema.fields().iter().eq(metadata.schema().fields().iter()),
+            schema.fields().len() == actual.fields().len()
+                && schema
+                    .fields()
+                    .iter()
+                    .zip(actual.fields())
+                    .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type()),
             "local Parquet schema does not match manifest"
         );
     }
@@ -600,4 +611,47 @@ pub(super) fn publish(staged: tempfile::TempDir, target: &Path) -> Result<()> {
     fs::rename(staged.path(), &destination)?;
     File::open(target)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+    use parquet::arrow::ArrowWriter;
+
+    #[test]
+    fn parquet_validation_allows_nullable_mismatch_after_compaction() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("part.parquet");
+        let compacted_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            compacted_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )?;
+        let mut writer = ArrowWriter::try_new(File::create(&path)?, batch.schema(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let manifest_non_null = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        parquet(File::open(&path)?, Some(2), Some(&manifest_non_null))?;
+
+        let wrong_type = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Int64, false),
+        ]);
+        assert!(parquet(File::open(&path)?, Some(2), Some(&wrong_type)).is_err());
+        Ok(())
+    }
 }

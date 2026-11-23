@@ -87,10 +87,13 @@ fn parquet_path(path: &Path) -> bool {
 async fn parquet_dir(root: &Path, relative: &Path, create: bool) -> Result<std::path::PathBuf> {
     let mut dir = root.to_owned();
     for part in relative.parent().unwrap_or(Path::new("")).components() {
+        let parent = dir.clone();
         dir.push(part.as_os_str());
         if create {
             match fs::create_dir(&dir).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    File::open(&parent).await?.sync_all().await?;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }

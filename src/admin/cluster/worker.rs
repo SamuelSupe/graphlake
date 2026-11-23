@@ -41,7 +41,42 @@ pub(super) struct Worker {
     pub(super) admission: Arc<crate::engine::Admission>,
     pub(super) shutdown: CancellationToken,
     pub(super) arc_cache: super::csr::ArcBlocks,
+    active_jobs: Arc<AtomicUsize>,
+    drained: Arc<tokio::sync::Notify>,
     metrics: Metrics,
+}
+
+pub(super) struct WorkerDrain {
+    active_jobs: Arc<AtomicUsize>,
+    drained: Arc<tokio::sync::Notify>,
+}
+
+impl WorkerDrain {
+    pub(super) async fn wait(self, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.drained.notified();
+                if self.active_jobs.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await;
+    }
+}
+
+struct ActiveJobGuard {
+    active_jobs: Arc<AtomicUsize>,
+    drained: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for ActiveJobGuard {
+    fn drop(&mut self) {
+        if self.active_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
 }
 
 pub(super) fn router(
@@ -49,8 +84,10 @@ pub(super) fn router(
     config: Config,
     source_dir: PathBuf,
     slots: usize,
-) -> (Router, CancellationToken) {
+) -> (Router, CancellationToken, WorkerDrain) {
     let shutdown = CancellationToken::new();
+    let active_jobs = Arc::new(AtomicUsize::new(0));
+    let drained = Arc::new(tokio::sync::Notify::new());
     let capacity = config.process_memory_mib / config.memory_mib;
     let reserve = usize::from(config.distributed_partitions > 0);
     let slots = slots.min(capacity - reserve);
@@ -82,6 +119,8 @@ pub(super) fn router(
         ),
         shutdown: shutdown.clone(),
         arc_cache: Default::default(),
+        active_jobs: Arc::clone(&active_jobs),
+        drained: Arc::clone(&drained),
         metrics: Metrics::new(slots),
     });
     if let Some(meter) = telemetry::meter() {
@@ -118,7 +157,14 @@ pub(super) fn router(
         .layer(DefaultBodyLimit::max(DISPATCH_LIMIT as usize))
         .layer(middleware::from_fn_with_state(worker.clone(), authenticate))
         .with_state(worker);
-    (router, shutdown)
+    (
+        router,
+        shutdown,
+        WorkerDrain {
+            active_jobs,
+            drained,
+        },
+    )
 }
 
 async fn metrics(State(worker): State<Arc<Worker>>) -> impl IntoResponse {
@@ -279,7 +325,13 @@ async fn accept(
         return Err(Error::not_found());
     }
     let span = telemetry::start_span("query", "worker", None);
+    worker.active_jobs.fetch_add(1, Ordering::AcqRel);
+    let active_guard = ActiveJobGuard {
+        active_jobs: Arc::clone(&worker.active_jobs),
+        drained: Arc::clone(&worker.drained),
+    };
     tokio::spawn(async move {
+        let _active_guard = active_guard;
         if let Some(span) = span {
             worker
                 .run(dispatch, job, slot, deadline, Some(&span))
@@ -326,7 +378,7 @@ impl Worker {
         {
             return Ok(cached.clone());
         }
-        if models.len() >= 4 {
+        if models.len() >= 32 {
             models.pop_back();
         }
         models.push_front((model.into(), revision.into(), engine.clone()));
@@ -730,6 +782,8 @@ mod tests {
             )?),
             shutdown: CancellationToken::new(),
             arc_cache: Default::default(),
+            active_jobs: Default::default(),
+            drained: Default::default(),
             metrics: Metrics::new(1),
         };
         let terminal = JobState::Done {

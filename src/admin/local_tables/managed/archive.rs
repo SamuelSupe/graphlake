@@ -8,7 +8,15 @@ use crate::admin::{cluster::control::Leadership, local_tables::store::Store};
 
 pub(in crate::admin) struct Archive {
     pub root: tempfile::TempDir,
-    _pin: Selection,
+    pin: Option<Selection>,
+}
+
+impl Archive {
+    pub(in crate::admin) async fn release(mut self) {
+        if let Some(pin) = self.pin.take() {
+            pin.release().await;
+        }
+    }
 }
 
 impl Managed {
@@ -46,7 +54,10 @@ impl Managed {
             anyhow::Ok(())
         };
         tokio::time::timeout(Duration::from_secs(4 * 3600), materialize).await??;
-        Ok(Some(Archive { root, _pin: pinned }))
+        Ok(Some(Archive {
+            root,
+            pin: Some(pinned),
+        }))
     }
 
     pub(in crate::admin) async fn restore_archive(

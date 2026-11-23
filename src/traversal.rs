@@ -744,9 +744,17 @@ fn walk_batches<'a>(
             if matches!(kind, crate::cypher::paths::Shortest::All) {
                 reservation.try_grow(topology.neighbors.len().saturating_mul(4 * size_of::<Neighbor>()))?;
             }
+        } else if matches!(kind, TraversalKind::Reachable | TraversalKind::Shortest { .. }) {
+            // BreadthFirst allocates predecessor, touched, and queue arrays proportional to N.
+            reservation.try_grow(topology.keys.num_rows().saturating_mul(64))?;
         }
-        reservation.try_grow(output.batch_size.saturating_mul(entry_bytes))?;
-        let mut depth_counts = vec![0_u64; max_hops + 1];
+        let expected_hits = if matches!(kind, TraversalKind::Shortest { .. }) {
+            1
+        } else {
+            output.batch_size
+        };
+        reservation.try_grow(expected_hits.saturating_mul(entry_bytes))?;
+        let mut depth_counts = Vec::<u64>::new();
         let mut hits = Vec::new();
         let mut work = 0;
         let mut path_bytes = 0;
@@ -763,6 +771,9 @@ fn walk_batches<'a>(
                 match walk.step(topology, max_hops) {
                     Step::Done => break,
                     Step::Visit { depth, hit } => {
+                        if depth >= depth_counts.len() {
+                            depth_counts.resize(depth + 1, 0);
+                        }
                         depth_counts[depth] += 1;
                         if let Some(hit) = hit {
                             if output.shortest.is_some() {

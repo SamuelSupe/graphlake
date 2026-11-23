@@ -127,6 +127,10 @@ pub(crate) struct RefinementBuffers {
     touched_mark: Vec<bool>,
     /// Per-layer `2 * total_weight` values.
     two_m_values: Vec<f64>,
+    /// Reusable global-node -> local-subset-index map (sized once to `node_count`).
+    node_to_local: Vec<usize>,
+    /// Reusable local refined community map (sized to `subset.nodes.len()`).
+    refined_local: Vec<usize>,
 }
 
 impl RefinementBuffers {
@@ -140,6 +144,8 @@ impl RefinementBuffers {
             touched_list: Vec::with_capacity(64),
             touched_mark: vec![false; capacity],
             two_m_values: vec![0.0; num_layers],
+            node_to_local: vec![usize::MAX; capacity],
+            refined_local: Vec::new(),
         }
     }
 
@@ -484,11 +490,14 @@ pub(crate) fn refinement_generic(
         }
         #[cfg(not(feature = "rayon"))]
         {
-            community_nodes
-                .iter()
-                .enumerate()
-                .map(|(community, nodes)| refine_fn(community, nodes, buffers))
-                .collect()
+            let mut out = Vec::with_capacity(community_nodes.len());
+            for (community, nodes) in community_nodes.iter().enumerate() {
+                if cancelled() {
+                    return refined;
+                }
+                out.push(refine_fn(community, nodes, buffers));
+            }
+            out
         }
     };
 
@@ -743,17 +752,21 @@ pub(crate) fn refine_community_generic(
     cfg: &MovingConfig,
     buffers: &mut RefinementBuffers,
 ) -> Vec<(usize, usize)> {
-    if subset.nodes.len() <= 1 {
+    let subset_len = subset.nodes.len();
+    if subset_len <= 1 || (cfg.cancelled)() {
         return Vec::new();
     }
 
     let num_layers = layers.len();
     let total_node_weight: f64 = layers[0].total_node_weight();
+    let node_count = layers[0].node_count();
 
-    let max_node_id = subset.nodes.iter().copied().max().unwrap_or(0);
-    let mut refined_map: Vec<usize> = (0..=max_node_id).collect();
-
-    buffers.resize_and_clear(max_node_id + 1, layers);
+    buffers.resize_and_clear(subset_len, layers);
+    if buffers.node_to_local.len() < node_count {
+        buffers.node_to_local.resize(node_count, usize::MAX);
+    }
+    buffers.refined_local.clear();
+    buffers.refined_local.extend(0..subset_len);
 
     // Split borrow: separate fields so the closure can read two_m_values
     // while other fields are accessed mutably through reborrow.
@@ -765,23 +778,26 @@ pub(crate) fn refine_community_generic(
     let layer_in_weights = &mut buffers.layer_in_weights;
     let touched_list = &mut buffers.touched_list;
     let touched_mark = &mut buffers.touched_mark;
+    let node_to_local = &mut buffers.node_to_local;
+    let refined_local = &mut buffers.refined_local;
 
-    for &node in subset.nodes {
+    for (local_idx, &node) in subset.nodes.iter().enumerate() {
+        node_to_local[node] = local_idx;
         for (l, layer) in layers.iter().enumerate() {
-            comm_total_degree[l][node] += layer.out_degree_of(node);
-            comm_in_degree[l][node] += layer.in_degree_of(node);
+            comm_total_degree[l][local_idx] = layer.out_degree_of(node);
+            comm_in_degree[l][local_idx] = layer.in_degree_of(node);
         }
-        comm_size[node] += layers[0].node_weight(node);
+        comm_size[local_idx] = layers[0].node_weight(node);
     }
 
     let mut k_v_out_buf: Vec<f64> = vec![0.0; num_layers];
     let mut k_v_in_buf: Vec<f64> = vec![0.0; num_layers];
 
-    for &node in subset.nodes {
+    for (local_idx, &node) in subset.nodes.iter().enumerate() {
         if (cfg.cancelled)() {
             return Vec::new();
         }
-        let current_refined = refined_map[node];
+        let current_refined = refined_local[local_idx];
 
         for l in 0..num_layers {
             layer_out_weights[l][current_refined] = 0.0;
@@ -799,7 +815,7 @@ pub(crate) fn refine_community_generic(
                 if neighbor == node {
                     continue;
                 }
-                let rc = refined_map[neighbor];
+                let rc = refined_local[node_to_local[neighbor]];
                 if layer_out_weights[l][rc] == 0.0
                     && layer_in_weights[l][rc] == 0.0
                     && rc != current_refined
@@ -820,7 +836,7 @@ pub(crate) fn refine_community_generic(
                 if neighbor == node {
                     continue;
                 }
-                let rc = refined_map[neighbor];
+                let rc = refined_local[node_to_local[neighbor]];
                 if layer_out_weights[l][rc] == 0.0
                     && layer_in_weights[l][rc] == 0.0
                     && rc != current_refined
@@ -844,7 +860,7 @@ pub(crate) fn refine_community_generic(
             current_refined,
             cfg.epsilon,
             0,
-            &comm_size[..],
+            &comm_size[..subset_len],
             node_weight,
             |target_comm| {
                 let mut total_delta = 0.0f64;
@@ -888,8 +904,8 @@ pub(crate) fn refine_community_generic(
 
         if best_refined != current_refined {
             apply_move(
-                MoveTarget::RefinedMap(&mut refined_map),
-                node,
+                MoveTarget::RefinedMap(refined_local),
+                local_idx,
                 current_refined,
                 best_refined,
                 NodeContribution {
@@ -900,7 +916,7 @@ pub(crate) fn refine_community_generic(
                 &mut CommunityStats {
                     total_degree_out: comm_total_degree,
                     in_degree_out: comm_in_degree,
-                    size: &mut comm_size[..],
+                    size: &mut comm_size[..subset_len],
                 },
             );
         }
@@ -909,9 +925,14 @@ pub(crate) fn refine_community_generic(
     subset
         .nodes
         .iter()
-        .filter_map(|&node| {
-            let rc = refined_map[node];
-            if rc != node { Some((node, rc)) } else { None }
+        .enumerate()
+        .filter_map(|(local_idx, &node)| {
+            let rc = refined_local[local_idx];
+            if rc != local_idx {
+                Some((node, subset.nodes[rc]))
+            } else {
+                None
+            }
         })
         .collect()
 }

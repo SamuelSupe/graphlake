@@ -64,6 +64,7 @@ impl PyEngine {
         }
         let runtime = Builder::new_multi_thread()
             .worker_threads(2)
+            .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()
             .map_err(runtime_error)?;

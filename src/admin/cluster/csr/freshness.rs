@@ -59,7 +59,38 @@ pub(super) async fn refresh_model(
         );
         previous
     };
+    struct BuildingGuard<'a> {
+        cluster: &'a crate::admin::cluster::Coordinator,
+        model: String,
+        revision: String,
+        failures: u32,
+        completed: bool,
+    }
+    impl Drop for BuildingGuard<'_> {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.cluster.csr_refresh.lock().unwrap().insert(
+                    self.model.clone(),
+                    RefreshStatus {
+                        attempted_at_ms: now(),
+                        status: "failed",
+                        error: Some("cancelled"),
+                        revision: self.revision.clone(),
+                        failures: self.failures.saturating_add(1),
+                    },
+                );
+            }
+        }
+    }
+    let mut guard = BuildingGuard {
+        cluster,
+        model: model.into(),
+        revision: revision.clone(),
+        failures,
+        completed: false,
+    };
     let result = build_and_publish(app, model, principal, request).await;
+    guard.completed = true;
     let (status, error, failures) = match &result {
         Ok(_) => ("succeeded", None, 0),
         Err(error) => ("failed", Some(error.code), failures.saturating_add(1)),
@@ -155,18 +186,7 @@ pub(in crate::admin) async fn watch(app: Weak<App>) {
         }
         let files = app.models.lock().unwrap().read_files();
         let models = tokio::task::spawn_blocking(move || {
-            files
-                .list(|_| Some(true))
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|m| {
-                    let (revision, _, catalog) = files.published_catalog(&m.id).ok()?;
-                    catalog
-                        .freshness
-                        .auto_refresh_csr
-                        .then_some((m.id, revision, catalog))
-                })
-                .collect::<Vec<_>>()
+            files.published_auto_refresh_csr().unwrap_or_default()
         })
         .await
         .unwrap_or_default();

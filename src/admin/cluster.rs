@@ -81,6 +81,8 @@ pub(super) struct Coordinator {
     graph_partitions: usize,
     memory_bytes: usize,
     heartbeats: Mutex<Heartbeats>,
+    dispatch_work: Arc<tokio::sync::Semaphore>,
+    dispatch_waiters: tokio::sync::Semaphore,
     csr_work: tokio::sync::Semaphore,
     csr_refresh: Mutex<std::collections::BTreeMap<String, csr::RefreshStatus>>,
 }
@@ -166,6 +168,8 @@ impl Coordinator {
                 config.local_snapshot_gc_grace_seconds,
             )
         });
+        let dispatch_slots = config.workers.len().saturating_mul(8).clamp(8, 256);
+        let dispatch_waiters = dispatch_slots.saturating_mul(2).clamp(16, 128);
         Ok(Self {
             shared,
             managed,
@@ -175,6 +179,8 @@ impl Coordinator {
             graph_partitions: config.distributed_partitions,
             memory_bytes: config.memory_mib * 1024 * 1024,
             heartbeats: Default::default(),
+            dispatch_work: Arc::new(tokio::sync::Semaphore::new(dispatch_slots)),
+            dispatch_waiters: tokio::sync::Semaphore::new(dispatch_waiters),
             csr_work: tokio::sync::Semaphore::new(1),
             csr_refresh: Default::default(),
         })
@@ -359,7 +365,16 @@ impl Coordinator {
             None
         };
         options.timeout = query::remaining(options.timeout, started)?;
-        let active = query::admit(app, id, &model, &owner, &mut options).await?;
+        let active = query::admit_with(
+            app,
+            &self.dispatch_work,
+            &self.dispatch_waiters,
+            id,
+            &model,
+            &owner,
+            &mut options,
+        )
+        .await?;
         let (_, yaml, engine) = app
             .query_model(&model, &request.model_revision, &owner)
             .await?;
@@ -420,7 +435,7 @@ impl Coordinator {
             }
             self.shared
                 .objects
-                .model(&model, &request.model_revision, yaml)
+                .ensure_model(&model, &request.model_revision, yaml)
                 .await
                 .map_err(storage)?;
             request.timeout_ms = Some(options.timeout.as_millis().max(1) as u64);
@@ -921,7 +936,7 @@ pub async fn serve_worker(
     );
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
     let addr = listener.local_addr()?;
-    let (router, shutdown) = worker::router(shared, config, source_dir, slots);
+    let (router, shutdown, drain) = worker::router(shared, config, source_dir, slots);
     eprintln!("GraphLake worker http://{addr}");
     super::telemetry::event(
         opentelemetry::logs::Severity::Info,
@@ -934,6 +949,7 @@ pub async fn serve_worker(
         .await;
     shutdown.cancel();
     signal.abort();
+    drain.wait(Duration::from_secs(10)).await;
     Ok(result?)
 }
 

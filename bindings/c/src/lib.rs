@@ -29,16 +29,23 @@ impl Iterator for Reader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let result = self.result.as_mut()?;
-        match self.runtime.block_on(result.batches.try_next()) {
-            Ok(Some(batch)) => Some(Ok(batch)),
-            completion => {
-                let _runtime = self.runtime.enter();
-                self.result.take();
-                completion
-                    .err()
-                    .map(|error| Err(ArrowError::ExternalError(Box::new(error))))
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = self.result.as_mut()?;
+            match self.runtime.block_on(result.batches.try_next()) {
+                Ok(Some(batch)) => Some(Ok(batch)),
+                completion => {
+                    let _runtime = self.runtime.enter();
+                    self.result.take();
+                    completion
+                        .err()
+                        .map(|error| Err(ArrowError::ExternalError(Box::new(error))))
+                }
             }
+        })) {
+            Ok(item) => item,
+            Err(_) => Some(Err(ArrowError::ExternalError(
+                anyhow::anyhow!("internal panic while reading Arrow stream").into(),
+            ))),
         }
     }
 }
@@ -77,26 +84,42 @@ pub unsafe extern "C" fn graphlake_engine_open(
     catalog: *const c_char,
     error: *mut *mut c_char,
 ) -> *mut GraphLakeEngine {
-    if !error.is_null() {
-        unsafe { error.write(ptr::null_mut()) };
-    }
-    let result = (|| {
-        let catalog = unsafe { input(catalog, "catalog path") }?;
-        let engine = Engine::new(Catalog::load(catalog)?)?;
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
-        Ok(GraphLakeEngine {
-            engine,
-            runtime: Arc::new(runtime),
-        })
-    })();
-    match result {
-        Ok(engine) => Box::into_raw(Box::new(engine)),
-        Err(failure) => {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !error.is_null() {
+            unsafe { error.write(ptr::null_mut()) };
+        }
+        let result = (|| {
+            let catalog = unsafe { input(catalog, "catalog path") }?;
+            let engine = Engine::new(Catalog::load(catalog)?)?;
+            let runtime = Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()?;
+            Ok(GraphLakeEngine {
+                engine,
+                runtime: Arc::new(runtime),
+            })
+        })();
+        match result {
+            Ok(engine) => Box::into_raw(Box::new(engine)),
+            Err(failure) => {
+                if !error.is_null() {
+                    unsafe { error.write(error_message(failure)) };
+                }
+                ptr::null_mut()
+            }
+        }
+    }));
+    match outcome {
+        Ok(ptr) => ptr,
+        Err(_) => {
             if !error.is_null() {
-                unsafe { error.write(error_message(failure)) };
+                unsafe {
+                    error.write(error_message(anyhow::anyhow!(
+                        "internal panic in graphlake_engine_open"
+                    )))
+                };
             }
             ptr::null_mut()
         }
@@ -174,52 +197,67 @@ pub unsafe extern "C" fn graphlake_engine_query_with_parameters(
     output: *mut FFI_ArrowArrayStream,
     error: *mut *mut c_char,
 ) -> c_int {
-    if !error.is_null() {
-        unsafe { error.write(ptr::null_mut()) };
-    }
-    let result = (|| {
-        let engine = unsafe { engine.as_ref() }.context("engine pointer is null")?;
-        ensure!(!output.is_null(), "Arrow stream pointer is null");
-        let statement = unsafe { input(statement, "statement") }?;
-        let language = match language {
-            0 => Language::Cypher,
-            1 => Language::Sql,
-            2 => Language::Gremlin,
-            _ => bail!("unsupported query language {language}"),
-        };
-        let mut options = QueryOptions::default();
-        if !graph_options.is_null() {
-            options.graph =
-                GraphOptions::from_json(unsafe { input(graph_options, "graph options") }?)?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !error.is_null() {
+            unsafe { error.write(ptr::null_mut()) };
         }
-        if !parameters.is_null() {
-            options =
-                options.with_parameters_json(unsafe { input(parameters, "Cypher parameters") }?)?;
+        let result = (|| {
+            let engine = unsafe { engine.as_ref() }.context("engine pointer is null")?;
+            ensure!(!output.is_null(), "Arrow stream pointer is null");
+            let statement = unsafe { input(statement, "statement") }?;
+            let language = match language {
+                0 => Language::Cypher,
+                1 => Language::Sql,
+                2 => Language::Gremlin,
+                _ => bail!("unsupported query language {language}"),
+            };
+            let mut options = QueryOptions::default();
+            if !graph_options.is_null() {
+                options.graph =
+                    GraphOptions::from_json(unsafe { input(graph_options, "graph options") }?)?;
+            }
+            if !parameters.is_null() {
+                options = options
+                    .with_parameters_json(unsafe { input(parameters, "Cypher parameters") }?)?;
+            }
+            if timeout_ms != 0 {
+                options.timeout = Duration::from_millis(timeout_ms);
+            }
+            if memory_bytes != 0 {
+                options.memory_bytes = memory_bytes;
+            }
+            let result = engine
+                .runtime
+                .block_on(engine.engine.query(language, statement, options))?;
+            let reader = Reader {
+                schema: result.batches.schema(),
+                result: Some(result),
+                runtime: Arc::clone(&engine.runtime),
+            };
+            Ok(FFI_ArrowArrayStream::new(Box::new(reader)))
+        })();
+        match result {
+            Ok(stream) => {
+                unsafe { output.write(stream) };
+                0
+            }
+            Err(failure) => {
+                if !error.is_null() {
+                    unsafe { error.write(error_message(failure)) };
+                }
+                1
+            }
         }
-        if timeout_ms != 0 {
-            options.timeout = Duration::from_millis(timeout_ms);
-        }
-        if memory_bytes != 0 {
-            options.memory_bytes = memory_bytes;
-        }
-        let result = engine
-            .runtime
-            .block_on(engine.engine.query(language, statement, options))?;
-        let reader = Reader {
-            schema: result.batches.schema(),
-            result: Some(result),
-            runtime: Arc::clone(&engine.runtime),
-        };
-        Ok(FFI_ArrowArrayStream::new(Box::new(reader)))
-    })();
-    match result {
-        Ok(stream) => {
-            unsafe { output.write(stream) };
-            0
-        }
-        Err(failure) => {
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
             if !error.is_null() {
-                unsafe { error.write(error_message(failure)) };
+                unsafe {
+                    error.write(error_message(anyhow::anyhow!(
+                        "internal panic in graphlake_engine_query"
+                    )))
+                };
             }
             1
         }
@@ -230,16 +268,20 @@ pub unsafe extern "C" fn graphlake_engine_query_with_parameters(
 /// The pointer is null or a live handle from graphlake_engine_open, released at most once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn graphlake_engine_close(engine: *mut GraphLakeEngine) {
-    if !engine.is_null() {
-        drop(unsafe { Box::from_raw(engine) });
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !engine.is_null() {
+            drop(unsafe { Box::from_raw(engine) });
+        }
+    }));
 }
 
 /// # Safety
 /// The pointer is null or a GraphLake error string, released at most once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn graphlake_error_free(error: *mut c_char) {
-    if !error.is_null() {
-        drop(unsafe { CString::from_raw(error) });
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !error.is_null() {
+            drop(unsafe { CString::from_raw(error) });
+        }
+    }));
 }

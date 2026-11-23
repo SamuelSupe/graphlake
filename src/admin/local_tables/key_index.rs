@@ -36,7 +36,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use super::{
-    load::writer_properties,
+    load::{staging_file, writer_properties},
     overlay::{self, Prepared},
     store::now,
 };
@@ -45,7 +45,7 @@ use crate::{
     engine::QueryScope,
     source::{
         ReadStats,
-        parquet_snapshot::{IndexedSnapshot, Part, Snapshot, row_selection},
+        parquet_snapshot::{IndexedSnapshot, MAX_DELETED, Part, Snapshot, row_selection},
     },
 };
 
@@ -53,7 +53,9 @@ use datafusion_proto::protobuf::ScalarValue as WireScalar;
 use prost::Message;
 
 mod storage;
-use storage::{generation, open, set_generation};
+use storage::{
+    checkpoint_truncate, generation, is_corrupt, open, reset, scratch_file, set_generation,
+};
 
 pub(super) fn supports(schema: &Schema, keys: &[String], signed: bool) -> bool {
     !keys.is_empty()
@@ -112,6 +114,25 @@ pub(super) fn full(
     run_id: Uuid,
     scope: &QueryScope,
 ) -> Result<()> {
+    match full_inner(anchor, managed, file, keys, column, value, run_id, scope) {
+        Err(error) if is_corrupt(&error) => {
+            reset(anchor, managed)?;
+            full_inner(anchor, managed, file, keys, column, value, run_id, scope)
+        }
+        result => result,
+    }
+}
+
+fn full_inner(
+    anchor: &Path,
+    managed: bool,
+    file: &NamedTempFile,
+    keys: &[String],
+    column: &str,
+    value: &ScalarValue,
+    run_id: Uuid,
+    scope: &QueryScope,
+) -> Result<()> {
     let data = counted(file.reopen()?, scope);
     let meta = ArrowReaderMetadata::load(&data, ArrowReaderOptions::new())?;
     let part = Part {
@@ -129,19 +150,24 @@ pub(super) fn full(
     };
     let mut conn = open(anchor, managed, scope)?;
     let tx = conn.transaction()?;
-    tx.execute("DELETE FROM position", [])?;
+    tx.execute_batch("DROP INDEX IF EXISTS position_part; DELETE FROM position;")?;
     insert_file(&tx, &part, data, keys, scope)?;
+    tx.execute(
+        "CREATE INDEX IF NOT EXISTS position_part ON position(part)",
+        [],
+    )?;
     let staged = Prepared {
         snapshot,
         staged: Vec::new(),
         anchor_part: None,
     };
-    let written = overlay::publish(anchor, file, &staged, scope, || {
+    let written = overlay::publish(anchor, Some(file), &staged, scope, || {
         set_generation(&tx, staged.snapshot.generation)?;
         tx.commit()?;
         Ok(())
     })?;
     ensure!(written, "could not publish indexed local snapshot");
+    checkpoint_truncate(&conn);
     Ok(())
 }
 
@@ -154,15 +180,13 @@ pub(super) fn compact(
     deleted: Option<&str>,
     scope: &QueryScope,
 ) -> Result<u64> {
-    let scratch = tempfile::Builder::new()
-        .prefix(".sync-")
-        .tempfile_in(anchor.parent().context("local table directory")?)?;
+    let scratch = scratch_file()?;
     let mut index = rusqlite::Connection::open(scratch.path())?;
     let cache_kib = (scope.options.memory_bytes / 8192).clamp(32, 8192);
     let batch_size = scope.options.batch_size.min(128);
     index.pragma_update(None, "cache_size", -(cache_kib as i64))?;
     index.execute_batch(
-        "PRAGMA journal_mode=OFF;
+        "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
          CREATE TABLE incoming (key BLOB PRIMARY KEY) WITHOUT ROWID;",
     )?;
     let memory = MemoryConsumer::new("local table compaction").register(&scope.runtime.memory_pool);
@@ -194,8 +218,19 @@ pub(super) fn compact(
     }
     tx.commit()?;
     let mut contains = index.prepare("SELECT 1 FROM incoming WHERE key = ?")?;
-    let mut writer =
-        ArrowWriter::try_new(output, metadata.schema().clone(), Some(writer_properties()))?;
+    // A previous snapshot may contain NULLs in a column that the latest source
+    // schema declares non-null. Normalize fields to nullable before writing so
+    // ArrowWriter preserves all historical NULLs instead of writing raw buffers.
+    let output_schema = Arc::new(Schema::new_with_metadata(
+        metadata
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+        metadata.schema().metadata().clone(),
+    ));
+    let mut writer = ArrowWriter::try_new(output, output_schema, Some(writer_properties()))?;
     let mut total = 0;
     let mut append = |batch: RecordBatch| -> Result<()> {
         total += batch.num_rows() as u64;
@@ -272,6 +307,7 @@ pub(super) fn compact(
 }
 
 /// None means the batch cannot be published within the existing overlay bounds.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn incremental(
     anchor: &Path,
     managed: bool,
@@ -280,6 +316,51 @@ pub(super) fn incremental(
     keys: &[String],
     column: &str,
     value: &ScalarValue,
+    deleted_column: Option<&str>,
+    run_id: Uuid,
+    scope: &QueryScope,
+) -> Result<Option<u64>> {
+    match incremental_inner(
+        anchor,
+        managed,
+        previous,
+        file,
+        keys,
+        column,
+        value,
+        deleted_column,
+        run_id,
+        scope,
+    ) {
+        Err(error) if is_corrupt(&error) => {
+            reset(anchor, managed)?;
+            incremental_inner(
+                anchor,
+                managed,
+                previous,
+                file,
+                keys,
+                column,
+                value,
+                deleted_column,
+                run_id,
+                scope,
+            )
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn incremental_inner(
+    anchor: &Path,
+    managed: bool,
+    previous: Option<&Snapshot>,
+    file: &NamedTempFile,
+    keys: &[String],
+    column: &str,
+    value: &ScalarValue,
+    deleted_column: Option<&str>,
     run_id: Uuid,
     scope: &QueryScope,
 ) -> Result<Option<u64>> {
@@ -325,8 +406,9 @@ pub(super) fn incremental(
         })
         .optional()?;
     let old = previous.map(|snapshot| generation(snapshot.generation));
-    if old.is_none() || cached != old {
-        tx.execute("DELETE FROM position", [])?;
+    let rebuilt = old.is_none() || cached != old;
+    if rebuilt {
+        tx.execute_batch("DROP INDEX IF EXISTS position_part; DELETE FROM position;")?;
         for part in &parts {
             let path = if first {
                 anchor.to_owned()
@@ -335,93 +417,185 @@ pub(super) fn incremental(
             };
             insert_file(&tx, part, counted(File::open(path)?, scope), keys, scope)?;
         }
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS position_part ON position(part)",
+            [],
+        )?;
     }
 
     let memory = datafusion::execution::memory_pool::MemoryConsumer::new("GraphLake indexed delta")
         .register(&scope.runtime.memory_pool);
-    let mut batches = Vec::new();
-    for batch in ParquetRecordBatchReaderBuilder::new_with_metadata(data, delta_meta.clone())
-        .with_batch_size(scope.options.batch_size)
-        .build()?
-    {
-        scope.check()?;
-        let batch = batch?;
-        memory.try_grow(batch.get_array_memory_size())?;
-        batches.push(batch);
-    }
-    let delta = datafusion::arrow::compute::concat_batches(delta_meta.schema(), &batches)?;
-    memory.try_grow(delta.get_array_memory_size())?;
-    drop(batches);
-    let encoded = Codec::new(delta.schema().as_ref(), keys)?.rows(&delta)?;
-    let mut touched: BTreeMap<Uuid, BTreeMap<usize, usize>> = BTreeMap::new();
-    let mut same = previous
+    let watermark_unchanged = previous
         .and_then(|snapshot| snapshot.indexed.as_ref())
         .map(checkpoint)
         .transpose()?
         .is_none_or(|bound| &bound == value);
+    let mut same = watermark_unchanged;
+
+    // Read only key columns (plus optional deleted_column) to avoid decompressing
+    // and buffering full payload columns on normal incremental updates.
+    let mut projected_roots: Vec<usize> = keys
+        .iter()
+        .map(|name| delta_meta.schema().index_of(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(del_col) = deleted_column {
+        let del_index = delta_meta.schema().index_of(del_col)?;
+        if !projected_roots.contains(&del_index) {
+            projected_roots.push(del_index);
+        }
+    }
+    let projection = ProjectionMask::roots(delta_meta.parquet_schema(), projected_roots);
+    let key_reader = ParquetRecordBatchReaderBuilder::new_with_metadata(data, delta_meta.clone())
+        .with_projection(projection)
+        .with_batch_size(scope.options.batch_size)
+        .build()?;
+    let key_codec = Codec::new(key_reader.schema().as_ref(), keys)?;
+
+    let mut touched: BTreeMap<Uuid, BTreeMap<usize, usize>> = BTreeMap::new();
+    let mut tombstone_keys: Vec<Vec<u8>> = Vec::new();
+    let mut live_count = 0usize;
+    let mut row_offset = 0usize;
     {
         let mut lookup = tx.prepare("SELECT part, row FROM position WHERE key = ?")?;
-        for (index, key) in encoded.iter().enumerate() {
+        for batch in key_reader {
             scope.check()?;
-            let previous = lookup
-                .query_row([key.as_ref()], |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-                })
-                .optional()?;
-            if let Some((part, row)) = previous {
-                ensure!(
-                    touched
-                        .entry(Uuid::from_slice(&part)?)
-                        .or_default()
-                        .insert(usize::try_from(row)?, index)
-                        .is_none(),
-                    "invalid duplicate position in local key index"
-                );
+            let batch = batch?;
+            let encoded = key_codec.rows(&batch)?;
+            let marks = if let Some(del_col) = deleted_column {
+                let marks = cast(
+                    batch
+                        .column_by_name(del_col)
+                        .context("missing deletion column")?,
+                    &DataType::Boolean,
+                )?;
+                Some(marks)
             } else {
-                same = false;
+                None
+            };
+            let marks_bool = marks
+                .as_ref()
+                .map(|m| {
+                    m.as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .context("invalid deletion column")
+                })
+                .transpose()?;
+            for (local_i, key) in encoded.iter().enumerate() {
+                scope.check()?;
+                let index = row_offset + local_i;
+                let prev = lookup
+                    .query_row([key.as_ref()], |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .optional()?;
+                let is_tombstone = marks_bool.is_some_and(|m| m.value(local_i));
+                if let Some((part, row)) = prev {
+                    memory.try_grow(48)?;
+                    ensure!(
+                        touched
+                            .entry(Uuid::from_slice(&part)?)
+                            .or_default()
+                            .insert(usize::try_from(row)?, index)
+                            .is_none(),
+                        "invalid duplicate position in local key index"
+                    );
+                    if is_tombstone {
+                        same = false;
+                    }
+                } else if !is_tombstone {
+                    same = false;
+                }
+                if is_tombstone {
+                    memory.try_grow(key.as_ref().len() + std::mem::size_of::<Vec<u8>>())?;
+                    tombstone_keys.push(key.as_ref().to_vec());
+                } else {
+                    live_count += 1;
+                }
+            }
+            row_offset += batch.num_rows();
+        }
+    }
+
+    // Only read full payload columns if watermark did not advance and every
+    // incoming key matched an existing live row.
+    if same {
+        let full_memory = memory.new_empty();
+        let mut batches = Vec::new();
+        let mut total_bytes = 0usize;
+        for batch in ParquetRecordBatchReaderBuilder::new_with_metadata(
+            counted(file.reopen()?, scope),
+            delta_meta.clone(),
+        )
+        .with_batch_size(scope.options.batch_size)
+        .build()?
+        {
+            scope.check()?;
+            let batch = batch?;
+            let bytes = batch.get_array_memory_size();
+            total_bytes = total_bytes.saturating_add(bytes);
+            full_memory.try_grow(bytes)?;
+            batches.push(batch);
+        }
+        full_memory.try_grow(total_bytes)?;
+        let delta = datafusion::arrow::compute::concat_batches(delta_meta.schema(), &batches)?;
+        drop(batches);
+        full_memory.shrink(total_bytes);
+        let encoded = Codec::new(delta.schema().as_ref(), keys)?.rows(&delta)?;
+        full_memory.try_grow(encoded.size())?;
+        for part in &parts {
+            let Some(rows) = touched.get(&part.id) else {
+                continue;
+            };
+            scope.check()?;
+            let selected = points(part, rows)?;
+            if same {
+                let path = if first {
+                    anchor.to_owned()
+                } else {
+                    part.path(anchor)
+                };
+                let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+                    counted(File::open(path)?, scope),
+                    ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+                )?
+                .with_row_selection(selected)
+                .with_batch_size(scope.options.batch_size)
+                .build()?;
+                let mut positions = rows.values();
+                let codec = Codec::new(reader.schema().as_ref(), keys)?;
+                for batch in reader {
+                    scope.check()?;
+                    let batch = batch?;
+                    let old_keys = codec.rows(&batch)?;
+                    for (i, key) in old_keys.iter().enumerate() {
+                        let j = *positions
+                            .next()
+                            .context("invalid local key index selection")?;
+                        ensure!(
+                            key.as_ref() == encoded.row(j).as_ref(),
+                            "local key index position changed"
+                        );
+                        same &= equal_row(&batch, i, &delta, j);
+                    }
+                }
+                ensure!(
+                    positions.next().is_none(),
+                    "incomplete local key index selection"
+                );
             }
         }
     }
+
     let mut matched = 0;
     for part in &mut parts {
         let Some(rows) = touched.get(&part.id) else {
             continue;
         };
         scope.check()?;
-        let selected = points(part, rows)?;
-        if same {
-            let path = if first {
-                anchor.to_owned()
-            } else {
-                part.path(anchor)
-            };
-            let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
-                counted(File::open(path)?, scope),
-                ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
-            )?
-            .with_row_selection(selected)
-            .with_batch_size(scope.options.batch_size)
-            .build()?;
-            let mut positions = rows.values();
-            let codec = Codec::new(reader.schema().as_ref(), keys)?;
-            for batch in reader {
-                scope.check()?;
-                let batch = batch?;
-                let old_keys = codec.rows(&batch)?;
-                for (i, key) in old_keys.iter().enumerate() {
-                    let j = *positions
-                        .next()
-                        .context("invalid local key index selection")?;
-                    ensure!(
-                        key.as_ref() == encoded.row(j).as_ref(),
-                        "local key index position changed"
-                    );
-                    same &= equal_row(&batch, i, &delta, j);
-                }
-            }
+        for &row in rows.keys() {
             ensure!(
-                positions.next().is_none(),
-                "incomplete local key index selection"
+                row < part.rows && part.deleted.binary_search(&row).is_err(),
+                "local key index points to a nonvisible row"
             );
         }
         matched += rows.len();
@@ -434,23 +608,117 @@ pub(super) fn incremental(
     );
     if same {
         if let Some(previous) = previous {
-            set_generation(&tx, previous.generation)?;
-            tx.commit()?;
+            if rebuilt {
+                set_generation(&tx, previous.generation)?;
+                tx.commit()?;
+            }
             return Ok(Some(previous.rows()));
         }
         return Ok(None);
     }
-    drop(encoded);
-    drop(delta);
-    drop(memory);
+    drop(touched);
     let anchor_part = first.then(|| parts[0].id);
+
+    // Pure soft-delete batch (0 surviving incoming rows): mark tombstones in
+    // existing parts and advance the manifest watermark without rewriting base.
+    if deleted_column.is_some() && live_count == 0 {
+        if matched == 0
+            && watermark_unchanged
+            && let Some(previous) = previous
+        {
+            if rebuilt {
+                set_generation(&tx, previous.generation)?;
+                tx.commit()?;
+            }
+            return Ok(Some(previous.rows()));
+        }
+        let total_deleted: usize = parts.iter().map(|part| part.deleted.len()).sum();
+        if total_deleted > MAX_DELETED {
+            return Ok(None);
+        }
+        let prepared = Prepared {
+            snapshot: Snapshot {
+                generation: Uuid::new_v4(),
+                base_parts,
+                parts,
+                pruning: None,
+                indexed: Some(indexed(delta_meta.schema(), keys, column, value, run_id)?),
+            },
+            staged: Vec::new(),
+            anchor_part,
+        };
+        let committed = overlay::publish(anchor, None, &prepared, scope, || {
+            let mut remove = tx.prepare("DELETE FROM position WHERE key = ?")?;
+            for key in &tombstone_keys {
+                remove.execute([key.as_slice()])?;
+            }
+            drop(remove);
+            set_generation(&tx, prepared.snapshot.generation)?;
+            tx.commit()?;
+            Ok(())
+        })?;
+        return Ok(committed.then(|| prepared.snapshot.rows()));
+    }
+
+    // If soft-delete tombstones exist alongside live upserts, filter them out
+    // into a clean live delta file before passing to overlay::finish.
+    let filtered_live: Option<(NamedTempFile, ArrowReaderMetadata)> =
+        if let Some(del_col) = deleted_column {
+            let live_file = staging_file(anchor.parent().context("local table directory")?)?;
+            let mut writer = ArrowWriter::try_new(
+                live_file.reopen()?,
+                delta_meta.schema().clone(),
+                Some(writer_properties()),
+            )?;
+            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+                counted(file.reopen()?, scope),
+                delta_meta.clone(),
+            )
+            .with_batch_size(scope.options.batch_size)
+            .build()?;
+            for batch in reader {
+                scope.check()?;
+                let batch = batch?;
+                let marks = cast(
+                    batch
+                        .column_by_name(del_col)
+                        .context("missing deletion column")?,
+                    &DataType::Boolean,
+                )?;
+                let marks = marks
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .context("invalid deletion column")?;
+                let kept = filter_record_batch(&batch, &not(marks)?)?;
+                if kept.num_rows() > 0 {
+                    writer.write(&kept)?;
+                    if writer.memory_size() > scope.options.memory_bytes / 8 {
+                        writer.flush()?;
+                    }
+                }
+            }
+            writer.close()?;
+            let meta = ArrowReaderMetadata::load(
+                &counted(live_file.reopen()?, scope),
+                ArrowReaderOptions::new(),
+            )?;
+            Some((live_file, meta))
+        } else {
+            None
+        };
+    let (append_file, append_meta) = match &filtered_live {
+        Some((live_file, live_meta)) => (live_file, live_meta),
+        None => (file, &delta_meta),
+    };
+
+    drop(memory);
     let Some(mut prepared) = overlay::finish(
         anchor,
         anchor_part,
         parts,
         base_parts,
-        file.reopen()?,
-        &delta_meta,
+        append_file.reopen()?,
+        append_meta,
         None,
         scope,
     )?
@@ -463,7 +731,7 @@ pub(super) fn incremental(
             .reads
             .local_parquet_write(file.as_file().metadata()?.len());
     }
-    let committed = overlay::publish(anchor, file, &prepared, scope, || {
+    let committed = overlay::publish(anchor, Some(append_file), &prepared, scope, || {
         let old_ids = anchor_part.into_iter().chain(
             previous
                 .into_iter()
@@ -475,6 +743,12 @@ pub(super) fn incremental(
                     "DELETE FROM position WHERE part = ?",
                     [id.as_bytes().as_slice()],
                 )?;
+            }
+        }
+        if !tombstone_keys.is_empty() {
+            let mut remove = tx.prepare("DELETE FROM position WHERE key = ?")?;
+            for key in &tombstone_keys {
+                remove.execute([key.as_slice()])?;
             }
         }
         for (id, staged) in &prepared.staged {
@@ -492,7 +766,13 @@ pub(super) fn incremental(
             .last()
             .context("missing incoming local snapshot part")?;
         if !prepared.staged.iter().any(|(id, _)| *id == tail.id) {
-            insert_file(&tx, tail, counted(file.reopen()?, scope), keys, scope)?;
+            insert_file(
+                &tx,
+                tail,
+                counted(append_file.reopen()?, scope),
+                keys,
+                scope,
+            )?;
         }
         set_generation(&tx, prepared.snapshot.generation)?;
         tx.commit()?;

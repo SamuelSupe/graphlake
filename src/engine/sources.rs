@@ -633,11 +633,16 @@ pub(super) async fn prepare<'a, 'q>(
                         .with_context(|| format!("opening Delta table {reference}"))?,
                     ),
                 };
+                let version_str = version.to_string();
+                file_versions = Some(vec![(
+                    format!("delta:{reference}:{}", mapping.path),
+                    version_str.clone(),
+                )]);
                 versions.insert(
                     reference.into(),
                     SourceVersion {
                         source: reference.into(),
-                        version: version.to_string(),
+                        version: version_str,
                         consistency: SourceConsistency::Delta.label(),
                     },
                 );
@@ -671,6 +676,10 @@ pub(super) async fn prepare<'a, 'q>(
                     Arc::clone(&scope.reads),
                 )
                 .await?;
+                file_versions = Some(vec![(
+                    format!("iceberg:{uri}:{reference}"),
+                    version.version.clone(),
+                )]);
                 versions.insert(reference.into(), version);
                 Arc::new(table)
             }

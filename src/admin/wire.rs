@@ -114,6 +114,7 @@ struct Rows {
     batch: Option<RecordBatch>,
     offset: usize,
     prefetched_paths: entities::Hydrated,
+    encoded: bytes::BytesMut,
     finished: bool,
     columns: Vec<String>,
     revision: String,
@@ -317,6 +318,7 @@ async fn execute_inner(
         batch: None,
         offset: 0,
         prefetched_paths: Default::default(),
+        encoded: bytes::BytesMut::new(),
         finished: false,
         columns,
         revision,
@@ -447,11 +449,11 @@ impl Rows {
             }
             values
         };
-        let mut encoded = bytes::BytesMut::new();
+        self.encoded.clear();
         for value in &values {
-            encode_value(&mut encoded, value);
+            encode_value(&mut self.encoded, value);
         }
-        if encoded.len() > ROW_BYTES {
+        if self.encoded.len() > ROW_BYTES {
             return Err(result_limit());
         }
         self.offset += 1;

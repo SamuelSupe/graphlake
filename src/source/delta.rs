@@ -134,7 +134,7 @@ pub(crate) async fn open_cached(
         {
             let mut entries = cache.0.lock().unwrap();
             entries.retain(|entry| !matches(entry));
-            if entries.len() == 4 {
+            if entries.len() == 32 {
                 entries.pop_front();
             }
             entries.push_back(CachedSnapshot {

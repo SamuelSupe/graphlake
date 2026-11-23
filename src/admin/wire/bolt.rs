@@ -231,19 +231,22 @@ impl BoltBackend for Backend {
         property: SessionProperty,
     ) -> Result<(), BoltError> {
         let SessionProperty::Database(model) = property;
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.get_mut(handle).ok_or_else(closed)?;
-        let target = session.target(&self.app)?;
-        if session
-            .transaction
-            .as_ref()
-            .is_some_and(|tx| tx.model != model)
-        {
-            return Err(transaction_error());
-        }
-        if !super::super::access::query_allowed(&self.app, &target.principal, &model) {
+        let principal = {
+            let sessions = self.sessions.lock().unwrap();
+            let session = sessions.get(handle).ok_or_else(closed)?;
+            let target = session.target(&self.app)?;
+            if session
+                .transaction
+                .as_ref()
+                .is_some_and(|tx| tx.model != model)
+            {
+                return Err(transaction_error());
+            }
+            target.principal
+        };
+        if !super::super::access::query_allowed(&self.app, &principal, &model) {
             self.app.access.record(
-                Some(&target.principal),
+                Some(&principal),
                 "bolt",
                 "select_model",
                 Some(&model),
@@ -251,6 +254,15 @@ impl BoltBackend for Backend {
                 403,
             );
             return Err(query_error(super::super::access::forbidden()));
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(handle).ok_or_else(closed)?;
+        if session
+            .transaction
+            .as_ref()
+            .is_some_and(|tx| tx.model != model)
+        {
+            return Err(transaction_error());
         }
         session.model = model;
         Ok(())

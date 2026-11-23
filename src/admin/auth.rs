@@ -602,11 +602,22 @@ impl Auth {
     ) -> super::ApiResult<i64> {
         use super::cluster::control;
         let saved = shared.leader.get::<SharedSessions>("sessions").await?;
-        let Some((sessions, current)) =
-            saved.filter(|(saved, _)| saved.password_version == shared.password_version)
-        else {
-            shared.leader.retire();
-            return Err(control::lost());
+        let (sessions, current) = match saved {
+            Some((saved, current)) if saved.password_version == shared.password_version => {
+                (saved, current)
+            }
+            Some(_) => {
+                shared.leader.retire();
+                return Err(control::lost());
+            }
+            None => (
+                SharedSessions {
+                    password_version: shared.password_version,
+                    tokens: Vec::new(),
+                    user_tokens: Vec::new(),
+                },
+                0,
+            ),
         };
         let current = if shared.write_uncertain.load(Ordering::Acquire) {
             // Fencing the observed revision prevents a delayed logout or

@@ -289,20 +289,23 @@ async fn pagerank(
             chunk.fill(base);
             tokio::task::yield_now().await;
         }
+        let mut work = 0usize;
         for (vertex, range) in graph.offsets.windows(2).enumerate() {
             let neighbors = &graph.neighbors[range[0]..range[1]];
             if !neighbors.is_empty() {
                 let share = damping * ranks[vertex] / neighbors.len() as f64;
-                for (chunk_index, chunk) in neighbors.chunks(COOPERATIVE_INTERVAL).enumerate() {
-                    for neighbor in chunk {
-                        next[neighbor.vertex] += share;
-                    }
-                    if chunk_index > 0 || chunk.len() == COOPERATIVE_INTERVAL {
+                for neighbor in neighbors {
+                    next[neighbor.vertex] += share;
+                    work += 1;
+                    if work == COOPERATIVE_INTERVAL {
+                        work = 0;
                         tokio::task::yield_now().await;
                     }
                 }
             }
-            if vertex % COOPERATIVE_INTERVAL == 0 {
+            work += 1;
+            if work >= COOPERATIVE_INTERVAL {
+                work = 0;
                 tokio::task::yield_now().await;
             }
         }
@@ -330,28 +333,27 @@ async fn weak_components(graph: &Topology) -> (Vec<usize>, usize) {
     let n = graph.keys.num_rows();
     let mut parents = (0..n).collect::<Vec<_>>();
     let mut sizes = vec![1_usize; n];
+    let mut work = 0usize;
     for (from, range) in graph.offsets.windows(2).enumerate() {
-        for (chunk_index, chunk) in graph.neighbors[range[0]..range[1]]
-            .chunks(COOPERATIVE_INTERVAL)
-            .enumerate()
-        {
-            for neighbor in chunk {
-                let mut a = root(&mut parents, from);
-                let mut b = root(&mut parents, neighbor.vertex);
-                if a == b {
-                    continue;
-                }
+        for neighbor in &graph.neighbors[range[0]..range[1]] {
+            let mut a = root(&mut parents, from);
+            let mut b = root(&mut parents, neighbor.vertex);
+            if a != b {
                 if sizes[a] < sizes[b] {
                     std::mem::swap(&mut a, &mut b);
                 }
                 parents[b] = a;
                 sizes[a] += sizes[b];
             }
-            if chunk_index > 0 || chunk.len() == COOPERATIVE_INTERVAL {
+            work += 1;
+            if work == COOPERATIVE_INTERVAL {
+                work = 0;
                 tokio::task::yield_now().await;
             }
         }
-        if from % COOPERATIVE_INTERVAL == 0 {
+        work += 1;
+        if work >= COOPERATIVE_INTERVAL {
+            work = 0;
             tokio::task::yield_now().await;
         }
     }

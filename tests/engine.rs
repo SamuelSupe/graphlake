@@ -851,3 +851,136 @@ async fn persisted_csr_keeps_old_readers_and_recovers_from_failed_refresh() -> R
     assert_eq!(rows(&mut recovered).await?.len(), 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn gremlin_repeat_project_emit_rejects_excessive_nesting() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let err = engine
+        .query(
+            Language::Gremlin,
+            "g.V().repeat(__.project('a')).emit()",
+            QueryOptions::default(),
+        )
+        .await
+        .err()
+        .expect("unbounded repeat(project) must be rejected before exponential nesting");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("nesting") || msg.contains("limit") || msg.contains("depth"),
+        "unexpected error: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cypher_reduce_concat_and_array_concat_respect_memory_budget() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let tight = QueryOptions {
+        memory_bytes: 2 * 1024 * 1024,
+        ..Default::default()
+    };
+
+    // 1. Exponential Utf8View/struct doubling in Cypher reduce() must hit the memory pool.
+    let reduce_attempt = async {
+        let mut r = engine
+            .query(
+                Language::Cypher,
+                "RETURN size(reduce(acc = {s: 'aaaaaaaa'}, i IN range(1, 26) | {s: acc.s + acc.s}).s) AS n",
+                tight.clone(),
+            )
+            .await?;
+        rows(&mut r).await
+    }
+    .await;
+    assert!(
+        reduce_attempt.is_err(),
+        "exponential reduce() bypassed memory_bytes budget"
+    );
+
+    // 2. Chained Cypher `+` string doubling must hit the memory pool.
+    let add_query = "WITH 'aaaaaaaa' AS s \
+        WITH s+s AS s WITH s+s AS s WITH s+s AS s WITH s+s AS s WITH s+s AS s \
+        WITH s+s AS s WITH s+s AS s WITH s+s AS s WITH s+s AS s WITH s+s AS s \
+        WITH s+s AS s WITH s+s AS s WITH s+s AS s WITH s+s AS s WITH s+s AS s \
+        WITH s+s AS s WITH s+s AS s WITH s+s AS s WITH s+s AS s WITH s+s AS s \
+        RETURN size(s) AS n";
+    let add_attempt = async {
+        let mut r = engine
+            .query(Language::Cypher, add_query, tight.clone())
+            .await?;
+        rows(&mut r).await
+    }
+    .await;
+    assert!(
+        add_attempt.is_err(),
+        "chained Cypher string doubling bypassed memory_bytes budget"
+    );
+
+    // 3. SQL array_concat exponential list doubling must hit the memory pool.
+    let array_sql = "WITH a0 AS (SELECT range(0, 256) AS a), \
+        a1 AS (SELECT array_concat(a, a) AS a FROM a0), \
+        a2 AS (SELECT array_concat(a, a) AS a FROM a1), \
+        a3 AS (SELECT array_concat(a, a) AS a FROM a2), \
+        a4 AS (SELECT array_concat(a, a) AS a FROM a3), \
+        a5 AS (SELECT array_concat(a, a) AS a FROM a4), \
+        a6 AS (SELECT array_concat(a, a) AS a FROM a5), \
+        a7 AS (SELECT array_concat(a, a) AS a FROM a6), \
+        a8 AS (SELECT array_concat(a, a) AS a FROM a7), \
+        a9 AS (SELECT array_concat(a, a) AS a FROM a8), \
+        a10 AS (SELECT array_concat(a, a) AS a FROM a9), \
+        a11 AS (SELECT array_concat(a, a) AS a FROM a10), \
+        a12 AS (SELECT array_concat(a, a) AS a FROM a11) \
+        SELECT array_length(a) AS n FROM a12";
+    let array_attempt = async {
+        let mut r = engine.query(Language::Sql, array_sql, tight).await?;
+        rows(&mut r).await
+    }
+    .await;
+    assert!(
+        array_attempt.is_err(),
+        "exponential SQL array_concat bypassed memory_bytes budget"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cypher_in_list_fast_path_preserves_three_valued_logic_and_nan() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let options = QueryOptions::default().with_parameters_json(
+        &serde_json::json!({
+            "with_null": [1, serde_json::Value::Null, 3],
+            "empty": [],
+        })
+        .to_string(),
+    )?;
+
+    let mut r = engine
+        .query(
+            Language::Cypher,
+            "WITH range(1, 5000) AS big \
+             RETURN \
+             (null IN $empty) AS null_empty, \
+             ((null IN big) IS NULL) AS null_nonempty_is_null, \
+             (42 IN big) AS hit_big, \
+             (9999 IN big) AS miss_big, \
+             (1 IN $with_null) AS hit_with_null, \
+             ((2 IN $with_null) IS NULL) AS miss_with_null_is_null, \
+             ((0.0 / 0.0) IN [0.0 / 0.0, 1.0]) AS nan_in_nan",
+            options,
+        )
+        .await?;
+    let out = rows(&mut r).await?;
+    assert_eq!(
+        out,
+        vec![serde_json::json!({
+            "null_empty": false,
+            "null_nonempty_is_null": true,
+            "hit_big": true,
+            "miss_big": false,
+            "hit_with_null": true,
+            "miss_with_null_is_null": true,
+            "nan_in_nan": false,
+        })]
+    );
+    Ok(())
+}

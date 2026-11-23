@@ -16,7 +16,11 @@ use hdbconnect_async::{
 };
 
 use super::{ReadStats, collect_rows, credential, types::numeric};
-use crate::{Predicate, Source, catalog::ident, engine::read_filters::where_clause};
+use crate::{
+    Predicate, Source,
+    catalog::ident,
+    engine::read_filters::{needs_sql_types, where_clause},
+};
 
 pub(crate) struct Hana {
     connection: Connection,
@@ -106,7 +110,7 @@ impl Hana {
         };
         let mut sql = format!("SELECT {selected} FROM {relation}");
         let version = uuid::Uuid::new_v4().to_string();
-        let expected = if explain_only || !filters.is_empty() {
+        let expected = if explain_only || needs_sql_types(filters) {
             let (schema, result) = self.query(format!("{sql} WHERE 1 = 0"), columns).await?;
             let (table, budget) = collect_rows(
                 rows(result),

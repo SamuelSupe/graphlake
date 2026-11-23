@@ -1,16 +1,21 @@
 mod maintenance;
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::Path,
+    time::Duration,
 };
 
 use anyhow::{Result, ensure};
-use datafusion::arrow::{
-    array::{Array, Int64Array},
-    compute::cast,
-    datatypes::{DataType, Schema},
+use datafusion::{
+    arrow::{
+        array::{Array, Int64Array},
+        compute::cast,
+        datatypes::{DataType, Schema},
+    },
+    execution::memory_pool::MemoryConsumer,
 };
 use parquet::{
     arrow::{
@@ -30,8 +35,8 @@ use super::{
 use crate::{
     engine::QueryScope,
     source::parquet_snapshot::{
-        MAX_BASE_PARTS, MAX_DELETED, MAX_DELTA_PARTS, Part, Snapshot, SnapshotPruning, parts_dir,
-        reader_lock, row_selection,
+        MAX_BASE_PARTS, MAX_DELETED, MAX_DELTA_PARTS, Part, Snapshot, SnapshotPruning,
+        generation_lock, locks_dir, parts_dir, reader_lock, row_selection,
     },
 };
 
@@ -58,7 +63,11 @@ pub(super) fn prepare(
     let Some(leaf) = key_leaf(delta_meta.parquet_schema(), key) else {
         return Ok(None);
     };
-    let mut keys = Vec::with_capacity(row_count(&delta_meta)?);
+    let count = row_count(&delta_meta)?;
+    let memory =
+        MemoryConsumer::new("local table overlay prepare").register(&scope.runtime.memory_pool);
+    memory.try_grow(count.saturating_mul(std::mem::size_of::<i64>()))?;
+    let mut keys = Vec::with_capacity(count);
     let projection = ProjectionMask::leaves(delta_meta.parquet_schema(), [leaf]);
     for batch in
         ParquetRecordBatchReaderBuilder::new_with_metadata(delta.try_clone()?, delta_meta.clone())
@@ -132,6 +141,7 @@ pub(super) fn prepare(
                 let array = cast(batch?.column(0), &DataType::Int64)?;
                 for value in integers(array.as_ref())?.values() {
                     if keys.binary_search(value).is_ok() {
+                        memory.try_grow(std::mem::size_of::<usize>())?;
                         part.deleted.push(row);
                     }
                     row += 1;
@@ -362,7 +372,7 @@ fn integers(array: &dyn Array) -> Result<&Int64Array> {
 
 pub(super) fn publish(
     anchor: &Path,
-    delta: &NamedTempFile,
+    delta: Option<&NamedTempFile>,
     prepared: &Prepared,
     scope: &QueryScope,
     before_manifest: impl FnOnce() -> Result<()>,
@@ -389,9 +399,10 @@ pub(super) fn publish(
             Err(error) => return Err(error.into()),
         }
     }
-    let latest = snapshot.parts.last().expect("incoming part");
-    let incoming =
-        (!prepared.staged.iter().any(|(id, _)| *id == latest.id)).then_some((latest.id, delta));
+    let incoming = delta.and_then(|delta| {
+        let latest = snapshot.parts.last()?;
+        (!prepared.staged.iter().any(|(id, _)| *id == latest.id)).then_some((latest.id, delta))
+    });
     for (id, file) in prepared
         .staged
         .iter()
@@ -410,7 +421,8 @@ pub(super) fn publish(
             Err(error) => return Err(error.into()),
         }
     }
-    File::open(directory)?.sync_all()?;
+    write_generation_lock(anchor, snapshot)?;
+    File::open(&directory)?.sync_all()?;
     File::open(root)?.sync_all()?;
 
     let mut manifest = staging_file(root)?;
@@ -424,6 +436,20 @@ pub(super) fn publish(
     Ok(true)
 }
 
+fn write_generation_lock(anchor: &Path, snapshot: &Snapshot) -> Result<()> {
+    let locks = locks_dir(anchor);
+    fs::create_dir_all(&locks)?;
+    let path = generation_lock(anchor, snapshot.generation);
+    let mut temp = staging_file(&locks)?;
+    for part in &snapshot.parts {
+        temp.write_all(part.id.as_bytes())?;
+    }
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    File::open(&locks)?.sync_all()?;
+    Ok(())
+}
+
 pub(super) fn links_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -431,6 +457,37 @@ pub(super) fn links_unavailable(error: &io::Error) -> bool {
             | io::ErrorKind::PermissionDenied
             | io::ErrorKind::CrossesDevices
     )
+}
+
+fn lock_readers_briefly(lock: &File) -> Result<bool> {
+    for attempt in 0..20 {
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if attempt + 1 < 20 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+fn read_generation_parts(file: &mut File) -> Result<Vec<Uuid>> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    ensure!(bytes.len() % 16 == 0, "invalid generation lock file");
+    bytes
+        .chunks_exact(16)
+        .map(|chunk| Ok(Uuid::from_slice(chunk)?))
+        .collect()
+}
+
+fn generation_lock_id(path: &Path) -> Option<Uuid> {
+    let name = path.file_name()?.to_str()?;
+    let id = name.strip_prefix("gen-")?.strip_suffix(".lock")?;
+    Uuid::parse_str(id).ok()
 }
 
 pub(super) fn clean(anchor: &Path) -> Result<bool> {
@@ -443,10 +500,8 @@ pub(super) fn clean(anchor: &Path) -> Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error.into()),
     };
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    if !lock_readers_briefly(&lock)? {
+        return Ok(false);
     }
     let directory = parts_dir(anchor);
     let entries = match fs::read_dir(&directory) {
@@ -454,18 +509,76 @@ pub(super) fn clean(anchor: &Path) -> Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error.into()),
     };
-    let live = Snapshot::read(anchor)?
+    let live_snapshot = Snapshot::read(anchor)?;
+    let live_generation = live_snapshot.as_ref().map(|snapshot| snapshot.generation);
+    let live_parts = live_snapshot
         .map(|snapshot| snapshot.parts)
         .unwrap_or_default();
-    // Establish the current manifest on disk before reclaiming any previous parts.
-    File::open(anchor.parent().expect("managed local table path"))?.sync_all()?;
+    let mut protected: BTreeSet<Uuid> = live_parts.iter().map(|part| part.id).collect();
+    let mut part_files = Vec::new();
     for entry in entries {
         let path = entry?.path();
-        if retired(&path, &live) {
-            fs::remove_file(path)?;
+        if path.extension().is_some_and(|ext| ext == "parquet") {
+            part_files.push(path);
         }
     }
-    Ok(true)
+    let mut lock_files = Vec::new();
+    match fs::read_dir(locks_dir(anchor)) {
+        Ok(lock_entries) => {
+            for entry in lock_entries {
+                let path = entry?.path();
+                if generation_lock_id(&path).is_some() {
+                    lock_files.push(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    for lock_path in lock_files {
+        let Some(gen_id) = generation_lock_id(&lock_path) else {
+            continue;
+        };
+        if Some(gen_id) == live_generation {
+            continue;
+        }
+        let mut gen_file = match File::options().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        match gen_file.try_lock() {
+            Ok(()) => {
+                let _ = fs::remove_file(&lock_path);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // An active reader is still pinned to this older generation.
+                let Ok(parts) = read_generation_parts(&mut gen_file) else {
+                    return Ok(false);
+                };
+                protected.extend(parts);
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+    // Establish the current manifest on disk before reclaiming any previous parts.
+    File::open(anchor.parent().expect("managed local table path"))?.sync_all()?;
+    let mut remaining_retired = false;
+    for path in part_files {
+        if let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| Uuid::parse_str(stem).ok())
+            && !live_parts.iter().any(|part| part.id == id)
+        {
+            if protected.contains(&id) {
+                remaining_retired = true;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    Ok(!remaining_retired)
 }
 
 fn retired(path: &Path, live: &[Part]) -> bool {

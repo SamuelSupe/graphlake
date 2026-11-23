@@ -311,19 +311,21 @@ impl Pages {
     }
 
     fn publish(&self, offset: u64, bytes: &[u8], next: Option<Anchor>) -> Result<()> {
-        let mut storage = self.storage.lock().unwrap();
-        storage.file.seek(SeekFrom::Start(offset))?;
-        storage.file.write_all(bytes)?;
-        let more = next.is_some();
-        let anchor = std::mem::replace(&mut storage.next_anchor, next);
-        storage.offsets.push(Page {
-            offset,
-            len: bytes.len(),
-            more,
-            anchor,
-        });
-        self.progress.send_replace(());
-        Ok(())
+        crate::blocking(|| {
+            let mut storage = self.storage.lock().unwrap();
+            storage.file.seek(SeekFrom::Start(offset))?;
+            storage.file.write_all(bytes)?;
+            let more = next.is_some();
+            let anchor = std::mem::replace(&mut storage.next_anchor, next);
+            storage.offsets.push(Page {
+                offset,
+                len: bytes.len(),
+                more,
+                anchor,
+            });
+            self.progress.send_replace(());
+            Ok(())
+        })
     }
 
     fn anchor(&self, page: usize) -> Option<Anchor> {
@@ -341,26 +343,28 @@ impl Pages {
     }
 
     fn read_page(&self, page: usize) -> super::ApiResult<Option<(Vec<u8>, bool)>> {
-        let mut storage = self.storage.lock().unwrap();
-        let index = page
-            .checked_sub(storage.first_page)
-            .ok_or_else(invalid_cursor)?;
-        let Some(&Page {
-            offset, len, more, ..
-        }) = storage.offsets.get(index)
-        else {
-            return match &storage.done {
-                Some(result) => Err(result.clone().err().unwrap_or_else(invalid_cursor)),
-                None => Ok(None),
+        crate::blocking(|| {
+            let mut storage = self.storage.lock().unwrap();
+            let index = page
+                .checked_sub(storage.first_page)
+                .ok_or_else(invalid_cursor)?;
+            let Some(&Page {
+                offset, len, more, ..
+            }) = storage.offsets.get(index)
+            else {
+                return match &storage.done {
+                    Some(result) => Err(result.clone().err().unwrap_or_else(invalid_cursor)),
+                    None => Ok(None),
+                };
             };
-        };
-        let mut bytes = vec![0; len];
-        storage
-            .file
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| storage.file.read_exact(&mut bytes))
-            .map_err(|_| super::Error::storage())?;
-        Ok(Some((bytes, more)))
+            let mut bytes = vec![0; len];
+            storage
+                .file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| storage.file.read_exact(&mut bytes))
+                .map_err(|_| super::Error::storage())?;
+            Ok(Some((bytes, more)))
+        })
     }
 
     pub async fn response(
@@ -368,8 +372,11 @@ impl Pages {
         cursors: &Cursors,
         id: Uuid,
         page: usize,
+        timeout: Duration,
     ) -> super::ApiResult<ExploreResult> {
-        let (bytes, more) = self.wait_for_page(page).await?;
+        let (bytes, more) = tokio::time::timeout(timeout, self.wait_for_page(page))
+            .await
+            .map_err(|_| super::query_error(anyhow::anyhow!("query deadline exceeded")))??;
         let graph = String::from_utf8(bytes).map_err(|_| super::Error::storage())?;
         let graph =
             serde_json::value::RawValue::from_string(graph).map_err(|_| super::Error::storage())?;

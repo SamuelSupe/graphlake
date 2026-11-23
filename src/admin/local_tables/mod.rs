@@ -94,13 +94,19 @@ pub(super) async fn list(
 ) -> ApiResult<Json<Vec<View>>> {
     app.models.lock().unwrap().get(&id)?;
     let mut views: Vec<_> = {
-        let store = app.local_tables.store.lock().unwrap();
-        store
-            .tables
-            .values()
-            .filter(|table| table.model == id && !table.managed)
-            .map(|table| store.view(table))
-            .collect()
+        let app = Arc::clone(&app);
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = app.local_tables.store.lock().unwrap();
+            store
+                .tables
+                .values()
+                .filter(|table| table.model == id && !table.managed)
+                .map(|table| store.view(table))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| Error::storage())?
     };
     if let Some(backend) = managed::backend(&app) {
         views.extend(backend.views(&id).await?);
@@ -129,7 +135,7 @@ pub(super) async fn create(
         .map_err(|_| Error::invalid("invalid_source", "来源表不存在或表名无效"))?;
     let key = key(&id, &config.name)?;
     let _serial = app.local_tables.create_work.lock().await;
-    let legacy_count = {
+    let (legacy_count, total_count) = {
         let store = app.local_tables.store.lock().unwrap();
         if store.tables.contains_key(&key) {
             return Err(conflict("本地表已存在"));
@@ -146,7 +152,10 @@ pub(super) async fn create(
                 ));
             }
         }
-        store.tables.values().filter(|table| !table.managed).count()
+        (
+            store.tables.values().filter(|table| !table.managed).count(),
+            store.tables.len(),
+        )
     };
     let table = Table {
         model: id,
@@ -170,7 +179,7 @@ pub(super) async fn create(
             Json(backend.create(&app, table, legacy_count).await?),
         ));
     }
-    if legacy_count >= 256 {
+    if total_count >= 256 {
         return Err(conflict("本地表最多 256 个"));
     }
     let mut store = app.local_tables.store.lock().unwrap();

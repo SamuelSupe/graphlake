@@ -685,27 +685,40 @@ impl ParquetTable {
             } else {
                 None
             };
-            let lease = managed
-                .as_deref()
-                .map(parquet_snapshot::pin)
-                .transpose()?
-                .flatten();
-            if let Some(path) = managed
-                && let Some(snapshot) = Snapshot::read(&path)?
-            {
-                // A publisher may have created the lock on the first conversion
-                // from an ordinary Parquet file after our initial open.
-                let (snapshot, lease) = if lease.is_none()
-                    && let Some(lease) = parquet_snapshot::pin(&path)?
-                {
-                    (
-                        Snapshot::read(&path)?.context("local snapshot changed while pinning")?,
-                        Some(lease),
-                    )
-                } else {
-                    (snapshot, lease)
-                };
-
+            let pinned = if let Some(path) = managed {
+                tokio::task::spawn_blocking(move || -> Result<_> {
+                    let lease = parquet_snapshot::pin(&path)?;
+                    let Some(snapshot) = Snapshot::read(&path)? else {
+                        return Ok(None);
+                    };
+                    // A publisher may have created the lock on the first conversion
+                    // from an ordinary Parquet file after our initial open.
+                    let (snapshot, lease) = if lease.is_none()
+                        && let Some(lease) = parquet_snapshot::pin(&path)?
+                    {
+                        (
+                            Snapshot::read(&path)?
+                                .context("local snapshot changed while pinning")?,
+                            Some(lease),
+                        )
+                    } else {
+                        (snapshot, lease)
+                    };
+                    // Upgrade to a per-generation reader lock when present so concurrent
+                    // readers do not block overlay cleanup of older generations.
+                    let lease = match parquet_snapshot::pin_generation(&path, snapshot.generation)?
+                    {
+                        Some(gen_lease) => Some(gen_lease),
+                        None => lease,
+                    };
+                    Ok(Some((path, snapshot, lease)))
+                })
+                .await
+                .context("pinning local Parquet snapshot")??
+            } else {
+                None
+            };
+            if let Some((path, snapshot, lease)) = pinned {
                 versions.push(snapshot_version(location, &snapshot));
                 // A singleton managed snapshot carries a validated schema and can
                 // postpone pinning its parts until DataFusion passes scan filters.
@@ -757,7 +770,17 @@ impl ParquetTable {
         pool: Arc<dyn MemoryPool>,
         stats: Arc<ReadStats>,
     ) -> Result<Self> {
-        let lease = parquet_snapshot::pin(path)?;
+        let pin_path = path.to_path_buf();
+        let generation = snapshot.generation;
+        let lease = tokio::task::spawn_blocking(move || -> Result<_> {
+            let lease = parquet_snapshot::pin(&pin_path)?;
+            match parquet_snapshot::pin_generation(&pin_path, generation)? {
+                Some(gen_lease) => Ok(Some(gen_lease)),
+                None => Ok(lease),
+            }
+        })
+        .await
+        .context("pinning local Parquet snapshot")??;
         if let Some(index) = &snapshot.indexed {
             let schema = selected_schema(&index.schema, &[], &path.display().to_string())?;
             return Ok(Self {
@@ -872,6 +895,9 @@ impl OpenedParquet {
                     .row_groups()
                     .iter()
                     .map(|group| {
+                        if group.num_columns() == 0 {
+                            return 0;
+                        }
                         let column = group.column(0);
                         column
                             .dictionary_page_offset()
@@ -1145,6 +1171,36 @@ mod range_tests {
             "one HEAD and two merged range requests"
         );
         assert_eq!(stats.metrics().object_bytes, 63);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_column_parquet_does_not_panic() -> Result<()> {
+        use datafusion::arrow::array::{RecordBatch, RecordBatchOptions};
+        use datafusion::execution::memory_pool::UnboundedMemoryPool;
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("empty_cols.parquet");
+        let schema = Arc::new(Schema::empty());
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&schema),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(2)),
+        )?;
+        let mut writer = ArrowWriter::try_new(std::fs::File::create(&path)?, schema, None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let (table, _) = ParquetTable::open(
+            &[path.to_string_lossy().into_owned()],
+            &[],
+            Arc::new(UnboundedMemoryPool::default()),
+            Arc::new(ReadStats::default()),
+            false,
+        )
+        .await?;
+        assert_eq!(table.schema().fields().len(), 0);
         Ok(())
     }
 }

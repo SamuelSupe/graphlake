@@ -277,7 +277,12 @@ impl Fixture {
         })
     }
 
-    fn bind(&self, mut catalog: Catalog, task: BusinessTask) -> Result<Engine> {
+    fn bind(
+        &self,
+        mut catalog: Catalog,
+        task: BusinessTask,
+        admission: &Arc<crate::engine::Admission>,
+    ) -> Result<Engine> {
         let labels = task
             .labels()
             .iter()
@@ -321,7 +326,7 @@ impl Fixture {
             .map(|(alias, tables)| (alias, Source::Jsonl { tables }))
             .collect();
         catalog.export_locations.clear();
-        Engine::new(catalog)
+        Engine::with_admission(catalog, Arc::clone(admission))
     }
 }
 
@@ -507,7 +512,13 @@ impl ImpactInput {
         })
     }
 
-    pub(in crate::admin) async fn run(mut self, options: QueryOptions) -> ApiResult<ImpactReport> {
+    pub(in crate::admin) async fn run(
+        mut self,
+        mut options: QueryOptions,
+        admission: &Arc<crate::engine::Admission>,
+    ) -> ApiResult<ImpactReport> {
+        options.memory_bytes = options.memory_bytes.min(64 * 1024 * 1024);
+        options.spill_bytes = options.spill_bytes.min(64 * 1024 * 1024);
         let candidate = models::parse(&self.candidate, &self.path)?;
         let Some(raw) = self.suite else {
             if self.protected || !candidate.tasks.is_empty() {
@@ -541,12 +552,16 @@ impl ImpactInput {
         let mut engines = BTreeMap::new();
         for task in required {
             let candidate = fixture
-                .bind(candidate.clone(), task)
+                .bind(candidate.clone(), task, admission)
                 .map_err(CaseIssue::from);
             let baseline = before
                 .as_ref()
                 .filter(|catalog| catalog.tasks.contains(&task))
-                .map(|catalog| fixture.bind(catalog.clone(), task).map_err(CaseIssue::from));
+                .map(|catalog| {
+                    fixture
+                        .bind(catalog.clone(), task, admission)
+                        .map_err(CaseIssue::from)
+                });
             let equivalent = same_revision
                 || match (&baseline, &candidate) {
                     (Some(Ok(before)), Ok(after)) => same_execution_mapping(before, after)?,
@@ -786,12 +801,18 @@ pub(in crate::admin) async fn http_rollback_impact(
 ) -> ApiResult<Json<ImpactReport>> {
     users::check(&app, &principal, &model, Role::Publisher)?;
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let (_, input) = app
-        .models
-        .lock()
-        .unwrap()
-        .rollback_impact(&model, &request)?;
-    let result = input.run(impact_options(&app, app.options.timeout)).await?;
+    let files = app.models.lock().unwrap().read_files();
+    let model_id = model.clone();
+    let (_, input) =
+        tokio::task::spawn_blocking(move || files.rollback_impact(&model_id, &request))
+            .await
+            .map_err(|_| Error::storage())??;
+    let result = input
+        .run(
+            impact_options(&app, app.options.timeout),
+            &app.impact_admission,
+        )
+        .await?;
     users::check(&app, &principal, &model, Role::Publisher)?;
     Ok(Json(result))
 }
@@ -809,24 +830,29 @@ pub(in crate::admin) async fn http_business_status(
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<BusinessStatus>> {
     check_preview_access(&app, &principal, &model)?;
-    let models = app.models.lock().unwrap();
-    let info = models.get(&model)?;
-    let suite_revision = suite_revision(&models, &model)?;
-    let required =
-        models.requires_task_publish(&model, &info.yaml)? || models.has_task_history(&model)?;
-    let active = match info.active_revision.as_deref() {
-        Some(rev) if required => {
-            let passed =
-                models.has_task_history(&model)? && models.task_stamp(&model, rev)?.is_some();
-            Some(if passed { "passed" } else { "stale" })
-        }
-        _ => None,
-    };
-    Ok(Json(BusinessStatus {
-        required,
-        suite_revision,
-        active,
-    }))
+    let files = app.models.lock().unwrap().read_files();
+    let status = tokio::task::spawn_blocking(move || -> ApiResult<BusinessStatus> {
+        let info = files.get(&model)?;
+        let suite_revision = suite_revision(&files, &model)?;
+        let required =
+            files.requires_task_publish(&model, &info.yaml)? || files.has_task_history(&model)?;
+        let active = match info.active_revision.as_deref() {
+            Some(rev) if required => {
+                let passed =
+                    files.has_task_history(&model)? && files.task_stamp(&model, rev)?.is_some();
+                Some(if passed { "passed" } else { "stale" })
+            }
+            _ => None,
+        };
+        Ok(BusinessStatus {
+            required,
+            suite_revision,
+            active,
+        })
+    })
+    .await
+    .map_err(|_| Error::storage())??;
+    Ok(Json(status))
 }
 
 fn check_preview_access(app: &App, principal: &Principal, model: &str) -> ApiResult<()> {
@@ -852,8 +878,14 @@ pub(in crate::admin) async fn validate_impact(
 ) -> ApiResult<ImpactReport> {
     check_preview_access(app, principal, model)?;
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
-    let (_, input) = app.models.lock().unwrap().draft_impact(model, &request)?;
-    let report = input.run(impact_options(app, timeout)).await?;
+    let files = app.models.lock().unwrap().read_files();
+    let model_id = model.to_owned();
+    let (_, input) = tokio::task::spawn_blocking(move || files.draft_impact(&model_id, &request))
+        .await
+        .map_err(|_| Error::storage())??;
+    let report = input
+        .run(impact_options(app, timeout), &app.impact_admission)
+        .await?;
     check_preview_access(app, principal, model)?;
     Ok(report)
 }
@@ -866,9 +898,14 @@ pub(in crate::admin) async fn http_read_suite(
     if principal != Principal::Admin {
         return Err(access::forbidden());
     }
-    let models = app.models.lock().unwrap();
-    models.get(&model)?;
-    Ok(Json(read_suite(&models, &model)?))
+    let files = app.models.lock().unwrap().read_files();
+    let suite = tokio::task::spawn_blocking(move || -> ApiResult<TaskSuite> {
+        files.get(&model)?;
+        read_suite(&files, &model)
+    })
+    .await
+    .map_err(|_| Error::storage())??;
+    Ok(Json(suite))
 }
 
 pub(in crate::admin) async fn http_save_suite(
@@ -894,6 +931,11 @@ pub(in crate::admin) async fn http_save_suite(
     }
     let _permit = app.metadata_work.try_acquire().map_err(|_| Error::busy())?;
     let _policy = app.users.writes.lock().await;
-    let info = save_suite(&app.models.lock().unwrap(), &model, request)?;
+    let app_for_save = Arc::clone(&app);
+    let info = tokio::task::spawn_blocking(move || {
+        save_suite(&app_for_save.models.lock().unwrap(), &model, request)
+    })
+    .await
+    .map_err(|_| Error::storage())??;
     Ok(models::model_response(info).into_response())
 }

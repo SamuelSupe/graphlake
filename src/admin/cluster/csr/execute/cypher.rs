@@ -1014,7 +1014,8 @@ fn walks<'a>(
                 if depth == max || remaining == Some(0) { break; }
                 let mut next = Vec::new();
                 let final_targets = if depth+1 == max { targets } else { None };
-                for mut batch in frontier.chunks(128).map(|chunk| adjacency(execution, chunk, final_targets, filters, false)) {
+                let local = frontier.len() <= 1;
+                for mut batch in frontier.chunks(128).map(|chunk| adjacency(execution, chunk, final_targets, filters, local)) {
                     while let Some((to,from,edge)) = batch.try_next().await? {
                         if depth+1 == max && targets.is_some_and(|targets| !targets.contains(&to)) {
                             continue;
@@ -1045,7 +1046,13 @@ fn walks<'a>(
             let mut stack = vec![memo.read(execution, start, if max == 1 { targets } else { None }, filters)];
             if expansion.min == 0 && targets.is_none_or(|targets| targets.contains(&start)) { yield (nodes.clone(), Vec::new()); }
             if max == 0 { return; }
+            let mut steps = 0usize;
             while let Some(next) = stack.last_mut() {
+                steps += 1;
+                if steps.is_multiple_of(256) {
+                    graph.scope.check()?;
+                    tokio::task::consume_budget().await;
+                }
                 if let Some((to, _, edge)) = next.try_next().await? {
                     if edges.contains(&edge) { continue; }
                     nodes.push(to);
@@ -1133,21 +1140,40 @@ fn adjacency<'a>(
             .insert(vertex);
     }
     Box::pin(async_stream::try_stream! {
+        if execution.graph.types.is_empty() { return; }
+        let remote_targets = targets.filter(|ids| ids.len() <= 256).cloned();
+        let mut tasks = Vec::new();
         for (shard, ids) in groups {
-            if execution.graph.types.is_empty() { continue; }
             let blocks = &execution.graph.manifest.partitions[shard].arcs;
-            let candidates = blocks.iter().enumerate().filter(|(_,block)| ids.range(block.first..=block.last).next().is_some())
-                .map(|(i,_)|i).collect::<Vec<_>>();
-            for group in candidates.chunk_by(|a,b| *a+1==*b) {
+            let candidates = blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| ids.range(block.first..=block.last).next().is_some())
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            for group in candidates.chunk_by(|a, b| *a + 1 == *b) {
                 for chunk in group.chunks(2) {
-                    let remote_targets = targets.filter(|ids| ids.len() <= 256).cloned();
-                    // Dispatching a single vertex costs more than scanning its blocks locally.
-                    let round = execution.run_round(vec![(shard, Step::Arcs { frontier: ids.clone(), start_block: chunk[0],
-                        end_block: chunk.last().unwrap()+1, targets: remote_targets, filters: filters.to_vec() })], local).await?;
-                    for output in round.outputs {
-                        for link in output.links { yield link; }
-                    }
+                    tasks.push((
+                        shard,
+                        Step::Arcs {
+                            frontier: ids.clone(),
+                            start_block: chunk[0],
+                            end_block: chunk.last().unwrap() + 1,
+                            targets: remote_targets.clone(),
+                            filters: filters.to_vec(),
+                        },
+                    ));
                 }
+            }
+        }
+        if tasks.is_empty() {
+            return;
+        }
+        // Dispatching a single vertex costs more than scanning its blocks locally.
+        let round = execution.run_round(tasks, local).await?;
+        for output in round.outputs {
+            for link in output.links {
+                yield link;
             }
         }
     })

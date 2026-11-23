@@ -59,6 +59,46 @@ pub(super) fn value_map(entity: &Entity, fields: &[String], alias: &str) -> Stri
 }
 
 impl Kind {
+    pub(super) fn depth(&self) -> usize {
+        match self {
+            Self::Element(_)
+            | Self::Property(_, _)
+            | Self::Label
+            | Self::Map(_, _)
+            | Self::Path
+            | Self::Count
+            | Self::Double
+            | Self::Null => 1,
+            Self::List(inner) | Self::Group(inner) | Self::Item(inner) => 1 + inner.depth(),
+            Self::Extremum(items) | Self::Sum(items) | Self::Variant(items) => {
+                1 + items.iter().map(Self::depth).max().unwrap_or(0)
+            }
+            Self::Record(fields) => 1 + fields.iter().map(|(_, k)| k.depth()).max().unwrap_or(0),
+        }
+    }
+
+    pub(super) fn node_count(&self) -> usize {
+        match self {
+            Self::Element(_)
+            | Self::Property(_, _)
+            | Self::Label
+            | Self::Map(_, _)
+            | Self::Path
+            | Self::Count
+            | Self::Double
+            | Self::Null => 1,
+            Self::List(inner) | Self::Group(inner) | Self::Item(inner) => {
+                1usize.saturating_add(inner.node_count())
+            }
+            Self::Extremum(items) | Self::Sum(items) | Self::Variant(items) => items
+                .iter()
+                .fold(1usize, |acc, k| acc.saturating_add(k.node_count())),
+            Self::Record(fields) => fields
+                .iter()
+                .fold(1usize, |acc, (_, k)| acc.saturating_add(k.node_count())),
+        }
+    }
+
     pub(super) fn null_slot(&self, alias: &str) -> String {
         match self {
             Self::Element(_) => "CASE WHEN FALSE THEN make_array('') END".into(),

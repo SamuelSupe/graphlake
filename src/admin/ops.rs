@@ -400,11 +400,10 @@ pub(super) async fn ready(State(app): State<Arc<App>>) -> impl IntoResponse {
             );
         }
     }
-    let dir = app.models.lock().unwrap().directory().to_path_buf();
+    let files = app.models.lock().unwrap().read_files();
     let checked = tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        let models = super::models::Models::new(dir);
-        models.check_published()
+        files.check_published()
     })
     .await;
     match checked {

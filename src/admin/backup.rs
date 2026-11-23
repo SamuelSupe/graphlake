@@ -212,12 +212,17 @@ pub(super) async fn export(
             },
             (state, _) => (state, None),
         };
-        tokio::task::spawn_blocking(move || {
+        let (result, archive) = tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            persist_export(dir, state, Some(&sources), archive)
+            let result = persist_export(dir, state, Some(&sources), archive.as_ref());
+            (result, archive)
         })
         .await
-        .map_err(|_| Error::storage())?
+        .map_err(|_| Error::storage())?;
+        if let Some(archive) = archive {
+            archive.release().await;
+        }
+        result
     })
     .await
     .map_err(|_| Error::storage())?
@@ -228,7 +233,7 @@ fn persist_export(
     dir: PathBuf,
     state: ApiResult<State>,
     sources: Option<&Path>,
-    archive: Option<Archive>,
+    archive: Option<&Archive>,
 ) -> ApiResult<Exported> {
     let meta = fs::symlink_metadata(&dir).ok();
     if !dir.is_absolute()
@@ -392,7 +397,7 @@ fn write(
     path: &Path,
     mut state: State,
     sources: Option<&Path>,
-    archive: Option<Archive>,
+    archive: Option<&Archive>,
 ) -> Result<(u64, Option<String>)> {
     let parent = parent(path);
     ensure!(
@@ -406,7 +411,6 @@ fn write(
         .transpose()?
         .flatten();
     let remote = archive
-        .as_ref()
         .map(|archive| local::Capture::take(archive.root.path(), true))
         .transpose()?
         .flatten();
@@ -457,8 +461,11 @@ fn publish(path: &Path, state: State, sources: Option<&Path>, timestamp: u64) ->
     };
     let parent = parent(path);
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(&mut temp, &backup)?;
-    temp.flush()?;
+    {
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, temp.as_file_mut());
+        serde_json::to_writer(&mut writer, &backup)?;
+        writer.flush()?;
+    }
     ensure!(
         temp.as_file().metadata()?.len() <= LIMIT,
         "backup exceeds size limit"
@@ -490,7 +497,7 @@ pub async fn run_with_catalog(
             Some(managed) => managed.backup().await?,
             None => None,
         };
-        let (timestamp, local_directory) = write(
+        let written = write(
             file,
             State {
                 catalog,
@@ -499,8 +506,12 @@ pub async fn run_with_catalog(
                 local_tables: None,
             },
             catalog_dir,
-            archive,
-        )?;
+            archive.as_ref(),
+        );
+        if let Some(archive) = archive {
+            archive.release().await;
+        }
+        let (timestamp, local_directory) = written?;
         if let Some(directory) = local_directory {
             eprintln!("GraphLake local-table backup: {directory}");
         }

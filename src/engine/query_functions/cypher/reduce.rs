@@ -10,6 +10,7 @@ use datafusion::{
         datatypes::{DataType, Field, FieldRef},
     },
     common::{Result, exec_err, plan_err},
+    execution::{memory_pool::MemoryConsumer, runtime_env::RuntimeEnv},
     logical_expr::{
         ColumnarValue, HigherOrderFunctionArgs, HigherOrderReturnFieldArgs, HigherOrderSignature,
         HigherOrderUDF, HigherOrderUDFImpl, LambdaParametersProgress, ValueOrLambda, Volatility,
@@ -18,6 +19,7 @@ use datafusion::{
 };
 
 use super::{common_value_type, flatten_value, merge_values, value_types};
+use crate::engine::query::allocation::slice_bytes;
 
 pub(in crate::engine) fn register(
     context: &SessionContext,
@@ -34,6 +36,7 @@ pub(in crate::engine) fn register(
     signature.lambda_parameters_max_iterations = 8;
     context.register_higher_order_function(Arc::new(HigherOrderUDF::from(Reduce {
         signature,
+        runtime: Arc::clone(&scope.runtime),
         memory: scope.options.memory_bytes,
         cancelled: scope.options.cancellation.clone(),
         deadline: scope.deadline,
@@ -43,6 +46,7 @@ pub(in crate::engine) fn register(
 #[derive(Debug)]
 struct Reduce {
     signature: HigherOrderSignature,
+    runtime: Arc<RuntimeEnv>,
     memory: usize,
     cancelled: crate::CancellationToken,
     deadline: tokio::time::Instant,
@@ -51,6 +55,7 @@ struct Reduce {
 impl PartialEq for Reduce {
     fn eq(&self, other: &Self) -> bool {
         self.signature == other.signature
+            && Arc::ptr_eq(&self.runtime, &other.runtime)
             && self.memory == other.memory
             && self.deadline == other.deadline
     }
@@ -61,6 +66,7 @@ impl Eq for Reduce {}
 impl Hash for Reduce {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.signature.hash(state);
+        Arc::as_ptr(&self.runtime).hash(state);
         self.memory.hash(state);
         self.deadline.hash(state);
     }
@@ -166,6 +172,8 @@ impl HigherOrderUDFImpl for Reduce {
             _ => return exec_err!("reduce() expects a list"),
         };
         let initial = initial.to_array(args.number_rows)?;
+        let reservation =
+            MemoryConsumer::new("GraphLake reduce()").register(&self.runtime.memory_pool);
         let mut output = Vec::with_capacity(args.number_rows);
         let mut bytes = 0usize;
         for row in 0..args.number_rows {
@@ -187,13 +195,14 @@ impl HigherOrderUDFImpl for Reduce {
                         )?
                         .into_array(1)?;
                     value = fit(update, ty)?;
-                    if bytes.saturating_add(value_bytes(&value)?) > self.memory {
+                    let current = bytes.saturating_add(value_bytes(&value)?);
+                    if current > self.memory || reservation.try_resize(current).is_err() {
                         return exec_err!("reduce() exceeds the query memory budget");
                     }
                 }
             }
             bytes = bytes.saturating_add(value_bytes(&value)?);
-            if bytes > self.memory {
+            if bytes > self.memory || reservation.try_resize(bytes).is_err() {
                 return exec_err!("reduce() exceeds the query memory budget");
             }
             output.push(value);
@@ -213,19 +222,7 @@ impl HigherOrderUDFImpl for Reduce {
 }
 
 fn value_bytes(value: &ArrayRef) -> Result<usize> {
-    // Arrow's slice estimate excludes the backing data of string views.
-    if let Some(view) = value
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::StringViewArray>()
-    {
-        return Ok(view
-            .iter()
-            .flatten()
-            .map(str::len)
-            .sum::<usize>()
-            .saturating_add(16 * value.len()));
-    }
-    Ok(value.to_data().get_slice_memory_size()?)
+    slice_bytes(value.as_ref())
 }
 
 fn fit(value: ArrayRef, ty: &DataType) -> Result<ArrayRef> {

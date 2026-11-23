@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::{
         array::{RecordBatch, RecordBatchOptions},
-        datatypes::{DataType, Schema, SchemaRef},
+        datatypes::{DataType, Schema, SchemaRef, TimeUnit},
         ipc::reader::StreamReader,
     },
     catalog::{Session, TableProvider},
@@ -264,45 +264,86 @@ impl PartitionStream for IcebergTable {
 }
 
 fn scan_predicate(schema: &Schema, expr: &Expr) -> Option<Predicate> {
-    let (column, op, value) = match expr {
-        Expr::IsNull(expr) => (expr.as_ref(), Comparison::IsNull, serde_json::Value::Null),
-        Expr::IsNotNull(expr) => (
-            expr.as_ref(),
-            Comparison::IsNotNull,
-            serde_json::Value::Null,
-        ),
-        Expr::BinaryExpr(expr) => {
-            let Expr::Literal(literal, _) = expr.right.as_ref() else {
+    match expr {
+        Expr::IsNull(expr) => {
+            let Expr::Column(column) = expr.as_ref() else {
                 return None;
             };
-            let value = match literal {
-                ScalarValue::Int32(Some(value)) => i64::from(*value),
-                ScalarValue::Int64(Some(value)) => *value,
-                _ => return None,
-            };
-            let comparison = match expr.op {
-                Operator::Eq => Comparison::Eq,
-                Operator::Lt => Comparison::Lt,
-                Operator::LtEq => Comparison::Le,
-                Operator::Gt => Comparison::Gt,
-                Operator::GtEq => Comparison::Ge,
-                _ => return None,
-            };
-            (expr.left.as_ref(), comparison, value.into())
+            if column.name.contains('.') || schema.field_with_name(&column.name).is_err() {
+                return None;
+            }
+            Some(Reference::new(&column.name).is_null())
         }
-        _ => return None,
-    };
-    let Expr::Column(column) = column else {
-        return None;
-    };
-    iceberg_predicate(
-        schema,
-        &ReadPredicate {
-            column: column.name.clone(),
-            op,
-            value,
-        },
-    )
+        Expr::IsNotNull(expr) => {
+            let Expr::Column(column) = expr.as_ref() else {
+                return None;
+            };
+            if column.name.contains('.') || schema.field_with_name(&column.name).is_err() {
+                return None;
+            }
+            Some(Reference::new(&column.name).is_not_null())
+        }
+        Expr::BinaryExpr(expr) if expr.op == Operator::And => {
+            let left = scan_predicate(schema, &expr.left)?;
+            let right = scan_predicate(schema, &expr.right)?;
+            Some(left.and(right))
+        }
+        Expr::BinaryExpr(expr) => {
+            let (column, op, literal) = match (expr.left.as_ref(), expr.right.as_ref()) {
+                (Expr::Column(column), Expr::Literal(literal, _)) => (column, expr.op, literal),
+                (Expr::Literal(literal, _), Expr::Column(column)) => {
+                    let flipped = match expr.op {
+                        Operator::Eq => Operator::Eq,
+                        Operator::NotEq => Operator::NotEq,
+                        Operator::Lt => Operator::Gt,
+                        Operator::LtEq => Operator::GtEq,
+                        Operator::Gt => Operator::Lt,
+                        Operator::GtEq => Operator::LtEq,
+                        _ => return None,
+                    };
+                    (column, flipped, literal)
+                }
+                _ => return None,
+            };
+            if column.name.contains('.') {
+                return None;
+            }
+            let kind = schema.field_with_name(&column.name).ok()?.data_type();
+            let value = match (kind, literal) {
+                (DataType::Int32, ScalarValue::Int32(Some(v))) => Datum::int(*v),
+                (DataType::Int64, ScalarValue::Int64(Some(v))) => Datum::long(*v),
+                (DataType::Int64, ScalarValue::Int32(Some(v))) => Datum::long(i64::from(*v)),
+                (DataType::Boolean, ScalarValue::Boolean(Some(v))) => Datum::bool(*v),
+                (
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+                    ScalarValue::Utf8(Some(v))
+                    | ScalarValue::LargeUtf8(Some(v))
+                    | ScalarValue::Utf8View(Some(v)),
+                ) => Datum::string(v.clone()),
+                (DataType::Date32, ScalarValue::Date32(Some(days))) => Datum::date(*days),
+                (
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    ScalarValue::TimestampMicrosecond(Some(us), None),
+                ) => Datum::timestamp_micros(*us),
+                (
+                    DataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+                    ScalarValue::TimestampMicrosecond(Some(us), Some(_)),
+                ) => Datum::timestamptz_micros(*us),
+                _ => return None,
+            };
+            let reference = Reference::new(&column.name);
+            Some(match op {
+                Operator::Eq => reference.equal_to(value),
+                Operator::NotEq => reference.not_equal_to(value),
+                Operator::Lt => reference.less_than(value),
+                Operator::LtEq => reference.less_than_or_equal_to(value),
+                Operator::Gt => reference.greater_than(value),
+                Operator::GtEq => reference.greater_than_or_equal_to(value),
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn iceberg_predicate(schema: &Schema, filter: &ReadPredicate) -> Option<Predicate> {
@@ -312,14 +353,18 @@ fn iceberg_predicate(schema: &Schema, filter: &ReadPredicate) -> Option<Predicat
     let kind = schema.field_with_name(&filter.column).ok()?.data_type();
     let reference = Reference::new(&filter.column);
     let value = match (kind, filter.op) {
-        (DataType::Int32 | DataType::Int64, Comparison::IsNull) => {
+        (_, Comparison::IsNull) => {
             return Some(reference.is_null());
         }
-        (DataType::Int32 | DataType::Int64, Comparison::IsNotNull) => {
+        (_, Comparison::IsNotNull) => {
             return Some(reference.is_not_null());
         }
         (DataType::Int32, _) => Datum::int(i32::try_from(filter.value.as_i64()?).ok()?),
         (DataType::Int64, _) => Datum::long(filter.value.as_i64()?),
+        (DataType::Boolean, _) => Datum::bool(filter.value.as_bool()?),
+        (DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View, _) => {
+            Datum::string(filter.value.as_str()?.to_owned())
+        }
         _ => return None,
     };
     Some(match filter.op {
@@ -351,4 +396,44 @@ fn bridge(
 
 fn external(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
     DataFusionError::External(error.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::{
+        arrow::datatypes::Field,
+        prelude::{col, lit},
+    };
+
+    #[test]
+    fn scan_predicate_pushes_down_strings_booleans_dates_timestamps_and_conjunctions() {
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("d", DataType::Date32, true),
+            Field::new(
+                "tz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        assert!(scan_predicate(&schema, &col("name").eq(lit("alice"))).is_some());
+        assert!(scan_predicate(&schema, &col("active").not_eq(lit(false))).is_some());
+        assert!(
+            scan_predicate(&schema, &lit(ScalarValue::Date32(Some(19723))).lt(col("d"))).is_some()
+        );
+        assert!(
+            scan_predicate(
+                &schema,
+                &col("name").eq(lit("alice")).and(col("tz").gt_eq(lit(
+                    ScalarValue::TimestampMicrosecond(
+                        Some(1_704_067_200_000_000),
+                        Some("UTC".into()),
+                    )
+                )))
+            )
+            .is_some()
+        );
+    }
 }

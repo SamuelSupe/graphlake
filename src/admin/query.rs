@@ -194,23 +194,48 @@ pub(super) async fn admit(
     principal: &Principal,
     options: &mut crate::QueryOptions,
 ) -> ApiResult<Active> {
+    admit_with(
+        app,
+        &app.work,
+        &app.query_waiters,
+        id,
+        model,
+        principal,
+        options,
+    )
+    .await
+}
+
+pub(super) async fn admit_with(
+    app: &Arc<App>,
+    slots: &Arc<tokio::sync::Semaphore>,
+    waiters: &tokio::sync::Semaphore,
+    id: Uuid,
+    model: &str,
+    principal: &Principal,
+    options: &mut crate::QueryOptions,
+) -> ApiResult<Active> {
     let mut active = register(app, id, model, principal)?;
-    active.acquire(options).await?;
+    active.acquire_from(slots, waiters, options).await?;
     Ok(active)
 }
 
 impl Active {
     async fn acquire(&mut self, options: &mut crate::QueryOptions) -> ApiResult<()> {
+        let slots = Arc::clone(&self.app.work);
+        let app = Arc::clone(&self.app);
+        self.acquire_from(&slots, &app.query_waiters, options).await
+    }
+
+    async fn acquire_from(
+        &mut self,
+        slots: &Arc<tokio::sync::Semaphore>,
+        waiters: &tokio::sync::Semaphore,
+        options: &mut crate::QueryOptions,
+    ) -> ApiResult<()> {
         let started = tokio::time::Instant::now();
         let app = &self.app;
-        let permit = acquire(
-            app,
-            &app.work,
-            &app.query_waiters,
-            options.timeout,
-            &self.token,
-        )
-        .await;
+        let permit = acquire(app, slots, waiters, options.timeout, &self.token).await;
         app.metrics.observe(
             "internal",
             "query_slot",

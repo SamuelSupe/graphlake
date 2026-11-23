@@ -481,7 +481,7 @@ pub(in crate::admin) async fn explore(
     if let Some(search) = search {
         return run_search(&app, &result, &cursors, session, &search, timeout).await;
     }
-    let mut page = result.response(&cursors, session, index).await?;
+    let mut page = result.response(&cursors, session, index, timeout).await?;
     if !neighbors {
         page.page_cursor = None;
     }
@@ -500,7 +500,7 @@ async fn render_exploration(
     if let Some(search) = &request.search {
         run_search(app, pages, cursors, session, search, timeout).await
     } else {
-        Ok(Json(pages.response(cursors, session, index).await?).into_response())
+        Ok(Json(pages.response(cursors, session, index, timeout).await?).into_response())
     }
 }
 

@@ -18,7 +18,10 @@ use google_cloud_spanner::{
 };
 
 use super::{ReadStats, collect_rows};
-use crate::{Predicate, Source, engine::read_filters::where_clause};
+use crate::{
+    Predicate, Source,
+    engine::read_filters::{needs_sql_types, where_clause},
+};
 
 #[derive(Default)]
 pub(crate) struct Client {
@@ -129,7 +132,7 @@ impl Snapshot {
             selected
         };
         let mut sql = format!("SELECT {selected} FROM {relation}");
-        let expected = if explain_only || !filters.is_empty() {
+        let expected = if explain_only || needs_sql_types(filters) {
             let (schema, result) = self.query(format!("{sql} WHERE FALSE"), columns).await?;
             let metadata = collect_rows(
                 rows(result),

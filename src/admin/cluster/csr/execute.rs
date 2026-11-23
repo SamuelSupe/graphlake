@@ -177,12 +177,9 @@ impl ArcBlocks {
 // All keys include the published generation. Keep a small cache per query so
 // the path stream, separate hydration expressions and graph preview can reuse it.
 #[derive(Default)]
-struct BlockCache(std::sync::Mutex<BlockCacheState>);
-
-#[derive(Default)]
-struct BlockCacheState {
-    hot: VecDeque<(Key, Arc<CachedBlock>)>,
-    spill: Option<BlockSpill>,
+struct BlockCache {
+    hot: std::sync::Mutex<VecDeque<(Key, Arc<CachedBlock>)>>,
+    spill: std::sync::Mutex<Option<BlockSpill>>,
 }
 
 struct BlockSpill {
@@ -194,98 +191,122 @@ struct BlockSpill {
     index_memory: MemoryReservation,
 }
 
-impl BlockCacheState {
-    fn evict(&mut self, scope: &QueryScope) -> Option<usize> {
-        let (key, data) = self.hot.pop_front()?;
+impl BlockCache {
+    fn spill_entry(&self, key: Key, data: Arc<CachedBlock>, scope: &QueryScope) {
         let len = data.bytes.len();
         let limit = (scope.options.spill_bytes / 8).min(64 * 1024 * 1024);
         if len as u64 > limit {
-            return Some(len);
+            return;
         }
-        let spilled = (|| -> Result<()> {
-            if self.spill.is_none() {
-                let file = scope
-                    .runtime
-                    .disk_manager
-                    .create_tmp_file("CSR lookup cache")?;
-                self.spill = Some(BlockSpill {
-                    lookup: BTreeMap::new(),
-                    size: 0,
-                    reader: std::fs::File::open(file.path().context("CSR lookup spill path")?)?,
-                    writer: file.open_writer()?,
-                    _file: file,
-                    index_memory: MemoryConsumer::new("CSR lookup spill index")
-                        .register(&scope.runtime.memory_pool),
-                });
+        // Check if already spilled before compressing (lock-free compression).
+        {
+            let guard = self.spill.lock().unwrap();
+            if guard
+                .as_ref()
+                .is_some_and(|spill| spill.lookup.contains_key(&key))
+            {
+                return;
             }
-            let spill = self.spill.as_mut().unwrap();
-            if !spill.lookup.contains_key(&key) {
-                let compression_memory = data._memory.new_empty();
-                let compressed =
-                    if data.compress_spill && compression_memory.try_grow(len + 1024).is_ok() {
-                        zstd::bulk::compress(&data.bytes, 1)
-                            .ok()
-                            .filter(|bytes| bytes.len() < len)
-                    } else {
-                        None
-                    };
-                let stored = compressed.as_deref().unwrap_or(&data.bytes);
-                if spill.size + stored.len() as u64 > limit {
-                    return Ok(());
-                }
-                if spill
-                    .index_memory
-                    .try_grow(key.as_ref().len() + 96)
-                    .is_err()
-                {
-                    return Ok(());
-                }
-                std::io::Write::write_all(&mut spill.writer, stored)?;
-                spill
-                    .lookup
-                    .insert(key, (spill.size, compressed.as_ref().map(Vec::len)));
-                spill.size += stored.len() as u64;
-                scope.reads.snapshot_spill(stored.len() as u64);
-            }
-            Ok(())
-        })();
-        if spilled.is_err() {
-            self.spill = None;
         }
-        Some(len)
+        crate::blocking(|| {
+            let compression_memory = data._memory.new_empty();
+            let compressed =
+                if data.compress_spill && compression_memory.try_grow(len + 1024).is_ok() {
+                    zstd::bulk::compress(&data.bytes, 1)
+                        .ok()
+                        .filter(|bytes| bytes.len() < len)
+                } else {
+                    None
+                };
+            let stored = compressed.as_deref().unwrap_or(&data.bytes);
+            let mut guard = self.spill.lock().unwrap();
+            let spilled = (|| -> Result<()> {
+                if guard.is_none() {
+                    let file = scope
+                        .runtime
+                        .disk_manager
+                        .create_tmp_file("CSR lookup cache")?;
+                    *guard = Some(BlockSpill {
+                        lookup: BTreeMap::new(),
+                        size: 0,
+                        reader: std::fs::File::open(file.path().context("CSR lookup spill path")?)?,
+                        writer: file.open_writer()?,
+                        _file: file,
+                        index_memory: MemoryConsumer::new("CSR lookup spill index")
+                            .register(&scope.runtime.memory_pool),
+                    });
+                }
+                let spill = guard.as_mut().unwrap();
+                if !spill.lookup.contains_key(&key) {
+                    if spill.size + stored.len() as u64 > limit {
+                        return Ok(());
+                    }
+                    if spill
+                        .index_memory
+                        .try_grow(key.as_ref().len() + 96)
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    std::io::Write::write_all(&mut spill.writer, stored)?;
+                    spill
+                        .lookup
+                        .insert(key, (spill.size, compressed.as_ref().map(Vec::len)));
+                    spill.size += stored.len() as u64;
+                    scope.reads.snapshot_spill(stored.len() as u64);
+                }
+                Ok(())
+            })();
+            if spilled.is_err() {
+                *guard = None;
+            }
+        });
     }
 
     fn read_spill(
-        &mut self,
+        &self,
         key: &Key,
         block: &Block,
         memory: &MemoryReservation,
     ) -> Option<bytes::Bytes> {
         use std::io::{Read, Seek, SeekFrom};
-        let spill = self.spill.as_mut()?;
-        let (offset, encoded) = *spill.lookup.get(key)?;
-        let compressed = memory.new_empty();
-        compressed.try_grow(encoded.unwrap_or(0)).ok()?;
-        let mut bytes = vec![0; encoded.unwrap_or(block.decoded_size())];
-        let success = spill
-            .reader
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| spill.reader.read_exact(&mut bytes))
-            .is_ok();
-        if success {
+        let (encoded, raw_disk) = crate::blocking(|| {
+            let mut guard = self.spill.lock().unwrap();
+            let spill = guard.as_mut()?;
+            let (offset, encoded) = *spill.lookup.get(key)?;
+            let compressed = memory.new_empty();
+            compressed.try_grow(encoded.unwrap_or(0)).ok()?;
+            let mut bytes = vec![0; encoded.unwrap_or(block.decoded_size())];
+            if spill
+                .reader
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| spill.reader.read_exact(&mut bytes))
+                .is_err()
+            {
+                *guard = None;
+                return None;
+            }
+            Some((encoded, bytes))
+        })?;
+        // Decompress and verify SHA-256 outside any mutex lock.
+        let decoded = crate::blocking(|| {
             let raw = match encoded {
-                Some(_) => zstd::bulk::decompress(&bytes, block.decoded_size()).ok(),
-                None => Some(bytes),
+                Some(_) => zstd::bulk::decompress(&raw_disk, block.decoded_size()).ok(),
+                None => Some(raw_disk),
             };
             if let Some(raw) = raw
                 && raw.len() == block.decoded_size()
                 && Sha256::digest(&raw).as_slice() == block.sha256
             {
-                return Some(raw.into());
+                Some(bytes::Bytes::from(raw))
+            } else {
+                None
             }
+        });
+        if decoded.is_none() {
+            *self.spill.lock().unwrap() = None;
         }
-        self.spill = None;
-        None
+        decoded
     }
 }
 
@@ -362,46 +383,49 @@ impl BlockCache {
         let memory = MemoryConsumer::new("CSR property and identity cache")
             .register(&scope.runtime.memory_pool);
         let mut keep = false;
-        let cached;
+        let mut evicted = Vec::new();
         {
-            let mut cache = self.0.lock().unwrap();
-            if let Some(pos) = cache
-                .hot
-                .iter()
-                .position(|(candidate, _)| *candidate == key)
-            {
-                let entry = cache.hot.remove(pos).unwrap();
+            let mut hot = self.hot.lock().unwrap();
+            if let Some(pos) = hot.iter().position(|(candidate, _)| *candidate == key) {
+                let entry = hot.remove(pos).unwrap();
                 let value = entry.1.clone();
-                cache.hot.push_back(entry);
+                hot.push_back(entry);
                 return Ok(value);
             }
             // Leave room for decoding and ordinary execution, even when many paths are emitted.
             let limit = self.capacity(scope);
             let size = block.decoded_size();
             if size <= limit {
-                let mut used = cache
-                    .hot
+                let mut used = hot
                     .iter()
                     .map(|(_, value)| value.bytes.len())
                     .sum::<usize>();
                 while used + size > limit {
-                    used -= cache.evict(scope).unwrap();
+                    let Some(entry) = hot.pop_front() else {
+                        break;
+                    };
+                    used -= entry.1.bytes.len();
+                    evicted.push(entry);
                 }
                 loop {
                     if memory.try_grow(size).is_ok() {
                         keep = true;
                         break;
                     }
-                    if cache.evict(scope).is_none() {
+                    let Some(entry) = hot.pop_front() else {
                         break;
-                    }
+                    };
+                    evicted.push(entry);
                 }
             }
-            if !keep {
-                memory.try_grow(size)?;
-            }
-            cached = cache.read_spill(&key, block, &memory);
         }
+        for (evicted_key, evicted_data) in evicted {
+            self.spill_entry(evicted_key, evicted_data, scope);
+        }
+        if !keep {
+            memory.try_grow(block.decoded_size())?;
+        }
+        let cached = self.read_spill(&key, block, &memory);
         let bytes = match cached {
             Some(bytes) => bytes,
             None => fetch.await?,
@@ -413,19 +437,28 @@ impl BlockCache {
             compress_spill: block.decoded_bytes.is_some() || block.ids.is_some(),
         });
         if keep {
-            let mut cache = self.0.lock().unwrap();
-            let limit = self.capacity(scope);
-            let mut used = cache
-                .hot
-                .iter()
-                .map(|(_, block)| block.bytes.len())
-                .sum::<usize>();
-            // Other expressions may have filled the cache while the request was in flight.
-            while used + value.bytes.len() > limit {
-                used -= cache.evict(scope).unwrap();
+            let mut post_evicted = Vec::new();
+            {
+                let mut hot = self.hot.lock().unwrap();
+                let limit = self.capacity(scope);
+                let mut used = hot
+                    .iter()
+                    .map(|(_, block)| block.bytes.len())
+                    .sum::<usize>();
+                // Other expressions may have filled the cache while the request was in flight.
+                while used + value.bytes.len() > limit {
+                    let Some(entry) = hot.pop_front() else {
+                        break;
+                    };
+                    used -= entry.1.bytes.len();
+                    post_evicted.push(entry);
+                }
+                hot.retain(|(candidate, _)| *candidate != key);
+                hot.push_back((key, value.clone()));
             }
-            cache.hot.retain(|(candidate, _)| *candidate != key);
-            cache.hot.push_back((key, value.clone()));
+            for (evicted_key, evicted_data) in post_evicted {
+                self.spill_entry(evicted_key, evicted_data, scope);
+            }
         }
         Ok(value)
     }
@@ -766,19 +799,23 @@ pub(in crate::admin::cluster) async fn run_task(
         Ok(())
     };
     let monitor = async {
+        let mut errors = 0u32;
         loop {
             tokio::time::sleep(super::super::WAIT).await;
-            if !worker
-                .shared
-                .metadata
-                .get(task.id)
-                .await?
-                .is_some_and(|saved| {
-                    saved.job.attempt == task.attempt
-                        && matches!(saved.job.state, JobState::Running)
-                })
-            {
-                anyhow::bail!("query cancelled");
+            match worker.shared.metadata.get(task.id).await {
+                Ok(Some(saved))
+                    if saved.job.attempt == task.attempt
+                        && matches!(saved.job.state, JobState::Running) =>
+                {
+                    errors = 0;
+                }
+                Ok(_) => anyhow::bail!("query cancelled"),
+                Err(error) => {
+                    errors += 1;
+                    if errors >= 6 {
+                        return Err(error);
+                    }
+                }
             }
         }
     };
@@ -945,10 +982,11 @@ impl<'a> Execution<'a> {
             }
             let endpoint = &peers[index];
             let output = Uuid::new_v4();
-            // Reserve an equal share of the remaining time for each alternative,
-            // including local execution when all peers fail.
-            let attempts = u32::try_from(peers.len() - offset + 1).unwrap_or(u32::MAX);
-            let attempt = self.graph.scope.remaining()? / attempts;
+            // Give healthy peers a realistic share of the remaining budget (never
+            // dividing by all 32 peers) so normal shard work does not cascade-timeout.
+            let remaining = self.graph.scope.remaining()?;
+            let attempts = u32::try_from((peers.len() - offset + 1).min(3)).unwrap_or(3);
+            let attempt = remaining / attempts.max(1);
             let millis = attempt.as_millis();
             if millis == 0 {
                 break;
@@ -982,12 +1020,11 @@ impl<'a> Execution<'a> {
                 let data = self
                     .graph
                     .objects
-                    .get_json(&key, (self.worker.memory_bytes / 6) as u64)
+                    .get_json_with_size(&key, (self.worker.memory_bytes / 6) as u64)
                     .await;
                 self.graph.objects.delete(&key).await;
-                if let Ok(data) = data {
-                    self.stats.lock().unwrap().exchange_bytes +=
-                        serde_json::to_vec(&data)?.len() as u64;
+                if let Ok((data, bytes_len)) = data {
+                    self.stats.lock().unwrap().exchange_bytes += bytes_len;
                     return Ok(data);
                 }
             } else if response.as_ref().is_ok_and(|r| {
@@ -996,10 +1033,16 @@ impl<'a> Execution<'a> {
                     StatusCode::CONFLICT | StatusCode::TOO_MANY_REQUESTS
                 )
             }) {
-                if response
-                    .as_ref()
-                    .is_ok_and(|r| r.status() == StatusCode::CONFLICT)
-                {
+                let response = response.unwrap();
+                let status = response.status();
+                if status == StatusCode::CONFLICT {
+                    let body = response
+                        .json::<serde_json::Value>()
+                        .await
+                        .unwrap_or_default();
+                    if body["code"].as_str() == Some("cancelled") {
+                        anyhow::bail!("query cancelled");
+                    }
                     self.unavailable.lock().unwrap().insert(index);
                 }
                 continue;

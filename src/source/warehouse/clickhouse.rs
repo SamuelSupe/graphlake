@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::{
@@ -20,12 +24,43 @@ fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+fn readonly_profile_key(uri: &str, user: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(uri.len().to_le_bytes());
+    hash.update(uri.as_bytes());
+    hash.update(user.len().to_le_bytes());
+    hash.update(user.as_bytes());
+    hash.finalize().into()
+}
+
+fn readonly_profiles() -> &'static Mutex<VecDeque<([u8; 32], Instant)>> {
+    static CACHE: OnceLock<Mutex<VecDeque<([u8; 32], Instant)>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+fn is_readonly_profile(key: &[u8; 32]) -> bool {
+    let mut cache = readonly_profiles().lock().unwrap();
+    cache.retain(|(_, seen)| seen.elapsed() < Duration::from_secs(300));
+    cache.iter().any(|(cached, _)| cached == key)
+}
+
+fn remember_readonly_profile(key: [u8; 32]) {
+    let mut cache = readonly_profiles().lock().unwrap();
+    cache.retain(|(cached, seen)| cached != &key && seen.elapsed() < Duration::from_secs(300));
+    if cache.len() >= 64 {
+        cache.pop_front();
+    }
+    cache.push_back((key, Instant::now()));
+}
+
 #[derive(Clone)]
 pub(crate) struct ClickHouse {
     http: Http,
     user: String,
     password: Option<String>,
     timeout: Duration,
+    profile_key: [u8; 32],
     server_settings: bool,
 }
 
@@ -75,12 +110,16 @@ impl ClickHouse {
         else {
             bail!("expected ClickHouse source");
         };
+        let http = Http::new(uri, None, timeout, pool, stats)?;
+        let profile_key = readonly_profile_key(http.base.as_str(), user);
+        let server_settings = is_readonly_profile(&profile_key);
         Ok(Self {
-            http: Http::new(uri, None, timeout, pool, stats)?,
+            http,
             user: user.clone(),
             password: password_env.as_deref().map(credential).transpose()?,
             timeout,
-            server_settings: false,
+            profile_key,
+            server_settings,
         })
     }
 
@@ -303,6 +342,7 @@ impl ClickHouse {
             drop(response);
             response = request(true).await?;
             self.server_settings = true;
+            remember_readonly_profile(self.profile_key);
         }
         ensure!(
             response.status().is_success(),

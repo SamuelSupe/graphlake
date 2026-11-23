@@ -19,6 +19,8 @@ pub(crate) mod sql_read;
 #[cfg(feature = "admin")]
 pub(crate) use query::Admission;
 #[cfg(feature = "admin")]
+pub(crate) use query::allocation::slice_bytes;
+#[cfg(feature = "admin")]
 pub(crate) use query::spilled_bytes as execution_spill;
 pub use query::{EngineLimits, QueryMetrics, QueryOptions, QueryResult};
 pub(crate) use query::{QueryScope, graph_frame, gremlin_frame};

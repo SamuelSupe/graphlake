@@ -23,7 +23,19 @@ use datafusion::{
     prelude::SessionContext,
 };
 
+#[cfg(feature = "admin")]
 pub(crate) fn register(context: &SessionContext) {
+    register_inner(context, None);
+}
+
+pub(in crate::engine) fn register_scoped(
+    context: &SessionContext,
+    scope: &crate::engine::query::QueryScope,
+) {
+    register_inner(context, Some(scope));
+}
+
+fn register_inner(context: &SessionContext, scope: Option<&crate::engine::query::QueryScope>) {
     context.register_udf(ScalarUDF::from(Items(Signature::any(
         1,
         Volatility::Immutable,
@@ -44,7 +56,7 @@ pub(crate) fn register(context: &SessionContext) {
         1,
         Volatility::Immutable,
     ))));
-    cypher::register(context);
+    cypher::register_inner(context, scope);
     context.register_udf(ScalarUDF::from(QueryValue {
         name: "__graphlake_numeric_input",
         signature: Signature::variadic_any(Volatility::Immutable),

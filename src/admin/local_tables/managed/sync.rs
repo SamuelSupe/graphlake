@@ -196,17 +196,17 @@ impl Managed {
         mode: Option<Mode>,
         scheduled: bool,
     ) -> ApiResult<Run> {
-        let _serial = app.local_tables.create_work.lock().await;
-        let leader = leader(app)?;
-        let lease = leader.confirm().await?;
-        self.migrate_retirements(id, leader).await.map_err(error)?;
-        let owner = owner(leader);
         let permit = app
             .local_tables
             .slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::busy())?;
+        let _serial = app.local_tables.create_work.lock().await;
+        let leader = leader(app)?;
+        let lease = leader.confirm().await?;
+        self.migrate_retirements(id, leader).await.map_err(error)?;
+        let owner = owner(leader);
         for _ in 0..8 {
             let (mut record, rev) = self
                 .record(id)
@@ -242,17 +242,46 @@ impl Managed {
                 .insert(key.clone(), cancel.clone());
             tokio::spawn(async move {
                 use futures::FutureExt;
+                let sync_app = Arc::clone(&app);
+                let sync_managed = managed.clone();
+                let sync_record = record.clone();
+                let sync_task = task.clone();
+                let sync_cancel = cancel.clone();
+                let mut worker = tokio::spawn(async move {
+                    std::panic::AssertUnwindSafe(sync_managed.sync(
+                        &sync_app,
+                        &sync_record,
+                        &sync_task,
+                        &sync_cancel,
+                    ))
+                    .catch_unwind()
+                    .await
+                });
+                let mut completed = false;
                 let result = tokio::select! {
                     biased;
-                    _ = lease.cancelled() => Err(anyhow::anyhow!("managed sync interrupted by leadership change")),
+                    _ = lease.cancelled() => {
+                        cancel.cancel();
+                        Err(anyhow::anyhow!("managed sync interrupted by leadership change"))
+                    }
                     _ = cancel.cancelled() => Err(anyhow::anyhow!("managed sync cancelled")),
-                    result = tokio::time::timeout(Duration::from_secs(record.table.config.timeout_seconds),
-                        std::panic::AssertUnwindSafe(managed.sync(&app, &record, &task, &cancel))
-                            .catch_unwind()) => {
+                    result = tokio::time::timeout(
+                        Duration::from_secs(record.table.config.timeout_seconds),
+                        &mut worker,
+                    ) => {
                         match result {
-                            Ok(Ok(result)) => result,
-                            Ok(Err(_)) => Err(anyhow::anyhow!("managed local-table load panicked")),
-                            Err(_) => Err(anyhow::anyhow!("deadline exceeded")),
+                            Ok(Ok(Ok(result))) => {
+                                completed = true;
+                                result
+                            }
+                            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                                completed = true;
+                                Err(anyhow::anyhow!("managed local-table load panicked"))
+                            }
+                            Err(_) => {
+                                cancel.cancel();
+                                Err(anyhow::anyhow!("deadline exceeded"))
+                            }
                         }
                     }
                 };
@@ -260,6 +289,7 @@ impl Managed {
                 let mut logged = false;
                 let confirmation_deadline = tokio::time::sleep(Duration::from_secs(30));
                 tokio::pin!(confirmation_deadline);
+                let mut confirmed = false;
                 loop {
                     let finished = tokio::select! {
                         biased;
@@ -268,7 +298,10 @@ impl Managed {
                         finished = managed.finish(&app, id, task.id, &owner, &result, cancel.is_cancelled()) => finished,
                     };
                     match finished {
-                        Ok(_) => break,
+                        Ok(ok) => {
+                            confirmed = ok;
+                            break;
+                        }
                         Err(e) => {
                             if !logged {
                                 let _ = writeln!(
@@ -280,6 +313,17 @@ impl Managed {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
+                }
+                if !completed {
+                    // Wait for any in-flight blocking task using this workspace to exit
+                    // before clearing `running`, preventing concurrent workspace corruption.
+                    tokio::select! {
+                        _ = app.shutdown.cancelled() => {}
+                        _ = worker => {}
+                    }
+                } else if confirmed && result.is_ok() {
+                    let path = Self::workspace(&app, id);
+                    let _ = tokio::task::spawn_blocking(move || load::clean_parts(&path)).await;
                 }
                 app.local_tables.running.lock().unwrap().remove(&key);
             });
@@ -456,6 +500,7 @@ impl Managed {
                 .into_iter()
                 .map(|(record, rev)| (record.table.data_id, (record, rev))),
         );
+        let mut due = Vec::new();
         for (record, rev) in cache.records.values() {
             if record.pending.is_some() {
                 // start() holds the same lock across publishing pending and
@@ -473,7 +518,9 @@ impl Managed {
                 .table
                 .history
                 .iter()
-                .take_while(|run| run.status == "failed")
+                .take_while(|run| {
+                    matches!(run.status.as_str(), "failed" | "cancelled" | "interrupted")
+                })
                 .count();
             if failures > 0
                 && record.table.history[0].finished_at_ms.is_some_and(|last| {
@@ -482,16 +529,24 @@ impl Managed {
             {
                 continue;
             }
-            if [
+            if let Some(earliest) = [
                 record.table.next_run_at_ms,
                 record.table.next_reconcile_at_ms,
             ]
             .into_iter()
             .flatten()
-            .any(|due| due <= now())
+            .filter(|due| *due <= now())
+            .min()
             {
-                let _ = self.start(app, record.table.data_id, None, true).await;
+                due.push((earliest, record.table.data_id));
             }
+        }
+        due.sort_unstable();
+        for (_, data_id) in due {
+            if app.local_tables.slots.available_permits() == 0 {
+                break;
+            }
+            let _ = self.start(app, data_id, None, true).await;
         }
     }
 }

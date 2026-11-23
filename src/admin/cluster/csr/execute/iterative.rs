@@ -114,7 +114,7 @@ fn append(writer: &mut impl Write, id: Vertex, value: Value) -> Result<()> {
 
 struct Spool {
     file: Arc<dyn SpillFile>,
-    writer: Box<dyn SpillWriter>,
+    writer: std::io::BufWriter<Box<dyn SpillWriter>>,
 }
 
 impl Spool {
@@ -125,13 +125,18 @@ impl Spool {
             .disk_manager
             .create_tmp_file("CSR algorithm exchange")?;
         Ok(Self {
-            writer: file.open_writer()?,
+            writer: std::io::BufWriter::with_capacity(64 * 1024, file.open_writer()?),
             file,
         })
     }
 
     async fn upload(mut self, graph: &Graph<'_>, key: &Key) -> Result<u64> {
-        self.writer.finish()?;
+        self.writer.flush()?;
+        let mut inner = self
+            .writer
+            .into_inner()
+            .map_err(|error| error.into_error())?;
+        inner.finish()?;
         let size = self.file.size().context("CSR exchange file size")?;
         let budget = graph.budget.new_empty();
         budget.try_grow(size.min(5 * 1024 * 1024) as usize)?;
@@ -304,8 +309,11 @@ pub(super) async fn partition_step(
                 )
                 .await?;
             }
-            for (id, current) in &next {
-                let previous = old[id];
+            for (index, ((_, previous), (_, current))) in old.iter().zip(&next).enumerate() {
+                if index.is_multiple_of(2048) {
+                    graph.scope.check()?;
+                    tokio::task::consume_budget().await;
+                }
                 report.changed |= previous.number != current.number;
                 if matches!(algorithm, Algorithm::Rank) {
                     report.delta +=
@@ -425,7 +433,11 @@ fn merge(value: &mut Value, candidate: Value, algorithm: Algorithm) {
 
 async fn save(graph: &Graph<'_>, key: &Key, state: State) -> Result<u64> {
     let mut spool = Spool::new(graph)?;
-    for (id, value) in state {
+    for (index, (id, value)) in state.into_iter().enumerate() {
+        if index.is_multiple_of(2048) {
+            graph.scope.check()?;
+            tokio::task::consume_budget().await;
+        }
         append(&mut spool.writer, id, value)?;
     }
     spool.upload(graph, key).await

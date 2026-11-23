@@ -17,14 +17,15 @@ use datafusion::{
 
 use super::{
     super::{numeric_array, numeric_type},
-    distinct_list,
+    ScopeGuard, distinct_list,
 };
 
-pub(super) fn register(context: &SessionContext) {
+pub(super) fn register(context: &SessionContext, guard: Option<ScopeGuard>) {
     for average in [false, true] {
         context.register_udf(ScalarUDF::from(NumericDistinct {
             average,
             signature: Signature::any(1, Volatility::Immutable),
+            guard: guard.clone(),
         }));
     }
 }
@@ -33,6 +34,7 @@ pub(super) fn register(context: &SessionContext) {
 struct NumericDistinct {
     average: bool,
     signature: Signature,
+    guard: Option<ScopeGuard>,
 }
 
 impl NumericDistinct {
@@ -76,7 +78,7 @@ impl ScalarUDFImpl for NumericDistinct {
         let ty = self.input_type(array.data_type())?;
         // Deduplicate original values before a promotion can round integers to
         // the same float. DataFusion still performs the typed sum or average.
-        let array = distinct_list(array)?;
+        let array = distinct_list(array, self.guard.as_ref())?;
         let list = array
             .as_any()
             .downcast_ref::<ListArray>()

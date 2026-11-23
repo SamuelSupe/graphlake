@@ -598,6 +598,15 @@ impl ProjectionAlgorithm {
                 })
                 .await??;
                 *graph = input;
+                // embedding::train dropped the `output` matrix; release its half of the reservation
+                // before materializing Arrow output batches.
+                let retained = stats
+                    .vertices
+                    .saturating_mul(options.dimensions)
+                    .saturating_mul(std::mem::size_of::<f32>());
+                if budget.size() > retained {
+                    budget.shrink(budget.size() - retained);
+                }
                 stats.iterations = Some(options.epochs);
                 Scores::Embedding {
                     values,
@@ -766,13 +775,14 @@ async fn label_propagation(
             .saturating_add(max_degree.saturating_mul(96)),
     )?;
     let mut labels = (0..graph.vertices.len() as u64).collect::<Vec<_>>();
+    let mut votes = std::collections::HashMap::<u64, f64>::with_capacity(max_degree.min(1024));
     let mut work = 0;
     for iteration in 1..=max_iterations {
         let mut changed = false;
         for (vertex, neighbors) in graph.adjacency.iter().enumerate() {
             work += 1;
             cooperate(scope, work).await?;
-            let mut votes = BTreeMap::<u64, f64>::new();
+            votes.clear();
             for neighbor in neighbors {
                 work += 1;
                 cooperate(scope, work).await?;
@@ -788,13 +798,13 @@ async fn label_propagation(
             }
             let current = labels[vertex];
             let next = votes
-                .into_iter()
+                .iter()
                 .max_by(|(left, a), (right, b)| {
                     a.total_cmp(b)
-                        .then_with(|| (*left == current).cmp(&(*right == current)))
+                        .then_with(|| (**left == current).cmp(&(**right == current)))
                         .then_with(|| right.cmp(left))
                 })
-                .map_or(current, |(label, _)| label);
+                .map_or(current, |(&label, _)| label);
             changed |= next != current;
             labels[vertex] = next;
         }

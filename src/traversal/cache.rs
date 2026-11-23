@@ -276,8 +276,7 @@ impl Cache {
             .map(serde_json::to_string)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         predicates.sort_unstable();
-        let mut scope =
-            serde_json::to_vec(&(self.binding.as_str(), predicates, &options.snapshot_time))?;
+        let mut scope = serde_json::to_vec(&(self.binding.as_str(), predicates, time))?;
         if options.require_consistent_snapshot {
             scope.extend_from_slice(b"/consistent-snapshot");
         }
@@ -318,7 +317,7 @@ impl Cache {
                     id: file_id(&file)?,
                 };
                 let flight = {
-                    let mut cache = recent.lock().unwrap();
+                    let mut cache = recent.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(graph) = cache.cached(&key) {
                         return Ok(Some(Arc::new(reuse(graph, &scope, None)?)));
                     }
@@ -326,7 +325,7 @@ impl Cache {
                 };
                 // Only callers loading the same inode and direction wait here.
                 // A weak entry also shares uncached topologies between active queries.
-                let mut shared = flight.lock().unwrap();
+                let mut shared = flight.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(graph) = shared.upgrade() {
                     reuse(graph, &scope, Some(flight.clone()))?
                 } else {
@@ -336,7 +335,10 @@ impl Cache {
                     if file_id(&file_check)? == key.id {
                         *shared = Arc::downgrade(&loaded.graph);
                         loaded._flight = Some(flight.clone());
-                        recent.lock().unwrap().retain(key, loaded.graph.clone());
+                        recent
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retain(key, loaded.graph.clone());
                     }
                     loaded
                 }
@@ -593,7 +595,8 @@ fn read(
         neighbors = combined;
     }
     let converter = row_converter(&keys.schema())?;
-    let mut index = HashMap::new();
+    let mut index = HashMap::with_capacity(keys.num_rows());
+    let mut index_bytes = 0usize;
     for offset in (0..keys.num_rows()).step_by(IPC_ROWS) {
         scope.check()?;
         let batch = keys.slice(offset, IPC_ROWS.min(keys.num_rows() - offset));
@@ -605,13 +608,26 @@ fn read(
             "null node key in CSR generation"
         );
         for row in converter.convert_columns(batch.columns())?.iter() {
-            budget.try_grow(row.data().len().saturating_add(160))?;
+            let entry_bytes = row.data().len().saturating_add(160);
+            budget.try_grow(entry_bytes)?;
+            index_bytes = index_bytes.saturating_add(entry_bytes);
             let id = index.len();
             ensure!(
                 index.insert(row.data().into(), id).is_none(),
                 "duplicate node key in CSR generation"
             );
         }
+    }
+    // Shrink reservation from transient decode peak to actual retained memory so
+    // cache hits and retention thresholds reflect real steady-state footprint.
+    let retained = keys
+        .get_array_memory_size()
+        .saturating_add(identities.get_array_memory_size())
+        .saturating_add(offsets.capacity().saturating_mul(size_of::<usize>()))
+        .saturating_add(neighbors.capacity().saturating_mul(size_of::<Neighbor>()))
+        .saturating_add(index_bytes);
+    if budget.size() > retained {
+        budget.shrink(budget.size() - retained);
     }
     let graph = Arc::new(Decoded {
         topology: Arc::new(Topology {

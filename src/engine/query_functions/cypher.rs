@@ -8,7 +8,12 @@ mod range;
 pub(in crate::engine) mod reduce;
 mod sum;
 
-use std::{cmp::Ordering, collections::HashSet, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::HashSet,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use datafusion::{
     arrow::{
@@ -22,6 +27,7 @@ use datafusion::{
         row::{RowConverter, SortField},
     },
     common::{Result, ScalarValue, exec_err},
+    execution::{memory_pool::MemoryConsumer, runtime_env::RuntimeEnv},
     logical_expr::{
         BinaryExpr, ColumnarValue, Expr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
         Signature, Volatility, expr_fn,
@@ -31,7 +37,53 @@ use datafusion::{
     prelude::SessionContext,
 };
 
-pub(super) fn register(context: &SessionContext) {
+#[derive(Clone, Debug)]
+pub(super) struct ScopeGuard {
+    pub(super) runtime: Arc<RuntimeEnv>,
+    pub(super) cancelled: crate::CancellationToken,
+    pub(super) deadline: tokio::time::Instant,
+}
+
+impl ScopeGuard {
+    fn from_scope(scope: &crate::engine::query::QueryScope) -> Self {
+        Self {
+            runtime: Arc::clone(&scope.runtime),
+            cancelled: scope.options.cancellation.clone(),
+            deadline: scope.deadline,
+        }
+    }
+
+    pub(super) fn check(&self) -> Result<()> {
+        if self.cancelled.is_cancelled() {
+            return exec_err!("query cancelled");
+        }
+        if tokio::time::Instant::now() >= self.deadline {
+            return exec_err!("query deadline exceeded");
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for ScopeGuard {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.runtime, &other.runtime) && self.deadline == other.deadline
+    }
+}
+
+impl Eq for ScopeGuard {}
+
+impl Hash for ScopeGuard {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.runtime).hash(state);
+        self.deadline.hash(state);
+    }
+}
+
+pub(super) fn register_inner(
+    context: &SessionContext,
+    scope: Option<&crate::engine::query::QueryScope>,
+) {
+    let guard = scope.map(ScopeGuard::from_scope);
     for (name, signature) in [
         (
             "__graphlake_cypher_property",
@@ -53,9 +105,9 @@ pub(super) fn register(context: &SessionContext) {
     ))));
     entity::register(context);
     hydrate::register(context);
-    arithmetic::register(context);
+    arithmetic::register(context, guard.clone());
     map::register(context);
-    numeric_distinct::register(context);
+    numeric_distinct::register(context, guard.clone());
     sum::register(context);
     range::register(context);
     for mode in [
@@ -77,6 +129,7 @@ pub(super) fn register(context: &SessionContext) {
         context.register_udf(ScalarUDF::from(Predicate {
             name,
             signature: Signature::any(arity, Volatility::Immutable),
+            guard: guard.clone(),
         }));
     }
 }
@@ -358,6 +411,7 @@ pub(in crate::engine) fn is_variant(fields: &Fields) -> bool {
 struct Predicate {
     name: &'static str,
     signature: Signature,
+    guard: Option<ScopeGuard>,
 }
 
 impl ScalarUDFImpl for Predicate {
@@ -433,6 +487,11 @@ impl ScalarUDFImpl for Predicate {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let input = args.args[0].to_array(args.number_rows)?;
+        if self.name == "__graphlake_cypher_in"
+            && let ColumnarValue::Scalar(ref right_scalar) = args.args[1]
+        {
+            return self.invoke_scalar_in(&input, right_scalar, args.number_rows);
+        }
         let right = args.args[1].to_array(args.number_rows)?;
         let op = if self.name == "__graphlake_cypher_compare" {
             args.args[2].to_array(args.number_rows)?
@@ -441,10 +500,15 @@ impl ScalarUDFImpl for Predicate {
         };
         let mut output = BooleanBuilder::with_capacity(args.number_rows);
         for row in 0..args.number_rows {
+            if row.is_multiple_of(256)
+                && let Some(guard) = &self.guard
+            {
+                guard.check()?;
+            }
             let left = unpack(ScalarValue::try_from_array(&input, row)?)?;
             let right = unpack(ScalarValue::try_from_array(&right, row)?)?;
             let result = match self.name {
-                "__graphlake_cypher_in" => membership(&left, &right)?,
+                "__graphlake_cypher_in" => membership(&left, &right, self.guard.as_ref())?,
                 "__graphlake_cypher_equals" => equal(&left, &right)?,
                 _ => {
                     let op = ScalarValue::try_from_array(&op, row)?.cast_to(&DataType::Utf8)?;
@@ -471,6 +535,103 @@ impl ScalarUDFImpl for Predicate {
                 }
             };
             output.append_option(result);
+        }
+        Ok(ColumnarValue::Array(Arc::new(output.finish())))
+    }
+}
+
+impl Predicate {
+    fn invoke_scalar_in(
+        &self,
+        input: &ArrayRef,
+        right_scalar: &ScalarValue,
+        number_rows: usize,
+    ) -> Result<ColumnarValue> {
+        let right = unpack(right_scalar.clone())?;
+        let mut output = BooleanBuilder::with_capacity(number_rows);
+        if right.is_null() {
+            for _ in 0..number_rows {
+                output.append_null();
+            }
+            return Ok(ColumnarValue::Array(Arc::new(output.finish())));
+        }
+        let Some(items) = list_items(&right) else {
+            return exec_err!("Cypher IN expects a list");
+        };
+        if items.is_empty() {
+            for _ in 0..number_rows {
+                output.append_value(false);
+            }
+            return Ok(ColumnarValue::Array(Arc::new(output.finish())));
+        }
+        let item_type = match items.data_type() {
+            DataType::Dictionary(_, value) => value.as_ref(),
+            other => other,
+        };
+        let flat_rhs = !item_type.is_nested();
+        if flat_rhs {
+            let reservation = self.guard.as_ref().map(|guard| {
+                MemoryConsumer::new("__graphlake_cypher_in set")
+                    .register(&guard.runtime.memory_pool)
+            });
+            let mut seen = HashSet::new();
+            let mut has_null = false;
+            for index in 0..items.len() {
+                if index.is_multiple_of(256)
+                    && let Some(guard) = &self.guard
+                {
+                    guard.check()?;
+                }
+                let item = unpack(ScalarValue::try_from_array(&items, index)?)?;
+                if item.is_null() {
+                    has_null = true;
+                    continue;
+                }
+                if float(&item).is_some_and(f64::is_nan) {
+                    continue;
+                }
+                let mut key = Vec::new();
+                encode_equivalence(item, &mut key)?;
+                if let Some(reservation) = &reservation {
+                    reservation.try_grow(key.len() + 32)?;
+                }
+                seen.insert(key);
+            }
+            let mut key = Vec::new();
+            for row in 0..number_rows {
+                if row.is_multiple_of(256)
+                    && let Some(guard) = &self.guard
+                {
+                    guard.check()?;
+                }
+                let left = unpack(ScalarValue::try_from_array(input, row)?)?;
+                let result = if left.is_null() {
+                    None
+                } else if float(&left).is_some_and(f64::is_nan) || left.data_type().is_nested() {
+                    if has_null { None } else { Some(false) }
+                } else {
+                    key.clear();
+                    encode_equivalence(left, &mut key)?;
+                    if seen.contains(&key) {
+                        Some(true)
+                    } else if has_null {
+                        None
+                    } else {
+                        Some(false)
+                    }
+                };
+                output.append_option(result);
+            }
+            return Ok(ColumnarValue::Array(Arc::new(output.finish())));
+        }
+        for row in 0..number_rows {
+            if row.is_multiple_of(256)
+                && let Some(guard) = &self.guard
+            {
+                guard.check()?;
+            }
+            let left = unpack(ScalarValue::try_from_array(input, row)?)?;
+            output.append_option(membership(&left, &right, self.guard.as_ref())?);
         }
         Ok(ColumnarValue::Array(Arc::new(output.finish())))
     }
@@ -505,7 +666,11 @@ fn list_items(value: &ScalarValue) -> Option<ArrayRef> {
     }
 }
 
-fn membership(left: &ScalarValue, right: &ScalarValue) -> Result<Option<bool>> {
+fn membership(
+    left: &ScalarValue,
+    right: &ScalarValue,
+    guard: Option<&ScopeGuard>,
+) -> Result<Option<bool>> {
     if right.is_null() {
         return Ok(None);
     }
@@ -514,6 +679,11 @@ fn membership(left: &ScalarValue, right: &ScalarValue) -> Result<Option<bool>> {
     };
     let mut found = Some(false);
     for index in 0..items.len() {
+        if index.is_multiple_of(256)
+            && let Some(guard) = guard
+        {
+            guard.check()?;
+        }
         match equal(left, &unpack(ScalarValue::try_from_array(&items, index)?)?)? {
             Some(true) => return Ok(Some(true)),
             None => found = None,
@@ -756,6 +926,54 @@ impl ScalarUDFImpl for ValueKey {
             }
             return Ok(ColumnarValue::Array(Arc::new(keys.finish())));
         }
+        // Vectorized batch path for fallback scalar types (Date, Timestamp, Binary, etc.)
+        // to avoid per-row RowConverter::new + ty.to_string() + to_array() allocations.
+        let ty = input.data_type();
+        let is_fallback_scalar = !ty.is_null()
+            && !ty.is_numeric()
+            && !text_type(ty)
+            && *ty != DataType::Boolean
+            && !ty.is_nested()
+            && !matches!(ty, DataType::Dictionary(..));
+        if is_fallback_scalar {
+            let ty_name = ty.to_string();
+            let converter = RowConverter::new(vec![SortField::new(ty.clone())])?;
+            let rows = converter.convert_columns(&[Arc::clone(&input)])?;
+            let mut keys = BinaryBuilder::with_capacity(input.len(), input.len() * 16);
+            let mut key = Vec::new();
+            let order_mode = matches!(self.mode, KeyMode::Order | KeyMode::GremlinOrder);
+            let gremlin = self.mode == KeyMode::GremlinOrder;
+            let order_tag = if gremlin {
+                match ty {
+                    DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) => 4,
+                    _ => 12,
+                }
+            } else {
+                9
+            };
+            for index in 0..input.len() {
+                if input.is_null(index) {
+                    if order_mode {
+                        keys.append_null();
+                    } else {
+                        keys.append_value([0u8]);
+                    }
+                    continue;
+                }
+                key.clear();
+                if order_mode {
+                    key.push(order_tag);
+                    encode_order_bytes(ty_name.as_bytes(), &mut key);
+                    encode_order_bytes(rows.row(index).as_ref(), &mut key);
+                } else {
+                    key.push(5);
+                    encode_bytes(ty_name.as_bytes(), &mut key);
+                    encode_bytes(rows.row(index).as_ref(), &mut key);
+                }
+                keys.append_value(&key);
+            }
+            return Ok(ColumnarValue::Array(Arc::new(keys.finish())));
+        }
         let mut keys = BinaryBuilder::new();
         let mut key = Vec::new();
         for index in 0..input.len() {
@@ -777,23 +995,42 @@ impl ScalarUDFImpl for ValueKey {
     }
 }
 
-fn distinct_list(input: ArrayRef) -> Result<ArrayRef> {
+fn distinct_list(input: ArrayRef, guard: Option<&ScopeGuard>) -> Result<ArrayRef> {
     let Some(list) = input.as_any().downcast_ref::<ListArray>() else {
         return exec_err!("collect(DISTINCT) requires a list");
     };
     let DataType::List(field) = list.data_type() else {
         unreachable!("collect list type")
     };
+    let reservation = guard.map(|guard| {
+        MemoryConsumer::new("GraphLake DISTINCT numeric aggregate")
+            .register(&guard.runtime.memory_pool)
+    });
+    if let Some(reservation) = &reservation {
+        let estimated = crate::engine::query::allocation::slice_bytes(list.values().as_ref())?;
+        reservation.try_grow(estimated)?;
+    }
     let data = list.values().to_data();
     let mut values = MutableArrayData::new(vec![&data], true, list.values().len());
     let mut seen = HashSet::new();
     let mut lengths = Vec::with_capacity(list.len());
+    let mut visited = 0usize;
     for window in list.value_offsets().windows(2) {
         seen.clear();
         for index in window[0] as usize..window[1] as usize {
+            visited += 1;
+            if visited.is_multiple_of(256)
+                && let Some(guard) = guard
+            {
+                guard.check()?;
+            }
             let mut key = Vec::new();
             encode_equivalence(ScalarValue::try_from_array(list.values(), index)?, &mut key)?;
-            if seen.insert(key) {
+            if !seen.contains(&key) {
+                if let Some(reservation) = &reservation {
+                    reservation.try_grow(key.len() + 32)?;
+                }
+                seen.insert(key);
                 values.try_extend(0, index, index + 1)?;
             }
         }
@@ -918,7 +1155,9 @@ fn encode_order(value: ScalarValue, key: &mut Vec<u8>, gremlin: bool) -> Result<
         key.extend_from_slice(&[if gremlin { 2 } else { 7 }, u8::from(value)]);
     } else if value.data_type().is_numeric() {
         key.push(if gremlin { 3 } else { 8 });
-        if let Some(decimal) = crate::scalar::finite_decimal(&value) {
+        if let Some(int_val) = integer_i128(&value) {
+            encode_order_i128(int_val, key);
+        } else if let Some(decimal) = crate::scalar::finite_decimal(&value) {
             let (coefficient, scale) = decimal.normalized().as_bigint_and_exponent();
             let digits = coefficient.to_string();
             if digits == "0" {
@@ -964,6 +1203,50 @@ fn encode_order(value: ScalarValue, key: &mut Vec<u8>, gremlin: bool) -> Result<
         encode_order_bytes(rows.row(0).as_ref(), key);
     }
     Ok(())
+}
+
+fn integer_i128(value: &ScalarValue) -> Option<i128> {
+    match value {
+        ScalarValue::Int8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::Int64(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt8(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Some(i128::from(*v)),
+        ScalarValue::UInt64(Some(v)) => Some(i128::from(*v)),
+        _ => None,
+    }
+}
+
+fn encode_order_i128(value: i128, key: &mut Vec<u8>) {
+    if value == 0 {
+        key.push(2);
+        return;
+    }
+    let negative = value < 0;
+    let mut mag = value.unsigned_abs();
+    let mut buf = [0u8; 40];
+    let mut pos = buf.len();
+    while mag > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (mag % 10) as u8;
+        mag /= 10;
+    }
+    let total_digits = (buf.len() - pos) as i64;
+    let mut end = buf.len();
+    while end > pos && buf[end - 1] == b'0' {
+        end -= 1;
+    }
+    let digits = &buf[pos..end];
+    key.push(if negative { 1 } else { 3 });
+    let exponent = (total_digits as u64) ^ (1 << 63);
+    let bytes = exponent
+        .to_be_bytes()
+        .into_iter()
+        .chain(digits.iter().copied())
+        .chain(std::iter::once(0));
+    key.extend(bytes.map(|byte| if negative { !byte } else { byte }));
 }
 
 fn encode_order_bytes(bytes: &[u8], key: &mut Vec<u8>) {

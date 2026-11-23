@@ -1,4 +1,4 @@
-mod allocation;
+pub(in crate::engine) mod allocation;
 
 use std::{
     collections::BTreeMap,
@@ -372,7 +372,7 @@ pub(crate) struct QueryScope {
     pub(crate) options: QueryOptions,
     start: Instant,
     pub(crate) wall_time: chrono::DateTime<chrono::Utc>,
-    pub(super) deadline: Instant,
+    pub(crate) deadline: Instant,
     lease: Mutex<Option<Lease>>,
     pub(crate) runtime: Arc<RuntimeEnv>,
     pool: Arc<PeakRecordingPool>,
@@ -505,7 +505,7 @@ impl QueryScope {
                 .with_optimizer_rules(rules)
                 .build(),
         );
-        super::query_functions::register(&context);
+        super::query_functions::register_scoped(&context, self);
         allocation::register(&context, self, &["__graphlake_cypher_range"]);
         super::query_functions::cypher::reduce::register(&context, self);
         super::query_functions::cypher::collect::register(

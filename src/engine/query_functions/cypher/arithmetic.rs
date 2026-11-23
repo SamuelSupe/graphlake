@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use datafusion::{
     arrow::{
@@ -11,6 +14,7 @@ use datafusion::{
         datatypes::DataType,
     },
     common::Result,
+    execution::memory_pool::MemoryConsumer,
     functions_nested::concat::array_concat_inner,
     logical_expr::{
         ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
@@ -19,9 +23,12 @@ use datafusion::{
     prelude::SessionContext,
 };
 
-use super::{common_value_type, flatten_value, is_variant, merge_values, text_type, value_types};
+use super::{
+    ScopeGuard, common_value_type, flatten_value, is_variant, merge_values, text_type, value_types,
+};
+use crate::engine::query::allocation::slice_bytes;
 
-pub(super) fn register(context: &SessionContext) {
+pub(super) fn register(context: &SessionContext, guard: Option<ScopeGuard>) {
     for (name, op) in [
         ("__graphlake_cypher_add", Operator::Plus),
         ("__graphlake_cypher_subtract", Operator::Minus),
@@ -33,15 +40,41 @@ pub(super) fn register(context: &SessionContext) {
             name,
             op,
             signature: Signature::any(2, Volatility::Immutable),
+            guard: if op == Operator::Plus {
+                guard.clone()
+            } else {
+                None
+            },
         }));
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 struct Arithmetic {
     name: &'static str,
     op: Operator,
     signature: Signature,
+    guard: Option<ScopeGuard>,
+}
+
+impl PartialEq for Arithmetic {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.op == other.op
+            && self.signature == other.signature
+            && self.guard == other.guard
+    }
+}
+
+impl Eq for Arithmetic {}
+
+impl Hash for Arithmetic {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.op.hash(state);
+        self.signature.hash(state);
+        self.guard.hash(state);
+    }
 }
 
 fn concat_type(a: &DataType, b: &DataType) -> Option<DataType> {
@@ -100,7 +133,18 @@ fn concatenate(
     b: ArrayRef,
     ty: &DataType,
     nulls: Option<NullBuffer>,
+    guard: Option<&ScopeGuard>,
 ) -> Result<ArrayRef> {
+    let _reservation = if let Some(guard) = guard {
+        guard.check()?;
+        let estimated = slice_bytes(a.as_ref())?.saturating_add(slice_bytes(b.as_ref())?);
+        let reservation = MemoryConsumer::new("__graphlake_cypher_add allocation")
+            .register(&guard.runtime.memory_pool);
+        reservation.try_grow(estimated.saturating_mul(3))?;
+        Some(reservation)
+    } else {
+        None
+    };
     if let DataType::List(item) = ty {
         let rows = a.len();
         let list = |value: ArrayRef| -> Result<ArrayRef> {
@@ -172,7 +216,13 @@ impl ScalarUDFImpl for Arithmetic {
                 if self.op == Operator::Plus
                     && let Some(ty) = concat_type(a.data_type(), b.data_type())
                 {
-                    values.push(concatenate(a.clone(), b.clone(), &ty, nulls)?);
+                    values.push(concatenate(
+                        a.clone(),
+                        b.clone(),
+                        &ty,
+                        nulls,
+                        self.guard.as_ref(),
+                    )?);
                     continue;
                 }
                 let (left, right) = integer_lanes(a.data_type(), b.data_type());

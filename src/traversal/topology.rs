@@ -73,6 +73,7 @@ impl Topology {
             let from = converter.convert_columns(&columns[..width])?;
             let to = converter.convert_columns(&columns[width..2 * width])?;
             let keys = identities.convert_columns(&columns[2 * width..])?;
+            let mut batch_arcs = 0usize;
             for (i, ((from, to), key)) in from.iter().zip(to.iter()).zip(keys.iter()).enumerate() {
                 unique_budget.try_grow(key.data().len().saturating_add(128))?;
                 ensure!(
@@ -84,7 +85,7 @@ impl Topology {
                     continue;
                 };
                 if undirected && from != to {
-                    reservation.try_grow(4 * std::mem::size_of::<Neighbor>())?;
+                    batch_arcs += 1;
                     arcs.push((
                         to,
                         Neighbor {
@@ -93,6 +94,7 @@ impl Topology {
                         },
                     ));
                 }
+                batch_arcs += 1;
                 arcs.push((
                     from,
                     Neighbor {
@@ -100,6 +102,11 @@ impl Topology {
                         edge: row_offset + i,
                     },
                 ));
+            }
+            if batch_arcs > 0 {
+                reservation.try_grow(batch_arcs.saturating_mul(
+                    std::mem::size_of::<(usize, Neighbor)>() + std::mem::size_of::<Neighbor>(),
+                ))?;
             }
             row_offset += batch.num_rows();
             edge_batches.push(RecordBatch::try_new(
@@ -111,6 +118,7 @@ impl Topology {
         let n = index.len();
         drop(unique);
         drop(unique_budget);
+        reservation.try_grow((n + 1).saturating_mul(2 * std::mem::size_of::<usize>()))?;
         let mut offsets = vec![0; n + 1];
         for chunk in arcs.chunks(COOPERATIVE_INTERVAL) {
             for (source, _) in chunk {
@@ -133,8 +141,17 @@ impl Topology {
             }
             tokio::task::yield_now().await;
         }
+        let arcs_bytes = arcs
+            .len()
+            .saturating_mul(std::mem::size_of::<(usize, Neighbor)>());
+        drop(arcs);
+        drop(positions);
+        reservation
+            .shrink(arcs_bytes.saturating_add(n.saturating_mul(std::mem::size_of::<usize>())));
         let keys = concat_batches(&node_schema, &key_batches)?;
+        drop(key_batches);
         let identities = concat_batches(&identity, &edge_batches)?;
+        drop(edge_batches);
         Ok(Self {
             keys,
             identities,

@@ -43,20 +43,22 @@ fn modularity_delta(resolution: f64, c: &MoveComponents) -> f64 {
         return 0.0;
     }
     if !c.directed {
+        // Divide each factor by `two_m` separately to prevent `two_m * two_m`
+        // from overflowing to `f64::INFINITY` on large edge weights.
         (c.k_v_to_target_out - c.k_v_to_current_out) * 2.0 / c.two_m
             - resolution
-                * c.k_v_out
-                * (c.sigma_tot_target_out - c.sigma_tot_current_out + c.k_v_out)
+                * (c.k_v_out / c.two_m)
+                * ((c.sigma_tot_target_out - c.sigma_tot_current_out + c.k_v_out) / c.two_m)
                 * 2.0
-                / (c.two_m * c.two_m)
     } else {
         let m = c.two_m / 2.0;
         let d_internal = (c.k_v_to_target_out + c.k_v_to_target_in)
             - (c.k_v_to_current_out + c.k_v_to_current_in);
-        let d_expected = c.k_v_in * (c.sigma_tot_target_out - c.sigma_tot_current_out)
-            + c.k_v_out * (c.sigma_tot_target_in - c.sigma_tot_current_in)
-            + 2.0 * c.k_v_out * c.k_v_in;
-        d_internal / m - resolution * d_expected / (m * m)
+        let d_expected_norm = (c.k_v_in / m)
+            * ((c.sigma_tot_target_out - c.sigma_tot_current_out) / m)
+            + (c.k_v_out / m) * ((c.sigma_tot_target_in - c.sigma_tot_current_in) / m)
+            + 2.0 * (c.k_v_out / m) * (c.k_v_in / m);
+        d_internal / m - resolution * d_expected_norm
     }
 }
 
@@ -356,6 +358,34 @@ mod tests {
         let m = Modularity::new();
         let delta = m.delta_move_from_components(&undirected_mc());
         assert!(delta > 0.0);
+    }
+
+    #[test]
+    fn test_modularity_delta_large_weights_no_overflow() {
+        let m = Modularity::new();
+        let mc = MoveComponents {
+            two_m: 1e200,
+            node_weight: 1.0,
+            total_node_weight: 10.0,
+            k_v_out: 1e199,
+            k_v_to_target_out: 5e198,
+            k_v_to_current_out: 0.0,
+            sigma_tot_target_out: 3e199,
+            sigma_tot_current_out: 1e199,
+            k_v_in: 0.0,
+            k_v_to_target_in: 0.0,
+            k_v_to_current_in: 0.0,
+            sigma_tot_target_in: 0.0,
+            sigma_tot_current_in: 0.0,
+            n_target: 1.0,
+            n_current: 1.0,
+            directed: false,
+        };
+        let delta = m.delta_move_from_components(&mc);
+        assert!(
+            delta.is_finite(),
+            "expected finite modularity delta, got {delta}"
+        );
     }
 
     #[test]

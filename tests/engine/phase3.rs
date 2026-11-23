@@ -127,7 +127,7 @@ async fn delta_cached_snapshot_observes_commits_and_a_replaced_log() -> Result<(
         "type":"struct", "fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}],
     });
     let add = |id| -> Result<_> {
-        let file = format!("part-{id}.parquet");
+        let file = format!("part-{id}-{}.parquet", uuid::Uuid::new_v4());
         let batch =
             RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(vec![id])) as _)])?;
         let bytes = parquet(&batch)?;
@@ -146,20 +146,20 @@ async fn delta_cached_snapshot_observes_commits_and_a_replaced_log() -> Result<(
         std::fs::write(file, format!("{bytes}\n"))?;
         Ok(())
     };
-    let initialize = |id| {
-        commit(
-            0,
-            &[
-                json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
-                json!({"metaData":{
-                    "id":uuid::Uuid::new_v4(),"format":{"provider":"parquet","options":{}},
-                    "schemaString":schema.to_string(),"partitionColumns":[],"configuration":{},
-                }}),
-                add(id)?,
-            ],
-        )
+    let initialize = |ids: &[i64]| {
+        let mut actions = vec![
+            json!({"protocol":{"minReaderVersion":1,"minWriterVersion":2}}),
+            json!({"metaData":{
+                "id":uuid::Uuid::new_v4(),"format":{"provider":"parquet","options":{}},
+                "schemaString":schema.to_string(),"partitionColumns":[],"configuration":{},
+            }}),
+        ];
+        for id in ids {
+            actions.push(add(*id)?);
+        }
+        commit(0, &actions)
     };
-    initialize(1)?;
+    initialize(&[1])?;
     let mapping = delta_mapping(table.to_str().unwrap(), None)?;
     let engine = Engine::new(serde_saphyr::from_str(&format!(
         "graph: delta\nsources:\n{mapping}\nnodes:\n  Node: {{source: lake.transfers, key: [id]}}"
@@ -179,8 +179,17 @@ async fn delta_cached_snapshot_observes_commits_and_a_replaced_log() -> Result<(
     assert_eq!(read().await?, [json!({"id":1}), json!({"id":2})]);
     std::fs::remove_dir_all(&log)?;
     std::fs::create_dir(&log)?;
-    initialize(3)?;
+    initialize(&[3])?;
     assert_eq!(read().await?, [json!({"id":3})]);
+    assert_eq!(read().await?, [json!({"id":3})]);
+    // Recreating the same numeric version invalidates the previous uniqueness proof.
+    initialize(&[4, 4])?;
+    let error = read()
+        .await
+        .expect_err("recreated table has duplicate keys");
+    assert!(format!("{error:#}").contains("duplicate business key"));
+    initialize(&[5])?;
+    assert_eq!(read().await?, [json!({"id":5})]);
     Ok(())
 }
 

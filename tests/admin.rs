@@ -3243,6 +3243,58 @@ edges:
             "valid_from: business_start, valid_to: business_end",
         ),
     )?;
+    // A single high-degree start vertex spans multiple CSR adjacency blocks.
+    // Even if an upper plan consumes all paths, dispatch must use bounded rounds.
+    let hub_edges = 100_000i64;
+    let hub_nodes =
+        RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(vec![1, 2])) as _)])?;
+    let hub_links = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int64Array::from_iter_values(0..hub_edges)) as _,
+        ),
+        (
+            "src",
+            Arc::new(Int64Array::from(vec![1; hub_edges as usize])) as _,
+        ),
+        (
+            "dst",
+            Arc::new(Int64Array::from(vec![2; hub_edges as usize])) as _,
+        ),
+        (
+            "flag",
+            Arc::new(Int64Array::from_iter_values((0..hub_edges).map(|i| i % 2))) as _,
+        ),
+    ])?;
+    for (name, batch) in [
+        ("hub-nodes.parquet", hub_nodes),
+        ("hub-edges.parquet", hub_links),
+    ] {
+        let mut writer = ArrowWriter::try_new(
+            fs::File::create(root.path().join(name))?,
+            batch.schema(),
+            None,
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+    fs::write(
+        root.path().join("hub.yaml"),
+        r#"
+graph: hub
+sources:
+  lake: {type: parquet, tables: {nodes: [hub-nodes.parquet], links: [hub-edges.parquet]}}
+nodes:
+  Node: {source: lake.nodes, key: [id]}
+edges:
+  Link:
+    source: lake.links
+    key: [id]
+    from: {node: Node, columns: [src]}
+    to: {node: Node, columns: [dst]}
+    properties: [flag]
+"#,
+    )?;
     let store = root.path().join("store");
     fs::create_dir(&store)?;
     let etcd = std::env::var("GRAPHLAKE_TEST_ETCD")?;
@@ -3320,6 +3372,28 @@ edges:
     assert_ne!(first["execution_worker"], second["execution_worker"]);
     assert_eq!(first["rows"], second["rows"]);
     assert_eq!(first["graph"]["elements"].as_array().unwrap().len(), 4);
+    let hub_revision = coordinator.model("hub").await?["active_revision"].clone();
+    let hub: Value = coordinator
+        .request(Method::POST, "models/hub/csr")
+        .json(&json!({"model_revision":hub_revision}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let limited: Value = coordinator.request(Method::POST, "models/hub/query")
+        .json(&json!({"request_id":Uuid::new_v4(),"language":"cypher",
+            "query":"MATCH p=(a:Node {id:1})-[:Link*1..2 {flag:1}]->(b:Node) RETURN length(p) AS hops LIMIT 1",
+            "model_revision":hub_revision,"csr_generation":hub["generation"]}))
+        .send().await?.error_for_status()?.json().await?;
+    assert_eq!(limited["rows"], json!([["1"]]));
+    let filtered = limited["csr_stats"]["filtered_arcs"].as_u64().unwrap();
+    assert!(filtered > 0, "{limited}");
+    assert!(
+        limited["csr_stats"]["rounds"].as_u64().unwrap() > 1,
+        "{limited}"
+    );
+    eprintln!("high-degree CSR: {}", limited["csr_stats"]);
     let outer = r#"SELECT p.payment_id, a.from_account_id FROM "Payment" p
         LEFT JOIN "Account" a ON a.from_account_id < p.payment_id ORDER BY p.payment_id"#;
     let preserved: Value = coordinator

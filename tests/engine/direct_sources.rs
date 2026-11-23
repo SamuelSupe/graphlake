@@ -252,6 +252,55 @@ async fn mysql_compatible_sources_read_real_types_and_statement_snapshots() -> R
 }
 
 #[tokio::test]
+#[ignore = "requires a disposable MariaDB server in GRAPHLAKE_TEST_MYSQL_COMPAT_DSN"]
+async fn mariadb_dropped_read_without_backend_identity_uses_no_extra_connection() -> Result<()> {
+    use mysql_async::{Conn, Opts, prelude::Queryable};
+    use std::time::Duration;
+
+    let mut server = Conn::new(Opts::from_url(&std::env::var(
+        "GRAPHLAKE_TEST_MYSQL_COMPAT_DSN",
+    )?)?)
+    .await?;
+    assert!(
+        server
+            .query_first::<String, _>("SELECT @@server_uuid")
+            .await
+            .is_err()
+    );
+    let schema = format!("graphlake_{}", uuid::Uuid::new_v4().simple());
+    server
+        .query_drop(format!("CREATE DATABASE {schema}"))
+        .await?;
+    let test = async {
+        server.query_drop(format!("CREATE TABLE {schema}.items (id BIGINT PRIMARY KEY) ENGINE=InnoDB")).await?;
+        server.query_drop(format!("INSERT INTO {schema}.items VALUES (1),(2),(3)")).await?;
+        let model: Catalog = serde_saphyr::from_str(&format!("graph: read\nsources:\n  db: {{type: mariadb, dsn_env: GRAPHLAKE_TEST_MYSQL_COMPAT_DSN, tls: false}}\nnodes:\n  Item: {{source: db.{schema}.items, key: [id]}}\n"))?;
+        let engine = Engine::new(model)?;
+        let (_, before): (String, u64) = server.query_first("SHOW GLOBAL STATUS LIKE 'Connections'").await?.unwrap();
+        let (_, connected): (String, u64) = server.query_first("SHOW GLOBAL STATUS LIKE 'Threads_connected'").await?.unwrap();
+        let mut query = engine.query(Language::Sql, r#"SELECT id FROM "Item""#, QueryOptions { batch_size: 1, ..Default::default() }).await?;
+        assert_eq!(query.batches.try_next().await?.unwrap().num_rows(), 1);
+        drop(query);
+        // Wait for the original read connection to close; no new control
+        // connection is allowed without a verified backend identity.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (_, active): (String, u64) = server.query_first("SHOW GLOBAL STATUS LIKE 'Threads_connected'").await?.unwrap();
+                if active == connected { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        let (_, after): (String, u64) = server.query_first("SHOW GLOBAL STATUS LIKE 'Connections'").await?.unwrap();
+        assert_eq!(after, before + 1);
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    server.query_drop(format!("DROP DATABASE {schema}")).await?;
+    server.disconnect().await?;
+    test
+}
+
+#[tokio::test]
 #[ignore = "requires a real SQL Server or Oracle fixture catalog in GRAPHLAKE_TEST_DIRECT_SQL_CATALOG"]
 async fn native_sql_sources_preserve_integer_decimal_timestamp_and_null_values() -> Result<()> {
     use graphlake::arrow::array::TimestampMicrosecondArray;

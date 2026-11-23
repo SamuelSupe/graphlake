@@ -1142,7 +1142,13 @@ fn adjacency<'a>(
     Box::pin(async_stream::try_stream! {
         if execution.graph.types.is_empty() { return; }
         let remote_targets = targets.filter(|ids| ids.len() <= 256).cloned();
-        let mut tasks = Vec::new();
+        // Preserve early termination and keep only a small parallel window of
+        // two-block reads/results live, even for a high-degree vertex.
+        let parallelism = if local { 1 } else {
+            execution.worker.workers.len().saturating_sub(1).clamp(1, 4)
+                .min((execution.graph.scope.options.memory_bytes / (4 * BLOCK_BYTES)).max(1))
+        };
+        let mut tasks = Vec::with_capacity(parallelism);
         for (shard, ids) in groups {
             let blocks = &execution.graph.manifest.partitions[shard].arcs;
             let candidates = blocks
@@ -1163,6 +1169,12 @@ fn adjacency<'a>(
                             filters: filters.to_vec(),
                         },
                     ));
+                    if tasks.len() == parallelism {
+                        let round = execution.run_round(std::mem::take(&mut tasks), local).await?;
+                        for output in round.outputs {
+                            for link in output.links { yield link; }
+                        }
+                    }
                 }
             }
         }

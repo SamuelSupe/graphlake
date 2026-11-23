@@ -407,6 +407,60 @@ pub(in crate::engine) fn is_variant(fields: &Fields) -> bool {
         .is_some_and(|field| field.metadata().contains_key(VARIANT))
 }
 
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use datafusion::arrow::{array::Int64Array, datatypes::Int64Type};
+
+    async fn scope(bytes: usize) -> anyhow::Result<crate::engine::query::QueryScope> {
+        let admission = Arc::new(crate::engine::query::Admission::new(
+            crate::EngineLimits::default(),
+        )?);
+        crate::engine::query::QueryScope::new(
+            crate::QueryOptions {
+                memory_bytes: bytes,
+                ..Default::default()
+            },
+            &admission,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn distinct_numeric_groups_reuse_set_budget() -> anyhow::Result<()> {
+        let scope = scope(128 * 1024).await?;
+        let guard = ScopeGuard::from_scope(&scope);
+        let input = ListArray::from_iter_primitive::<Int64Type, _, _>(
+            (0..128).map(|_| Some((0..64).map(Some))),
+        );
+        let result = distinct_list(Arc::new(input.clone()), Some(&guard))?;
+        assert_eq!(result.as_any().downcast_ref::<ListArray>().unwrap(), &input);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scalar_in_duplicate_values_only_reserve_unique_keys() -> anyhow::Result<()> {
+        use datafusion::arrow::array::BooleanArray;
+        let scope = scope(4096).await?;
+        let predicate = Predicate {
+            name: "__graphlake_cypher_in",
+            signature: Signature::any(2, Volatility::Immutable),
+            guard: Some(ScopeGuard::from_scope(&scope)),
+        };
+        let list =
+            ListArray::from_iter_primitive::<Int64Type, _, _>([Some((0..8192).map(|_| Some(7)))]);
+        let input = Arc::new(Int64Array::from(vec![7, 8])) as ArrayRef;
+        let result = predicate
+            .invoke_scalar_in(&input, &ScalarValue::List(Arc::new(list)), 2)?
+            .into_array(2)?;
+        assert_eq!(
+            result.as_any().downcast_ref::<BooleanArray>().unwrap(),
+            &BooleanArray::from(vec![true, false])
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Predicate {
     name: &'static str,
@@ -569,7 +623,7 @@ impl Predicate {
             other => other,
         };
         let flat_rhs = !item_type.is_nested();
-        if flat_rhs {
+        if flat_rhs && number_rows > 1 {
             let reservation = self.guard.as_ref().map(|guard| {
                 MemoryConsumer::new("__graphlake_cypher_in set")
                     .register(&guard.runtime.memory_pool)
@@ -592,10 +646,12 @@ impl Predicate {
                 }
                 let mut key = Vec::new();
                 encode_equivalence(item, &mut key)?;
-                if let Some(reservation) = &reservation {
-                    reservation.try_grow(key.len() + 32)?;
+                if !seen.contains(&key) {
+                    if let Some(reservation) = &reservation {
+                        reservation.try_grow(key.capacity().saturating_add(32))?;
+                    }
+                    seen.insert(key);
                 }
-                seen.insert(key);
             }
             let mut key = Vec::new();
             for row in 0..number_rows {
@@ -1012,11 +1068,13 @@ fn distinct_list(input: ArrayRef, guard: Option<&ScopeGuard>) -> Result<ArrayRef
     }
     let data = list.values().to_data();
     let mut values = MutableArrayData::new(vec![&data], true, list.values().len());
-    let mut seen = HashSet::new();
     let mut lengths = Vec::with_capacity(list.len());
     let mut visited = 0usize;
     for window in list.value_offsets().windows(2) {
-        seen.clear();
+        let set_memory = reservation
+            .as_ref()
+            .map(|reservation| reservation.new_empty());
+        let mut seen = HashSet::new();
         for index in window[0] as usize..window[1] as usize {
             visited += 1;
             if visited.is_multiple_of(256)
@@ -1027,8 +1085,8 @@ fn distinct_list(input: ArrayRef, guard: Option<&ScopeGuard>) -> Result<ArrayRef
             let mut key = Vec::new();
             encode_equivalence(ScalarValue::try_from_array(list.values(), index)?, &mut key)?;
             if !seen.contains(&key) {
-                if let Some(reservation) = &reservation {
-                    reservation.try_grow(key.len() + 32)?;
+                if let Some(memory) = &set_memory {
+                    memory.try_grow(key.capacity().saturating_add(32))?;
                 }
                 seen.insert(key);
                 values.try_extend(0, index, index + 1)?;

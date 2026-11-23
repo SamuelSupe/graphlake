@@ -620,24 +620,29 @@ pub(super) async fn prepare<'a, 'q>(
             }
             Source::Delta { tables } => {
                 let mapping = &tables[relation];
-                let (table, version) = match deltas.entry((&mapping.path, mapping.version)) {
-                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                        source::delta::open_cached(
-                            mapping,
-                            &private,
-                            &scope.reads,
-                            delta_snapshots,
-                        )
-                        .await
-                        .with_context(|| format!("opening Delta table {reference}"))?,
-                    ),
-                };
+                let (table, version, identity) =
+                    match deltas.entry((&mapping.path, mapping.version)) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                            source::delta::open_cached(
+                                mapping,
+                                &private,
+                                &scope.reads,
+                                delta_snapshots,
+                            )
+                            .await
+                            .with_context(|| format!("opening Delta table {reference}"))?,
+                        ),
+                    };
                 let version_str = version.to_string();
-                file_versions = Some(vec![(
-                    format!("delta:{reference}:{}", mapping.path),
-                    version_str.clone(),
-                )]);
+                // A recreated transaction log can reuse the same numeric version.
+                // Only a retained, verified snapshot can reuse a prior key proof.
+                file_versions = identity.map(|identity| {
+                    vec![(
+                        format!("delta:{reference}:{}", mapping.path),
+                        identity.to_string(),
+                    )]
+                });
                 versions.insert(
                     reference.into(),
                     SourceVersion {

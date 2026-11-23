@@ -3,6 +3,41 @@ use std::{collections::BTreeMap, io::Write as _, path::PathBuf, sync::Arc, time:
 use anyhow::{Result, ensure};
 use uuid::Uuid;
 
+fn spawn_sync_worker<F>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(async move {
+        let _permit = permit;
+        work.await
+    })
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn timed_out_sync_keeps_slot_until_io_finishes() -> anyhow::Result<()> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(2));
+    let other = slots.clone().try_acquire_owned()?;
+    let (finished, pending) = tokio::sync::oneshot::channel();
+    let mut worker = spawn_sync_worker(slots.clone().try_acquire_owned()?, pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut worker)
+            .await
+            .is_err()
+    );
+    assert!(slots.clone().try_acquire_owned().is_err());
+    finished.send(()).unwrap();
+    worker.await??;
+    let replacement = slots.clone().try_acquire_owned()?;
+    assert!(slots.clone().try_acquire_owned().is_err());
+    drop((replacement, other));
+    Ok(())
+}
+
 use super::files::preserve_parquet_anchor;
 use super::metadata::{Historical, Pending};
 use super::{Head, Managed, Record, api_error, error, unavailable};
@@ -247,7 +282,8 @@ impl Managed {
                 let sync_record = record.clone();
                 let sync_task = task.clone();
                 let sync_cancel = cancel.clone();
-                let mut worker = tokio::spawn(async move {
+                // A cancelled sync can still be finishing blocking or network IO.
+                let mut worker = spawn_sync_worker(permit, async move {
                     std::panic::AssertUnwindSafe(sync_managed.sync(
                         &sync_app,
                         &sync_record,
@@ -285,7 +321,6 @@ impl Managed {
                         }
                     }
                 };
-                drop(permit);
                 let mut logged = false;
                 let confirmation_deadline = tokio::time::sleep(Duration::from_secs(30));
                 tokio::pin!(confirmation_deadline);
@@ -387,6 +422,7 @@ impl Managed {
                 .unwrap()
                 .insert(id, (generation, version));
         }
+        ensure!(!cancel.is_cancelled(), "managed sync cancelled");
         let (loaded, rows, reads, _) = load::run(
             &record.table,
             &path,

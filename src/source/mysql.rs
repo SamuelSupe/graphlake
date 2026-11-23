@@ -315,7 +315,6 @@ impl Snapshot {
         if self.transactional && stream && (proven || raw_table) {
             let conn = OwnedConnection {
                 conn: self.conn.take(),
-                transactional: self.transactional,
                 server_uuid: self.server_uuid.clone(),
             };
             let provider = super::snapshot::stream_once(schema, move |context| {
@@ -347,7 +346,6 @@ impl Snapshot {
         // Own the connection for the scan so conversion errors and cancellation kill it.
         let mut owned = OwnedConnection {
             conn: self.conn.take(),
-            transactional: self.transactional,
             server_uuid: self.server_uuid.clone(),
         };
         let mut batches = query.batches(
@@ -429,39 +427,31 @@ impl Scan {
 
 struct OwnedConnection {
     conn: Option<Conn>,
-    transactional: bool,
     server_uuid: Option<String>,
 }
 
 impl Drop for OwnedConnection {
     fn drop(&mut self) {
         let Some(conn) = self.conn.take() else { return };
-        let transactional = self.transactional;
         let expected_uuid = self.server_uuid.take();
         // mysql_async normally drains unread rows on drop. Terminate this
         // dedicated connection through the same account before closing it,
-        // after confirming server identity when available so proxies or multi-FE
-        // clusters do not kill an unrelated session on another backend.
+        // only after confirming server identity, since connection IDs are local
+        // to a backend. Without it, rely on disconnect and the statement timeout.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if expected_uuid.is_some() || transactional {
+                if let Some(expected) = expected_uuid {
                     let id = conn.id();
                     let options = conn.opts().clone();
                     let _ = tokio::time::timeout(Duration::from_secs(2), async {
                         let mut cancel = Conn::new(options).await?;
-                        let same_server = match &expected_uuid {
-                            Some(expected) => {
-                                let actual = cancel
-                                    .query_first::<Option<String>, _>("SELECT @@server_uuid")
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .flatten();
-                                actual.as_deref() == Some(expected.as_str())
-                            }
-                            None => true,
-                        };
-                        if same_server {
+                        let actual = cancel
+                            .query_first::<Option<String>, _>("SELECT @@server_uuid")
+                            .await
+                            .ok()
+                            .flatten()
+                            .flatten();
+                        if actual.as_deref() == Some(expected.as_str()) {
                             cancel.query_drop(format!("KILL CONNECTION {id}")).await?;
                         }
                         cancel.disconnect().await

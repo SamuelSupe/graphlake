@@ -81,7 +81,6 @@ pub struct Engine {
     pub(crate) managed_parquet: Arc<BTreeMap<uuid::Uuid, source::parquet_snapshot::RemoteSnapshot>>,
     spanner: Arc<BTreeMap<String, source::warehouse::spanner::Client>>,
     trino_schemas: Arc<source::warehouse::trino::SchemaCache>,
-    delta_snapshots: Arc<source::delta::SnapshotCache>,
 }
 
 impl Engine {
@@ -112,7 +111,6 @@ impl Engine {
             file_keys: Arc::new(Mutex::new(BTreeMap::new())),
             spanner: Arc::new(spanner),
             trino_schemas: Arc::default(),
-            delta_snapshots: Arc::default(),
             managed_parquet: Arc::default(),
         })
     }
@@ -877,7 +875,7 @@ impl Engine {
             catalog,
             &self.spanner,
             &self.trino_schemas,
-            Some(&self.delta_snapshots),
+            Some(&self.admission.delta_snapshots),
             &self.managed_parquet,
             scope,
             required,

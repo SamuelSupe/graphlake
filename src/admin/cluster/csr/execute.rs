@@ -270,11 +270,11 @@ impl BlockCache {
         memory: &MemoryReservation,
     ) -> Option<bytes::Bytes> {
         use std::io::{Read, Seek, SeekFrom};
+        let compressed = memory.new_empty();
         let (encoded, raw_disk) = crate::blocking(|| {
             let mut guard = self.spill.lock().unwrap();
             let spill = guard.as_mut()?;
             let (offset, encoded) = *spill.lookup.get(key)?;
-            let compressed = memory.new_empty();
             compressed.try_grow(encoded.unwrap_or(0)).ok()?;
             let mut bytes = vec![0; encoded.unwrap_or(block.decoded_size())];
             if spill
@@ -308,6 +308,52 @@ impl BlockCache {
         }
         decoded
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn block_cache_reclaims_only_the_memory_needed_for_another_block() -> Result<()> {
+    let admission = Arc::new(crate::engine::Admission::new(
+        crate::EngineLimits::default(),
+    )?);
+    let scope = QueryScope::new(
+        QueryOptions {
+            memory_bytes: 1024 * 1024,
+            ..Default::default()
+        },
+        &admission,
+    )
+    .await?;
+    let cache = BlockCache::default();
+    let bytes = bytes::Bytes::from(vec![7; 16 * 1024]);
+    let block = Block {
+        bytes: bytes.len() as u64,
+        decoded_bytes: None,
+        sha256: Sha256::digest(&bytes).into(),
+        first: 0,
+        last: 0,
+        ids: None,
+        numbers: Default::default(),
+        columns: vec![],
+    };
+    for name in ["a", "b", "c"] {
+        cache
+            .read_with(Key::from(name), &block, &scope, async { Ok(bytes.clone()) })
+            .await?;
+    }
+    let pressure =
+        MemoryConsumer::new("test concurrent query state").register(&scope.runtime.memory_pool);
+    pressure.try_grow(scope.options.memory_bytes - 3 * bytes.len() - 4096)?;
+    let read = cache
+        .read_with(Key::from("d"), &block, &scope, async { Ok(bytes.clone()) })
+        .await?;
+    assert_eq!(read.bytes, bytes);
+    let hot = cache.hot.lock().unwrap();
+    assert_eq!(
+        hot.iter().map(|(key, _)| key.as_ref()).collect::<Vec<_>>(),
+        vec!["b", "c", "d"]
+    );
+    Ok(())
 }
 
 struct CachedBlock {
@@ -382,46 +428,37 @@ impl BlockCache {
         scope.check()?;
         let memory = MemoryConsumer::new("CSR property and identity cache")
             .register(&scope.runtime.memory_pool);
-        let mut keep = false;
-        let mut evicted = Vec::new();
-        {
-            let mut hot = self.hot.lock().unwrap();
-            if let Some(pos) = hot.iter().position(|(candidate, _)| *candidate == key) {
-                let entry = hot.remove(pos).unwrap();
-                let value = entry.1.clone();
-                hot.push_back(entry);
-                return Ok(value);
-            }
-            // Leave room for decoding and ordinary execution, even when many paths are emitted.
-            let limit = self.capacity(scope);
-            let size = block.decoded_size();
-            if size <= limit {
-                let mut used = hot
+        let limit = self.capacity(scope);
+        let size = block.decoded_size();
+        let keep = loop {
+            scope.check()?;
+            let evicted = {
+                let mut hot = self.hot.lock().unwrap();
+                if let Some(pos) = hot.iter().position(|(candidate, _)| *candidate == key) {
+                    let entry = hot.remove(pos).unwrap();
+                    let value = entry.1.clone();
+                    hot.push_back(entry);
+                    return Ok(value);
+                }
+                // Leave room for decoding and ordinary execution.
+                if size > limit {
+                    break false;
+                }
+                let used = hot
                     .iter()
                     .map(|(_, value)| value.bytes.len())
                     .sum::<usize>();
-                while used + size > limit {
-                    let Some(entry) = hot.pop_front() else {
-                        break;
-                    };
-                    used -= entry.1.bytes.len();
-                    evicted.push(entry);
+                if used.saturating_add(size) <= limit && memory.try_grow(size).is_ok() {
+                    break true;
                 }
-                loop {
-                    if memory.try_grow(size).is_ok() {
-                        keep = true;
-                        break;
-                    }
-                    let Some(entry) = hot.pop_front() else {
-                        break;
-                    };
-                    evicted.push(entry);
-                }
-            }
-        }
-        for (evicted_key, evicted_data) in evicted {
+                hot.pop_front()
+            };
+            let Some((evicted_key, evicted_data)) = evicted else {
+                break false;
+            };
+            // Release this block's reservation before retrying the allocation.
             self.spill_entry(evicted_key, evicted_data, scope);
-        }
+        };
         if !keep {
             memory.try_grow(block.decoded_size())?;
         }

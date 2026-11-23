@@ -378,7 +378,7 @@ impl Worker {
         {
             return Ok(cached.clone());
         }
-        if models.len() >= 32 {
+        if models.len() >= 4 {
             models.pop_back();
         }
         models.push_front((model.into(), revision.into(), engine.clone()));

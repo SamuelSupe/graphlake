@@ -595,7 +595,7 @@ fn read(
         neighbors = combined;
     }
     let converter = row_converter(&keys.schema())?;
-    let mut index = HashMap::with_capacity(keys.num_rows());
+    let mut index = HashMap::new();
     let mut index_bytes = 0usize;
     for offset in (0..keys.num_rows()).step_by(IPC_ROWS) {
         scope.check()?;

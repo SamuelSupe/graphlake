@@ -201,6 +201,7 @@ pub(crate) struct Admission {
     limits: EngineLimits,
     usage: Mutex<Usage>,
     changed: Notify,
+    pub(super) delta_snapshots: crate::source::delta::SnapshotCache,
 }
 
 impl Admission {
@@ -213,6 +214,7 @@ impl Admission {
             limits,
             usage: Mutex::default(),
             changed: Notify::new(),
+            delta_snapshots: crate::source::delta::SnapshotCache::new(limits.memory_bytes),
         })
     }
 

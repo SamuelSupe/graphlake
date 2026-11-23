@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.7
+
+- Redesign the administration console with light and dark themes, consistent navigation, denser layouts, and clearer model, graph, source, query, and operations views. Remember the selected theme in the browser.
+- Use the model directory as the main entry point, with Graph Models, Data Sources, and Query available within an open model. Improve graph canvas and explorer controls, selection details, and query graph presentation.
+- Publish a saved draft directly when business validation is not required. Models with business tasks retain the preview and confirmation flow. Confirm direct rollback without discarding the working draft. Use Ctrl/Cmd+S to save model edits.
+- Separate Cypher parameters and query scope from Advanced options, which provides timeout, result capture, freshness policies, and published CSR selection. Keep the query editor focused on running and inspecting results.
+- Improve AI setup progress, copy confirmation, model directory controls, and overview charts.
+
 ## v1.1.6
 
 - Explore the built-in order relationship example, connect a first data source directly, or import a model from the empty model library.

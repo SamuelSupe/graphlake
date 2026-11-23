@@ -17,7 +17,7 @@ Build a graph over existing tables, query it with **Cypher**, **SQL**, or **Grem
 
 [![English GraphLake Query workbench showing three accounts, four transfers, and the amount on the selected relationship](docs/images/query-workbench-en.jpg)](docs/images/query-workbench-en.jpg)
 
-*The Cypher workbench displays the accounts and transfers from the built-in Parquet demo.*
+*The Cypher workbench displays the accounts and transfers from the built-in Parquet demo (earlier console layout).*
 
 ## Try the Parquet demo
 
@@ -42,7 +42,7 @@ The result is account `30`, with two paths and a total amount of `600`.
 | **Sync locally** | Load selected source columns into managed Parquet tables and refresh them incrementally by key and watermark. |
 | **Operate** | Manage users, service accounts, and model-level roles. Collect audit events, Prometheus metrics, and OTLP signals. Restore from an off-site checkpoint. |
 
-The browser console defaults to English and supports Simplified Chinese. Choose an interface language on the sign-in page or in the main navigation. The browser remembers your choice.
+The browser console defaults to English and supports Simplified Chinese. Choose an interface language on the sign-in page or in the main navigation. The browser remembers your choice. Use the theme switch in the main navigation to choose a light or dark appearance. Open a model to access its Graph Models, Data Sources, and Query workspaces.
 
 ## Local tables and data sync
 

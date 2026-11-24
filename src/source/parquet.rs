@@ -454,7 +454,10 @@ impl AsRef<[u8]> for ReservedBytes {
 }
 
 #[derive(Debug)]
-struct PinnedReaderFactory(BTreeMap<ObjectPath, PinnedFile>);
+struct PinnedReaderFactory {
+    readers: BTreeMap<ObjectPath, PinnedFile>,
+    _metadata_budget: Option<MemoryReservation>,
+}
 
 #[cfg(feature = "admin")]
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -476,7 +479,7 @@ impl ParquetFileReaderFactory for PinnedReaderFactory {
         _: Option<usize>,
         _: &ExecutionPlanMetricsSet,
     ) -> datafusion::common::Result<Box<dyn AsyncFileReader + Send>> {
-        let reader = self.0.get(&file.object_meta.location).ok_or_else(|| {
+        let reader = self.readers.get(&file.object_meta.location).ok_or_else(|| {
             datafusion::common::DataFusionError::Internal("missing pinned Parquet file".into())
         })?;
         Ok(Box::new(reader.clone()))
@@ -513,7 +516,6 @@ struct OpenedParquet {
     readers: Arc<PinnedReaderFactory>,
     files: Vec<PartitionedFile>,
     metadata: Vec<Arc<ParquetMetaData>>,
-    _metadata_budget: MemoryReservation,
     #[cfg(feature = "admin")]
     scan_objects: Vec<ScanObject>,
 }
@@ -540,7 +542,10 @@ impl ParquetTable {
             );
             readers.insert(ObjectPath::parse(&expected.path)?, file);
         }
-        Ok(Arc::new(PinnedReaderFactory(readers)))
+        Ok(Arc::new(PinnedReaderFactory {
+            readers,
+            _metadata_budget: None,
+        }))
     }
     #[cfg(feature = "admin")]
     pub(crate) fn for_exploration(mut self) -> Self {
@@ -548,7 +553,7 @@ impl ParquetTable {
         if let ParquetInput::Open(open) = &mut self.input {
             for file in Arc::get_mut(&mut open.readers)
                 .expect("new Parquet table")
-                .0
+                .readers
                 .values_mut()
             {
                 file.parallel_ranges = true;
@@ -882,33 +887,38 @@ impl OpenedParquet {
                 versions.push(file.version(&location));
             }
             #[cfg(feature = "admin")]
-            scan_objects.push(ScanObject {
-                path: format!("object-{index}.parquet"),
-                location: location.clone(),
-                version: file.version(&location).version,
-                size: file.meta.size,
-                mask: mask
-                    .as_deref()
-                    .filter(|part| !part.deleted.is_empty())
-                    .map(|part| Part {
-                        key_range: None,
-                        ..part.clone()
-                    }),
-                row_groups: builder
-                    .metadata()
-                    .row_groups()
-                    .iter()
-                    .map(|group| {
-                        if group.num_columns() == 0 {
-                            return 0;
-                        }
-                        let column = group.column(0);
-                        column
-                            .dictionary_page_offset()
-                            .unwrap_or_else(|| column.data_page_offset())
-                    })
-                    .collect(),
-            });
+            if store.is_none() {
+                // Source::ObjectStorage locations are bare bucket-relative keys requiring
+                // the configured ObjectStore client; only self-contained URLs/paths can be
+                // reopened on remote workers via PinnedFile::open.
+                scan_objects.push(ScanObject {
+                    path: format!("object-{index}.parquet"),
+                    location: location.clone(),
+                    version: file.version(&location).version,
+                    size: file.meta.size,
+                    mask: mask
+                        .as_deref()
+                        .filter(|part| !part.deleted.is_empty())
+                        .map(|part| Part {
+                            key_range: None,
+                            ..part.clone()
+                        }),
+                    row_groups: builder
+                        .metadata()
+                        .row_groups()
+                        .iter()
+                        .map(|group| {
+                            if group.num_columns() == 0 {
+                                return 0;
+                            }
+                            let column = group.column(0);
+                            column
+                                .dictionary_page_offset()
+                                .unwrap_or_else(|| column.data_page_offset())
+                        })
+                        .collect(),
+                });
+            }
             let projected = selected_schema(builder.schema(), columns, &location)?;
             if let Some(expected) = &schema {
                 check_schema(expected, &projected)?;
@@ -928,10 +938,12 @@ impl OpenedParquet {
         Ok((
             schema.context("no Parquet files")?,
             Self {
-                readers: Arc::new(PinnedReaderFactory(readers)),
+                readers: Arc::new(PinnedReaderFactory {
+                    readers,
+                    _metadata_budget: Some(metadata_budget),
+                }),
                 files,
                 metadata,
-                _metadata_budget: metadata_budget,
                 #[cfg(feature = "admin")]
                 scan_objects,
             },
@@ -1111,18 +1123,27 @@ impl TableProvider for ParquetTable {
                 .any(|filter| column_equality(filter).is_some());
             // Full scans also carry the model's key null checks. A row filter
             // costs memory on those scans without avoiding payload pages.
-            if point_filter && open.readers.0.values().all(|file| file.footer.is_some()) {
+            if point_filter
+                && open
+                    .readers
+                    .readers
+                    .values()
+                    .all(|file| file.footer.is_some())
+            {
                 source = source.with_pushdown_filters(true);
             }
             source = source.with_predicate(state.create_physical_expr(predicate, &schema)?);
         }
         #[cfg(feature = "admin")]
-        let files = open
-            .files
-            .iter()
-            .zip(&open.scan_objects)
-            .map(|(file, object)| file.clone().with_extension(object.clone()))
-            .collect();
+        let files = if open.scan_objects.is_empty() {
+            open.files.clone()
+        } else {
+            open.files
+                .iter()
+                .zip(&open.scan_objects)
+                .map(|(file, object)| file.clone().with_extension(object.clone()))
+                .collect()
+        };
         #[cfg(not(feature = "admin"))]
         let files = open.files.clone();
         let config =

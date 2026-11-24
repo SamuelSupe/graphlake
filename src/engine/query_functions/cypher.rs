@@ -141,10 +141,10 @@ pub(super) fn register_inner(
         1,
         Volatility::Immutable,
     ))));
-    entity::register(context);
+    entity::register(context, guard.clone());
     hydrate::register(context, guard.clone());
     arithmetic::register(context, guard.clone());
-    map::register(context);
+    map::register(context, guard.clone());
     numeric_distinct::register(context, guard.clone());
     sum::register(context);
     range::register(context);

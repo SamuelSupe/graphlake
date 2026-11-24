@@ -60,11 +60,25 @@ impl Warehouse {
             let handle = result.statement_handle.take().context("missing Snowflake statement handle")?;
             uuid::Uuid::parse_str(&handle).context("invalid Snowflake statement handle")?;
             let mut pending = Pending(Some(http.client.post(http.endpoint(&["api", "v2", "statements", &handle, "cancel"]))));
+            let deadline = tokio::time::Instant::now() + self.timeout;
             let status_url = http.endpoint(&["api", "v2", "statements", &handle]);
             while status == StatusCode::ACCEPTED {
                 drop(budget);
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                (status, result, budget) = http.receive(http.client.get(status_url.clone())).await?;
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .context("Snowflake statement timed out")?;
+                tokio::time::sleep(Duration::from_millis(200).min(remaining)).await;
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .context("Snowflake statement timed out")?;
+                (status, result, budget) = tokio::time::timeout(
+                    remaining,
+                    http.receive(http.client.get(status_url.clone())),
+                )
+                .await
+                .context("Snowflake statement timed out")??;
             }
             verify(status == StatusCode::OK, format!("unexpected Snowflake status {status}"))?;
             pending.0 = None;
@@ -76,9 +90,18 @@ impl Warehouse {
             let mut received = rows.len();
             yield Page { fields: Some(fields), rows, _budget: budget };
             for (index, part) in parts.iter().enumerate().skip(1) {
-                let (status, response, budget) = http.receive::<Response>(
-                    http.client.get(status_url.clone()).query(&[("partition", index)])
-                ).await?;
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .context("Snowflake statement timed out")?;
+                let (status, response, budget) = tokio::time::timeout(
+                    remaining,
+                    http.receive::<Response>(
+                        http.client.get(status_url.clone()).query(&[("partition", index)])
+                    ),
+                )
+                .await
+                .context("Snowflake statement timed out")??;
                 verify(status == StatusCode::OK, format!("unexpected Snowflake partition status {status}"))?;
                 rows = response.data.context("missing Snowflake partition data")?;
                 verify(rows.len() == part.row_count, format!("incomplete Snowflake partition {index}"))?;

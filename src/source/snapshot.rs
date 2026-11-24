@@ -130,7 +130,16 @@ impl Buffer {
     }
 
     pub(crate) fn push_chunks(&mut self, batch: RecordBatch, batch_size: usize) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
         let bytes = ipc_batch_bytes(&batch);
+        if let MemoryLimit::Finite(limit) = self.pool.memory_limit() {
+            ensure!(
+                bytes <= limit,
+                "source snapshot batch ({bytes} bytes) exceeds query memory limit ({limit} bytes)"
+            );
+        }
         // Leave room for the next connector page and downstream operators.
         // A source engine reservation already has its own share of the pool.
         if self.file.is_none()
@@ -349,6 +358,18 @@ mod tests {
         let mut buffer = Buffer::new(&pool, None);
         buffer.push_chunks(decoded, 16)?;
         assert_eq!(buffer.memory().len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn push_chunks_ignores_empty_batches() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::Utf8, false)]));
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64));
+        let mut buffer = Buffer::new(&pool, None);
+        buffer.push_chunks(empty, 16)?;
+        assert!(buffer.memory().is_empty());
+        assert_eq!(buffer.budget.size(), 0);
         Ok(())
     }
 }

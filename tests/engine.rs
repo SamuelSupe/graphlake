@@ -1146,3 +1146,392 @@ async fn gremlin_times_zero_repeat_preserves_input_with_barriers() -> Result<()>
     assert_eq!(rows(&mut dedup_barrier).await?, statuses);
     Ok(())
 }
+
+#[tokio::test]
+async fn undirected_shortest_path_avoids_edge_reuse_and_finds_true_cycles() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let users = RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(Int64Array::from((1..=12).collect::<Vec<_>>())) as _,
+    )])?;
+    let edges = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int64Array::from(vec![
+                10, // isolated edge 1-2
+                20, 21, 22, // triangle 3-4-5-3
+                30, 31, 32, 33, // 4-cycle 6-7-8-9-6
+                40, 41, // parallel edges 10-11
+                50, // self-loop 12-12
+            ])) as _,
+        ),
+        (
+            "src",
+            Arc::new(Int64Array::from(vec![1, 3, 4, 5, 6, 7, 8, 9, 10, 10, 12])) as _,
+        ),
+        (
+            "dst",
+            Arc::new(Int64Array::from(vec![2, 4, 5, 3, 7, 8, 9, 6, 11, 11, 12])) as _,
+        ),
+    ])?;
+    std::fs::write(dir.path().join("users.parquet"), parquet(&users)?)?;
+    std::fs::write(dir.path().join("edges.parquet"), parquet(&edges)?)?;
+    let path = dir.path().join("graph.yaml");
+    std::fs::write(
+        &path,
+        "graph: undirected_cycles
+sources:
+  data:
+    type: parquet
+    tables:
+      users: [users.parquet]
+      edges: [edges.parquet]
+nodes:
+  User:
+    source: data.users
+    key: [id]
+    properties: []
+edges:
+  LINK:
+    source: data.edges
+    key: [id]
+    from: { node: User, columns: [src] }
+    to: { node: User, columns: [dst] }
+",
+    )?;
+    let engine = Engine::new(Catalog::load(&path)?)?;
+
+    // Isolated undirected edge 1-2 must NOT produce an edge-repeating [10, 10] 2-hop cycle.
+    let mut no_cycle = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 1}), p = shortestPath((u)-[:LINK*1..4]-(u)) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(rows(&mut no_cycle).await?, Vec::<serde_json::Value>::new());
+
+    // Open-ended undirected shortestPath from 1 must reach only 2, never bounce back to 1.
+    let mut open_ended = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 1}), p = shortestPath((u)-[:LINK*1..4]-(v:User)) RETURN v.id AS dst, length(p) AS hops ORDER BY dst",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut open_ended).await?,
+        vec![serde_json::json!({"dst": 2, "hops": 1})]
+    );
+
+    // Triangle 3-4-5-3: shortest undirected cycle has length 3; allShortestPaths yields both orientations.
+    let mut triangle = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 3}), p = shortestPath((u)-[:LINK*1..5]-(u)) RETURN length(p) AS hops, [r IN relationships(p) | r.id] AS rids",
+            QueryOptions::default(),
+        )
+        .await?;
+    let tri_rows = rows(&mut triangle).await?;
+    assert_eq!(tri_rows.len(), 1);
+    assert_eq!(tri_rows[0]["hops"], 3);
+    let rids = tri_rows[0]["rids"].as_array().unwrap();
+    let unique: std::collections::BTreeSet<_> = rids.iter().filter_map(|v| v.as_i64()).collect();
+    assert_eq!(unique.len(), 3, "triangle cycle must use 3 distinct edges");
+
+    let mut triangle_all = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 3}), p = allShortestPaths((u)-[:LINK*1..5]-(u)) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut triangle_all).await?,
+        vec![
+            serde_json::json!({"hops": 3}),
+            serde_json::json!({"hops": 3}),
+        ]
+    );
+
+    // 4-cycle 6-7-8-9-6: length 4, both orientations.
+    let mut square_all = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 6}), p = allShortestPaths((u)-[:LINK*1..5]-(u)) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut square_all).await?,
+        vec![
+            serde_json::json!({"hops": 4}),
+            serde_json::json!({"hops": 4}),
+        ]
+    );
+
+    // Parallel edges 10-11 (ids 40 and 41): valid edge-unique 2-cycle in both orientations.
+    let mut parallel_all = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 10}), p = allShortestPaths((u)-[:LINK*1..4]-(u)) RETURN length(p) AS hops, [r IN relationships(p) | r.id] AS rids",
+            QueryOptions::default(),
+        )
+        .await?;
+    let par_rows = rows(&mut parallel_all).await?;
+    assert_eq!(par_rows.len(), 2);
+    for row in &par_rows {
+        assert_eq!(row["hops"], 2);
+        let ids: std::collections::BTreeSet<_> = row["rids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_i64())
+            .collect();
+        assert_eq!(ids, std::collections::BTreeSet::from([40, 41]));
+    }
+
+    // Undirected self-loop 12-12: length 1.
+    let mut self_loop = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 12}), p = shortestPath((u)-[:LINK*1..4]-(u)) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut self_loop).await?,
+        vec![serde_json::json!({"hops": 1})]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shortest_path_where_can_reference_outer_variables() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let users = RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as _,
+    )])?;
+    let edges = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as _),
+        ("src", Arc::new(Int64Array::from(vec![1, 2, 1, 3, 5])) as _),
+        ("dst", Arc::new(Int64Array::from(vec![2, 4, 3, 5, 4])) as _),
+        (
+            "weight",
+            Arc::new(Int64Array::from(vec![10, 10, 50, 50, 50])) as _,
+        ),
+    ])?;
+    std::fs::write(dir.path().join("users.parquet"), parquet(&users)?)?;
+    std::fs::write(dir.path().join("edges.parquet"), parquet(&edges)?)?;
+    let path = dir.path().join("graph.yaml");
+    std::fs::write(
+        &path,
+        "graph: outer_shortest
+sources:
+  data:
+    type: parquet
+    tables:
+      users: [users.parquet]
+      edges: [edges.parquet]
+nodes:
+  User:
+    source: data.users
+    key: [id]
+    properties: []
+edges:
+  LINK:
+    source: data.edges
+    key: [id]
+    from: { node: User, columns: [src] }
+    to: { node: User, columns: [dst] }
+    properties: [weight]
+",
+    )?;
+    let engine = Engine::new(Catalog::load(&path)?)?;
+
+    let mut filtered = engine
+        .query(
+            Language::Cypher,
+            "WITH 25 AS min_w MATCH (a:User {id: 1}), (b:User {id: 4}) MATCH p = shortestPath((a)-[r:LINK*1..5]->(b)) WHERE all(e IN r WHERE e.weight >= min_w) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut filtered).await?,
+        vec![serde_json::json!({"hops": 3})]
+    );
+
+    let mut inline_endpoints = engine
+        .query(
+            Language::Cypher,
+            "WITH 25 AS min_w MATCH p = shortestPath((a:User {id: 1})-[r:LINK*1..5]->(b:User {id: 4})) WHERE all(e IN r WHERE e.weight >= min_w) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut inline_endpoints).await?,
+        vec![serde_json::json!({"hops": 3})]
+    );
+
+    let mut optional_none = engine
+        .query(
+            Language::Cypher,
+            "WITH 100 AS min_w MATCH (a:User {id: 1}), (b:User {id: 4}) OPTIONAL MATCH p = shortestPath((a)-[r:LINK*1..5]->(b)) WHERE all(e IN r WHERE e.weight >= min_w) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut optional_none).await?,
+        vec![serde_json::json!({})]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gremlin_repeat_barriers_where_predicates_and_variant_mean() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let accounts = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1, 2])) as _),
+        ("score", Arc::new(Int64Array::from(vec![10, 20])) as _),
+    ])?;
+    let merchants = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![3])) as _),
+        ("score", Arc::new(graphlake::arrow::array::Float64Array::from(vec![30.0])) as _),
+    ])?;
+    let transfers = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1, 2])) as _),
+        ("src", Arc::new(Int64Array::from(vec![1, 2])) as _),
+        ("dst", Arc::new(Int64Array::from(vec![2, 1])) as _),
+    ])?;
+    std::fs::write(dir.path().join("accounts.parquet"), parquet(&accounts)?)?;
+    std::fs::write(dir.path().join("merchants.parquet"), parquet(&merchants)?)?;
+    std::fs::write(dir.path().join("transfers.parquet"), parquet(&transfers)?)?;
+    let path = dir.path().join("graph.yaml");
+    std::fs::write(
+        &path,
+        "graph: gremlin_regressions
+sources:
+  data:
+    type: parquet
+    tables:
+      accounts: [accounts.parquet]
+      merchants: [merchants.parquet]
+      transfers: [transfers.parquet]
+nodes:
+  Account:
+    source: data.accounts
+    key: [id]
+    properties: [score]
+  Merchant:
+    source: data.merchants
+    key: [id]
+    properties: [score]
+edges:
+  Transfer:
+    source: data.transfers
+    key: [id]
+    from: { node: Account, columns: [src] }
+    to: { node: Account, columns: [dst] }
+",
+    )?;
+    let engine = Engine::new(Catalog::load(&path)?)?;
+
+    // times(0).emit().repeat(...) must preserve input kind rather than merging the unexecuted body's type.
+    let mut emit_zero = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').times(0).emit().repeat(__.label()).values('score').sum()",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut emit_zero).await?,
+        vec![serde_json::json!({"value": 30})]
+    );
+
+    // fold() and group() inside repeat must be treated as barriers (preserving input on times(0) and working with fold().unfold()).
+    let mut times_zero_fold = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').values('score').order().times(0).repeat(__.fold())",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut times_zero_fold).await?,
+        vec![
+            serde_json::json!({"value": 10}),
+            serde_json::json!({"value": 20}),
+        ]
+    );
+
+    let mut times_zero_group = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').values('score').order().times(0).repeat(__.group())",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut times_zero_group).await?,
+        vec![
+            serde_json::json!({"value": 10}),
+            serde_json::json!({"value": 20}),
+        ]
+    );
+
+    let mut repeat_fold_unfold = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').values('score').order().repeat(__.fold().unfold()).times(1)",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut repeat_fold_unfold).await?,
+        vec![
+            serde_json::json!({"value": 10}),
+            serde_json::json!({"value": 20}),
+        ]
+    );
+
+    // where('a', neq('b')) and where(P.neq('a')) inside repeat must not be rejected as nested traversals.
+    let mut where_two_arg = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').as('a').repeat(__.out('Transfer').as('b').where('a', neq('b'))).times(1).count()",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut where_two_arg).await?,
+        vec![serde_json::json!({"value": 2})]
+    );
+
+    let mut where_one_arg = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').as('a').repeat(__.out('Transfer').where(P.neq('a'))).times(1).count()",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut where_one_arg).await?,
+        vec![serde_json::json!({"value": 2})]
+    );
+
+    // Mixed numeric variant values through min().mean() must unwrap Variant struct in __graphlake_gremlin_number.
+    let mut variant_mean = engine
+        .query(
+            Language::Gremlin,
+            "g.V().values('score').min().mean()",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut variant_mean).await?,
+        vec![serde_json::json!({"value": 10.0})]
+    );
+    Ok(())
+}

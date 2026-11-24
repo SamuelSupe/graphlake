@@ -1536,7 +1536,7 @@ fn join_match(
             )
         });
     let first_expansion = plan.expansions.len();
-    let (right_sql, right_columns, consume_predicate) = match_input(
+    let (right_sql, right_columns, consume_predicate, deferred_shortest) = match_input(
         catalog,
         pattern,
         prior.as_ref().unwrap_or(&left.scope),
@@ -1649,7 +1649,10 @@ fn join_match(
     };
     let mut predicate_scope = new_predicate_scope();
     let mut optional_filter = None;
-    if !consume_predicate && let Some(where_clause) = &pattern.where_clause {
+    if !consume_predicate
+        && deferred_shortest.is_none()
+        && let Some(where_clause) = &pattern.where_clause
+    {
         let mut exists = HasExists(false);
         opencypher::Visitor::visit_expr(&mut exists, where_clause);
         if pattern.optional && exists.0 {
@@ -1679,7 +1682,117 @@ fn join_match(
         join.push("TRUE".into());
     }
     let join = join.join(" AND ");
-    let sql = if let Some(predicate) = optional_filter {
+    let sql = if let Some(deferred) = deferred_shortest {
+        let predicate = pattern
+            .where_clause
+            .as_ref()
+            .expect("deferred shortest ranking requires WHERE predicate");
+        let mut row_name = format!("__graphlake_shortest_row_{}", pattern.span.start);
+        while scope.columns.contains_key(&row_name) {
+            row_name.push('_');
+        }
+        let row = ident(&row_name);
+        let table = format!("__graphlake_shortest_input_{}", pattern.span.start);
+        plan.calls.push(super::apply::Apply {
+            table: table.clone(),
+            seed: String::new(),
+            outer: format!("SELECT l.*, row_number() OVER () AS {row}{}", left.input()),
+            inner: String::new(),
+            nested: Vec::new(),
+            lookups: Vec::new(),
+            limit: None,
+            mode: super::apply::Mode::Materialize,
+        });
+        let table = ident(&table);
+        let mut fields = vec![qualified("l", &row_name)];
+        let mut out_cols = Vec::new();
+        for name in scope.columns.keys() {
+            let from_right =
+                right_columns.columns.contains_key(name) && bound_anchor.as_ref() != Some(name);
+            fields.push(qualified(if from_right { "r" } else { "l" }, name));
+            out_cols.push(qualified("c", name));
+        }
+        let mut partition_cols = vec![qualified("c", &row_name)];
+        for index in 0..deferred.endpoints {
+            let ep = format!("__graphlake_rank_ep_{index}");
+            fields.push(qualified("r", &ep));
+            partition_cols.push(qualified("c", &ep));
+        }
+        fields.push(qualified("r", "__graphlake_rank_hops"));
+        let mut candidates = scope.clone();
+        candidates.columns.extend(
+            right_columns
+                .columns
+                .iter()
+                .filter(|(name, _)| bound_anchor.as_ref() != Some(*name))
+                .map(|(name, kind)| (name.clone(), kind.clone())),
+        );
+        candidates.bind("c", &mut predicate_scope);
+        let filter_sql = predicate_scope.expr(predicate)?;
+        let candidate_sql = format!(
+            "SELECT {} FROM {table} AS l JOIN ({right_sql}) AS r ON {join}",
+            fields.join(", "),
+        );
+        let from = if predicate_scope
+            .expression_joins
+            .borrow()
+            .iter()
+            .any(|expression| !expression.captures.is_empty())
+        {
+            let candidate_table = format!("__graphlake_shortest_candidates_{}", pattern.span.start);
+            plan.calls.push(super::apply::Apply {
+                table: candidate_table.clone(),
+                seed: String::new(),
+                outer: candidate_sql,
+                inner: String::new(),
+                nested: Vec::new(),
+                lookups: Vec::new(),
+                limit: None,
+                mode: super::apply::Mode::Materialize,
+            });
+            format!(" FROM {} AS c", ident(&candidate_table))
+        } else {
+            format!(" FROM ({candidate_sql}) AS c")
+        };
+        let from = predicate_scope.join_expressions(&from);
+        let rank_fn = if deferred.all { "rank" } else { "row_number" };
+        let candidate_projection = if out_cols.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", out_cols.join(", "))
+        };
+        let ranked_sql = format!(
+            "SELECT * FROM (
+               SELECT c.{row}{candidate_projection},
+                      {rank_fn}() OVER (PARTITION BY {} ORDER BY {}) AS __graphlake_path_rank
+               {from}
+               WHERE {filter_sql}
+             ) AS ranked WHERE __graphlake_path_rank = 1",
+            partition_cols.join(", "),
+            qualified("c", "__graphlake_rank_hops"),
+        );
+        if pattern.optional {
+            if project.is_empty() {
+                project.push("1 AS __graphlake_seed".into());
+            }
+            format!(
+                "SELECT {projection} FROM {table} AS l LEFT JOIN ({ranked_sql}) AS r ON l.{row} = r.{row}",
+                projection = project.join(", "),
+            )
+        } else {
+            let final_cols = scope
+                .columns
+                .keys()
+                .map(|name| qualified("r", name))
+                .collect::<Vec<_>>();
+            let final_cols = if final_cols.is_empty() {
+                "1 AS __graphlake_seed".into()
+            } else {
+                final_cols.join(", ")
+            };
+            format!("SELECT {final_cols} FROM ({ranked_sql}) AS r")
+        }
+    } else if let Some(predicate) = optional_filter {
         // Correlated predicates must be evaluated on the matched candidates.
         // Left joining those candidates by input row keeps one null row for
         // unmatched inputs, including duplicate rows from an earlier UNWIND.
@@ -1802,6 +1915,33 @@ impl opencypher::Visitor for HasExists {
     }
 }
 
+struct DeferredShortest {
+    endpoints: usize,
+    all: bool,
+}
+
+struct UsesOuter<'a> {
+    prior: &'a Scope,
+    right: &'a Scope,
+    found: bool,
+}
+
+impl opencypher::Visitor for UsesOuter<'_> {
+    fn visit_expr(&mut self, expr: &Expr) {
+        if self.found {
+            return;
+        }
+        if let ExprKind::Variable(name) = &expr.kind
+            && self.prior.columns.contains_key(&name.0)
+            && !self.right.columns.contains_key(&name.0)
+        {
+            self.found = true;
+            return;
+        }
+        opencypher::walk_expr(self, expr);
+    }
+}
+
 fn typed_match_input(
     catalog: &Catalog,
     pattern: &opencypher::Match,
@@ -1810,7 +1950,7 @@ fn typed_match_input(
     plan: &mut Plan,
     (match_types, base): (MatchTypes, usize),
     lookup: Option<&super::apply::Lookup>,
-) -> Result<(String, Scope, bool)> {
+) -> Result<(String, Scope, bool, Option<DeferredShortest>)> {
     let mut right = MatchPlan::new(catalog);
     right.call_imports = extensions.call_imports.clone();
     right.partitioned_csr = extensions.partitioned_csr;
@@ -1846,14 +1986,15 @@ fn typed_match_input(
                 .retain(|name| binding.keys.contains(name) || fields.contains(name));
         }
     }
-    render_match_input(right, pattern, plan)
+    render_match_input(right, pattern, prior, plan)
 }
 
 fn render_match_input(
     mut right: MatchPlan,
     pattern: &opencypher::Match,
+    prior: &Scope,
     plan: &mut Plan,
-) -> Result<(String, Scope, bool)> {
+) -> Result<(String, Scope, bool, Option<DeferredShortest>)> {
     let right_columns = Scope::from_plan(&right);
     let mut selected = Vec::new();
     for name in right_columns.columns.keys() {
@@ -1866,9 +2007,20 @@ fn render_match_input(
         .shortest_ranking
         .as_ref()
         .is_some_and(|rank| rank.consume_predicate);
+    let defer_ranking = consume_predicate
+        && pattern.where_clause.as_ref().is_some_and(|predicate| {
+            let mut visitor = UsesOuter {
+                prior,
+                right: &right_columns,
+                found: false,
+            };
+            opencypher::Visitor::visit_expr(&mut visitor, predicate);
+            visitor.found
+        });
     // Capture path predicates over joined endpoints and valid path rows. The
     // predicate itself can depend on the expression joins being planned here.
     let seed_where = if consume_predicate
+        && !defer_ranking
         && right.expression_joins.borrow().is_empty()
         && !right.predicates.is_empty()
     {
@@ -1876,17 +2028,36 @@ fn render_match_input(
     } else {
         String::new()
     };
-    if consume_predicate && let Some(predicate) = &pattern.where_clause {
+    if consume_predicate
+        && !defer_ranking
+        && let Some(predicate) = &pattern.where_clause
+    {
         right.predicates.push(right.expr(predicate)?);
     }
-    if let Some(rank) = &right.shortest_ranking {
-        let function = if rank.all { "rank" } else { "row_number" };
-        selected.push(format!(
-            "{function}() OVER (PARTITION BY {} ORDER BY {}) AS __graphlake_path_rank",
-            rank.endpoints.join(", "),
-            rank.hops
-        ));
-    }
+    let deferred = if defer_ranking {
+        let rank = right
+            .shortest_ranking
+            .as_ref()
+            .expect("deferred shortest ranking");
+        for (index, endpoint) in rank.endpoints.iter().enumerate() {
+            selected.push(format!("{endpoint} AS \"__graphlake_rank_ep_{index}\""));
+        }
+        selected.push(format!("{} AS \"__graphlake_rank_hops\"", rank.hops));
+        Some(DeferredShortest {
+            endpoints: rank.endpoints.len(),
+            all: rank.all,
+        })
+    } else {
+        if let Some(rank) = &right.shortest_ranking {
+            let function = if rank.all { "rank" } else { "row_number" };
+            selected.push(format!(
+                "{function}() OVER (PARTITION BY {} ORDER BY {}) AS __graphlake_path_rank",
+                rank.endpoints.join(", "),
+                rank.hops
+            ));
+        }
+        None
+    };
     let mut right_sql = format!(
         "SELECT {}{}{}",
         selected.join(", "),
@@ -1897,7 +2068,7 @@ fn render_match_input(
             format!(" WHERE {}", right.predicates.join(" AND "))
         }
     );
-    if right.shortest_ranking.is_some() {
+    if right.shortest_ranking.is_some() && deferred.is_none() {
         right_sql =
             format!("SELECT * FROM ({right_sql}) AS ranked WHERE __graphlake_path_rank = 1");
     }
@@ -1905,7 +2076,12 @@ fn render_match_input(
     plan.labels.extend(right.labels);
     plan.expansions.extend(right.expansions);
 
-    Ok((right_sql, right_columns, consume_predicate))
+    Ok((
+        right_sql,
+        right_columns,
+        consume_predicate && deferred.is_none(),
+        deferred,
+    ))
 }
 
 fn match_input(
@@ -1916,7 +2092,7 @@ fn match_input(
     plan: &mut Plan,
     base: usize,
     lookup: Option<&super::apply::Lookup>,
-) -> Result<(String, Scope, bool)> {
+) -> Result<(String, Scope, bool, Option<DeferredShortest>)> {
     if !super::alternatives::has_untyped(catalog, pattern) {
         return typed_match_input(
             catalog,
@@ -1943,5 +2119,5 @@ fn match_input(
     let mut right =
         super::wildcard::bind(catalog, pattern, &domains, &mut extensions.shortest, base)?;
     right.call_imports = extensions.call_imports.clone();
-    render_match_input(right, pattern, plan)
+    render_match_input(right, pattern, prior, plan)
 }

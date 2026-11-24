@@ -3,8 +3,8 @@ mod frontier;
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -43,13 +43,19 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use super::{ReadStats, decimal128};
 use crate::catalog::ident;
 
+#[derive(Default)]
+struct RequestState {
+    next_seq: u64,
+    last_dropped_seq: u64,
+    interrupted: bool,
+}
+
 pub(crate) struct Snapshot {
     client: Client,
     driver: Option<JoinHandle<()>>,
     tls: MakeRustlsConnect,
     next_cursor: AtomicU64,
-    in_flight: AtomicUsize,
-    interrupted: AtomicBool,
+    requests: Mutex<RequestState>,
     cancelled: crate::CancellationToken,
     stats: Arc<ReadStats>,
     pub(crate) version: String,
@@ -58,8 +64,8 @@ pub(crate) struct Snapshot {
 }
 
 struct ActiveRequest<'a> {
-    in_flight: &'a AtomicUsize,
-    interrupted: &'a AtomicBool,
+    state: &'a Mutex<RequestState>,
+    seq: u64,
     active: bool,
 }
 
@@ -67,11 +73,12 @@ impl ActiveRequest<'_> {
     fn finish(&mut self) {
         if self.active {
             self.active = false;
-            // PostgreSQL executes statements strictly serially on a single connection;
-            // once the last in-flight request completes, any earlier dropped statement
-            // has already finished draining on the backend.
-            if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-                self.interrupted.store(false, Ordering::Release);
+            // PostgreSQL executes pipelined requests strictly FIFO on a single connection;
+            // completing a request newer than every dropped request proves all earlier
+            // dropped requests have already finished draining on the backend.
+            let mut state = self.state.lock().unwrap();
+            if self.seq > state.last_dropped_seq {
+                state.interrupted = false;
             }
         }
     }
@@ -80,20 +87,30 @@ impl ActiveRequest<'_> {
 impl Drop for ActiveRequest<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.in_flight.fetch_sub(1, Ordering::AcqRel);
-            self.interrupted.store(true, Ordering::Release);
+            let mut state = self.state.lock().unwrap();
+            state.last_dropped_seq = state.last_dropped_seq.max(self.seq);
+            state.interrupted = true;
         }
     }
 }
 
 impl Snapshot {
     fn active_request(&self) -> ActiveRequest<'_> {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let seq = {
+            let mut state = self.requests.lock().unwrap();
+            state.next_seq += 1;
+            state.next_seq
+        };
         ActiveRequest {
-            in_flight: &self.in_flight,
-            interrupted: &self.interrupted,
+            state: &self.requests,
+            seq,
             active: true,
         }
+    }
+
+    fn take_interrupted(&self) -> bool {
+        let mut state = self.requests.lock().unwrap();
+        std::mem::replace(&mut state.interrupted, false)
     }
 
     async fn request<F: std::future::Future>(&self, future: F) -> F::Output {
@@ -438,8 +455,7 @@ impl Snapshot {
             tls,
             stats,
             next_cursor: AtomicU64::new(0),
-            in_flight: AtomicUsize::new(0),
-            interrupted: AtomicBool::new(false),
+            requests: Mutex::new(RequestState::default()),
             cancelled,
             version: String::new(),
             #[cfg(feature = "admin")]
@@ -542,7 +558,7 @@ impl Snapshot {
 impl Drop for Snapshot {
     fn drop(&mut self) {
         // Closing the socket alone may leave a backend computing until its next write.
-        let interrupted = self.interrupted.swap(false, Ordering::AcqRel);
+        let interrupted = self.take_interrupted();
         if interrupted {
             if let Ok(handle) = Handle::try_current() {
                 let token = self.client.cancel_token();
@@ -1083,9 +1099,8 @@ impl Drop for CursorCleanup {
         // stop (e.g. LIMIT or UNION ALL short-circuit), because PostgreSQL CancelRequest
         // aborts the entire transaction block and kills sibling cursors / Bolt ReadTransactions.
         // Only send cancel_query while shared if the query's own CancellationToken fired.
-        let cancel = (snapshot.cancelled.is_cancelled()
-            && snapshot.interrupted.swap(false, Ordering::AcqRel))
-        .then(|| (snapshot.client.cancel_token(), snapshot.tls.clone()));
+        let cancel = (snapshot.cancelled.is_cancelled() && snapshot.take_interrupted())
+            .then(|| (snapshot.client.cancel_token(), snapshot.tls.clone()));
         let weak = Arc::downgrade(&snapshot);
         drop(snapshot);
         runtime.spawn(async move {
@@ -1642,5 +1657,33 @@ mod tests {
         )
         .unwrap();
         assert!(dec_sql.contains("-0.05::numeric"), "{dec_sql}");
+    }
+
+    #[test]
+    fn request_state_preserves_interrupted_on_out_of_order_drop() {
+        fn start(requests: &Mutex<RequestState>) -> ActiveRequest<'_> {
+            let mut state = requests.lock().unwrap();
+            state.next_seq += 1;
+            ActiveRequest {
+                state: requests,
+                seq: state.next_seq,
+                active: true,
+            }
+        }
+        let requests = Mutex::new(RequestState::default());
+
+        let mut req1 = start(&requests);
+        let req2 = start(&requests);
+        drop(req2);
+        assert!(requests.lock().unwrap().interrupted);
+
+        // Older req1 completing must not clear interrupted set by newer dropped req2.
+        req1.finish();
+        assert!(requests.lock().unwrap().interrupted);
+
+        // A newer req3 completing proves the backend finished draining dropped req2.
+        let mut req3 = start(&requests);
+        req3.finish();
+        assert!(!requests.lock().unwrap().interrupted);
     }
 }

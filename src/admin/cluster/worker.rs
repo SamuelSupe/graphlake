@@ -402,22 +402,42 @@ impl Worker {
         deadline: Instant,
         span: Option<&opentelemetry::Context>,
     ) {
+        use futures::FutureExt;
+
+        struct CancelOnDrop(CancellationToken);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+
         let started = std::time::Instant::now();
         let token = self.shutdown.child_token();
         let id = dispatch.id;
         let result = {
+            let _cancel = CancelOnDrop(token.clone());
             let worker = self.clone();
             let lease_job = job.clone();
             let lease_token = token.clone();
             let lease = tokio::spawn(async move {
                 worker.maintain_lease(id, &lease_job, &lease_token).await;
             });
-            let operation = self.compute(id, &job, &dispatch, token.clone(), deadline);
+            let operation = std::panic::AssertUnwindSafe(self.compute(
+                id,
+                &job,
+                &dispatch,
+                token.clone(),
+                deadline,
+            ))
+            .catch_unwind();
             let result = tokio::select! {
                 biased;
                 _ = token.cancelled() => Err(cancelled()),
                 _ = tokio::time::sleep_until(deadline) => Err(timeout()),
-                result = operation => result,
+                result = operation => match result {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(Error::storage()),
+                },
             };
             token.cancel();
             // Finish any in-flight heartbeat before attempting the terminal CAS.
@@ -431,6 +451,12 @@ impl Worker {
             .observe("worker", "query", status, started.elapsed());
         if let Some(span) = span {
             telemetry::finish_span(span, status);
+        }
+        if self.shutdown.is_cancelled() && result.is_err() {
+            // Do not overwrite the job with 409 cancelled or delete request.json on graceful
+            // worker shutdown so the Coordinator can fail over the attempt to another worker.
+            drop(slot);
+            return;
         }
         if status >= 500 {
             telemetry::event(

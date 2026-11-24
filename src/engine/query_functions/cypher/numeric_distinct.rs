@@ -74,6 +74,12 @@ impl ScalarUDFImpl for NumericDistinct {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let _broadcast = super::reserve_scalar_broadcast(
+            &args.args[..1],
+            args.number_rows,
+            self.name(),
+            self.guard.as_ref(),
+        )?;
         let array = args.args[0].to_array(args.number_rows)?;
         let ty = self.input_type(array.data_type())?;
         // Deduplicate original values before a promotion can round integers to
@@ -97,6 +103,11 @@ impl ScalarUDFImpl for NumericDistinct {
         let result = ScalarValue::iter_to_array(
             (0..list.len())
                 .map(|index| {
+                    if index.is_multiple_of(256)
+                        && let Some(guard) = &self.guard
+                    {
+                        guard.check()?;
+                    }
                     if list.is_null(index) {
                         return ScalarValue::try_from(args.return_field.data_type());
                     }

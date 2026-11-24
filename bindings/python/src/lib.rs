@@ -19,10 +19,39 @@ use pyo3::{
 };
 use tokio::runtime::{Builder, Runtime};
 
+#[derive(Clone)]
+struct NonBlockingRuntime(Option<Arc<Runtime>>);
+
+impl NonBlockingRuntime {
+    fn new(runtime: Runtime) -> Self {
+        Self(Some(Arc::new(runtime)))
+    }
+}
+
+impl std::ops::Deref for NonBlockingRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().expect("Tokio runtime active")
+    }
+}
+
+impl Drop for NonBlockingRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take()
+            && let Ok(runtime) = Arc::try_unwrap(runtime)
+        {
+            // Dropping a Tokio Runtime normally blocks until all spawn_blocking tasks finish.
+            // Never block indefinitely while Python holds the GIL during GC teardown.
+            runtime.shutdown_background();
+        }
+    }
+}
+
 #[pyclass(name = "Engine", frozen)]
 struct PyEngine {
     engine: Engine,
-    runtime: Arc<Runtime>,
+    runtime: Mutex<Option<NonBlockingRuntime>>,
     options: QueryOptions,
 }
 
@@ -70,7 +99,7 @@ impl PyEngine {
             .map_err(runtime_error)?;
         Ok(Self {
             engine,
-            runtime: Arc::new(runtime),
+            runtime: Mutex::new(Some(NonBlockingRuntime::new(runtime))),
             options: QueryOptions {
                 timeout: Duration::from_millis(timeout_ms),
                 memory_bytes,
@@ -316,19 +345,47 @@ impl PyEngine {
     }
 
     fn refresh<'py>(&self, py: Python<'py>, edge: &str) -> PyResult<Bound<'py, PyAny>> {
+        let runtime = self.runtime()?;
         let options = self.options.clone();
         let report = py
-            .detach(|| self.runtime.block_on(self.engine.refresh(edge, options)))
+            .detach(|| runtime.block_on(self.engine.refresh(edge, options)))
             .map_err(runtime_error)?;
         to_python(py, &report)
+    }
+
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let taken = self
+            .runtime
+            .lock()
+            .map_err(|_| runtime_error(anyhow::anyhow!("engine runtime state is unavailable")))?
+            .take();
+        if let Some(mut wrapper) = taken
+            && let Some(runtime) = wrapper.0.take()
+        {
+            py.detach(|| {
+                if let Ok(runtime) = Arc::try_unwrap(runtime) {
+                    runtime.shutdown_timeout(Duration::from_secs(2));
+                }
+            });
+        }
+        Ok(())
     }
 }
 
 impl PyEngine {
+    fn runtime(&self) -> PyResult<NonBlockingRuntime> {
+        self.runtime
+            .lock()
+            .map_err(|_| runtime_error(anyhow::anyhow!("engine runtime state is unavailable")))?
+            .clone()
+            .ok_or_else(|| runtime_error(anyhow::anyhow!("engine is closed")))
+    }
+
     fn run<F>(&self, py: Python<'_>, start: impl FnOnce(QueryOptions) -> F) -> PyResult<PyQuery>
     where
         F: Future<Output = anyhow::Result<QueryResult>> + Send,
     {
+        let runtime = self.runtime()?;
         let cancellation = CancellationToken::new();
         let options = QueryOptions {
             cancellation: cancellation.clone(),
@@ -336,14 +393,14 @@ impl PyEngine {
         };
         let query = start(options);
         let result = py
-            .detach(|| self.runtime.block_on(query))
+            .detach(|| runtime.block_on(query))
             .map_err(runtime_error)?;
         Ok(PyQuery {
             schema: result.batches.schema(),
             versions: result.versions.clone(),
             plan: result.physical_plan.clone(),
             result: Mutex::new(Some(result)),
-            runtime: Arc::clone(&self.runtime),
+            runtime,
             cancellation,
         })
     }
@@ -352,7 +409,7 @@ impl PyEngine {
 #[pyclass(name = "Query", frozen)]
 struct PyQuery {
     result: Mutex<Option<QueryResult>>,
-    runtime: Arc<Runtime>,
+    runtime: NonBlockingRuntime,
     cancellation: CancellationToken,
     schema: SchemaRef,
     versions: Vec<SourceVersion>,

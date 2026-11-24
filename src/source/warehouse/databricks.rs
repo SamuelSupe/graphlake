@@ -201,7 +201,16 @@ impl Databricks {
                 let url = http.base.join(&next)?;
                 let expected = http.endpoint(&["api", "2.0", "sql", "statements", &id, "result", "chunks", &index.to_string()]);
                 verify(url.origin() == http.base.origin() && url.path() == expected.path() && url.fragment().is_none() && url.username().is_empty() && url.password().is_none(), "Databricks cursor escaped the statement result")?;
-                (_, chunk, budget) = http.receive(http.client.get(url)).await?;
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .context("Databricks statement timed out")?;
+                (_, chunk, budget) = tokio::time::timeout(
+                    remaining,
+                    http.receive(http.client.get(url)),
+                )
+                .await
+                .context("Databricks statement timed out")??;
             }
             verify(offset == manifest.total_row_count, "incomplete Databricks result")?;
             pending.0 = None;

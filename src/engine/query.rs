@@ -398,13 +398,16 @@ impl QueryScope {
         Ok(self.deadline.saturating_duration_since(Instant::now()))
     }
 
-    pub(crate) async fn new(options: QueryOptions, admission: &Arc<Admission>) -> Result<Self> {
+    pub(crate) async fn new(mut options: QueryOptions, admission: &Arc<Admission>) -> Result<Self> {
         ensure!(!options.timeout.is_zero(), "query timeout must be positive");
         ensure!(
             options.memory_bytes > 0 && options.partitions > 0 && options.batch_size > 0,
             "memory, partitions and batch size must be positive"
         );
         options.graph.validate()?;
+        // Derive a per-query child token so internal timeout/error teardown cancels
+        // this query's cursors/scans without poisoning a caller's reused QueryOptions.
+        options.cancellation = options.cancellation.child_token();
         let start = Instant::now();
         let wall_time = chrono::Utc::now();
         let deadline = start
@@ -530,7 +533,10 @@ impl QueryScope {
         tokio::select! {
             biased;
             _ = self.options.cancellation.cancelled() => bail!("query cancelled"),
-            _ = tokio::time::sleep_until(self.deadline) => bail!("query deadline exceeded"),
+            _ = tokio::time::sleep_until(self.deadline) => {
+                self.options.cancellation.cancel();
+                bail!("query deadline exceeded");
+            }
             result = future => result,
         }
     }
@@ -593,6 +599,9 @@ impl QueryScope {
                     Err(error) => break Err(DataFusionError::External(error.into())),
                 }
             };
+            if completion.is_err() {
+                scope.options.cancellation.cancel();
+            }
             drop(batches);
             scope.spilled_bytes.store(spilled_bytes(plan.as_ref()), Ordering::Relaxed);
             *scope.finished_ms.lock().expect("elapsed time") = Some(scope.start.elapsed().as_millis() as u64);

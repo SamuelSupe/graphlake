@@ -2,7 +2,11 @@ use std::{cell::RefCell, collections::BTreeSet, iter::Peekable, rc::Rc, slice::I
 
 use anyhow::{Context, Result, bail, ensure};
 
-use super::{PATH, Step, Traversers, condition, parse_chain, qualified, scalar_identity, text};
+use super::{
+    PATH, Step, Traversers, condition, parse::parse_expr, parse_chain, qualified, scalar_identity,
+    text,
+};
+use opencypher::ExprKind;
 use super::{
     repeat::{OutputLimit, Repeat, Stage},
     variants::{Kind, extend_tags},
@@ -37,6 +41,8 @@ fn barrier(name: &str) -> bool {
     matches!(
         name,
         "count"
+            | "fold"
+            | "group"
             | "mean"
             | "sum"
             | "min"
@@ -774,7 +780,9 @@ impl Traversers<'_> {
                 checked = sql;
                 checked_nested.extend(nested);
             }
-            terminal.clone_from(&kinds);
+            if !matches!(end, LoopEnd::Times(0)) {
+                terminal.clone_from(&kinds);
+            }
             Some(flag)
         } else {
             None
@@ -1051,11 +1059,33 @@ fn simple_check(steps: &[Step<'_>]) -> bool {
         .all(|step| matches!(step.name, "has" | "hasLabel" | "is" | "simplePath"))
 }
 
+pub(super) fn is_where_label_predicate(raw: &str) -> bool {
+    let Ok(expression) = parse_expr(raw) else {
+        return false;
+    };
+    matches!(
+        expression.kind,
+        ExprKind::FunctionCall {
+            ref name,
+            ref args,
+            distinct: false,
+        } if matches!(name.0.trim_start_matches("P."), "eq" | "neq")
+            && matches!(args.as_slice(), [arg] if matches!(arg.kind, ExprKind::String(_)))
+    )
+}
+
 fn traversal_contains(steps: &[Step<'_>], depth: usize, test: fn(&str) -> bool) -> Result<bool> {
     ensure!(depth <= 16, "Gremlin nesting exceeds 16");
     for step in steps {
         if test(step.name) {
             return Ok(true);
+        }
+        if step.name == "where" {
+            match step.args.as_slice() {
+                [_, predicate] if is_where_label_predicate(predicate) => continue,
+                [predicate] if is_where_label_predicate(predicate) => continue,
+                _ => {}
+            }
         }
         if matches!(
             step.name,

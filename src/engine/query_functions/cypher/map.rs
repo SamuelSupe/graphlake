@@ -10,6 +10,7 @@ use datafusion::{
         datatypes::{DataType, Field, FieldRef, Fields},
     },
     common::{Result, ScalarValue, exec_err, internal_err, plan_err},
+    execution::memory_pool::MemoryConsumer,
     logical_expr::{
         ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
         Volatility,
@@ -17,13 +18,14 @@ use datafusion::{
     prelude::SessionContext,
 };
 
-use super::{common_value_type, flatten_value, merge_values, unpack, value_types};
+use super::{ScopeGuard, common_value_type, flatten_value, merge_values, unpack, value_types};
 
-pub(super) fn register(context: &SessionContext) {
+pub(super) fn register(context: &SessionContext, guard: Option<ScopeGuard>) {
     for operation in ["get", "merge", "keys"] {
         context.register_udf(ScalarUDF::from(MapProjection {
             operation,
             signature: Signature::any(2, Volatility::Immutable),
+            guard: guard.clone(),
         }));
     }
 }
@@ -32,6 +34,7 @@ pub(super) fn register(context: &SessionContext) {
 struct MapProjection {
     operation: &'static str,
     signature: Signature,
+    guard: Option<ScopeGuard>,
 }
 
 fn map_fields(ty: &DataType) -> Result<&[FieldRef]> {
@@ -133,6 +136,17 @@ impl ScalarUDFImpl for MapProjection {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let broadcast_slice = if self.operation == "merge" {
+            &args.args[..2]
+        } else {
+            &args.args[..1]
+        };
+        let _broadcast = super::reserve_scalar_broadcast(
+            broadcast_slice,
+            args.number_rows,
+            self.name(),
+            self.guard.as_ref(),
+        )?;
         let base = args.args[0].to_array(args.number_rows)?;
         let ty = args.return_field.data_type();
         if self.operation == "keys" {
@@ -140,7 +154,12 @@ impl ScalarUDFImpl for MapProjection {
                 &args.args[1],
                 ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))
             );
-            return Ok(ColumnarValue::Array(keys(base, ty, omit_null)?));
+            return Ok(ColumnarValue::Array(keys(
+                base,
+                ty,
+                omit_null,
+                self.guard.as_ref(),
+            )?));
         }
         let mut maps = Vec::new();
         flatten_value(base, &mut maps);
@@ -151,17 +170,23 @@ impl ScalarUDFImpl for MapProjection {
             };
             let key = property_name(key)?;
             for map in maps {
+                if let Some(guard) = &self.guard {
+                    guard.check()?;
+                }
                 if let Some(record) = map.as_any().downcast_ref::<StructArray>()
                     && let Some((index, _)) = record.fields().find(key)
                 {
                     results.push(record.flatten().1[index].clone());
                 } else if let Some(map) = map.as_any().downcast_ref::<MapArray>() {
-                    results.push(get_map_value(map, key)?);
+                    results.push(get_map_value(map, key, self.guard.as_ref())?);
                 }
             }
         } else {
             let overrides = args.args[1].to_array(args.number_rows)?;
             for map in maps {
+                if let Some(guard) = &self.guard {
+                    guard.check()?;
+                }
                 results.push(merge_map(&map, &overrides)?);
             }
         }
@@ -211,10 +236,15 @@ fn merge_map(base: &ArrayRef, overrides: &ArrayRef) -> Result<ArrayRef> {
     )?))
 }
 
-fn get_map_value(map: &MapArray, key: &str) -> Result<ArrayRef> {
+fn get_map_value(map: &MapArray, key: &str, guard: Option<&ScopeGuard>) -> Result<ArrayRef> {
     let data = map.values().to_data();
     let mut values = MutableArrayData::new(vec![&data], true, map.len());
     for (row, offset) in map.value_offsets().windows(2).enumerate() {
+        if row.is_multiple_of(256)
+            && let Some(guard) = guard
+        {
+            guard.check()?;
+        }
         let mut found = None;
         if map.is_valid(row) {
             for index in offset[0] as usize..offset[1] as usize {
@@ -234,14 +264,28 @@ fn get_map_value(map: &MapArray, key: &str) -> Result<ArrayRef> {
     Ok(make_array(values.freeze()))
 }
 
-fn keys(input: ArrayRef, ty: &DataType, omit_null: bool) -> Result<ArrayRef> {
+fn keys(
+    input: ArrayRef,
+    ty: &DataType,
+    omit_null: bool,
+    guard: Option<&ScopeGuard>,
+) -> Result<ArrayRef> {
     let DataType::List(field) = ty else {
         return internal_err!("expected keys list");
     };
+    let reservation = guard.map(|guard| {
+        MemoryConsumer::new("__graphlake_cypher_keys output").register(&guard.runtime.memory_pool)
+    });
     let mut keys = StringViewBuilder::new();
     let mut lengths = Vec::with_capacity(input.len());
     let mut valid = Vec::with_capacity(input.len());
+    let mut total_items = 0usize;
     for row in 0..input.len() {
+        if row.is_multiple_of(256)
+            && let Some(guard) = guard
+        {
+            guard.check()?;
+        }
         let value = unpack(ScalarValue::try_from_array(&input, row)?)?;
         let start = keys.len();
         valid.push(!value.is_null());
@@ -250,6 +294,17 @@ fn keys(input: ArrayRef, ty: &DataType, omit_null: bool) -> Result<ArrayRef> {
         {
             for (field, column) in record.fields().iter().zip(record.columns()) {
                 if !omit_null || !ScalarValue::try_from_array(column, 0)?.is_null() {
+                    total_items = total_items
+                        .checked_add(1)
+                        .filter(|&n| n <= i32::MAX as usize)
+                        .ok_or_else(|| {
+                            datafusion::common::exec_datafusion_err!(
+                                "Cypher keys() exceeds Arrow list offset range"
+                            )
+                        })?;
+                    if let Some(reservation) = &reservation {
+                        reservation.try_grow(field.name().len().saturating_add(16))?;
+                    }
                     keys.append_value(field.name());
                 }
             }
@@ -258,10 +313,23 @@ fn keys(input: ArrayRef, ty: &DataType, omit_null: bool) -> Result<ArrayRef> {
         {
             let offset = map.value_offsets();
             for index in offset[0] as usize..offset[1] as usize {
-                keys.append_value(property_name(&ScalarValue::try_from_array(
-                    map.keys(),
-                    index,
-                )?)?);
+                if omit_null && map.values().is_null(index) {
+                    continue;
+                }
+                let key_scalar = ScalarValue::try_from_array(map.keys(), index)?;
+                let key = property_name(&key_scalar)?;
+                total_items = total_items
+                    .checked_add(1)
+                    .filter(|&n| n <= i32::MAX as usize)
+                    .ok_or_else(|| {
+                        datafusion::common::exec_datafusion_err!(
+                            "Cypher keys() exceeds Arrow list offset range"
+                        )
+                    })?;
+                if let Some(reservation) = &reservation {
+                    reservation.try_grow(key.len().saturating_add(16))?;
+                }
+                keys.append_value(key);
             }
         }
         lengths.push(keys.len() - start);

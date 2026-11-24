@@ -439,16 +439,45 @@ impl<'a> Traversers<'a> {
             return Ok(());
         }
         let cte = self.shared_input(&table, !early_limit && states.len() > 1);
+        let mut lane_unfold = Vec::with_capacity(states.len());
         for state in &mut states {
             if let Some(cte) = &cte {
                 state.ctes.push(cte.clone());
             }
             state.next_column = self.next_column;
             state.apply(std::slice::from_ref(step), depth)?;
+            let added_unfold = (step.name == "unfold" && state.order.len() == self.order.len() + 1)
+                .then(|| state.order.remove(0).0);
+            lane_unfold.push(added_unfold);
             // An implicit multi-edge hop may build an internal branch. All lanes
             // still carry the ordering of their common input.
             state.order.clone_from(&self.order);
             self.next_column = self.next_column.max(state.next_column);
+        }
+        if lane_unfold.iter().any(Option::is_some) {
+            let shared = self.fresh("unfold_index");
+            for (state, added) in states.iter_mut().zip(lane_unfold) {
+                match added {
+                    Some(column) if column != shared => {
+                        state.sql = format!(
+                            "SELECT v.*, {} AS {} FROM ({}) AS v",
+                            qualified("v", &column),
+                            ident(&shared),
+                            state.sql
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.sql = format!(
+                            "SELECT v.*, CAST(0 AS BIGINT) AS {} FROM ({}) AS v",
+                            ident(&shared),
+                            state.sql
+                        );
+                    }
+                }
+                state.order.insert(0, (shared.clone(), false));
+            }
+            self.order.insert(0, (shared, false));
         }
         let combined = self.combine(&states);
         self.sql = with_input(cte, combined);

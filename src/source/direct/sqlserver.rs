@@ -77,7 +77,10 @@ impl Driver {
             EncryptionLevel::NotSupported
         });
         if let Some(path) = ca_file {
-            config.trust_cert_ca(path);
+            let bundle = tokio::fs::read(path)
+                .await
+                .context("reading SQL Server CA file")?;
+            config.trust_cert_ca_bundle(bundle);
         }
         let client = tokio::time::timeout(timeout, async {
             let tcp = TcpStream::connect(config.get_addr()).await?;

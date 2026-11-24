@@ -81,7 +81,7 @@ pub(in crate::cypher) fn exists(
         .filter_map(|pattern| pattern.where_clause.as_ref())
         .collect::<Vec<_>>();
     let (sql, columns) = if let [pattern] = patterns.as_slice() {
-        let (sql, columns, _) = match_input(
+        let (sql, columns, _, _) = match_input(
             catalog,
             pattern,
             &prior,

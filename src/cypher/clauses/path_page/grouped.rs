@@ -174,17 +174,28 @@ impl Grouped {
             let mut rewritten = query.clone();
             rewritten.clauses[i] = Clause::With(with);
             if terminal {
-                let items = original
-                    .iter()
-                    .map(|item| {
-                        let name = output_name(item);
-                        restored
-                            .iter()
-                            .find(|item| item.alias.as_ref().is_some_and(|alias| alias.0 == name))
-                            .cloned()
-                            .unwrap_or_else(|| variable(&name, &name, item.span))
-                    })
-                    .collect();
+                if ret.body.star && injected {
+                    return None;
+                }
+                let items = if ret.body.star {
+                    // `WITH *, ...` already carries every original non-restored item in scope;
+                    // only emit items that were removed from `with.body.items` into `restored`.
+                    restored
+                } else {
+                    original
+                        .iter()
+                        .map(|item| {
+                            let name = output_name(item);
+                            restored
+                                .iter()
+                                .find(|item| {
+                                    item.alias.as_ref().is_some_and(|alias| alias.0 == name)
+                                })
+                                .cloned()
+                                .unwrap_or_else(|| variable(&name, &name, item.span))
+                        })
+                        .collect()
+                };
                 rewritten.clauses.push(Clause::Return(Return {
                     distinct: false,
                     body: ReturnBody {

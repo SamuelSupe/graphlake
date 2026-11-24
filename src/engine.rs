@@ -925,10 +925,26 @@ impl Engine {
 pub(crate) struct ReadTransaction {
     postgres: tokio::sync::Mutex<BTreeMap<String, Arc<Snapshot>>>,
     parquet: std::sync::Mutex<BTreeMap<String, String>>,
+    cancellation: crate::CancellationToken,
+}
+
+#[cfg(feature = "admin")]
+impl Drop for ReadTransaction {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 #[cfg(feature = "admin")]
 impl ReadTransaction {
+    pub(crate) fn with_cancellation(cancellation: crate::CancellationToken) -> Self {
+        Self {
+            postgres: Default::default(),
+            parquet: Default::default(),
+            cancellation,
+        }
+    }
+
     async fn postgres(
         &self,
         name: &str,
@@ -940,9 +956,14 @@ impl ReadTransaction {
             return Ok(snapshot.clone());
         }
         let snapshot = Arc::new(
-            Snapshot::open(dsn_env, scope.options.timeout, scope.reads.clone())
-                .await
-                .with_context(|| format!("opening PostgreSQL source {name}"))?,
+            Snapshot::open_with_cancellation(
+                dsn_env,
+                scope.options.timeout,
+                scope.reads.clone(),
+                self.cancellation.clone(),
+            )
+            .await
+            .with_context(|| format!("opening PostgreSQL source {name}"))?,
         );
         snapshots.insert(name.into(), snapshot.clone());
         Ok(snapshot)

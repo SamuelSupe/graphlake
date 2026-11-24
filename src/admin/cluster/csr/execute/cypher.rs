@@ -972,6 +972,84 @@ fn path_array<'a>(
     )?))
 }
 
+#[derive(Clone, Copy)]
+enum CsrCycleWitness {
+    SelfLoop(u64),
+    Odd {
+        u: Vertex,
+        w: Vertex,
+        edge: u64,
+        depth: usize,
+    },
+    Even {
+        meet: Vertex,
+        u: Vertex,
+        edge: u64,
+        depth: usize,
+    },
+}
+
+fn record_csr_cycle(
+    best_len: &mut Option<usize>,
+    witnesses: &mut Vec<CsrCycleWitness>,
+    len: usize,
+    witness: CsrCycleWitness,
+    keep_all: bool,
+) {
+    match *best_len {
+        None => {
+            *best_len = Some(len);
+            witnesses.push(witness);
+        }
+        Some(best) if len < best => {
+            *best_len = Some(len);
+            witnesses.clear();
+            witnesses.push(witness);
+        }
+        Some(best) if len == best && keep_all => {
+            witnesses.push(witness);
+        }
+        _ => {}
+    }
+}
+
+fn collect_csr_paths(
+    start: Vertex,
+    parents: &BTreeMap<Vertex, Vec<(Vertex, u64)>>,
+    target: Vertex,
+    depth: usize,
+    all: bool,
+    scope: &QueryScope,
+) -> Result<Vec<Path>> {
+    let mut results = Vec::new();
+    let mut stack = vec![(target, 0usize)];
+    let mut edges = Vec::with_capacity(depth);
+    while let Some((vertex, choice)) = stack.last_mut() {
+        scope.check()?;
+        if *vertex == start && edges.len() == depth {
+            results.push((
+                stack.iter().rev().map(|(v, _)| *v).collect(),
+                edges.iter().rev().copied().collect(),
+            ));
+            if !all {
+                break;
+            }
+            stack.pop();
+            edges.pop();
+            continue;
+        }
+        if let Some(&(parent, edge)) = parents.get(vertex).and_then(|p| p.get(*choice)) {
+            *choice += 1;
+            stack.push((parent, 0));
+            edges.push(edge);
+        } else {
+            stack.pop();
+            edges.pop();
+        }
+    }
+    Ok(results)
+}
+
 fn walks<'a>(
     execution: &'a Execution<'a>,
     start: Vertex,
@@ -983,11 +1061,29 @@ fn walks<'a>(
     Box::pin(async_stream::try_stream! {
         let graph = &execution.graph;
         if let Some(kind) = expansion.shortest {
-            let mut depths = BTreeMap::from([(start, 0usize)]);
+            let undirected = expansion.direction == Direction::Undirected;
+            let want_start_cycle = expansion.min >= 1 && targets.is_none_or(|t| t.contains(&start));
+            let allow_directed_return = !undirected && want_start_cycle;
+            let track_undirected_cycle = undirected && want_start_cycle;
+            let keep_all = matches!(kind, Shortest::All);
+            let mut depths = if allow_directed_return {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(start, 0usize)])
+            };
             let mut parents = BTreeMap::<Vertex, Vec<(Vertex,u64)>>::new();
+            let mut root_edge = BTreeMap::<Vertex, u64>::new();
+            let mut best_cycle_len = None;
+            let mut cycle_witnesses = Vec::new();
             let budget = graph.budget.new_empty();
             let mut frontier = vec![start];
-            let mut remaining = targets.map(BTreeSet::len);
+            let mut remaining = targets.map(|t| {
+                if track_undirected_cycle && t.contains(&start) {
+                    t.len() - 1
+                } else {
+                    t.len()
+                }
+            });
             for depth in 0..=max {
                 if frontier.is_empty() { break; }
                 if depth >= expansion.min {
@@ -998,7 +1094,7 @@ fn walks<'a>(
                         let mut edges = Vec::new();
                         while let Some((vertex, choice)) = stack.last_mut() {
                             graph.scope.check()?;
-                            if *vertex == start {
+                            if *vertex == start && edges.len() == depth {
                                 yield (stack.iter().rev().map(|(v,_)| *v).collect(), edges.iter().rev().copied().collect());
                             } else if let Some(&(parent, edge)) = parents.get(vertex).and_then(|p| p.get(*choice)) {
                                 *choice += 1;
@@ -1011,12 +1107,102 @@ fn walks<'a>(
                         }
                     }
                 }
-                if depth == max || remaining == Some(0) { break; }
+                let cycle_done = !track_undirected_cycle
+                    || 2 * depth + 1 > max
+                    || best_cycle_len.is_some_and(|best| 2 * depth + 1 > best);
+                if depth == max || (remaining == Some(0) && cycle_done) { break; }
+                let expand: Vec<Vertex> = if depth > 0 && allow_directed_return {
+                    frontier.into_iter().filter(|&v| v != start).collect()
+                } else {
+                    frontier
+                };
+                if expand.is_empty() { break; }
                 let mut next = Vec::new();
                 let final_targets = if depth+1 == max { targets } else { None };
-                let local = frontier.len() <= 1;
-                for mut batch in frontier.chunks(128).map(|chunk| adjacency(execution, chunk, final_targets, filters, local)) {
+                let local = expand.len() <= 1;
+                for mut batch in expand.chunks(128).map(|chunk| adjacency(execution, chunk, final_targets, filters, local)) {
                     while let Some((to,from,edge)) = batch.try_next().await? {
+                        if track_undirected_cycle {
+                            if depth == 0 && to == start {
+                                if 1 >= expansion.min && 1 <= max {
+                                    record_csr_cycle(
+                                        &mut best_cycle_len,
+                                        &mut cycle_witnesses,
+                                        1,
+                                        CsrCycleWitness::SelfLoop(edge),
+                                        keep_all,
+                                    );
+                                }
+                                continue;
+                            }
+                            if to == start {
+                                continue;
+                            }
+                            if depth+1 == max && targets.is_some_and(|targets| !targets.contains(&to)) {
+                                continue;
+                            }
+                            let my_root = if depth == 0 { edge } else { root_edge[&from] };
+                            match depths.get(&to).copied() {
+                                None => {
+                                    budget.try_grow(160)?;
+                                    depths.insert(to, depth + 1);
+                                    root_edge.insert(to, my_root);
+                                    budget.try_grow(40)?;
+                                    parents.entry(to).or_default().push((from, edge));
+                                    next.push(to);
+                                }
+                                Some(w_depth) if w_depth == depth + 1 => {
+                                    let choices = parents.entry(to).or_default();
+                                    if choices.is_empty() || keep_all {
+                                        budget.try_grow(40)?;
+                                        choices.push((from, edge));
+                                    }
+                                    let len = 2 * (depth + 1);
+                                    if len >= expansion.min
+                                        && len <= max
+                                        && my_root != root_edge[&to]
+                                    {
+                                        record_csr_cycle(
+                                            &mut best_cycle_len,
+                                            &mut cycle_witnesses,
+                                            len,
+                                            CsrCycleWitness::Even {
+                                                meet: to,
+                                                u: from,
+                                                edge,
+                                                depth: depth + 1,
+                                            },
+                                            keep_all,
+                                        );
+                                    }
+                                }
+                                Some(w_depth) if depth >= 1 && w_depth == depth => {
+                                    let len = 2 * depth + 1;
+                                    if len >= expansion.min
+                                        && len <= max
+                                        && my_root != root_edge[&to]
+                                    {
+                                        record_csr_cycle(
+                                            &mut best_cycle_len,
+                                            &mut cycle_witnesses,
+                                            len,
+                                            CsrCycleWitness::Odd {
+                                                u: from,
+                                                w: to,
+                                                edge,
+                                                depth,
+                                            },
+                                            keep_all,
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        if allow_directed_return && to == start && depth + 1 < expansion.min {
+                            continue;
+                        }
                         if depth+1 == max && targets.is_some_and(|targets| !targets.contains(&to)) {
                             continue;
                         }
@@ -1027,7 +1213,7 @@ fn walks<'a>(
                         }
                         if depths[&to] == depth+1 {
                             let choices = parents.entry(to).or_default();
-                            if choices.is_empty() || matches!(kind, Shortest::All) {
+                            if choices.is_empty() || keep_all {
                                 budget.try_grow(40)?;
                                 choices.push((from,edge));
                             }
@@ -1035,6 +1221,97 @@ fn walks<'a>(
                     }
                 }
                 frontier = next;
+            }
+            if track_undirected_cycle && let Some(best_len) = best_cycle_len {
+                let mut seen_edges = BTreeSet::<Vec<u64>>::new();
+                let mut seen_meets = BTreeSet::<Vertex>::new();
+                let mut emitted = false;
+                for witness in cycle_witnesses {
+                    match witness {
+                        CsrCycleWitness::SelfLoop(edge) => {
+                            let edges = vec![edge];
+                            if !keep_all || seen_edges.insert(edges.clone()) {
+                                yield (vec![start, start], edges);
+                                emitted = true;
+                                if !keep_all {
+                                    break;
+                                }
+                            }
+                        }
+                        CsrCycleWitness::Odd { u, w, edge, depth } => {
+                            let left_paths = collect_csr_paths(start, &parents, u, depth, keep_all, graph.scope)?;
+                            let right_paths = collect_csr_paths(start, &parents, w, depth, keep_all, graph.scope)?;
+                            for (lv, le) in &left_paths {
+                                for (rv, re) in &right_paths {
+                                    if le.first() == re.first() || le.iter().any(|e| re.contains(e)) {
+                                        continue;
+                                    }
+                                    let mut edges = Vec::with_capacity(best_len);
+                                    edges.extend_from_slice(le);
+                                    edges.push(edge);
+                                    edges.extend(re.iter().rev().copied());
+                                    if !keep_all || seen_edges.insert(edges.clone()) {
+                                        let mut nodes = Vec::with_capacity(best_len + 1);
+                                        nodes.extend_from_slice(lv);
+                                        nodes.extend(rv.iter().rev().copied());
+                                        yield (nodes, edges);
+                                        emitted = true;
+                                        if !keep_all {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !keep_all && emitted {
+                                    break;
+                                }
+                            }
+                            if !keep_all && emitted {
+                                break;
+                            }
+                        }
+                        CsrCycleWitness::Even { meet, u, edge, depth } => {
+                            if !keep_all {
+                                let left_paths = collect_csr_paths(start, &parents, meet, depth, false, graph.scope)?;
+                                let right_paths = collect_csr_paths(start, &parents, u, depth - 1, false, graph.scope)?;
+                                if let (Some((lv, le)), Some((rv, re))) = (left_paths.first(), right_paths.first()) {
+                                    let mut edges = Vec::with_capacity(best_len);
+                                    edges.extend_from_slice(le);
+                                    edges.push(edge);
+                                    edges.extend(re.iter().rev().copied());
+                                    let mut nodes = Vec::with_capacity(best_len + 1);
+                                    nodes.extend_from_slice(lv);
+                                    nodes.extend(rv.iter().rev().copied());
+                                    yield (nodes, edges);
+                                    break;
+                                }
+                                continue;
+                            }
+                            if !seen_meets.insert(meet) {
+                                continue;
+                            }
+                            let paths = collect_csr_paths(start, &parents, meet, depth, true, graph.scope)?;
+                            for (i, (lv, le)) in paths.iter().enumerate() {
+                                for (j, (rv, re)) in paths.iter().enumerate() {
+                                    if i == j
+                                        || le.first() == re.first()
+                                        || le.iter().any(|e| re.contains(e))
+                                    {
+                                        continue;
+                                    }
+                                    let mut edges = Vec::with_capacity(best_len);
+                                    edges.extend_from_slice(le);
+                                    edges.extend(re.iter().rev().copied());
+                                    if seen_edges.insert(edges.clone()) {
+                                        let mut nodes = Vec::with_capacity(best_len + 1);
+                                        nodes.extend_from_slice(lv);
+                                        nodes.extend(rv.iter().rev().skip(1).copied());
+                                        yield (nodes, edges);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else {
             let memo = WalkAdjacency {

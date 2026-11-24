@@ -776,6 +776,7 @@ impl Hydrate {
             .context("invalid CSR entity kind")?;
         let mut indices = BTreeMap::new();
         let mut payloads = Vec::new();
+        let mut payload_sizes = Vec::new();
         source
             .identities(
                 &unique,
@@ -784,13 +785,23 @@ impl Hydrate {
                 |bytes| self.csr.property_column_bytes(bytes, self.order_only),
                 |label, id, batch, row| {
                     let value = entity(label, id, kind, batch, row, item.data_type())?;
-                    budget.try_grow(id.len() + value.size() + 64)?;
+                    let size = value.size();
+                    budget.try_grow(id.len() + size + 64)?;
                     indices.insert(id.to_owned(), payloads.len() as u32);
                     payloads.push(value);
+                    payload_sizes.push(size);
                     Ok(())
                 },
             )
             .await?;
+        let mut estimated_take_bytes = keys.len().saturating_mul(std::mem::size_of::<u32>());
+        for id in keys.iter().flatten() {
+            if let Some(&idx) = indices.get(id) {
+                estimated_take_bytes = estimated_take_bytes.saturating_add(payload_sizes[idx as usize]);
+            }
+        }
+        // Reserve expanded output memory before materializing repeated payloads via `take`.
+        budget.try_grow(estimated_take_bytes)?;
         // Reuse the Arrow payloads for repeated elements while preserving list order and nulls.
         let raw = if payloads.is_empty() {
             datafusion::arrow::array::new_empty_array(item.data_type())
@@ -802,7 +813,10 @@ impl Hydrate {
                 .map(|id| id.and_then(|id| indices.get(id).copied())),
         );
         let values = take(&raw, &take_ids, None)?;
-        budget.try_grow(values.get_array_memory_size())?;
+        let actual_bytes = values.get_array_memory_size();
+        if actual_bytes > estimated_take_bytes {
+            budget.try_grow(actual_bytes - estimated_take_bytes)?;
+        }
         let result = ListArray::try_new(
             item.clone(),
             OffsetBuffer::new(

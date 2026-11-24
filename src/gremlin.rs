@@ -302,6 +302,7 @@ fn needs_path(steps: &[Step<'_>], depth: usize) -> Result<bool> {
             "path" | "simplePath" | "otherV" => return Ok(true),
             "by" | "where" | "filter" | "not" | "map" | "emit" | "until" => {
                 if let [argument] = step.args.as_slice()
+                    && !(step.name == "where" && control::is_where_label_predicate(argument))
                     && let Some(nested) = values::by_traversal(argument)
                     && needs_path(&parse_chain(&nested, "__")?, depth + 1)?
                 {

@@ -320,18 +320,32 @@ impl Trino {
 
     fn pages<'a>(&'a self, sql: String, id: &'a mut Option<String>) -> BoxStream<'a, Result<Page>> {
         Box::pin(async_stream::try_stream! {
+            let limit_ms = self.timeout.as_millis().max(1);
             let mut request = self.auth(self.http.client.post(self.http.endpoint(&["v1", "statement"])))
                 .header(CONTENT_TYPE, "text/plain; charset=utf-8")
                 .header("X-Trino-User", &self.user)
                 .header("X-Trino-Source", "GraphLake")
                 .header("X-Trino-Client-Capabilities", "PARAMETRIC_DATETIME")
                 .header("X-Trino-Time-Zone", "UTC")
-                .header("X-Trino-Session", format!("query_max_run_time={}ms", self.timeout.as_millis().max(1)))
+                .header(
+                    "X-Trino-Session",
+                    format!("query_max_run_time={limit_ms}ms,query_max_execution_time={limit_ms}ms"),
+                )
                 .body(sql);
             let mut pending = Pending(None);
             let mut previous = None;
+            let deadline = tokio::time::Instant::now() + self.timeout;
             loop {
-                let (_, result, budget) = self.http.receive::<Results>(request).await?;
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .context("Trino query timed out")?;
+                let (_, result, budget) = tokio::time::timeout(
+                    remaining,
+                    self.http.receive::<Results>(request),
+                )
+                .await
+                .context("Trino query timed out")??;
                 verify(!result.id.is_empty() && id.as_ref().is_none_or(|expected| expected == &result.id),
                     "Trino returned a different query ID")?;
                 if id.is_none() { *id = Some(result.id); }
@@ -346,10 +360,20 @@ impl Trino {
                     .collect::<Result<Vec<_>>>()).transpose()?;
                 let rows = result.data.unwrap_or_default().into_iter().map(|row| row.into_iter().map(cell).collect())
                     .collect::<Result<Vec<_>>>()?;
-                if fields.is_some() || !rows.is_empty() {
+                let empty_page = fields.is_none() && rows.is_empty();
+                if !empty_page {
                     yield Page { fields, rows, _budget: budget };
+                } else {
+                    drop(budget);
                 }
                 let Some(next) = next else { break; };
+                if empty_page {
+                    let remaining = deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .filter(|d| !d.is_zero())
+                        .context("Trino query timed out")?;
+                    tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+                }
                 request = self.auth(self.http.client.get(next.clone()));
                 previous = Some(next);
             }

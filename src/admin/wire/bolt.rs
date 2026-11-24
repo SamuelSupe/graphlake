@@ -384,7 +384,7 @@ impl BoltBackend for Backend {
             model: target.model.clone(),
             revision,
             engine,
-            snapshots: ReadTransaction::default(),
+            snapshots: ReadTransaction::with_cancellation(self.app.shutdown.child_token()),
             managed,
             deadline,
         }));

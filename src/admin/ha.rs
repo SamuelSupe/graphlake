@@ -32,6 +32,7 @@ pub(super) struct Ha {
     pub leader: Arc<Leadership>,
     source: SourceProbe,
     pub catalog: tokio::sync::Mutex<(String, i64)>,
+    policy: tokio::sync::Mutex<()>,
     probe_generation: std::sync::RwLock<String>,
     pub recovery_configured: bool,
     pub recovery_pending: AtomicBool,
@@ -196,6 +197,7 @@ impl Ha {
             recovery_pending: AtomicBool::new(recovery.is_some_and(|(gate, _)| !gate.approved)),
             recovery_check: tokio::sync::Mutex::new(()),
             catalog: tokio::sync::Mutex::new((generation, version)),
+            policy: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -389,7 +391,9 @@ async fn mutate_inner(
                 "请求标识已用于不同的操作",
             ));
         }
-        let state = ha.leader.load_catalog(&receipt.generation).await?;
+        let state = tokio::time::timeout_at(deadline, ha.leader.load_catalog(&receipt.generation))
+            .await
+            .map_err(|_| control::timeout())??;
         let id_owned = id.to_owned();
         let validated = receipt.validated;
         let model = tokio::task::spawn_blocking(move || {
@@ -718,7 +722,12 @@ pub(super) async fn change_policy(
     super::access::Policy::validate_config(&body)?;
     let leader = ha.leader.clone();
     tokio::spawn(async move {
-        let _serialized = app.ha.as_ref().unwrap().catalog.lock().await;
+        let _serialized = tokio::time::timeout(
+            Duration::from_secs(15),
+            app.ha.as_ref().unwrap().policy.lock(),
+        )
+        .await
+        .map_err(|_| control::timeout())?;
         let (_, version) = leader
             .get::<String>("policy")
             .await?

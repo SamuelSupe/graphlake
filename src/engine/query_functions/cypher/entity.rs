@@ -12,15 +12,16 @@ use datafusion::{
     prelude::SessionContext,
 };
 
-use super::{common_value_type, merge_values, text_type};
+use super::{ScopeGuard, common_value_type, merge_values, text_type};
 
 const ENTITY: &str = "graphlake.cypher.entity";
 
-pub(super) fn register(context: &SessionContext) {
+pub(super) fn register(context: &SessionContext, guard: Option<ScopeGuard>) {
     for public in [false, true] {
         context.register_udf(ScalarUDF::from(Entity {
             public,
             signature: Signature::any(1, Volatility::Immutable),
+            guard: guard.clone(),
         }));
     }
 }
@@ -49,6 +50,7 @@ pub(super) fn identity(value: &ScalarValue) -> Result<Option<[ScalarValue; 3]>> 
 struct Entity {
     public: bool,
     signature: Signature,
+    guard: Option<ScopeGuard>,
 }
 
 impl ScalarUDFImpl for Entity {
@@ -98,6 +100,12 @@ impl ScalarUDFImpl for Entity {
     }
 
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let _broadcast = super::reserve_scalar_broadcast(
+            &args.args[..1],
+            args.number_rows,
+            self.name(),
+            self.guard.as_ref(),
+        )?;
         let input = args.args.remove(0);
         let target = args.return_field.data_type();
         if input.data_type() == *target {

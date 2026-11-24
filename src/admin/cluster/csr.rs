@@ -726,22 +726,51 @@ async fn read_block(
     Ok(data)
 }
 
+fn compact_byte_view<T: datafusion::arrow::datatypes::ByteViewType>(
+    view: &datafusion::arrow::array::GenericByteViewArray<T>,
+) -> datafusion::arrow::array::ArrayRef {
+    use datafusion::arrow::{
+        array::GenericByteViewArray,
+        buffer::{NullBuffer, ScalarBuffer},
+    };
+    let gc = view.gc();
+    let oversized_views =
+        gc.views().inner().capacity() > gc.len().saturating_mul(16).saturating_add(64);
+    let oversized_nulls = gc
+        .nulls()
+        .is_some_and(|n| n.buffer().capacity() > gc.len().div_ceil(8).saturating_add(64));
+    if oversized_views || oversized_nulls {
+        let views = ScalarBuffer::from(gc.views().as_ref().to_vec());
+        let nulls = gc.nulls().map(|n| NullBuffer::from_iter(n.iter()));
+        if let Ok(shrunk) = GenericByteViewArray::<T>::try_new(
+            views,
+            gc.data_buffers().to_vec(),
+            nulls,
+        ) {
+            return Arc::new(shrunk);
+        }
+    }
+    Arc::new(gc)
+}
+
 fn compact_view(array: datafusion::arrow::array::ArrayRef) -> datafusion::arrow::array::ArrayRef {
     use datafusion::arrow::{
         array::{
             BinaryViewArray, DictionaryArray, FixedSizeListArray, LargeListArray, ListArray,
-            MapArray, StringViewArray, StructArray,
+            MapArray, PrimitiveArray, StringViewArray, StructArray, UInt32Array, new_empty_array,
         },
+        buffer::OffsetBuffer,
+        compute::take,
         datatypes::{
-            DataType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
-            UInt64Type,
+            ArrowPrimitiveType, DataType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type,
+            UInt16Type, UInt32Type, UInt64Type,
         },
     };
     if let Some(view) = array.as_any().downcast_ref::<StringViewArray>() {
-        return Arc::new(view.gc());
+        return compact_byte_view(view);
     }
     if let Some(view) = array.as_any().downcast_ref::<BinaryViewArray>() {
-        return Arc::new(view.gc());
+        return compact_byte_view(view);
     }
     match array.data_type() {
         DataType::Struct(fields) => {
@@ -757,42 +786,82 @@ fn compact_view(array: datafusion::arrow::array::ArrayRef) -> datafusion::arrow:
         }
         DataType::List(field) => {
             let l = array.as_any().downcast_ref::<ListArray>().unwrap();
-            let values = compact_view(Arc::clone(l.values()));
-            ListArray::try_new(
-                Arc::clone(field),
-                l.offsets().clone(),
-                values,
-                l.nulls().cloned(),
-            )
-            .map(|a| Arc::new(a) as _)
-            .unwrap_or(array)
+            if l.is_empty() {
+                return new_empty_array(array.data_type());
+            }
+            let offsets = l.value_offsets();
+            let first = offsets[0];
+            let start = first as usize;
+            let end = offsets[l.len()] as usize;
+            let values = compact_view(l.values().slice(start, end.saturating_sub(start)));
+            let rebased = OffsetBuffer::new(
+                offsets
+                    .iter()
+                    .map(|&offset| offset - first)
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+            ListArray::try_new(Arc::clone(field), rebased, values, l.nulls().cloned())
+                .map(|a| Arc::new(a) as _)
+                .unwrap_or(array)
         }
         DataType::LargeList(field) => {
             let l = array.as_any().downcast_ref::<LargeListArray>().unwrap();
-            let values = compact_view(Arc::clone(l.values()));
-            LargeListArray::try_new(
-                Arc::clone(field),
-                l.offsets().clone(),
-                values,
-                l.nulls().cloned(),
-            )
-            .map(|a| Arc::new(a) as _)
-            .unwrap_or(array)
+            if l.is_empty() {
+                return new_empty_array(array.data_type());
+            }
+            let offsets = l.value_offsets();
+            let first = offsets[0];
+            let start = first as usize;
+            let end = offsets[l.len()] as usize;
+            let values = compact_view(l.values().slice(start, end.saturating_sub(start)));
+            let rebased = OffsetBuffer::new(
+                offsets
+                    .iter()
+                    .map(|&offset| offset - first)
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+            LargeListArray::try_new(Arc::clone(field), rebased, values, l.nulls().cloned())
+                .map(|a| Arc::new(a) as _)
+                .unwrap_or(array)
         }
         DataType::FixedSizeList(field, size) => {
             let l = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
-            let values = compact_view(Arc::clone(l.values()));
+            if l.is_empty() {
+                return new_empty_array(array.data_type());
+            }
+            let unit = *size as usize;
+            let start = l.offset().saturating_mul(unit);
+            let len = l.len().saturating_mul(unit);
+            let values = compact_view(l.values().slice(start, len));
             FixedSizeListArray::try_new(Arc::clone(field), *size, values, l.nulls().cloned())
                 .map(|a| Arc::new(a) as _)
                 .unwrap_or(array)
         }
         DataType::Map(field, ordered) => {
             let m = array.as_any().downcast_ref::<MapArray>().unwrap();
-            let entries = compact_view(Arc::new(m.entries().clone()));
+            if m.is_empty() {
+                return new_empty_array(array.data_type());
+            }
+            let offsets = m.value_offsets();
+            let first = offsets[0];
+            let start = first as usize;
+            let end = offsets[m.len()] as usize;
+            let entries = compact_view(Arc::new(
+                m.entries().slice(start, end.saturating_sub(start)),
+            ));
+            let rebased = OffsetBuffer::new(
+                offsets
+                    .iter()
+                    .map(|&offset| offset - first)
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
             if let Some(entries) = entries.as_any().downcast_ref::<StructArray>() {
                 MapArray::try_new(
                     Arc::clone(field),
-                    m.offsets().clone(),
+                    rebased,
                     entries.clone(),
                     m.nulls().cloned(),
                     *ordered,
@@ -807,10 +876,61 @@ fn compact_view(array: datafusion::arrow::array::ArrayRef) -> datafusion::arrow:
             macro_rules! compact_dict {
                 ($k:ty) => {{
                     let d = array.as_any().downcast_ref::<DictionaryArray<$k>>().unwrap();
-                    let values = compact_view(Arc::clone(d.values()));
-                    DictionaryArray::<$k>::try_new(d.keys().clone(), values)
-                        .map(|a| Arc::new(a) as _)
-                        .unwrap_or(array)
+                    let mut remap = HashMap::<usize, <$k as ArrowPrimitiveType>::Native>::new();
+                    let mut take_indices = Vec::<u32>::new();
+                    let mut new_keys =
+                        Vec::<Option<<$k as ArrowPrimitiveType>::Native>>::with_capacity(d.len());
+                    let mut remappable = true;
+                    for key in d.keys().iter() {
+                        match key {
+                            Some(k) => {
+                                #[allow(irrefutable_let_patterns)]
+                                let Ok(old) = usize::try_from(k) else {
+                                    remappable = false;
+                                    break;
+                                };
+                                let Ok(old_u32) = u32::try_from(old) else {
+                                    remappable = false;
+                                    break;
+                                };
+                                if let Some(&mapped) = remap.get(&old) {
+                                    new_keys.push(Some(mapped));
+                                } else {
+                                    #[allow(irrefutable_let_patterns)]
+                                    let Ok(mapped) =
+                                        <$k as ArrowPrimitiveType>::Native::try_from(take_indices.len())
+                                    else {
+                                        remappable = false;
+                                        break;
+                                    };
+                                    take_indices.push(old_u32);
+                                    remap.insert(old, mapped);
+                                    new_keys.push(Some(mapped));
+                                }
+                            }
+                            None => new_keys.push(None),
+                        }
+                    }
+                    if remappable {
+                        let values = if take_indices.is_empty() {
+                            new_empty_array(d.values().data_type())
+                        } else {
+                            let indices = UInt32Array::from(take_indices);
+                            match take(d.values().as_ref(), &indices, None) {
+                                Ok(referenced) => compact_view(referenced),
+                                Err(_) => compact_view(Arc::clone(d.values())),
+                            }
+                        };
+                        let keys = PrimitiveArray::<$k>::from(new_keys);
+                        DictionaryArray::<$k>::try_new(keys, values)
+                            .map(|a| Arc::new(a) as _)
+                            .unwrap_or(array)
+                    } else {
+                        let values = compact_view(Arc::clone(d.values()));
+                        DictionaryArray::<$k>::try_new(d.keys().clone(), values)
+                            .map(|a| Arc::new(a) as _)
+                            .unwrap_or(array)
+                    }
                 }};
             }
             match key_type.as_ref() {
@@ -874,6 +994,88 @@ mod compact_view_tests {
             compacted_struct.get_array_memory_size() < 4096,
             "nested Struct<Utf8View> was not compacted: {}",
             compacted_struct.get_array_memory_size()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_view_reclaims_sliced_list_map_and_dictionary_string_views() -> Result<()> {
+        use datafusion::arrow::{
+            array::{DictionaryArray, Int32Array, MapArray},
+            datatypes::Int32Type,
+        };
+        let big = "b".repeat(4096);
+        let mut raw = vec![big.as_str(); 256];
+        raw[0] = "tiny_entry";
+        let views = Arc::new(StringViewArray::from(raw)) as datafusion::arrow::array::ArrayRef;
+        assert!(views.get_array_memory_size() > 512 * 1024);
+
+        // Slicing the outer ListArray leaves inner values unsliced until compact_view slices & rebases.
+        let full_list = ListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Utf8View, true)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(1, 256)),
+            Arc::clone(&views),
+            None,
+        )?;
+        let sliced_list = Arc::new(full_list.slice(0, 1)) as datafusion::arrow::array::ArrayRef;
+        let compacted_list = compact_view(sliced_list);
+        assert!(
+            compacted_list.get_array_memory_size() < 4096,
+            "sliced List<Utf8View> retained parent buffers: {}",
+            compacted_list.get_array_memory_size()
+        );
+        let compacted_list = compacted_list.as_any().downcast_ref::<ListArray>().unwrap();
+        let inner = compacted_list.value(0);
+        let inner = inner.as_any().downcast_ref::<StringViewArray>().unwrap();
+        assert_eq!(inner.value(0), "tiny_entry");
+
+        // Slicing a DictionaryArray must drop unreferenced dictionary values before gc().
+        let full_dict = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from_iter_values(0..256),
+            Arc::clone(&views),
+        )?;
+        let sliced_dict = Arc::new(full_dict.slice(0, 1)) as datafusion::arrow::array::ArrayRef;
+        let compacted_dict = compact_view(sliced_dict);
+        assert!(
+            compacted_dict.get_array_memory_size() < 4096,
+            "sliced Dictionary<Int32, Utf8View> retained unreferenced values: {}",
+            compacted_dict.get_array_memory_size()
+        );
+        let compacted_dict = compacted_dict
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        assert_eq!(compacted_dict.values().len(), 1);
+        assert_eq!(
+            compacted_dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .value(0),
+            "tiny_entry"
+        );
+
+        // Slicing a MapArray must slice entries & rebase offsets before gc().
+        let keys = Arc::new(StringViewArray::from(vec!["k"; 256])) as datafusion::arrow::array::ArrayRef;
+        let entry_fields = Fields::from(vec![
+            Field::new("keys", DataType::Utf8View, false),
+            Field::new("values", DataType::Utf8View, true),
+        ]);
+        let entries = StructArray::try_new(entry_fields.clone(), vec![keys, views], None)?;
+        let full_map = MapArray::try_new(
+            Arc::new(Field::new("entries", DataType::Struct(entry_fields), false)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(1, 256)),
+            entries,
+            None,
+            false,
+        )?;
+        let sliced_map = Arc::new(full_map.slice(0, 1)) as datafusion::arrow::array::ArrayRef;
+        let compacted_map = compact_view(sliced_map);
+        assert!(
+            compacted_map.get_array_memory_size() < 4096,
+            "sliced Map<Utf8View, Utf8View> retained parent buffers: {}",
+            compacted_map.get_array_memory_size()
         );
         Ok(())
     }

@@ -529,7 +529,7 @@ impl ImpactInput {
             }
             return self.report.finish();
         };
-        let mut suite = Suite::parse(&raw)?;
+        let suite = Suite::parse(&raw)?;
         let required = suite.tasks();
         if required != candidate.tasks {
             return Err(Error::invalid(
@@ -537,118 +537,128 @@ impl ImpactInput {
                 "候选模型的任务必须与运维配置的固定场景一致",
             ));
         }
-        let fixture = Fixture::new(suite.tables)
+        let tables = suite.tables;
+        let fixture = tokio::task::spawn_blocking(move || Fixture::new(tables))
+            .await
+            .map_err(|_| Error::storage())?
             .map_err(|_| Error::invalid("invalid_task_suite", "固定数据列定义或数据文件无效"))?;
-        let before = self
-            .baseline
-            .as_deref()
-            .map(|yaml| models::parse(yaml, &self.path))
-            .transpose()?;
-        let same_revision = self.report.active_revision.as_deref() == Some(&self.report.revision);
-        if let Some(before) = &before {
-            self.report.mapping_changes = mapping_changes(before, &candidate)?;
-        }
-        let start = Instant::now();
-        let mut engines = BTreeMap::new();
-        for task in required {
-            let candidate = fixture
-                .bind(candidate.clone(), task, admission)
-                .map_err(CaseIssue::from);
-            let baseline = before
-                .as_ref()
-                .filter(|catalog| catalog.tasks.contains(&task))
-                .map(|catalog| {
-                    fixture
-                        .bind(catalog.clone(), task, admission)
-                        .map_err(CaseIssue::from)
-                });
-            let equivalent = same_revision
-                || match (&baseline, &candidate) {
-                    (Some(Ok(before)), Ok(after)) => same_execution_mapping(before, after)?,
-                    _ => false,
-                };
-            engines.insert(task, (baseline, candidate, equivalent));
-        }
-        self.report.status = "passed";
-        for case in &mut suite.cases {
-            case.expected.findings.sort();
-            let task = case.task;
-            let mut result = CaseResult {
-                id: case.id.clone(),
-                task,
-                tenant_id: case.tenant_id.clone(),
-                parameters: case.parameters.clone(),
-                status: "passed",
-                baseline_matches: None,
-                candidate_matches: None,
-                baseline_subject: None,
-                candidate_subject: None,
-                baseline_findings: None,
-                candidate_findings: None,
-                baseline_anchor: None,
-                candidate_anchor: None,
-                added: Vec::new(),
-                removed: Vec::new(),
-                changed: Vec::new(),
-                issue: None,
-                expected_on_mismatch: None,
-            };
-            let (baseline, candidate, equivalent) = &engines[&task];
-            let previous = match baseline {
-                Some(engine) if !equivalent => Some(run_case(engine, case, &options, start).await),
-                _ => None,
-            };
-            let proposed = run_case(candidate, case, &options, start).await;
-            let previous = if *equivalent {
-                Some(&proposed)
-            } else {
-                previous.as_ref()
-            };
-            if let Some(previous) = previous {
-                match previous {
-                    Ok(output) => {
-                        result.baseline_matches = Some(case.expected.matches(output));
-                        result.baseline_subject = Some(output.subject);
-                        result.baseline_findings = Some(output.findings.len());
-                        result.baseline_anchor.clone_from(&output.anchor);
-                    }
-                    Err(issue) => issue.record(&mut result, "baseline"),
-                }
+        let mut cases = suite.cases;
+        let outcome = async {
+            let before = self
+                .baseline
+                .as_deref()
+                .map(|yaml| models::parse(yaml, &self.path))
+                .transpose()?;
+            let same_revision =
+                self.report.active_revision.as_deref() == Some(&self.report.revision);
+            if let Some(before) = &before {
+                self.report.mapping_changes = mapping_changes(before, &candidate)?;
             }
-            match &proposed {
-                Ok(output) => {
-                    let matches = case.expected.matches(output);
-                    result.candidate_matches = Some(matches);
-                    result.candidate_subject = Some(output.subject);
-                    result.candidate_findings = Some(output.findings.len());
-                    result.candidate_anchor.clone_from(&output.anchor);
-                    if !matches {
-                        result.expected_on_mismatch = Some(case.expected.clone());
-                        if result.status == "passed" {
-                            result.status = "failed";
+            let start = Instant::now();
+            let mut engines = BTreeMap::new();
+            for task in required {
+                let candidate = fixture
+                    .bind(candidate.clone(), task, admission)
+                    .map_err(CaseIssue::from);
+                let baseline = before
+                    .as_ref()
+                    .filter(|catalog| catalog.tasks.contains(&task))
+                    .map(|catalog| {
+                        fixture
+                            .bind(catalog.clone(), task, admission)
+                            .map_err(CaseIssue::from)
+                    });
+                let equivalent = same_revision
+                    || match (&baseline, &candidate) {
+                        (Some(Ok(before)), Ok(after)) => same_execution_mapping(before, after)?,
+                        _ => false,
+                    };
+                engines.insert(task, (baseline, candidate, equivalent));
+            }
+            self.report.status = "passed";
+            for case in &mut cases {
+                case.expected.findings.sort();
+                let task = case.task;
+                let mut result = CaseResult {
+                    id: case.id.clone(),
+                    task,
+                    tenant_id: case.tenant_id.clone(),
+                    parameters: case.parameters.clone(),
+                    status: "passed",
+                    baseline_matches: None,
+                    candidate_matches: None,
+                    baseline_subject: None,
+                    candidate_subject: None,
+                    baseline_findings: None,
+                    candidate_findings: None,
+                    baseline_anchor: None,
+                    candidate_anchor: None,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    changed: Vec::new(),
+                    issue: None,
+                    expected_on_mismatch: None,
+                };
+                let (baseline, candidate, equivalent) = &engines[&task];
+                let previous = match baseline {
+                    Some(engine) if !equivalent => Some(run_case(engine, case, &options, start).await),
+                    _ => None,
+                };
+                let proposed = run_case(candidate, case, &options, start).await;
+                let previous = if *equivalent {
+                    Some(&proposed)
+                } else {
+                    previous.as_ref()
+                };
+                if let Some(previous) = previous {
+                    match previous {
+                        Ok(output) => {
+                            result.baseline_matches = Some(case.expected.matches(output));
+                            result.baseline_subject = Some(output.subject);
+                            result.baseline_findings = Some(output.findings.len());
+                            result.baseline_anchor.clone_from(&output.anchor);
+                        }
+                        Err(issue) => issue.record(&mut result, "baseline"),
+                    }
+                }
+                match &proposed {
+                    Ok(output) => {
+                        let matches = case.expected.matches(output);
+                        result.candidate_matches = Some(matches);
+                        result.candidate_subject = Some(output.subject);
+                        result.candidate_findings = Some(output.findings.len());
+                        result.candidate_anchor.clone_from(&output.anchor);
+                        if !matches {
+                            result.expected_on_mismatch = Some(case.expected.clone());
+                            if result.status == "passed" {
+                                result.status = "failed";
+                            }
                         }
                     }
+                    Err(issue) => issue.record(&mut result, "candidate"),
                 }
-                Err(issue) => issue.record(&mut result, "candidate"),
-            }
-            match result.status {
-                "passed" | "failed" => {
-                    let before = previous
-                        .and_then(|r| r.as_ref().ok())
-                        .map_or(&[][..], |r| &r.findings);
-                    let after = &proposed.as_ref().expect("complete candidate").findings;
-                    if before != after {
-                        delta(before.to_vec(), after.clone(), &mut result);
+                match result.status {
+                    "passed" | "failed" => {
+                        let before = previous
+                            .and_then(|r| r.as_ref().ok())
+                            .map_or(&[][..], |r| &r.findings);
+                        let after = &proposed.as_ref().expect("complete candidate").findings;
+                        if before != after {
+                            delta(before.to_vec(), after.clone(), &mut result);
+                        }
+                        if result.status == "failed" && self.report.status == "passed" {
+                            self.report.status = "failed";
+                        }
                     }
-                    if result.status == "failed" && self.report.status == "passed" {
-                        self.report.status = "failed";
-                    }
+                    _ => self.report.status = "inconclusive",
                 }
-                _ => self.report.status = "inconclusive",
+                self.report.cases.push(result);
             }
-            self.report.cases.push(result);
+            self.report.finish()
         }
-        self.report.finish()
+        .await;
+        let _ = tokio::task::spawn_blocking(move || drop(fixture)).await;
+        outcome
     }
 }
 

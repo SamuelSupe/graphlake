@@ -96,6 +96,20 @@ impl ScalarUDFImpl for Hydrate {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("lookup text ids");
+        let _indices_mem = if let Some(guard) = &self.guard {
+            guard.check()?;
+            let bytes = requested.len().saturating_mul(std::mem::size_of::<u32>());
+            if bytes > 0 {
+                let reservation = MemoryConsumer::new("__graphlake_cypher_hydrate indices")
+                    .register(&guard.runtime.memory_pool);
+                reservation.try_grow(bytes)?;
+                Some(reservation)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut indices = UInt32Builder::new();
         let mut lengths = Vec::with_capacity(identities.len());
         let mut total_items = 0usize;

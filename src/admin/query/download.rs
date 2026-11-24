@@ -357,24 +357,35 @@ pub(in crate::admin) async fn export(
                 index += 1;
             }
         }
-        let mut busy = false;
-        while downloads.len() >= 4
-            || length
-                + downloads
+        let other_count = downloads
+            .iter()
+            .filter(|download| download.owner != principal)
+            .count();
+        let other_bytes: u64 = downloads
+            .iter()
+            .filter(|download| download.owner != principal)
+            .map(|download| download.length)
+            .sum();
+        let mut busy = other_count >= 4 || length.saturating_add(other_bytes) > budget;
+        if !busy {
+            while downloads.len() >= 4
+                || length.saturating_add(
+                    downloads
+                        .iter()
+                        .map(|download| download.length)
+                        .sum::<u64>(),
+                ) > budget
+            {
+                let Some(index) = downloads
                     .iter()
-                    .map(|download| download.length)
-                    .sum::<u64>()
-                > budget
-        {
-            let Some(index) = downloads
-                .iter()
-                .position(|download| download.owner == principal)
-            else {
-                busy = true;
-                break;
-            };
-            if let Some(evicted) = downloads.remove(index) {
-                removed.push(evicted);
+                    .position(|download| download.owner == principal)
+                else {
+                    busy = true;
+                    break;
+                };
+                if let Some(evicted) = downloads.remove(index) {
+                    removed.push(evicted);
+                }
             }
         }
         if !busy {

@@ -587,6 +587,11 @@ impl ExecutionPlan for TraversalExec {
             };
             let expand = matches!(mode, Mode::Expand(_));
             let track_vertices = matches!(&mode, Mode::Expand(expansion) if expansion.track_vertices);
+            let undirected = match &mode {
+                Mode::Single(request) => request.direction == Direction::Undirected,
+                Mode::Expand(expansion) => expansion.direction == Direction::Undirected,
+                Mode::Algorithm { .. } => false,
+            };
             let shortest = match &mode {
                 Mode::Expand(expansion) => expansion.shortest.map(|kind| (kind, expansion.min)),
                 _ => None,
@@ -627,7 +632,7 @@ impl ExecutionPlan for TraversalExec {
                 }
             };
             let mut batches = walk_batches(&topology, starts, target, kind, max_hops,
-                WalkOutput { batch_size, schema: output_schema, expand, visits, shortest, track_vertices }, &reservation);
+                WalkOutput { batch_size, schema: output_schema, expand, visits, shortest, track_vertices, undirected }, &reservation);
             while let Some(batch) = batches.try_next().await? {
                 yield batch;
             }
@@ -719,6 +724,7 @@ struct WalkOutput {
     visits: Arc<Mutex<Vec<u64>>>,
     shortest: Option<(crate::cypher::paths::Shortest, usize)>,
     track_vertices: bool,
+    undirected: bool,
 }
 
 fn walk_batches<'a>(
@@ -771,7 +777,7 @@ fn walk_batches<'a>(
                     walk.restart(topology, start, target);
                     walk
                 }
-                slot => slot.insert(Walk::new(topology, start, target, kind.clone(), output.shortest, output.track_vertices)),
+                slot => slot.insert(Walk::new(topology, start, target, kind.clone(), output.shortest, output.track_vertices, output.undirected)),
             };
             loop {
                 match walk.step(topology, max_hops) {

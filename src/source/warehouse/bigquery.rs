@@ -70,22 +70,36 @@ impl Warehouse {
             }
             drop(submit_budget);
 
+            let deadline = tokio::time::Instant::now() + self.timeout;
             let results = http.endpoint(&["bigquery", "v2", "projects", &self.project, "queries", &job]);
             let max_results = batch_size.min(10_000).to_string();
             let mut token: Option<String> = None;
             let mut total = None;
             let mut seen = 0_u64;
             loop {
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .context("BigQuery job timed out")?;
                 let mut request = http.client.get(results.clone()).query(&[
                     ("location", self.location.as_str()), ("timeoutMs", "500"),
                     ("maxResults", max_results.as_str()), ("formatOptions.useInt64Timestamp", "true"),
                 ]);
                 if let Some(token) = &token { request = request.query(&[("pageToken", token)]); }
-                let (_, result, budget) = http.receive::<Response>(request).await?;
+                let (_, result, budget) = tokio::time::timeout(
+                    remaining,
+                    http.receive::<Response>(request),
+                )
+                .await
+                .context("BigQuery job timed out")??;
                 if !result.job_complete {
                     verify(token.is_none(), "BigQuery completed job became incomplete during pagination")?;
                     drop(budget);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let remaining = deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .filter(|d| !d.is_zero())
+                        .context("BigQuery job timed out")?;
+                    tokio::time::sleep(Duration::from_millis(200).min(remaining)).await;
                     continue;
                 }
                 pending.0 = None;

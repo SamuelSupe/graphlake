@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use arrow_array::{RecordBatch, RecordBatchReader, ffi_stream::FFI_ArrowArrayStream};
 use futures::TryStreamExt;
 use graphlake_engine::{
-    Catalog, Engine, GraphOptions, Language, QueryOptions, QueryResult,
+    CancellationToken, Catalog, Engine, GraphOptions, Language, QueryOptions, QueryResult,
     arrow::{datatypes::SchemaRef, error::ArrowError},
 };
 use tokio::runtime::{Builder, Runtime};
@@ -22,7 +22,8 @@ pub struct GraphLakeEngine {
 struct Reader {
     result: Option<QueryResult>,
     schema: SchemaRef,
-    runtime: Arc<Runtime>,
+    runtime: Option<Arc<Runtime>>,
+    cancellation: CancellationToken,
 }
 
 impl Iterator for Reader {
@@ -31,22 +32,23 @@ impl Iterator for Reader {
     fn next(&mut self) -> Option<Self::Item> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let result = self.result.as_mut()?;
-            match self.runtime.block_on(result.batches.try_next()) {
+            let runtime = self.runtime.as_ref()?;
+            match runtime.block_on(result.batches.try_next()) {
                 Ok(Some(batch)) => Some(Ok(batch)),
                 completion => {
-                    let _runtime = self.runtime.enter();
+                    let _runtime = runtime.enter();
                     self.result.take();
-                    completion
-                        .err()
-                        .map(|error| Err(ArrowError::ExternalError(Box::new(error))))
+                    completion.err().map(|error| Err(sanitize_arrow_error(&error)))
                 }
             }
         })) {
             Ok(item) => item,
             Err(_) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _runtime = self.runtime.enter();
-                    self.result.take();
+                    if let Some(runtime) = self.runtime.as_ref() {
+                        let _runtime = runtime.enter();
+                        self.result.take();
+                    }
                 }));
                 Some(Err(ArrowError::ExternalError(
                     anyhow::anyhow!("internal panic while reading Arrow stream").into(),
@@ -64,11 +66,22 @@ impl RecordBatchReader for Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _runtime = self.runtime.enter();
-            self.result.take();
+            if let Some(runtime) = self.runtime.as_ref() {
+                let _runtime = runtime.enter();
+                self.result.take();
+            }
+            drop(self.runtime.take());
         }));
     }
+}
+
+fn sanitize_arrow_error(error: impl std::fmt::Display) -> ArrowError {
+    // FFI_ArrowArrayStream converts errors with CString::new().expect()
+    // outside our catch_unwind; strip NUL bytes so we never abort C callers.
+    let sanitized = format!("{error:#}").replace('\0', "\\0");
+    ArrowError::ExternalError(anyhow::anyhow!("{sanitized}").into())
 }
 
 fn error_message(error: anyhow::Error) -> *mut c_char {
@@ -219,7 +232,11 @@ pub unsafe extern "C" fn graphlake_engine_query_with_parameters(
                 2 => Language::Gremlin,
                 _ => bail!("unsupported query language {language}"),
             };
-            let mut options = QueryOptions::default();
+            let cancellation = CancellationToken::new();
+            let mut options = QueryOptions {
+                cancellation: cancellation.clone(),
+                ..Default::default()
+            };
             if !graph_options.is_null() {
                 options.graph =
                     GraphOptions::from_json(unsafe { input(graph_options, "graph options") }?)?;
@@ -240,7 +257,8 @@ pub unsafe extern "C" fn graphlake_engine_query_with_parameters(
             let reader = Reader {
                 schema: result.batches.schema(),
                 result: Some(result),
-                runtime: Arc::clone(&engine.runtime),
+                runtime: Some(Arc::clone(&engine.runtime)),
+                cancellation,
             };
             Ok(FFI_ArrowArrayStream::new(Box::new(reader)))
         })();
@@ -292,4 +310,45 @@ pub unsafe extern "C" fn graphlake_error_free(error: *mut c_char) {
             drop(unsafe { CString::from_raw(error) });
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::ffi_stream::ArrowArrayStreamReader;
+    use graphlake_engine::arrow::datatypes::{DataType, Field, Schema};
+
+    struct FailingReader {
+        schema: SchemaRef,
+        message: Option<anyhow::Error>,
+    }
+
+    impl Iterator for FailingReader {
+        type Item = Result<RecordBatch, ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.message
+                .take()
+                .map(|error| Err(sanitize_arrow_error(&error)))
+        }
+    }
+
+    impl RecordBatchReader for FailingReader {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    #[test]
+    fn ffi_stream_sanitizes_nul_in_runtime_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let ffi = FFI_ArrowArrayStream::new(Box::new(FailingReader {
+            schema,
+            message: Some(anyhow::anyhow!("upstream\0error")),
+        }));
+        let mut reader = ArrowArrayStreamReader::try_new(ffi).expect("open FFI stream");
+        let err = reader.next().expect("error item").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("upstream\\0error"), "unexpected error: {text}");
+    }
 }

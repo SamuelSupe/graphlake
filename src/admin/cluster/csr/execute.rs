@@ -1103,7 +1103,10 @@ impl<'a> Execution<'a> {
             {
                 self.unavailable.lock().unwrap().insert(index);
             } else if let Ok(response) = response
-                && response.status() == StatusCode::UNPROCESSABLE_ENTITY
+                && matches!(
+                    response.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY | StatusCode::INSUFFICIENT_STORAGE
+                )
             {
                 let status = response.status();
                 let body = response

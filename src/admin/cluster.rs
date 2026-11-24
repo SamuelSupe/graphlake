@@ -670,7 +670,7 @@ impl Coordinator {
                         &dispatch,
                         Instant::now()
                             + Duration::from_millis(job.deadline_ms.saturating_sub(now_ms())),
-                        true,
+                        false,
                     )
                     .await?;
                 } else {

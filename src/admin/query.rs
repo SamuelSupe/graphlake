@@ -307,6 +307,12 @@ pub(super) fn validate_request(
 ) -> ApiResult<(Uuid, Language, QueryOptions)> {
     let request_id = Uuid::parse_str(&request.request_id)
         .map_err(|_| Error::invalid("invalid_request_id", "查询请求标识必须是 UUID"))?;
+    if request.capture_result && request.preview_without_arrow {
+        return Err(Error::invalid(
+            "invalid_query",
+            "capture_result 不能与 preview_without_arrow 同时使用",
+        ));
+    }
     if request.csr_generation.is_some()
         && (request.csr.is_some()
             || !matches!(request.language, Some(Dialect::Cypher | Dialect::Gremlin))
@@ -998,4 +1004,32 @@ pub(super) fn explain_error(error: &anyhow::Error) -> String {
         return format!("数据源或字段校验失败（{outer}）");
     }
     "执行失败，请检查查询语句、映射字段或数据源连接".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_request_rejects_capture_result_with_preview_without_arrow() {
+        let request = Request {
+            request_id: Uuid::new_v4().to_string(),
+            model_revision: "rev1".into(),
+            timeout_ms: None,
+            language: Some(Dialect::Cypher),
+            query: "RETURN 1".into(),
+            csr: None,
+            csr_generation: None,
+            parameters_json: None,
+            graph_options: None,
+            freshness: None,
+            capture_result: true,
+            preview_without_arrow: true,
+            tenant_partition: None,
+            capture_graph: false,
+        };
+        let err = validate_request(&request, QueryOptions::default()).unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.code, "invalid_query");
+    }
 }

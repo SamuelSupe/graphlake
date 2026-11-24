@@ -333,21 +333,34 @@ impl ScalarUDFImpl for QueryValue {
     }
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+        fn unwrapped(mut current: &DataType) -> &DataType {
+            while let DataType::Dictionary(_, inner) = current {
+                current = inner.as_ref();
+            }
+            current
+        }
         match self.name {
             "__graphlake_key_text" => Ok(DataType::Utf8),
-            "__graphlake_gremlin_number" if args[0].is_numeric() || args[0].is_null() => {
-                Ok(DataType::Float64)
-            }
             "__graphlake_gremlin_number" => {
-                plan_err!("mean() requires numeric values, got {}", args[0])
+                let mut types = Vec::new();
+                cypher::value_types(&args[0], &mut types);
+                if types.iter().all(DataType::is_numeric) {
+                    Ok(DataType::Float64)
+                } else {
+                    plan_err!("mean() requires numeric values, got {}", args[0])
+                }
             }
             "__graphlake_gremlin_key" => Ok(DataType::Utf8View),
             "__graphlake_gremlin_repeat_depth" if args[0] == DataType::Int64 => Ok(DataType::Int64),
             "__graphlake_gremlin_repeat_depth" => plan_err!("repeat depth must be an integer"),
             "__graphlake_numeric_input" => Ok(numeric_type(args)),
-            "__graphlake_gremlin_sum_zero" if args[0].is_numeric() => Ok(args[0].clone()),
+            "__graphlake_gremlin_sum_zero" if unwrapped(&args[0]).is_numeric() => {
+                Ok(unwrapped(&args[0]).clone())
+            }
             "__graphlake_gremlin_sum_zero" => plan_err!("sum() requires numeric values"),
-            "__graphlake_cypher_index" if args[0].is_integer() || args[0].is_null() => {
+            "__graphlake_cypher_index"
+                if unwrapped(&args[0]).is_integer() || unwrapped(&args[0]).is_null() =>
+            {
                 Ok(DataType::Int64)
             }
             "__graphlake_cypher_index" => {
@@ -372,9 +385,16 @@ impl ScalarUDFImpl for QueryValue {
         }
         let input = args.args[0].to_array(args.number_rows)?;
         let value = match self.name {
-            "__graphlake_gremlin_number" => cast(&input, &DataType::Float64)?,
+            "__graphlake_gremlin_number" => {
+                numeric_array(vec![input], &DataType::Float64, args.number_rows)?
+            }
             "__graphlake_gremlin_sum_zero" => {
-                let ty = input.data_type().clone();
+                let ty = args.return_field.data_type().clone();
+                let input = if input.data_type() == &ty {
+                    input
+                } else {
+                    cast(&input, &ty)?
+                };
                 let zero = ScalarValue::Int64(Some(0))
                     .cast_to(&ty)?
                     .to_array_of_size(input.len())?;
@@ -465,7 +485,11 @@ fn numeric_array(inputs: Vec<ArrayRef>, ty: &DataType, rows: usize) -> Result<Ar
     }
     let mut values = Vec::new();
     for slot in slots {
-        if slot.data_type().is_numeric() {
+        let mut inner = slot.data_type();
+        while let DataType::Dictionary(_, value) = inner {
+            inner = value.as_ref();
+        }
+        if inner.is_numeric() {
             values.push(cast_with_options(
                 &slot,
                 ty,
@@ -521,5 +545,113 @@ fn numeric_type(args: &[DataType]) -> DataType {
         (true, true) => DataType::Decimal128(38, 0),
         (false, true) => DataType::UInt64,
         _ => DataType::Int64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::{
+        arrow::{
+            array::{
+                DictionaryArray, Int32Array, Int64Array, ListArray, MapBuilder, RecordBatch,
+                StringBuilder,
+            },
+            datatypes::{Int32Type, Schema},
+        },
+        execution::FunctionRegistry,
+    };
+
+    #[tokio::test]
+    async fn dictionary_numeric_and_index_functions_unwrap_dictionary() -> anyhow::Result<()> {
+        let ctx = SessionContext::new();
+        register_inner(&ctx, None);
+
+        let keys = Int32Array::from(vec![Some(0), Some(1), None]);
+        let values = Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef;
+        let dict = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values)?) as ArrayRef;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", dict.data_type().clone(), true)]));
+        let batch = RecordBatch::try_new(schema, vec![dict])?;
+        ctx.register_batch("t", batch)?;
+
+        let batches = ctx
+            .sql(
+                "SELECT \
+                    __graphlake_numeric_input(n) AS num, \
+                    __graphlake_gremlin_number(n) AS gnum, \
+                    __graphlake_gremlin_sum_zero(n) AS gzero, \
+                    __graphlake_cypher_index(n) AS idx \
+                 FROM t",
+            )
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(batches.len(), 1);
+        let b = &batches[0];
+        assert_eq!(b.num_rows(), 3);
+        let gzero = b
+            .column_by_name("gzero")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(gzero.value(0), 10);
+        assert_eq!(gzero.value(1), 20);
+        assert_eq!(gzero.value(2), 0);
+        let idx = b
+            .column_by_name("idx")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(idx.value(0), 10);
+        assert_eq!(idx.value(1), 20);
+        assert!(idx.is_null(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cypher_keys_on_scalar_map_omits_null_values() -> anyhow::Result<()> {
+        let ctx = SessionContext::new();
+        register_inner(&ctx, None);
+
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        builder.keys().append_value("present");
+        builder.values().append_value("ok");
+        builder.keys().append_value("missing");
+        builder.values().append_null();
+        builder.append(true)?;
+        let map = Arc::new(builder.finish());
+
+        let udf = ctx.udf("__graphlake_cypher_keys")?;
+        let scalar = ScalarValue::Map(map);
+        let out = udf.invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Scalar(scalar.clone()),
+                ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))),
+            ],
+            arg_fields: vec![
+                Arc::new(Field::new("m", scalar.data_type(), true)),
+                Arc::new(Field::new("omit", DataType::Boolean, false)),
+            ],
+            number_rows: 1,
+            return_field: Arc::new(Field::new(
+                "keys",
+                DataType::List(Arc::new(Field::new_list_field(DataType::Utf8View, true))),
+                true,
+            )),
+            config_options: ctx.copied_config().options().clone(),
+        })?;
+        let array = out.into_array(1)?;
+        let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = list.value(0);
+        let keys = values
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.value(0), "present");
+        Ok(())
     }
 }

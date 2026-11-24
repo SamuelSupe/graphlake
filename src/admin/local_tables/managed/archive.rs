@@ -16,6 +16,8 @@ impl Archive {
         if let Some(pin) = self.pin.take() {
             pin.release().await;
         }
+        let root = self.root;
+        let _ = tokio::task::spawn_blocking(move || drop(root)).await;
     }
 }
 

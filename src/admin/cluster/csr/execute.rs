@@ -950,8 +950,8 @@ impl<'a> Execution<'a> {
                 .vertices
                 .saturating_add(self.graph.manifest.edges)
                 < self.worker.distributed_min_rows as u64;
-        let mut tasks =
-            futures::stream::iter(inputs.into_iter().map(|(shard, input)| async move {
+        let mut tasks = futures::stream::iter(inputs.into_iter().enumerate().map(
+            |(seq, (shard, input))| async move {
                 self.graph.scope.check()?;
                 let task_id = Uuid::new_v4();
                 if local {
@@ -965,7 +965,7 @@ impl<'a> Execution<'a> {
                         task_id,
                     )
                     .await?;
-                    return Ok((shard, output));
+                    return Ok((seq, output));
                 }
                 let objects = self.graph.objects;
                 let key = objects.stage(self.id, self.job.attempt, task_id, "csr-input");
@@ -976,11 +976,16 @@ impl<'a> Execution<'a> {
                 );
                 self.stats.lock().unwrap().exchange_bytes += bytes.len() as u64;
                 objects.put_bytes(&key, bytes).await?;
-                let output = self.send(shard, task_id, &input).await;
+                let route = match &input {
+                    Step::Arcs { start_block, .. } => shard.wrapping_add(*start_block / 2),
+                    _ => shard,
+                };
+                let output = self.send(shard, route, task_id, &input).await;
                 objects.delete(&key).await;
-                Ok::<_, anyhow::Error>((shard, output?))
-            }))
-            .buffer_unordered(self.worker.workers.len().saturating_sub(1).max(1));
+                Ok::<_, anyhow::Error>((seq, output?))
+            },
+        ))
+        .buffer_unordered(self.worker.workers.len().saturating_sub(1).max(1));
         let pending = self.graph.budget.new_empty();
         let mut output = Vec::new();
         while let Some(item) = tasks.try_next().await? {
@@ -1003,17 +1008,17 @@ impl<'a> Execution<'a> {
             output.push(item);
         }
         self.stats.lock().unwrap().rounds += 1;
-        output.sort_unstable_by_key(|(shard, _)| *shard);
+        output.sort_unstable_by_key(|(seq, _)| *seq);
         Ok(Round {
             outputs: output.into_iter().map(|(_, output)| output).collect(),
             _budget: pending,
         })
     }
 
-    async fn send(&self, shard: usize, input: Uuid, step: &Step) -> Result<Output> {
+    async fn send(&self, shard: usize, route: usize, input: Uuid, step: &Step) -> Result<Output> {
         let peers = &self.worker.workers;
         for offset in 0..peers.len() {
-            let index = (shard + offset) % peers.len();
+            let index = (route + offset) % peers.len();
             if self.unavailable.lock().unwrap().contains(&index) {
                 continue;
             }

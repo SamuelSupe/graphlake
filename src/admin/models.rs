@@ -491,7 +491,7 @@ impl Models {
                 {
                     continue;
                 }
-                if engines.len() >= 4 {
+                if engines.len() >= 16 {
                     engines.pop_front();
                 }
                 engines.push_back(entry);
@@ -697,7 +697,7 @@ impl Models {
         if let Some(archive) = stamp {
             let mut engines = self.engines.lock().unwrap();
             engines.retain(|entry| entry.id != id || entry.revision != revision);
-            if engines.len() >= 4 {
+            if engines.len() >= 16 {
                 engines.pop_front();
             }
             engines.push_back(CachedEngine {

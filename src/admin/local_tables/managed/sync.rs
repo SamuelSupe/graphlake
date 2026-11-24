@@ -3,6 +3,17 @@ use std::{collections::BTreeMap, io::Write as _, path::PathBuf, sync::Arc, time:
 use anyhow::{Result, ensure};
 use uuid::Uuid;
 
+async fn cancellable<T>(
+    cancel: &CancellationToken,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("managed sync cancelled")),
+        result = work => result,
+    }
+}
+
 fn spawn_sync_worker<F>(
     permit: tokio::sync::OwnedSemaphorePermit,
     work: F,
@@ -35,6 +46,22 @@ async fn timed_out_sync_keeps_slot_until_io_finishes() -> anyhow::Result<()> {
     let replacement = slots.clone().try_acquire_owned()?;
     assert!(slots.clone().try_acquire_owned().is_err());
     drop((replacement, other));
+    Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn cancellable_aborts_pending_io_and_releases_slot() -> anyhow::Result<()> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(2));
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let worker = spawn_sync_worker(slots.clone().try_acquire_owned()?, async move {
+        cancellable(&worker_cancel, std::future::pending::<Result<()>>()).await
+    });
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(1), worker).await??;
+    assert!(result.is_err());
+    assert_eq!(slots.available_permits(), 2);
     Ok(())
 }
 
@@ -388,7 +415,7 @@ impl Managed {
         let id = record.table.data_id;
         let path = Self::workspace(app, id);
         let previous = match &record.head {
-            Some(head) => Some(self.snapshot(id, head).await?),
+            Some(head) => Some(cancellable(cancel, self.snapshot(id, head)).await?),
             None => None,
         };
         let cached = app.local_tables.cached.lock().unwrap().remove(&id);
@@ -397,7 +424,7 @@ impl Managed {
             Some(generation) == committed && Some(version) == WorkspaceVersion::read(&path)
         }) {
             if let Some(previous) = &previous {
-                self.download(id, previous, &path).await?;
+                cancellable(cancel, self.download(id, previous, &path)).await?;
             } else {
                 let root = path.parent().unwrap();
                 match tokio::fs::remove_dir_all(root).await {
@@ -436,8 +463,7 @@ impl Managed {
         )
         .await?;
         ensure!(!cancel.is_cancelled(), "managed sync cancelled");
-        let next = self
-            .upload(id, run.id, &path, previous.as_ref(), None)
+        let next = cancellable(cancel, self.upload(id, run.id, &path, previous.as_ref(), None))
             .await?;
         let generation = next.as_ref().map(|h| h.generation);
         if let (Some(generation), Some(version)) =

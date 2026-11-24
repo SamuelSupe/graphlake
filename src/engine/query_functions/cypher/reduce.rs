@@ -210,6 +210,10 @@ impl HigherOrderUDFImpl for Reduce {
         let array = if output.is_empty() {
             new_empty_array(ty)
         } else {
+            let peak = bytes.saturating_mul(2);
+            if peak > self.memory || reservation.try_resize(peak).is_err() {
+                return exec_err!("reduce() exceeds the query memory budget");
+            }
             concat(
                 &output
                     .iter()

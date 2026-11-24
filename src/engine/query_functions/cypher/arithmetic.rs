@@ -39,7 +39,16 @@ pub(super) fn register(context: &SessionContext, guard: Option<ScopeGuard>) {
         context.register_udf(ScalarUDF::from(Arithmetic {
             name,
             op,
-            signature: Signature::any(2, Volatility::Immutable),
+            // `+` can concatenate strings/lists; prevent constant folding from
+            // retaining unbounded literals outside the query memory pool.
+            signature: Signature::any(
+                2,
+                if op == Operator::Plus && guard.is_some() {
+                    Volatility::Volatile
+                } else {
+                    Volatility::Immutable
+                },
+            ),
             guard: if op == Operator::Plus {
                 guard.clone()
             } else {
@@ -199,6 +208,30 @@ impl ScalarUDFImpl for Arithmetic {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        // Reserve scalar-broadcast expansion before `to_array(number_rows)` allocates
+        // an entire batch of repeated strings or lists outside the query MemoryPool.
+        let _broadcast = if self.op == Operator::Plus
+            && let Some(guard) = &self.guard
+        {
+            guard.check()?;
+            let mut bytes = 0usize;
+            for arg in &args.args {
+                if let ColumnarValue::Scalar(scalar) = arg {
+                    let one = slice_bytes(scalar.to_array_of_size(1)?.as_ref())?;
+                    bytes = bytes.saturating_add(one.saturating_mul(args.number_rows));
+                }
+            }
+            if bytes > 0 {
+                let reservation = MemoryConsumer::new("__graphlake_cypher_add broadcast")
+                    .register(&guard.runtime.memory_pool);
+                reservation.try_grow(bytes)?;
+                Some(reservation)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut left = Vec::new();
         let mut right = Vec::new();
         flatten_value(args.args[0].to_array(args.number_rows)?, &mut left);

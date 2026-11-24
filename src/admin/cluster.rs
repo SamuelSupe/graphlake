@@ -81,6 +81,7 @@ pub(super) struct Coordinator {
     graph_partitions: usize,
     memory_bytes: usize,
     heartbeats: Mutex<Heartbeats>,
+    dispatch_slots: usize,
     dispatch_work: Arc<tokio::sync::Semaphore>,
     dispatch_waiters: tokio::sync::Semaphore,
     csr_work: tokio::sync::Semaphore,
@@ -145,6 +146,10 @@ impl Coordinator {
             .max(crate::QueryOptions::default().memory_bytes)
     }
 
+    pub(super) fn dispatch_slots(&self) -> usize {
+        self.dispatch_slots
+    }
+
     pub fn load(path: &FsPath) -> Result<Self> {
         let (config, shared) = Config::load(path)?;
         ensure!(
@@ -168,7 +173,14 @@ impl Coordinator {
                 config.local_snapshot_gc_grace_seconds,
             )
         });
-        let dispatch_slots = config.workers.len().saturating_mul(8).clamp(8, 256);
+        let worker_slots = (config.process_memory_mib / config.memory_mib)
+            .saturating_sub(usize::from(config.distributed_partitions > 0))
+            .clamp(1, 8);
+        let dispatch_slots = config
+            .workers
+            .len()
+            .saturating_mul(worker_slots)
+            .clamp(1, 256);
         let dispatch_waiters = dispatch_slots.saturating_mul(2).clamp(16, 128);
         Ok(Self {
             shared,
@@ -179,6 +191,7 @@ impl Coordinator {
             graph_partitions: config.distributed_partitions,
             memory_bytes: config.memory_mib * 1024 * 1024,
             heartbeats: Default::default(),
+            dispatch_slots,
             dispatch_work: Arc::new(tokio::sync::Semaphore::new(dispatch_slots)),
             dispatch_waiters: tokio::sync::Semaphore::new(dispatch_waiters),
             csr_work: tokio::sync::Semaphore::new(1),

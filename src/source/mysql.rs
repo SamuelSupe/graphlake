@@ -147,13 +147,21 @@ impl Snapshot {
                 .await
                 .context("initializing read connection")?;
         }
-        let server_uuid = conn
-            .query_first::<Option<String>, _>("SELECT @@server_uuid")
+        let server_uuid = if dialect == "mariadb" {
+            None
+        } else {
+            stats.request();
+            tokio::time::timeout(
+                timeout,
+                conn.query_first::<Option<String>, _>("SELECT @@server_uuid"),
+            )
             .await
             .ok()
+            .and_then(|res| res.ok())
             .flatten()
             .flatten()
-            .filter(|id| !id.is_empty());
+            .filter(|id| !id.is_empty())
+        };
         Ok(Self {
             conn: Some(conn),
             stats,

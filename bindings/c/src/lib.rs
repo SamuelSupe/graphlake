@@ -43,9 +43,15 @@ impl Iterator for Reader {
             }
         })) {
             Ok(item) => item,
-            Err(_) => Some(Err(ArrowError::ExternalError(
-                anyhow::anyhow!("internal panic while reading Arrow stream").into(),
-            ))),
+            Err(_) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _runtime = self.runtime.enter();
+                    self.result.take();
+                }));
+                Some(Err(ArrowError::ExternalError(
+                    anyhow::anyhow!("internal panic while reading Arrow stream").into(),
+                )))
+            }
         }
     }
 }
@@ -58,8 +64,10 @@ impl RecordBatchReader for Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        let _runtime = self.runtime.enter();
-        self.result.take();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _runtime = self.runtime.enter();
+            self.result.take();
+        }));
     }
 }
 

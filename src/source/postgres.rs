@@ -848,7 +848,15 @@ impl TableProvider for PgTable {
             .iter()
             .map(|expr| {
                 if predicate(expr, &self.schema, &self.types).is_some() {
-                    TableProviderFilterPushDown::Exact
+                    // NUMERIC, DATE, TIMESTAMP, and TIMESTAMPTZ allow special PostgreSQL
+                    // values (NaN / +-infinity) that satisfy SQL comparisons but cannot
+                    // be decoded to Arrow. Mark filters touching them Inexact so DataFusion
+                    // retains those columns in the scan and rejects unrepresentable rows.
+                    if expr_has_special_pg_type(expr, &self.schema, &self.types) {
+                        TableProviderFilterPushDown::Inexact
+                    } else {
+                        TableProviderFilterPushDown::Exact
+                    }
                 } else {
                     TableProviderFilterPushDown::Unsupported
                 }
@@ -1037,9 +1045,11 @@ impl Drop for CursorCleanup {
                 let _ = tokio::time::timeout(Duration::from_secs(2), token.cancel_query(tls)).await;
             }
             if let Some(snapshot) = weak.upgrade() {
+                // Best-effort CLOSE on a shared snapshot must not mark the connection
+                // interrupted if queued behind a healthy FETCH on another cursor.
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2),
-                    snapshot.request(snapshot.client.batch_execute(&format!("CLOSE {name}"))),
+                    snapshot.client.batch_execute(&format!("CLOSE {name}")),
                 )
                 .await;
             }
@@ -1094,54 +1104,116 @@ fn text_equality(name: &str, literal: &str) -> String {
     format!("({name} = {literal} AND ({name} COLLATE \"C\") = {literal})")
 }
 
+fn expr_has_special_pg_type(expr: &Expr, schema: &Schema, types: &[Type]) -> bool {
+    match expr {
+        Expr::Column(column) => schema.index_of(&column.name).ok().is_some_and(|index| {
+            matches!(
+                types[index],
+                Type::NUMERIC | Type::DATE | Type::TIMESTAMP | Type::TIMESTAMPTZ
+            )
+        }),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_has_special_pg_type(inner, schema, types)
+        }
+        Expr::InList(list) => {
+            expr_has_special_pg_type(&list.expr, schema, types)
+                || list
+                    .list
+                    .iter()
+                    .any(|item| expr_has_special_pg_type(item, schema, types))
+        }
+        Expr::BinaryExpr(binary) => {
+            expr_has_special_pg_type(&binary.left, schema, types)
+                || expr_has_special_pg_type(&binary.right, schema, types)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OperandFamily {
+    Bool,
+    Numeric,
+    Text,
+    Date,
+    Timestamp,
+    Timestamptz,
+}
+
 fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
     let column = |expr: &Expr| match expr {
         Expr::Column(column) => schema.field_with_name(&column.name).ok(),
         _ => None,
     };
-    let operand = |expr: &Expr| {
+    let operand = |expr: &Expr| -> Option<(String, OperandFamily)> {
         if let Some(field) = column(expr) {
             let name = ident(field.name());
-            return key_operand(&name, &types[schema.index_of(field.name()).ok()?]);
+            let ty = &types[schema.index_of(field.name()).ok()?];
+            let family = match *ty {
+                Type::BOOL => OperandFamily::Bool,
+                Type::INT2 | Type::INT4 | Type::INT8 | Type::NUMERIC => OperandFamily::Numeric,
+                Type::TEXT | Type::VARCHAR | Type::UUID => OperandFamily::Text,
+                Type::DATE => OperandFamily::Date,
+                Type::TIMESTAMP => OperandFamily::Timestamp,
+                Type::TIMESTAMPTZ => OperandFamily::Timestamptz,
+                _ => return None,
+            };
+            return Some((key_operand(&name, ty)?, family));
         }
         match expr {
-            Expr::Literal(ScalarValue::Int16(Some(value)), _) => Some(value.to_string()),
-            Expr::Literal(ScalarValue::Int32(Some(value)), _) => Some(value.to_string()),
-            Expr::Literal(ScalarValue::Int64(Some(value)), _) => Some(value.to_string()),
-            Expr::Literal(ScalarValue::Boolean(Some(value)), _) => Some(value.to_string()),
+            Expr::Literal(ScalarValue::Int16(Some(value)), _) => {
+                Some((value.to_string(), OperandFamily::Numeric))
+            }
+            Expr::Literal(ScalarValue::Int32(Some(value)), _) => {
+                Some((value.to_string(), OperandFamily::Numeric))
+            }
+            Expr::Literal(ScalarValue::Int64(Some(value)), _) => {
+                Some((value.to_string(), OperandFamily::Numeric))
+            }
+            Expr::Literal(ScalarValue::Boolean(Some(value)), _) => {
+                Some((value.to_string(), OperandFamily::Bool))
+            }
             Expr::Literal(ScalarValue::Date32(Some(days)), _) => {
-                Some(format!("(DATE '1970-01-01' + {days})"))
+                // CE offset of 1970-01-01 is 719_163; format directly as DATE literal
+                // within safe years 1..=9999 to avoid PG integer/date range errors.
+                let date = NaiveDate::from_num_days_from_ce_opt(days.checked_add(719_163)?)
+                    .filter(|date| (1..=9999).contains(&date.year()))?;
+                Some((
+                    format!("DATE '{}'", date.format("%Y-%m-%d")),
+                    OperandFamily::Date,
+                ))
             }
             Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), tz), _) => {
                 let date = DateTime::from_timestamp_micros(*value)
                     .filter(|date| (1..=9999).contains(&date.year()))?;
                 if tz.is_some() {
-                    Some(format!(
-                        "TIMESTAMPTZ '{}+00:00'",
-                        date.format("%Y-%m-%d %H:%M:%S%.6f")
+                    Some((
+                        format!("TIMESTAMPTZ '{}+00:00'", date.format("%Y-%m-%d %H:%M:%S%.6f")),
+                        OperandFamily::Timestamptz,
                     ))
                 } else {
-                    Some(format!(
-                        "TIMESTAMP '{}'",
-                        date.format("%Y-%m-%d %H:%M:%S%.6f")
+                    Some((
+                        format!("TIMESTAMP '{}'", date.format("%Y-%m-%d %H:%M:%S%.6f")),
+                        OperandFamily::Timestamp,
                     ))
                 }
             }
             Expr::Literal(ScalarValue::Decimal128(Some(value), _, scale), _) => {
-                format_decimal(*value, *scale).map(|lit| format!("{lit}::numeric"))
+                format_decimal(*value, *scale)
+                    .map(|lit| (format!("{lit}::numeric"), OperandFamily::Numeric))
             }
             Expr::Literal(
                 ScalarValue::Utf8(Some(value))
                 | ScalarValue::Utf8View(Some(value))
                 | ScalarValue::LargeUtf8(Some(value)),
                 _,
-            ) if !value.contains('\0') => Some(text_literal(value)),
+            ) if !value.contains('\0') => Some((text_literal(value), OperandFamily::Text)),
             _ => None,
         }
     };
     match expr {
         Expr::Column(_) if types[schema.index_of(column(expr)?.name()).ok()?] == Type::BOOL => {
-            operand(expr)
+            operand(expr).map(|(sql, _)| sql)
         }
         Expr::Literal(ScalarValue::Boolean(Some(value)), _) => {
             Some(if *value { "TRUE" } else { "FALSE" }.into())
@@ -1149,8 +1221,15 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
         Expr::IsNull(value) => Some(format!("{} IS NULL", ident(column(value)?.name()))),
         Expr::IsNotNull(value) => Some(format!("{} IS NOT NULL", ident(column(value)?.name()))),
         Expr::InList(list) if !list.negated && !list.list.is_empty() => {
-            let field = operand(&list.expr)?;
-            let values = list.list.iter().map(operand).collect::<Option<Vec<_>>>()?;
+            let (field, field_family) = operand(&list.expr)?;
+            let mut values = Vec::with_capacity(list.list.len());
+            for item in &list.list {
+                let (sql, family) = operand(item)?;
+                if family != field_family {
+                    return None;
+                }
+                values.push(sql);
+            }
             let exact = format!("({field} IN ({}))", values.join(", "));
             if let Some(column) = column(&list.expr)
                 && let Some(strings) = list
@@ -1206,7 +1285,7 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
                         continue;
                     };
                     let name = ident(field.name());
-                    let lit = operand(literal)?;
+                    let (lit, _) = operand(literal)?;
                     match types[schema.index_of(field.name()).ok()?] {
                         Type::UUID
                             if uuid::Uuid::parse_str(value)
@@ -1231,7 +1310,14 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
                 | Operator::Lt
                 | Operator::LtEq
                 | Operator::Gt
-                | Operator::GtEq => (operand(&binary.left)?, operand(&binary.right)?),
+                | Operator::GtEq => {
+                    let (left, left_family) = operand(&binary.left)?;
+                    let (right, right_family) = operand(&binary.right)?;
+                    if left_family != right_family {
+                        return None;
+                    }
+                    (left, right)
+                }
                 _ => return None,
             };
             Some(format!("({left} {op} {right})"))
@@ -1438,7 +1524,40 @@ mod tests {
             &types,
         )
         .unwrap();
-        assert!(date_sql.contains("DATE '1970-01-01' + 19723"), "{date_sql}");
+        assert!(date_sql.contains("DATE '2024-01-01'"), "{date_sql}");
+        assert!(
+            predicate(
+                &col("d").gt_eq(lit(ScalarValue::Date32(Some(i32::MIN)))),
+                &schema,
+                &types,
+            )
+            .is_none()
+        );
+        // Cross-family temporal comparisons must not be pushed down.
+        assert!(
+            predicate(
+                &col("d").eq(lit(ScalarValue::TimestampMicrosecond(
+                    Some(1_704_067_200_000_000),
+                    Some("UTC".into()),
+                ))),
+                &schema,
+                &types,
+            )
+            .is_none()
+        );
+        assert!(expr_has_special_pg_type(&col("amt").gt(lit(0)), &schema, &types));
+        assert!(expr_has_special_pg_type(&col("d").is_not_null(), &schema, &types));
+
+        let plain_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let plain_types = [Type::INT8, Type::TEXT];
+        assert!(!expr_has_special_pg_type(
+            &col("id").eq(lit(1i64)).and(col("name").eq(lit("a"))),
+            &plain_schema,
+            &plain_types,
+        ));
 
         let ts_sql = predicate(
             &col("ts").lt(lit(ScalarValue::TimestampMicrosecond(

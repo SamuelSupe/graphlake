@@ -984,9 +984,26 @@ async fn write_snapshot(
     Ok(())
 }
 
+fn has_view_type(ty: &DataType) -> bool {
+    match ty {
+        DataType::Utf8View
+        | DataType::BinaryView
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => true,
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            has_view_type(f.data_type())
+        }
+        DataType::Struct(fields) => fields.iter().any(|f| has_view_type(f.data_type())),
+        DataType::Map(f, _) => has_view_type(f.data_type()),
+        DataType::Dictionary(_, v) => has_view_type(v),
+        _ => false,
+    }
+}
+
 struct SnapshotWriter {
     prefix: Key,
     schema: Arc<Schema>,
+    has_view: bool,
     writer: StreamWriter<Vec<u8>>,
     blocks: Vec<Block>,
     uploads: futures::stream::FuturesOrdered<futures::future::BoxFuture<'static, Result<Block>>>,
@@ -1032,10 +1049,15 @@ impl SnapshotWriter {
             let writer = file.open_writer()?;
             Some((file, writer))
         };
+        let has_view = schema
+            .fields()
+            .iter()
+            .any(|field| has_view_type(field.data_type()));
         Ok(Self {
             filter_prefix: prefix.clone().join("filter-columns"),
             prefix,
             writer: Self::writer(&schema)?,
+            has_view,
             schema,
             blocks: Vec::new(),
             uploads: Default::default(),
@@ -1076,17 +1098,28 @@ impl SnapshotWriter {
         while offset < batch.num_rows() {
             let mut count = (batch.num_rows() - offset).min(128);
             let slice = loop {
-                let slice = batch.slice(offset, count);
-                let slice_bytes: usize = slice
-                    .columns()
-                    .iter()
-                    .map(|col| {
-                        crate::engine::slice_bytes(col.as_ref())
-                            .unwrap_or_else(|_| col.get_array_memory_size())
-                    })
-                    .sum();
-                if self.writer.get_ref().len() + slice_bytes < BLOCK_BYTES / 2 {
-                    break slice;
+                let mut slice = batch.slice(offset, count);
+                if self.has_view {
+                    // Compact sliced view arrays so Arrow IPC does not rewrite the
+                    // parent batch's entire variadic data buffers into every block.
+                    let arrays = slice
+                        .columns()
+                        .iter()
+                        .map(|col| super::compact_view(Arc::clone(col)))
+                        .collect::<Vec<_>>();
+                    slice = RecordBatch::try_new(slice.schema(), arrays)?;
+                } else {
+                    let slice_bytes: usize = slice
+                        .columns()
+                        .iter()
+                        .map(|col| {
+                            crate::engine::slice_bytes(col.as_ref())
+                                .unwrap_or_else(|_| col.get_array_memory_size())
+                        })
+                        .sum();
+                    if self.writer.get_ref().len() + slice_bytes < BLOCK_BYTES / 2 {
+                        break slice;
+                    }
                 }
                 let mut probe = Self::writer(&self.schema)?;
                 probe.write(&slice)?;
@@ -1264,6 +1297,41 @@ mod tests {
         let mut expected = (0..count).map(|id| (id % 2, id, id)).collect::<Vec<_>>();
         expected.sort_unstable();
         assert_eq!(sorted, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_writer_compacts_string_view_slices_within_block_size() -> Result<()> {
+        use datafusion::arrow::array::{StringArray, StringViewArray};
+        let scratch = tempfile::tempdir()?;
+        let objects = Objects::open(scratch.path().to_str().unwrap(), "test")?;
+        let admission = Arc::new(crate::engine::Admission::new(
+            crate::EngineLimits::default(),
+        )?);
+        let scope = QueryScope::new(crate::QueryOptions::default(), &admission).await?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("__id", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8View, false),
+        ]));
+        // 512 rows * ~3 KiB = ~1.5 MiB parent variadic buffer (> 2 * BLOCK_BYTES = 1 MiB).
+        let ids: Vec<String> = (0..512).map(|i| format!("{i:04}")).collect();
+        let payloads: Vec<String> = (0..512)
+            .map(|i| format!("{i:04}-{}", "z".repeat(3072)))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringViewArray::from(
+                    payloads.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+            ],
+        )?;
+        let mut writer = SnapshotWriter::new(Key::from("test-view"), schema, 0, &[], &scope)?;
+        writer.push(&objects, &batch).await?;
+        let blocks = writer.finish(&objects, &scope).await?;
+        assert!(!blocks.is_empty());
+        assert!(blocks.iter().all(|b| b.decoded_size() <= 2 * BLOCK_BYTES));
         Ok(())
     }
 }

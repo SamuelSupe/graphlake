@@ -281,32 +281,39 @@ pub async fn serve_clustered_with_status(
         }
         let leader = control.acquire_with_metrics(&shutdown, elections).await?;
         ha::watch_source(probe.clone(), shutdown.clone());
-        if let Some(public_url) = &public_url
-            && std::env::var_os("GRAPHLAKE_RESTORE_INBOX").is_some()
-            && leader
-                .get::<String>("catalog")
-                .await
-                .map_err(|e| anyhow::anyhow!(e.message))?
-                .is_none()
-        {
-            let stage_listener =
-                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
-            let bound = stage_listener.local_addr()?;
-            if let Err(error) = recovery::import::serve(
-                stage_listener,
-                assets.clone(),
-                leader.clone(),
-                public_url.origin().ascii_serialization(),
-                catalog_dir.clone(),
-                shutdown.clone(),
-                cluster.as_ref().and_then(|cluster| cluster.managed.clone()),
-            )
-            .await
+        let restore = async {
+            if let Some(public_url) = &public_url
+                && std::env::var_os("GRAPHLAKE_RESTORE_INBOX").is_some()
+                && leader
+                    .get::<String>("catalog")
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.message))?
+                    .is_none()
             {
+                let stage_listener =
+                    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
+                let bound = stage_listener.local_addr()?;
+                recovery::import::serve(
+                    stage_listener,
+                    assets.clone(),
+                    leader.clone(),
+                    public_url.origin().ascii_serialization(),
+                    catalog_dir.clone(),
+                    shutdown.clone(),
+                    cluster.as_ref().and_then(|cluster| cluster.managed.clone()),
+                )
+                .await?;
+                return Ok::<_, anyhow::Error>(Some(TcpListener::bind(bound).await?));
+            }
+            Ok(None)
+        }
+        .await;
+        match restore {
+            Ok(bound) => listener = bound,
+            Err(error) => {
                 leader.release().await;
                 return Err(error);
             }
-            listener = Some(TcpListener::bind(bound).await?);
         }
         let ha = match ha::Ha::open(leader.clone(), probe, &metadata_dir).await {
             Ok(ha) => ha,
@@ -454,7 +461,11 @@ pub async fn serve_clustered_with_status(
             authority,
             origin: origin.clone(),
             shutdown: shutdown.clone(),
-            metrics: ops::Metrics::new(query_slots),
+            metrics: ops::Metrics::new(
+                cluster
+                    .as_ref()
+                    .map_or(query_slots, |cluster| cluster.dispatch_slots()),
+            ),
             readiness: Arc::new(Semaphore::new(1)),
             manual_backup_dir: ha
                 .as_ref()

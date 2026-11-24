@@ -380,6 +380,7 @@ pub(super) fn publish(
     let root = anchor.parent().expect("managed local table path");
     let directory = parts_dir(anchor);
     let snapshot = &prepared.snapshot;
+    let encoded_manifest = snapshot.encode()?;
     fs::create_dir_all(&directory)?;
     File::options()
         .create(true)
@@ -426,7 +427,7 @@ pub(super) fn publish(
     File::open(root)?.sync_all()?;
 
     let mut manifest = staging_file(root)?;
-    manifest.write_all(&snapshot.encode()?)?;
+    manifest.write_all(&encoded_manifest)?;
     manifest.as_file().sync_all()?;
     scope.check()?;
     before_manifest()?;
@@ -477,7 +478,10 @@ fn lock_readers_briefly(lock: &File) -> Result<bool> {
 fn read_generation_parts(file: &mut File) -> Result<Vec<Uuid>> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    ensure!(bytes.len() % 16 == 0, "invalid generation lock file");
+    ensure!(
+        !bytes.is_empty() && bytes.len() % 16 == 0,
+        "invalid generation lock file"
+    );
     bytes
         .chunks_exact(16)
         .map(|chunk| Ok(Uuid::from_slice(chunk)?))
@@ -561,6 +565,9 @@ pub(super) fn clean(anchor: &Path) -> Result<bool> {
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
     }
+    // Release the reader gate before fsyncing the directory and unlinking retired
+    // part files so concurrent query opens are not stalled on disk maintenance.
+    drop(lock);
     // Establish the current manifest on disk before reclaiming any previous parts.
     File::open(anchor.parent().expect("managed local table path"))?.sync_all()?;
     let mut remaining_retired = false;

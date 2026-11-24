@@ -489,11 +489,11 @@ fn incremental_inner(
                     })
                     .optional()?;
                 let is_tombstone = marks_bool.is_some_and(|m| m.value(local_i));
-                if let Some((part, row)) = prev {
+                if let Some((ref part, row)) = prev {
                     memory.try_grow(48)?;
                     ensure!(
                         touched
-                            .entry(Uuid::from_slice(&part)?)
+                            .entry(Uuid::from_slice(part)?)
                             .or_default()
                             .insert(usize::try_from(row)?, index)
                             .is_none(),
@@ -506,8 +506,10 @@ fn incremental_inner(
                     same = false;
                 }
                 if is_tombstone {
-                    memory.try_grow(key.as_ref().len() + std::mem::size_of::<Vec<u8>>())?;
-                    tombstone_keys.push(key.as_ref().to_vec());
+                    if prev.is_some() {
+                        memory.try_grow(key.as_ref().len() + std::mem::size_of::<Vec<u8>>())?;
+                        tombstone_keys.push(key.as_ref().to_vec());
+                    }
                 } else {
                     live_count += 1;
                 }
@@ -518,7 +520,7 @@ fn incremental_inner(
 
     // Only read full payload columns if watermark did not advance and every
     // incoming key matched an existing live row.
-    if same {
+    if same && !touched.is_empty() {
         let full_memory = memory.new_empty();
         let mut batches = Vec::new();
         let mut total_bytes = 0usize;
@@ -622,16 +624,6 @@ fn incremental_inner(
     // Pure soft-delete batch (0 surviving incoming rows): mark tombstones in
     // existing parts and advance the manifest watermark without rewriting base.
     if deleted_column.is_some() && live_count == 0 {
-        if matched == 0
-            && watermark_unchanged
-            && let Some(previous) = previous
-        {
-            if rebuilt {
-                set_generation(&tx, previous.generation)?;
-                tx.commit()?;
-            }
-            return Ok(Some(previous.rows()));
-        }
         let total_deleted: usize = parts.iter().map(|part| part.deleted.len()).sum();
         if total_deleted > MAX_DELETED {
             return Ok(None);

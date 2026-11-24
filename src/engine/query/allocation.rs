@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -6,7 +7,10 @@ use std::{
 use datafusion::{
     arrow::{
         array::{Array, ArrayRef, AsArray},
-        datatypes::{DataType, FieldRef, Int64Type, IntervalMonthDayNanoType},
+        datatypes::{
+            DataType, FieldRef, Int8Type, Int16Type, Int32Type, Int64Type,
+            IntervalMonthDayNanoType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+        },
     },
     common::{Result, ScalarValue, exec_err},
     execution::{memory_pool::MemoryConsumer, runtime_env::RuntimeEnv},
@@ -127,20 +131,63 @@ impl ScalarUDFImpl for CheckedFunction {
             .args
             .iter()
             .all(|arg| matches!(arg, ColumnarValue::Scalar(_)));
-        let mut bytes = 0usize;
-        for row in 0..if scalar { 1 } else { rows } {
-            if row.is_multiple_of(256) {
-                self.check()?;
+        let scalar_sizes: Vec<Option<usize>> = args
+            .args
+            .iter()
+            .map(|arg| match arg {
+                ColumnarValue::Scalar(_) => value_bytes(arg, 0).map(Some),
+                ColumnarValue::Array(_) => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        let (bytes, reserve_bytes) = if matches!(
+            self.name(),
+            "array_concat" | "array_cat" | "list_concat" | "list_cat"
+        ) {
+            let mut single_or_total = 0usize;
+            for (arg, cached) in args.args.iter().zip(&scalar_sizes) {
+                match (arg, cached) {
+                    (_, Some(sz)) => {
+                        single_or_total = single_or_total
+                            .saturating_add(if scalar { *sz } else { sz.saturating_mul(rows) });
+                    }
+                    (ColumnarValue::Array(array), None) => {
+                        single_or_total =
+                            single_or_total.saturating_add(slice_bytes(array.as_ref())?);
+                    }
+                    _ => {}
+                }
             }
-            bytes = bytes.saturating_add(row_bytes(self.name(), &args.args, row)?);
-        }
-        if scalar {
-            bytes = bytes.saturating_mul(rows.max(1));
-        }
+            if scalar {
+                let per_row = single_or_total.saturating_add(16);
+                let total = per_row.saturating_mul(rows.max(1));
+                // 3x scratch for the single scalar evaluation plus 1x broadcast if projected.
+                let reserve = per_row.saturating_mul(rows.max(1).saturating_add(2));
+                (total, reserve)
+            } else {
+                let total = single_or_total.saturating_add(rows.saturating_mul(16));
+                (total, total.saturating_mul(3))
+            }
+        } else {
+            let mut per_batch = 0usize;
+            for row in 0..if scalar { 1 } else { rows } {
+                if row.is_multiple_of(256) {
+                    self.check()?;
+                }
+                per_batch = per_batch
+                    .saturating_add(row_bytes(self.name(), &args.args, &scalar_sizes, row)?);
+            }
+            if scalar {
+                let total = per_batch.saturating_mul(rows.max(1));
+                let reserve = per_batch.saturating_mul(rows.max(1).saturating_add(2));
+                (total, reserve)
+            } else {
+                (per_batch, per_batch.saturating_mul(3))
+            }
+        };
         // Include scratch space and Arrow's output builders.
         let memory = MemoryConsumer::new(format!("{} scalar allocation", self.name()))
             .register(&self.runtime.memory_pool);
-        memory.try_grow(bytes.saturating_mul(3))?;
+        memory.try_grow(reserve_bytes)?;
         let result = if bytes >= 256 * 1024 {
             crate::blocking(|| self.function.invoke_with_args(args))
         } else {
@@ -178,8 +225,25 @@ fn integer(value: &ColumnarValue, row: usize) -> Option<i64> {
     }
 }
 
+fn dict_key(keys: &dyn Array, row: usize) -> Option<usize> {
+    if !keys.is_valid(row) {
+        return None;
+    }
+    match keys.data_type() {
+        DataType::Int8 => usize::try_from(keys.as_primitive::<Int8Type>().value(row)).ok(),
+        DataType::Int16 => usize::try_from(keys.as_primitive::<Int16Type>().value(row)).ok(),
+        DataType::Int32 => usize::try_from(keys.as_primitive::<Int32Type>().value(row)).ok(),
+        DataType::Int64 => usize::try_from(keys.as_primitive::<Int64Type>().value(row)).ok(),
+        DataType::UInt8 => Some(usize::from(keys.as_primitive::<UInt8Type>().value(row))),
+        DataType::UInt16 => Some(usize::from(keys.as_primitive::<UInt16Type>().value(row))),
+        DataType::UInt32 => usize::try_from(keys.as_primitive::<UInt32Type>().value(row)).ok(),
+        DataType::UInt64 => usize::try_from(keys.as_primitive::<UInt64Type>().value(row)).ok(),
+        _ => None,
+    }
+}
+
 // List slices share their child buffers. Follow the offsets before estimating
-// the bytes copied into an output, including nested lists and structs.
+// the bytes copied into an output, including nested lists, structs, and dictionaries.
 pub(crate) fn slice_bytes(array: &dyn Array) -> Result<usize> {
     if let Some(width) = array.data_type().primitive_width() {
         return Ok(array.len().saturating_mul(width));
@@ -194,6 +258,48 @@ pub(crate) fn slice_bytes(array: &dyn Array) -> Result<usize> {
         Ok(bytes)
     };
     let total = match array.data_type() {
+        DataType::Dictionary(key_type, _) => {
+            let dict = array.as_any_dictionary();
+            let keys = dict.keys();
+            let values = dict.values();
+            let mut bytes = array
+                .len()
+                .saturating_mul(key_type.primitive_width().unwrap_or(4));
+            if let Some(width) = values.data_type().primitive_width() {
+                bytes = bytes.saturating_add(
+                    array
+                        .len()
+                        .saturating_sub(array.null_count())
+                        .saturating_mul(width),
+                );
+            } else if array.len() <= 16 {
+                for row in 0..array.len() {
+                    if let Some(index) = dict_key(keys, row)
+                        && index < values.len()
+                    {
+                        bytes = bytes.saturating_add(slice_bytes(values.slice(index, 1).as_ref())?);
+                    }
+                }
+            } else {
+                let mut seen: HashMap<usize, usize> = HashMap::new();
+                for row in 0..array.len() {
+                    if let Some(index) = dict_key(keys, row)
+                        && index < values.len()
+                    {
+                        let entry = match seen.get(&index) {
+                            Some(&size) => size,
+                            None => {
+                                let size = slice_bytes(values.slice(index, 1).as_ref())?;
+                                seen.insert(index, size);
+                                size
+                            }
+                        };
+                        bytes = bytes.saturating_add(entry);
+                    }
+                }
+            }
+            bytes
+        }
         DataType::List(_) => nested(&|i| array.as_list::<i32>().value(i))?,
         DataType::LargeList(_) => nested(&|i| array.as_list::<i64>().value(i))?,
         DataType::FixedSizeList(_, _) => nested(&|i| array.as_fixed_size_list().value(i))?,
@@ -234,6 +340,10 @@ fn value_bytes(value: &ColumnarValue, row: usize) -> Result<usize> {
         ColumnarValue::Scalar(ScalarValue::List(array)) => slice_bytes(array.as_ref()),
         ColumnarValue::Scalar(ScalarValue::LargeList(array)) => slice_bytes(array.as_ref()),
         ColumnarValue::Scalar(ScalarValue::FixedSizeList(array)) => slice_bytes(array.as_ref()),
+        ColumnarValue::Scalar(ScalarValue::ListView(array)) => slice_bytes(array.as_ref()),
+        ColumnarValue::Scalar(ScalarValue::LargeListView(array)) => slice_bytes(array.as_ref()),
+        ColumnarValue::Scalar(ScalarValue::Struct(array)) => slice_bytes(array.as_ref()),
+        ColumnarValue::Scalar(ScalarValue::Map(array)) => slice_bytes(array.as_ref()),
         ColumnarValue::Scalar(value) => Ok(value.size()),
         ColumnarValue::Array(array) => {
             if let Some(width) = array.data_type().primitive_width() {
@@ -327,9 +437,21 @@ fn range_bytes(args: &[ColumnarValue], row: usize, inclusive: bool) -> Result<us
         .saturating_mul(8))
 }
 
-fn row_bytes(name: &str, args: &[ColumnarValue], row: usize) -> Result<usize> {
+fn row_bytes(
+    name: &str,
+    args: &[ColumnarValue],
+    scalar_sizes: &[Option<usize>],
+    row: usize,
+) -> Result<usize> {
     let string = |index| args.get(index).and_then(|arg| text(arg, row));
     let len = |index| string(index).map_or(0, str::len);
+    let item_bytes = |index: usize| -> Result<usize> {
+        if let Some(size) = scalar_sizes[index] {
+            Ok(size)
+        } else {
+            value_bytes(&args[index], row)
+        }
+    };
     let count =
         || usize::try_from(integer(&args[1], row).unwrap_or_default().max(0)).unwrap_or(usize::MAX);
     let bytes = match name {
@@ -368,19 +490,19 @@ fn row_bytes(name: &str, args: &[ColumnarValue], row: usize) -> Result<usize> {
                 total.saturating_add(len(i)).saturating_add(separator)
             })
         }
-        "array_repeat" => count().saturating_mul(value_bytes(&args[0], row)?.saturating_add(8)),
+        "array_repeat" => count().saturating_mul(item_bytes(0)?.saturating_add(8)),
         "array_resize" => {
-            let fill = args
-                .get(2)
-                .map(|value| value_bytes(value, row).map(|bytes| bytes.saturating_add(8)))
-                .transpose()?
-                .unwrap_or(8);
-            value_bytes(&args[0], row)?.saturating_add(count().saturating_mul(fill))
+            let fill = if args.len() > 2 {
+                item_bytes(2)?.saturating_add(8)
+            } else {
+                8
+            };
+            item_bytes(0)?.saturating_add(count().saturating_mul(fill))
         }
         "array_concat" | "array_cat" | "list_concat" | "list_cat" => {
             let mut total = 0usize;
-            for arg in args {
-                total = total.saturating_add(value_bytes(arg, row)?);
+            for i in 0..args.len() {
+                total = total.saturating_add(item_bytes(i)?);
             }
             total
         }
@@ -397,4 +519,38 @@ fn row_bytes(name: &str, args: &[ColumnarValue], row: usize) -> Result<usize> {
             total.saturating_add(text(arg, row).map_or(0, str::len))
         });
     Ok(bytes.saturating_add(input).saturating_add(16))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{DictionaryArray, Int32Array, StringArray, StringViewArray};
+
+    #[test]
+    fn slice_bytes_handles_dictionaries_without_false_oom_or_view_bypass() -> Result<()> {
+        // Large dictionary (1000 * 1 KiB = ~1 MiB) where row 0 references a 4-byte entry.
+        let mut dict_values = vec!["a".repeat(1024); 1000];
+        dict_values[0] = "tiny".into();
+        let values = Arc::new(StringArray::from(dict_values));
+        let keys = Int32Array::from(vec![0; 16]);
+        let dict = DictionaryArray::try_new(keys, values)?;
+        let one_row = dict.slice(0, 1);
+        let one_row_bytes = slice_bytes(&one_row)?;
+        assert!(
+            one_row_bytes < 4096,
+            "1-row dictionary slice should not count whole dictionary: {one_row_bytes}"
+        );
+
+        // Dictionary(_, Utf8View) must count out-of-line string view buffers.
+        let big = "x".repeat(4096);
+        let view_values = Arc::new(StringViewArray::from(vec![big.as_str()]));
+        let view_keys = Int32Array::from(vec![0; 32]);
+        let view_dict = DictionaryArray::try_new(view_keys, view_values)?;
+        let expanded = slice_bytes(&view_dict)?;
+        assert!(
+            expanded >= 32 * 4096,
+            "Dictionary(_, Utf8View) must account for out-of-line bytes: {expanded}"
+        );
+        Ok(())
+    }
 }

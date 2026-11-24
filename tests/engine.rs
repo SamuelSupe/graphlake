@@ -940,6 +940,28 @@ async fn cypher_reduce_concat_and_array_concat_respect_memory_budget() -> Result
         array_attempt.is_err(),
         "exponential SQL array_concat bypassed memory_bytes budget"
     );
+
+    // 4. Cypher `+` broadcasting a large scalar across many rows must hit the memory pool.
+    let broadcast_options = QueryOptions {
+        memory_bytes: 8 * 1024 * 1024,
+        ..Default::default()
+    }
+    .with_parameters_json(&serde_json::json!({ "big": "a".repeat(32 * 1024) }).to_string())?;
+    let broadcast_attempt = async {
+        let mut r = engine
+            .query(
+                Language::Cypher,
+                "WITH range(1, 2000) AS r UNWIND r AS i RETURN $big + toString(i) AS s",
+                broadcast_options,
+            )
+            .await?;
+        rows(&mut r).await
+    }
+    .await;
+    assert!(
+        broadcast_attempt.is_err(),
+        "Cypher scalar broadcast `+` bypassed memory_bytes budget"
+    );
     Ok(())
 }
 
@@ -966,7 +988,7 @@ async fn cypher_in_list_fast_path_preserves_three_valued_logic_and_nan() -> Resu
              (1 IN $with_null) AS hit_with_null, \
              ((2 IN $with_null) IS NULL) AS miss_with_null_is_null, \
              ((0.0 / 0.0) IN [0.0 / 0.0, 1.0]) AS nan_in_nan",
-            options,
+            options.clone(),
         )
         .await?;
     let out = rows(&mut r).await?;
@@ -981,6 +1003,29 @@ async fn cypher_in_list_fast_path_preserves_three_valued_logic_and_nan() -> Resu
             "miss_with_null_is_null": true,
             "nan_in_nan": false,
         })]
+    );
+
+    // Multi-row input (`number_rows > 1`) explicitly exercises the HashSet fast path.
+    let mut multi = engine
+        .query(
+            Language::Cypher,
+            "UNWIND [1, 2, null, 0.0 / 0.0] AS x \
+             RETURN \
+             (x IN $empty) AS in_empty, \
+             (x IN $with_null) AS in_with_null, \
+             (x IN [0.0 / 0.0, 1.0]) AS in_nan_list",
+            options,
+        )
+        .await?;
+    let multi_out = rows(&mut multi).await?;
+    assert_eq!(
+        multi_out,
+        vec![
+            serde_json::json!({"in_empty": false, "in_with_null": true, "in_nan_list": true}),
+            serde_json::json!({"in_empty": false, "in_nan_list": false}),
+            serde_json::json!({"in_empty": false}),
+            serde_json::json!({"in_empty": false, "in_nan_list": false}),
+        ]
     );
     Ok(())
 }

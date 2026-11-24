@@ -262,10 +262,9 @@ impl Snapshot {
         }
         ensure!(
             deleted <= MAX_DELETED
-                && self
-                    .parts
-                    .last()
-                    .is_some_and(|p| (p.rows > 0 || self.indexed.is_some()) && p.deleted.is_empty()),
+                && self.parts.last().is_some_and(|p| {
+                    self.indexed.is_some() || (p.rows > 0 && p.deleted.is_empty())
+                }),
             "invalid local Parquet snapshot deletions"
         );
         Ok(())

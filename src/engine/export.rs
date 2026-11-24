@@ -299,7 +299,14 @@ impl Destination {
                                 format_args!("{}", fmt.value(row)),
                             )
                             .map_err(std::io::Error::other)?;
+                            if cell.capacity() > 64 * 1024 {
+                                budget.try_resize(cell.capacity())?;
+                            }
                             write_csv_cell(&mut writer, &cell)?;
+                            if cell.capacity() > 64 * 1024 {
+                                cell = String::new();
+                                budget.free();
+                            }
                         }
                         writer.write_all(b"\n")?;
                     }
@@ -312,11 +319,18 @@ impl Destination {
                 for offset in (0..batch.num_rows()).step_by(CSV_CHUNK) {
                     scope.check()?;
                     let slice = batch.slice(offset, CSV_CHUNK.min(batch.num_rows() - offset));
+                    let mut estimated = 0usize;
+                    for col in slice.columns() {
+                        estimated = estimated.saturating_add(
+                            crate::engine::query::allocation::slice_bytes(col.as_ref())?,
+                        );
+                    }
+                    budget.try_grow(estimated.saturating_mul(2))?;
                     let mut json = crate::json_writer().build::<_, LineDelimited>(Vec::new());
                     json.write(&slice)?;
                     json.finish()?;
                     let bytes = json.into_inner();
-                    budget.try_grow(bytes.len().saturating_mul(2))?;
+                    budget.try_resize(bytes.len().saturating_mul(2))?;
                     for line in bytes
                         .split(|byte| *byte == b'\n')
                         .filter(|line| !line.is_empty())
@@ -348,7 +362,16 @@ impl Destination {
 
 fn write_csv_cell(writer: &mut impl Write, cell: &str) -> std::io::Result<()> {
     if cell.is_empty() || cell.contains([',', '"', '\r', '\n']) {
-        write!(writer, "\"{}\"", cell.replace('"', "\"\""))
+        writer.write_all(b"\"")?;
+        let mut first = true;
+        for part in cell.split('"') {
+            if !first {
+                writer.write_all(b"\"\"")?;
+            }
+            writer.write_all(part.as_bytes())?;
+            first = false;
+        }
+        writer.write_all(b"\"")
     } else {
         writer.write_all(cell.as_bytes())
     }

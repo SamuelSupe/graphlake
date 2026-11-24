@@ -10,9 +10,12 @@ use deltalake_core::{DeltaTable, logstore::default_logstore};
 use object_store::{
     ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectPath, prefix::PrefixStore,
 };
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use super::ReadStats;
+
+const MAX_CACHE_ENTRIES: usize = 64;
 
 pub(crate) struct SnapshotCache {
     entries: Mutex<VecDeque<CachedSnapshot>>,
@@ -27,15 +30,24 @@ impl SnapshotCache {
         }
     }
 
+    fn get(&self, matches: impl Fn(&CachedSnapshot) -> bool) -> Option<CachedSnapshot> {
+        let mut entries = self.entries.lock().unwrap();
+        let pos = entries.iter().position(matches)?;
+        let entry = entries.remove(pos).unwrap();
+        let cloned = entry.clone();
+        entries.push_back(entry);
+        Some(cloned)
+    }
+
     fn replace(
         &self,
         matches: impl Fn(&CachedSnapshot) -> bool,
         entry: Option<CachedSnapshot>,
-    ) -> Option<uuid::Uuid> {
+    ) -> Option<String> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|entry| !matches(entry));
         let entry = entry.filter(|entry| entry.bytes <= self.max_bytes)?;
-        while entries.len() >= 4
+        while entries.len() >= MAX_CACHE_ENTRIES
             || entries
                 .iter()
                 .map(|entry| entry.bytes)
@@ -45,9 +57,9 @@ impl SnapshotCache {
         {
             entries.pop_front();
         }
-        let identity = entry.identity;
+        let proof = entry.proof.clone();
         entries.push_back(entry);
-        Some(identity)
+        Some(proof)
     }
 }
 
@@ -58,8 +70,45 @@ struct CachedSnapshot {
     remote_store: Option<Arc<dyn ObjectStore>>,
     commit: ObjectMeta,
     table: DeltaTable,
-    identity: uuid::Uuid,
+    proof: String,
     bytes: usize,
+}
+
+fn snapshot_proof(table: &DeltaTable, version: u64, commit: &ObjectMeta) -> String {
+    let mut hash = Sha256::new();
+    if let Some(state) = table.state.as_ref() {
+        hash.update(state.snapshot().metadata().id().as_bytes());
+    }
+    hash.update(b"\0");
+    hash.update(version.to_le_bytes());
+    hash.update(b"\0");
+    if let Some(etag) = &commit.e_tag {
+        hash.update(etag.as_bytes());
+    }
+    hash.update(b"\0");
+    if let Some(ver) = &commit.version {
+        hash.update(ver.as_bytes());
+    }
+    hash.update(b"\0");
+    hash.update(commit.last_modified.timestamp_nanos_opt().unwrap_or(0).to_le_bytes());
+    hash.update(commit.size.to_le_bytes());
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // Bound retention conservatively using active-file metadata, including variable-width
@@ -73,11 +122,11 @@ fn cache_weight(table: &DeltaTable, limit: usize) -> Option<usize> {
         return None;
     }
     for file in log.iter() {
-        // The library does not expose the retained Arrow buffers; the full add
-        // action gives a conservative payload estimate without another scan.
+        // Count the serialized add action without heap-allocating per-file buffers.
+        let mut counter = ByteCounter(0);
         #[allow(deprecated)]
-        let payload = serde_json::to_vec(&file.add_action()).ok()?;
-        bytes = bytes.saturating_add(payload.len().saturating_mul(2));
+        serde_json::to_writer(&mut counter, &file.add_action()).ok()?;
+        bytes = bytes.saturating_add(counter.0.saturating_mul(2));
         if bytes > limit {
             return None;
         }
@@ -100,7 +149,7 @@ pub(crate) async fn open_cached(
     context: &SessionContext,
     stats: &ReadStats,
     cache: Option<&SnapshotCache>,
-) -> Result<(Arc<dyn TableProvider>, u64, Option<uuid::Uuid>)> {
+) -> Result<(Arc<dyn TableProvider>, u64, Option<String>)> {
     let url = if mapping.path.contains("://") {
         Url::parse(&mapping.path).context("invalid Delta table URI")?
     } else {
@@ -131,19 +180,13 @@ pub(crate) async fn open_cached(
     let matches =
         |cached: &CachedSnapshot| cached.url == url && cached.requested == mapping.version;
     let cached = cache.and_then(|cache| {
-        cache
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|entry| {
-                matches(entry)
-                    && entry
-                        .remote_store
-                        .as_ref()
-                        .is_none_or(|cached| Arc::ptr_eq(cached, &store))
-            })
-            .cloned()
+        cache.get(|entry| {
+            matches(entry)
+                && entry
+                    .remote_store
+                    .as_ref()
+                    .is_none_or(|cached| Arc::ptr_eq(cached, &store))
+        })
     });
     let cached = if let Some(cached) = cached {
         stats.request();
@@ -180,37 +223,43 @@ pub(crate) async fn open_cached(
     let version = table
         .version()
         .context("Delta table has no committed snapshot")?;
-    let mut identity = cached
+    let mut proof = cached
         .as_ref()
         .filter(|entry| entry.table.version() == Some(version))
-        .map(|entry| entry.identity);
+        .map(|entry| entry.proof.clone());
     if let Some(cache) = cache
-        && identity.is_none()
+        && proof.is_none()
     {
-        let commit = ObjectPath::from(format!("_delta_log/{version:020}.json"));
+        let commit_path = ObjectPath::from(format!("_delta_log/{version:020}.json"));
         // Tables restored at the same path must start a new transaction log.
-        // Only reuse a snapshot while its immutable commit is still present.
-        let entry = if let Some(bytes) = cache_weight(&table, cache.max_bytes) {
-            stats.request();
-            if let Ok(commit) = prefixed.head(&commit).await
-                && (commit.e_tag.is_some() || commit.version.is_some())
-            {
-                Some(CachedSnapshot {
-                    url: url.clone(),
-                    requested: mapping.version,
-                    remote_store: (url.scheme() == "s3").then_some(store),
-                    commit,
-                    table: table.clone(),
-                    identity: uuid::Uuid::new_v4(),
-                    bytes,
-                })
-            } else {
-                None
-            }
+        // Only issue a proof when the immutable commit metadata is verifiable.
+        stats.request();
+        let commit = prefixed
+            .head(&commit_path)
+            .await
+            .ok()
+            .filter(|commit| commit.e_tag.is_some() || commit.version.is_some());
+        let verified_proof = commit
+            .as_ref()
+            .map(|commit| snapshot_proof(&table, version, commit));
+        let entry = if let (Some(commit), Some(verified_proof)) = (commit, verified_proof.as_ref())
+        {
+            let max_bytes = cache.max_bytes;
+            let bytes = crate::blocking(|| cache_weight(&table, max_bytes));
+            bytes.map(|bytes| CachedSnapshot {
+                url: url.clone(),
+                requested: mapping.version,
+                remote_store: (url.scheme() == "s3").then_some(store),
+                commit,
+                table: table.clone(),
+                proof: verified_proof.clone(),
+                bytes,
+            })
         } else {
             None
         };
-        identity = cache.replace(matches, entry);
+        let _ = cache.replace(matches, entry);
+        proof = verified_proof;
     }
     let mut session = context.state();
     session
@@ -224,7 +273,7 @@ pub(crate) async fn open_cached(
         .with_session(Arc::new(session))
         .build()
         .await?;
-    Ok((Arc::new(provider), version, identity))
+    Ok((Arc::new(provider), version, proof))
 }
 
 #[cfg(test)]
@@ -255,7 +304,7 @@ mod tests {
                 version: None,
             },
             table: table.clone(),
-            identity: uuid::Uuid::new_v4(),
+            proof: uuid::Uuid::new_v4().to_string(),
             bytes,
         };
         for (version, bytes) in [(0, 30), (1, 30), (2, 60)] {
@@ -284,6 +333,63 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.entries.lock().unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_cache_retains_more_than_four_tables_and_uses_lru() -> Result<()> {
+        let cache = SnapshotCache::new(16 * 100);
+        let dir = tempfile::tempdir()?;
+        let url = Url::from_directory_path(dir.path()).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let table = DeltaTable::new(default_logstore(
+            store.clone(),
+            store,
+            &url,
+            &Default::default(),
+        ));
+        let entry = |version, bytes| CachedSnapshot {
+            url: url.clone(),
+            requested: Some(version),
+            remote_store: None,
+            commit: ObjectMeta {
+                location: ObjectPath::from("commit"),
+                last_modified: chrono::Utc::now(),
+                size: 1,
+                e_tag: Some("test".into()),
+                version: None,
+            },
+            table: table.clone(),
+            proof: format!("proof-{version}"),
+            bytes,
+        };
+        for version in 0..6 {
+            assert!(
+                cache
+                    .replace(
+                        |cached| cached.requested == Some(version),
+                        Some(entry(version, 15))
+                    )
+                    .is_some()
+            );
+        }
+        assert_eq!(cache.entries.lock().unwrap().len(), 6);
+        // Promote version 0 via LRU hit; inserting a 25-byte entry must evict 1 (not 0).
+        assert!(cache.get(|cached| cached.requested == Some(0)).is_some());
+        assert!(
+            cache
+                .replace(|cached| cached.requested == Some(6), Some(entry(6, 25)))
+                .is_some()
+        );
+        let retained: Vec<_> = cache
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.requested)
+            .collect();
+        assert!(retained.contains(&Some(0)), "LRU hit was evicted: {retained:?}");
+        assert!(!retained.contains(&Some(1)), "oldest unaccessed entry should be evicted: {retained:?}");
         Ok(())
     }
 }

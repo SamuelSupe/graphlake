@@ -145,6 +145,15 @@ impl IcebergTable {
             version,
         ))
     }
+
+    pub(crate) fn proof_token(&self, version: &SourceVersion) -> Option<String> {
+        // Predicate-filtered scans only see a subset of keys and must not cache a
+        // full-table uniqueness proof; include the table UUID so recreated tables
+        // reusing a numeric snapshot ID cannot reuse a prior proof.
+        self.filter
+            .is_none()
+            .then(|| format!("{}:{}", self.table.metadata().uuid(), version.version))
+    }
 }
 
 impl fmt::Debug for IcebergTable {
@@ -269,7 +278,11 @@ fn scan_predicate(schema: &Schema, expr: &Expr) -> Option<Predicate> {
             let Expr::Column(column) = expr.as_ref() else {
                 return None;
             };
-            if column.name.contains('.') || schema.field_with_name(&column.name).is_err() {
+            if column.name.contains('.') {
+                return None;
+            }
+            let field = schema.field_with_name(&column.name).ok()?;
+            if field.data_type().is_nested() {
                 return None;
             }
             Some(Reference::new(&column.name).is_null())
@@ -278,7 +291,11 @@ fn scan_predicate(schema: &Schema, expr: &Expr) -> Option<Predicate> {
             let Expr::Column(column) = expr.as_ref() else {
                 return None;
             };
-            if column.name.contains('.') || schema.field_with_name(&column.name).is_err() {
+            if column.name.contains('.') {
+                return None;
+            }
+            let field = schema.field_with_name(&column.name).ok()?;
+            if field.data_type().is_nested() {
                 return None;
             }
             Some(Reference::new(&column.name).is_not_null())
@@ -353,10 +370,10 @@ fn iceberg_predicate(schema: &Schema, filter: &ReadPredicate) -> Option<Predicat
     let kind = schema.field_with_name(&filter.column).ok()?.data_type();
     let reference = Reference::new(&filter.column);
     let value = match (kind, filter.op) {
-        (_, Comparison::IsNull) => {
+        (ty, Comparison::IsNull) if !ty.is_nested() => {
             return Some(reference.is_null());
         }
-        (_, Comparison::IsNotNull) => {
+        (ty, Comparison::IsNotNull) if !ty.is_nested() => {
             return Some(reference.is_not_null());
         }
         (DataType::Int32, _) => Datum::int(i32::try_from(filter.value.as_i64()?).ok()?),
@@ -435,5 +452,41 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn nested_is_null_predicates_are_not_pushed_down() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new(
+                "tags",
+                DataType::new_list(DataType::Utf8, true),
+                true,
+            ),
+            Field::new(
+                "meta",
+                DataType::Struct(vec![Field::new("k", DataType::Utf8, true)].into()),
+                true,
+            ),
+        ]);
+        assert!(scan_predicate(&schema, &col("id").is_null()).is_some());
+        assert!(scan_predicate(&schema, &col("id").is_not_null()).is_some());
+        assert!(scan_predicate(&schema, &col("tags").is_null()).is_none());
+        assert!(scan_predicate(&schema, &col("tags").is_not_null()).is_none());
+        assert!(scan_predicate(&schema, &col("meta").is_null()).is_none());
+        assert!(scan_predicate(&schema, &col("meta").is_not_null()).is_none());
+
+        let nested_read = ReadPredicate {
+            column: "tags".into(),
+            op: Comparison::IsNotNull,
+            value: serde_json::Value::Null,
+        };
+        assert!(iceberg_predicate(&schema, &nested_read).is_none());
+        let primitive_read = ReadPredicate {
+            column: "id".into(),
+            op: Comparison::IsNotNull,
+            value: serde_json::Value::Null,
+        };
+        assert!(iceberg_predicate(&schema, &primitive_read).is_some());
     }
 }

@@ -119,7 +119,7 @@ fn modularity_total_quality(
 
         let mut q = 0.0;
         for c in 0..num_comms {
-            q += e_c[c] / m - resolution * sigma_tot_out[c] * sigma_tot_in[c] / (m * m);
+            q += e_c[c] / m - resolution * (sigma_tot_out[c] / m) * (sigma_tot_in[c] / m);
         }
         q
     }

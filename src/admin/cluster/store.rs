@@ -409,6 +409,8 @@ impl Metadata {
     }
 }
 
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+
 #[derive(Clone)]
 pub(in crate::admin) struct Objects {
     pub(super) store: Arc<dyn ObjectStore>,
@@ -417,7 +419,8 @@ pub(in crate::admin) struct Objects {
     bucket: Option<String>,
     pub(super) prefix: Key,
     pub(super) csr_manifests: Arc<std::sync::Mutex<super::csr::ManifestCache>>,
-    uploaded_models: Arc<std::sync::Mutex<std::collections::VecDeque<(String, String)>>>,
+    uploaded_models:
+        Arc<std::sync::Mutex<std::collections::VecDeque<(String, String, std::time::Instant)>>>,
 }
 
 impl Objects {
@@ -574,23 +577,31 @@ impl Objects {
     }
 
     fn is_model_cached(&self, model: &str, revision: &str) -> bool {
+        let now = std::time::Instant::now();
         let mut cache = self.uploaded_models.lock().unwrap();
-        if let Some(pos) = cache.iter().position(|(m, r)| m == model && r == revision) {
+        if let Some(pos) = cache
+            .iter()
+            .position(|(m, r, _)| m == model && r == revision)
+        {
             let entry = cache.remove(pos).unwrap();
-            cache.push_back(entry);
-            true
-        } else {
-            false
+            if now.duration_since(entry.2) < MODEL_CACHE_TTL {
+                cache.push_back(entry);
+                return true;
+            }
         }
+        false
     }
 
     fn remember_model(&self, model: &str, revision: &str) {
+        let now = std::time::Instant::now();
         let mut cache = self.uploaded_models.lock().unwrap();
-        cache.retain(|(m, r)| !(m == model && r == revision));
+        cache.retain(|(m, r, ts)| {
+            !(m == model && r == revision) && now.duration_since(*ts) < MODEL_CACHE_TTL
+        });
         if cache.len() >= 256 {
             cache.pop_front();
         }
-        cache.push_back((model.to_owned(), revision.to_owned()));
+        cache.push_back((model.to_owned(), revision.to_owned(), now));
     }
 
     pub async fn ensure_model(&self, model: &str, revision: &str, yaml: String) -> Result<()> {

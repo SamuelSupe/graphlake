@@ -452,10 +452,16 @@ async fn load(
                 let staged = delta.reopen()?;
                 let key = key.clone();
                 let worker_scope = Arc::clone(scope);
-                if let Some(next) = tokio::task::spawn_blocking(move || {
+                let prepared = match tokio::task::spawn_blocking(move || {
                     overlay::prepare(&anchor, previous, staged, &key, &worker_scope)
                 })
-                .await??
+                .await?
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) if out_of_memory(&error) => None,
+                    Err(error) => return Err(error),
+                };
+                if let Some(next) = prepared
                     && crate::blocking(|| {
                         overlay::publish(path, Some(&delta), &next, scope, || Ok(()))
                     })?
@@ -469,10 +475,15 @@ async fn load(
                 let root = root.to_owned();
                 let key = key.clone();
                 let scope = Arc::clone(scope);
-                tokio::task::spawn_blocking(move || {
+                match tokio::task::spawn_blocking(move || {
                     row_groups::merge(previous, incoming, &root, &key, &scope)
                 })
-                .await??
+                .await?
+                {
+                    Ok(merged) => merged,
+                    Err(error) if out_of_memory(&error) => None,
+                    Err(error) => return Err(error),
+                }
             } else {
                 None
             }
@@ -697,17 +708,35 @@ async fn any(context: &SessionContext, sql: &str) -> Result<bool> {
 }
 
 async fn write(frame: DataFrame, file: File, scope: &QueryScope) -> Result<u64> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct AbortGuard(Arc<AtomicBool>, bool);
+    impl Drop for AbortGuard {
+        fn drop(&mut self) {
+            if !self.1 {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     let mut stream = frame.execute_stream().await?;
     let schema = stream.schema();
     let flush_limit = scope.options.memory_bytes / 8;
-    let (send, mut receive) =
-        tokio::sync::mpsc::channel::<datafusion::arrow::array::RecordBatch>(2);
+    let (send, mut receive) = tokio::sync::mpsc::channel::<(
+        datafusion::arrow::array::RecordBatch,
+        datafusion::execution::memory_pool::MemoryReservation,
+    )>(2);
     let cancelled = scope.options.cancellation.clone();
     let deadline = scope.deadline;
+    let aborted = Arc::new(AtomicBool::new(false));
+    let mut abort_guard = AbortGuard(Arc::clone(&aborted), false);
+    let writer_aborted = Arc::clone(&aborted);
     let task = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut writer = ArrowWriter::try_new(file, schema, Some(writer_properties()))?;
         let mut count = 0;
-        while let Some(batch) = receive.blocking_recv() {
+        while let Some((batch, _budget)) = receive.blocking_recv() {
+            if writer_aborted.load(Ordering::Relaxed) {
+                return Ok(count);
+            }
             ensure!(!cancelled.is_cancelled(), "query cancelled");
             ensure!(
                 tokio::time::Instant::now() < deadline,
@@ -719,29 +748,53 @@ async fn write(frame: DataFrame, file: File, scope: &QueryScope) -> Result<u64> 
                 writer.flush()?;
             }
         }
+        if writer_aborted.load(Ordering::Relaxed) {
+            return Ok(count);
+        }
+        ensure!(!cancelled.is_cancelled(), "query cancelled");
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "query deadline exceeded"
+        );
         writer.close()?;
         Ok(count)
     });
-    let mut stream_err = None;
+    let mut stream_err: Option<anyhow::Error> = None;
     loop {
         match stream.try_next().await {
             Ok(Some(batch)) => {
-                scope.check()?;
-                if send.send(batch).await.is_err() {
+                if let Err(error) = scope.check() {
+                    stream_err = Some(error);
+                    break;
+                }
+                let budget = datafusion::execution::memory_pool::MemoryConsumer::new(
+                    "local table parquet write queue",
+                )
+                .register(&scope.runtime.memory_pool);
+                if let Err(error) = budget.try_grow(batch.get_array_memory_size()) {
+                    stream_err = Some(error.into());
+                    break;
+                }
+                if send.send((batch, budget)).await.is_err() {
                     break;
                 }
             }
             Ok(None) => break,
             Err(error) => {
-                stream_err = Some(error);
+                stream_err = Some(error.into());
                 break;
             }
         }
     }
+    if stream_err.is_some() {
+        aborted.store(true, Ordering::Relaxed);
+    } else {
+        abort_guard.1 = true;
+    }
     drop(send);
     let written = task.await?;
     if let Some(error) = stream_err {
-        return Err(error.into());
+        return Err(error);
     }
     written
 }
@@ -850,6 +903,73 @@ mod tests {
                 .map(|id| (id, if (4401..=4800).contains(&id) { 0 } else { 2 }))
                 .collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pure_soft_delete_incremental_sync_updates_last_part_and_watermark() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let source = scratch.path().join("soft_delete.db");
+        {
+            let db = rusqlite::Connection::open(&source)?;
+            db.execute_batch(
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, ver INTEGER NOT NULL, removed INTEGER NOT NULL) STRICT;
+                 INSERT INTO items VALUES (1, 1, 0), (2, 1, 0), (3, 1, 0);",
+            )?;
+        }
+        let mut table: Table = serde_json::from_value(serde_json::json!({
+            "model": "model", "data_id": uuid::Uuid::new_v4(), "revision": uuid::Uuid::new_v4(),
+            "source": {"type":"sqlite", "path":source},
+            "config": {"name":"items","source_table":"db.items","columns":["id","ver","removed"],
+                "key_columns":["id"],"watermark_column":"ver","deleted_column":"removed","mode":"incremental"},
+            "history":[]
+        }))?;
+        let path = scratch.path().join("items.parquet");
+        let admission = Arc::new(Admission::new(crate::EngineLimits::default())?);
+        super::super::prepare_run(&mut table, Some(Mode::Full), false, false)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let (_, before, _, _) = run(
+            &table,
+            &path,
+            Mode::Full,
+            QueryOptions::default(),
+            &admission,
+        )
+        .await?;
+        assert_eq!(before, 3);
+
+        // Pure soft-delete targeting the sole (last) part right after Mode::Full.
+        rusqlite::Connection::open(&source)?
+            .execute_batch("UPDATE items SET removed = 1, ver = 2 WHERE id = 3;")?;
+        table.history[0].id = uuid::Uuid::new_v4();
+        let (_, total, _, committed) = run(
+            &table,
+            &path,
+            Mode::Incremental,
+            QueryOptions::default(),
+            &admission,
+        )
+        .await?;
+        assert_eq!(total, 2);
+        assert!(committed.is_some());
+        let snapshot = Snapshot::read(&path)?.expect("indexed local snapshot after pure soft-delete");
+        assert_eq!(snapshot.rows(), 2);
+        assert_eq!(
+            key_index::checkpoint(snapshot.indexed.as_ref().unwrap())?,
+            ScalarValue::Int64(Some(2))
+        );
+
+        // Re-running with an unchanged watermark and only already-deleted tombstones is a no-op.
+        table.history[0].id = uuid::Uuid::new_v4();
+        let (_, total_noop, _, _) = run(
+            &table,
+            &path,
+            Mode::Incremental,
+            QueryOptions::default(),
+            &admission,
+        )
+        .await?;
+        assert_eq!(total_noop, 2);
         Ok(())
     }
 }

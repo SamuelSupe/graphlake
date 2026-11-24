@@ -636,12 +636,9 @@ pub(super) async fn prepare<'a, 'q>(
                     };
                 let version_str = version.to_string();
                 // A recreated transaction log can reuse the same numeric version.
-                // Only a retained, verified snapshot can reuse a prior key proof.
-                file_versions = identity.map(|identity| {
-                    vec![(
-                        format!("delta:{reference}:{}", mapping.path),
-                        identity.to_string(),
-                    )]
+                // Bind uniqueness proofs to the verified immutable commit metadata.
+                file_versions = identity.as_ref().map(|proof| {
+                    vec![(format!("delta:{reference}:{}", mapping.path), proof.clone())]
                 });
                 versions.insert(
                     reference.into(),
@@ -681,10 +678,15 @@ pub(super) async fn prepare<'a, 'q>(
                     Arc::clone(&scope.reads),
                 )
                 .await?;
-                file_versions = Some(vec![(
-                    format!("iceberg:{uri}:{reference}"),
-                    version.version.clone(),
-                )]);
+                file_versions = table.proof_token(&version).map(|token| {
+                    vec![(
+                        format!(
+                            "iceberg:{uri}:{}:{reference}",
+                            warehouse.as_deref().unwrap_or("")
+                        ),
+                        token,
+                    )]
+                });
                 versions.insert(reference.into(), version);
                 Arc::new(table)
             }

@@ -45,7 +45,7 @@ impl ClickHouse {
                 .to_owned(),
         };
         let (table, _budget, _) = self
-            .read(sql, &["name".to_owned()], 256, Some(disk))
+            .read(sql, &["name".to_owned()], 256, Some(disk), &mut false)
             .await?;
         let mut names = Vec::new();
         for batch in context.read_table(table)?.collect().await? {
@@ -94,7 +94,10 @@ impl ClickHouse {
         stream: bool,
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, String)> {
         let relation = relation.split('.').map(ident).collect::<Vec<_>>().join(".");
-        let metadata_columns = self.describe(&relation, batch_size).await?;
+        let mut server_settings = false;
+        let metadata_columns = self
+            .describe(&relation, batch_size, &mut server_settings)
+            .await?;
         let dates: BTreeSet<_> = metadata_columns
             .iter()
             .filter(|column| {
@@ -154,6 +157,7 @@ impl ClickHouse {
                     columns,
                     batch_size,
                     None,
+                    &mut server_settings,
                 )
                 .await?;
             if explain_only {
@@ -204,10 +208,14 @@ impl ClickHouse {
             let table = crate::source::snapshot::stream_once(schema.clone(), move |context| {
                 let pool = context.runtime_env().memory_pool.clone();
                 let expected = schema.clone();
+                let mut stream_server_settings = server_settings;
                 Box::pin(RecordBatchStreamAdapter::new(
                     schema,
                     async_stream::try_stream! {
-                        let response = driver.request(sql, batch_size, &query_id).await.map_err(external)?;
+                        let response = driver
+                            .request_with(sql, batch_size, &query_id, &mut stream_server_settings)
+                            .await
+                            .map_err(external)?;
                         let mut reader = IpcRead::new(response, &pool, driver.http.stats.clone());
                         let budget = MemoryConsumer::new("GraphLake ClickHouse IPC output").register(&pool);
                         while let Some(batch) = reader.next().await.map_err(external)? {
@@ -226,7 +234,9 @@ impl ClickHouse {
                 MemoryConsumer::new("GraphLake ClickHouse stream").register(&self.http.pool);
             return Ok((table, budget, id));
         }
-        let result = self.read(sql, columns, batch_size, Some(disk)).await?;
+        let result = self
+            .read(sql, columns, batch_size, Some(disk), &mut server_settings)
+            .await?;
         ensure!(
             expected.is_none_or(|expected| expected.fields() == result.0.schema().fields()),
             "ClickHouse result schema changed after describing the table"
@@ -234,12 +244,18 @@ impl ClickHouse {
         Ok(result)
     }
 
-    async fn describe(&mut self, relation: &str, batch_size: usize) -> Result<Vec<Column>> {
+    async fn describe(
+        &mut self,
+        relation: &str,
+        batch_size: usize,
+        server_settings: &mut bool,
+    ) -> Result<Vec<Column>> {
         let mut response = self
-            .request(
+            .request_with(
                 format!("DESCRIBE TABLE {relation} FORMAT JSONEachRow"),
                 batch_size,
                 &uuid::Uuid::new_v4().to_string(),
+                server_settings,
             )
             .await?;
         let mut bytes = Vec::new();
@@ -259,22 +275,33 @@ impl ClickHouse {
         Ok(columns)
     }
 
+    #[cfg(all(test, feature = "admin"))]
     async fn request(
         &mut self,
         sql: String,
         batch_size: usize,
         id: &str,
     ) -> Result<reqwest::Response> {
+        self.request_with(sql, batch_size, id, &mut false).await
+    }
+
+    async fn request_with(
+        &mut self,
+        sql: String,
+        batch_size: usize,
+        id: &str,
+        server_settings: &mut bool,
+    ) -> Result<reqwest::Response> {
         let timeout = self.timeout.as_secs_f64().to_string();
         let batch = batch_size.to_string();
-        let request = |server_settings| {
+        let request = |use_server_settings| {
             let request = self
                 .http
                 .client
                 .post(self.http.base.clone())
                 .basic_auth(&self.user, Some(self.password.as_deref().unwrap_or("")))
                 .query(&[("query_id", id), ("readonly", "1")]);
-            let request = if server_settings {
+            let request = if use_server_settings {
                 request
             } else {
                 request.query(&[
@@ -290,10 +317,12 @@ impl ClickHouse {
             request.body(sql.clone()).send()
         };
         const EXCEPTION_CODE: &str = "X-ClickHouse-Exception-Code";
-        // Backend profiles may differ behind a proxy or change between requests.
-        // Retry without settings only for the current statement if rejected.
-        let mut response = request(false).await?;
-        if !response.status().is_success()
+        // Remember readonly profile fallback within a single `table()` scan once
+        // confirmed by a successful retry, while keeping independent statements fresh.
+        let mut response = request(*server_settings).await?;
+        let mut retried = false;
+        if !*server_settings
+            && !response.status().is_success()
             && response
                 .headers()
                 .get(EXCEPTION_CODE)
@@ -301,6 +330,7 @@ impl ClickHouse {
         {
             // A readonly profile can disallow per-statement settings before the SELECT starts.
             drop(response);
+            retried = true;
             response = request(true).await?;
         }
         ensure!(
@@ -317,6 +347,9 @@ impl ClickHouse {
             response.headers().get(EXCEPTION_CODE).is_none(),
             "ClickHouse query failed"
         );
+        if retried {
+            *server_settings = true;
+        }
         Ok(response)
     }
 
@@ -326,9 +359,12 @@ impl ClickHouse {
         columns: &[String],
         batch_size: usize,
         disk: Option<&Arc<DiskManager>>,
+        server_settings: &mut bool,
     ) -> Result<(Arc<dyn TableProvider>, MemoryReservation, String)> {
         let id = uuid::Uuid::new_v4().to_string();
-        let response = self.request(sql, batch_size, &id).await?;
+        let response = self
+            .request_with(sql, batch_size, &id, server_settings)
+            .await?;
         let mut reader = IpcRead::new(response, &self.http.pool, self.http.stats.clone());
         let mut snapshot = crate::source::snapshot::Buffer::new(&self.http.pool, disk);
         while let Some(batch) = reader.next().await? {
@@ -492,6 +528,102 @@ mod tests {
             *calls.lock().unwrap(),
             vec![true, false, true, true, false, true]
         );
+        server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn table_reuses_readonly_fallback_within_single_scan() -> Result<()> {
+        use axum::{
+            Router, extract::OriginalUri, http::StatusCode, response::IntoResponse, routing::post,
+        };
+        use datafusion::arrow::{
+            array::Int64Array,
+            datatypes::{DataType, Field, Schema},
+            ipc::writer::StreamWriter,
+        };
+        use std::sync::Mutex;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )?;
+        let mut arrow_bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut arrow_bytes, &schema)?;
+            writer.write(&batch)?;
+            writer.finish()?;
+        }
+        let mut empty_arrow = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut empty_arrow, &schema)?;
+            writer.finish()?;
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |OriginalUri(uri): OriginalUri, body: String| {
+                let observed = observed.clone();
+                let arrow_bytes = arrow_bytes.clone();
+                let empty_arrow = empty_arrow.clone();
+                async move {
+                    let settings = uri
+                        .query()
+                        .unwrap_or_default()
+                        .contains("max_execution_time=");
+                    observed.lock().unwrap().push(settings);
+                    if settings {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            [("X-ClickHouse-Exception-Code", "164")],
+                        )
+                            .into_response();
+                    }
+                    if body.starts_with("DESCRIBE TABLE") {
+                        return "{\"name\":\"id\",\"type\":\"Int64\"}\n".into_response();
+                    }
+                    if body.contains("WHERE 0") {
+                        return empty_arrow.into_response();
+                    }
+                    arrow_bytes.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let source = Source::Clickhouse {
+            uri: format!("http://{}", listener.local_addr()?).parse()?,
+            user: "readonly_reader".into(),
+            password_env: None,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let runtime = SessionContext::new().runtime_env();
+        let mut connector = ClickHouse::new(
+            &source,
+            Duration::from_secs(10),
+            runtime.memory_pool.clone(),
+            Arc::default(),
+        )?;
+        let filter = crate::Predicate {
+            column: "id".into(),
+            op: Comparison::Eq,
+            value: serde_json::json!(1),
+        };
+        let (_table, _budget, _) = connector
+            .table(
+                "db.items",
+                &["id".into()],
+                &[filter],
+                128,
+                &runtime.disk_manager,
+                false,
+                false,
+            )
+            .await?;
+        // Only DESCRIBE pays the 400/164 probe; WHERE 0 and SELECT reuse fallback directly.
+        assert_eq!(*calls.lock().unwrap(), vec![true, false, false, false]);
         server.abort();
         Ok(())
     }

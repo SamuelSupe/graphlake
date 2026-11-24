@@ -38,7 +38,9 @@ impl Iterator for Reader {
                 completion => {
                     let _runtime = runtime.enter();
                     self.result.take();
-                    completion.err().map(|error| Err(sanitize_arrow_error(&error)))
+                    completion
+                        .err()
+                        .map(|error| Err(sanitize_arrow_error(&error)))
                 }
             }
         })) {
@@ -349,6 +351,9 @@ mod tests {
         let mut reader = ArrowArrayStreamReader::try_new(ffi).expect("open FFI stream");
         let err = reader.next().expect("error item").unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("upstream\\0error"), "unexpected error: {text}");
+        assert!(
+            text.contains("upstream\\0error"),
+            "unexpected error: {text}"
+        );
     }
 }

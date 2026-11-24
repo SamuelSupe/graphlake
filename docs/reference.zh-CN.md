@@ -532,7 +532,7 @@ cargo run --locked -- --catalog /tmp/graphlake-demo/graph.yaml --diagnostics \
 
 可通过 `--timeout-ms`、`--memory-mib`、`--spill-mib`、`--partitions` 和 `--batch-size` 控制每次查询。内存上限用于 DataFusion 追踪的算子、来源读取批次、Parquet 范围缓冲、查询内物化和图遍历状态。进程 RSS 还包含运行时开销、解码中的临时缓冲和调用方持有的批次。图状态达到预算时返回资源错误。关闭结果流会释放本地状态和来源连接，CLI 支持 Ctrl-C。诊断记录前沿请求、扫描回退、CSR 代次和各深度访问数。`first_batch_ms` 从查询开始计到结果流交付首批，首批尚未到达时为空。PostgreSQL、MySQL、SQLite、Iceberg 和数仓的通用字节数为已解码的 Arrow 批次大小。`clickhouse_http_bytes` 统计已消费的 Arrow IPC HTTP 响应体，Parquet、CSV、JSON Lines 的 `object_bytes` 统计读取的对象范围。连接器的接收行数与数据库内部扫描量分别计量，后者以来源执行计划或服务端指标为准。Iceberg 请求数按 Catalog 加载和扫描调用统计，Delta 请求数按快照加载统计。Delta 扫描的文件和行级执行统计可通过 `EXPLAIN ANALYZE` 查看。
 
-Delta 快照缓存根据同一准入控制器的内存额度和快照元数据估算大小限制跨查询保留；仅复用已确认事务日志身份的快照及其业务键校验。表在同一路径重建时，版本号相同也会重新校验。MySQL 仅在确认同一后端实例时进行跨连接取消；无法确认时依赖连接关闭及来源语句超时。ClickHouse 每条语句先尝试带查询时限及取消设置，仅当前语句在账户设置拒绝时重试服务端配置，不影响下一条语句。
+Delta 快照缓存根据同一准入控制器的内存额度和快照元数据估算大小限制跨查询保留；仅复用已确认事务日志身份的快照及其业务键校验。表在同一路径重建时，版本号相同也会重新校验。MySQL 仅在确认同一后端实例时进行跨连接取消；无法确认时依赖连接关闭及来源语句超时。ClickHouse 独立读取先尝试带查询时限及取消设置；账户拒绝设置时，可在同一次表扫描内部复用成功的服务端配置回退，不影响后续独立读取。
 
 同一进程通过 `Engine::new` 创建的实例共享 8 个活动查询、2 GiB 内存预算和 8 GiB 临时磁盘预算。查询进入时预留声明的额度，读取完成或关闭结果流后释放。等待资源计入查询超时，也可以取消。Rust 可通过 `Engine::new_with_limits` 为一个实例及其克隆配置独立预算。CLI 单次执行按命令行参数分配预算。
 
@@ -654,7 +654,7 @@ with engine.query('SELECT count(*) AS n FROM "Transfer"', language="sql") as que
     print(query.versions, query.metrics())
 ```
 
-`Engine.traverse`、`Engine.refresh` 和 `Engine.analyze` 共用 Rust 引擎。遍历复合键按映射顺序传入字符串列表。同步调用在等待 Rust 查询时释放 GIL，查询对象可显式取消或用上下文管理器关闭。Python 流式验证可运行 `python tests/python_smoke.py /tmp/graphlake-demo/graph.yaml`。
+`Engine.traverse`、`Engine.refresh` 和 `Engine.analyze` 共用 Rust 引擎。遍历复合键按映射顺序传入字符串列表。同步调用在等待 Rust 查询时释放 GIL，查询对象可显式取消或用上下文管理器关闭。使用结束后可调用 `engine.close()` 关闭引擎，关闭后不能发起新查询；建议先关闭所有结果流。Python 流式验证可运行 `python tests/python_smoke.py /tmp/graphlake-demo/graph.yaml`。
 
 `Engine.query(..., parameters={"tenant": 1})` 将 Python 字典中的值绑定到 Cypher 查询，`Engine.route(..., strategy="bellman_ford")` 可显式选择路径策略。
 

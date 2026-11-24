@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.8
+
+- Include the redesigned model-centered administration console from the v1.1.7 development release, with light and dark themes, streamlined publication, rollback, query controls, and graph exploration.
+- Correct Cypher shortest-path cycles, path-dependent predicates, DISTINCT and IN semantics, and Gremlin repeat, fold, group, and label predicates. Preserve exact values and business-key validation across lakehouse snapshot replacement and filtered source scans.
+- Bound query allocations, CSR adjacency batches and caches, snapshot materialization, export encoding, and projected graph operations. Share Delta snapshot retention under a byte budget and improve metadata reuse.
+- Preserve local-table data and historical NULLs during incremental loads, soft deletes, compaction, backup, and recovery. Keep synchronization slots occupied until cancelled background work exits, and isolate sync and probe admission from foreground queries.
+- Improve cancellation, deadlines, read consistency, and resource release across database, warehouse, object-storage and Parquet connectors, including backend-verified MySQL cancellation and scoped ClickHouse readonly fallback.
+- Harden Coordinator/Worker failover, leadership reconciliation, query admission, job recovery, distributed execution, retention and backup behavior. Bound recovery retries and preserve committed state across interruption.
+- Improve C and Python stream lifetime and error handling, including explicit Python `Engine.close()`. Add regressions for query correctness, bounded memory, cancellation, local-table recovery, connector behavior and cluster execution.
+
 ## v1.1.7
 
 - Redesign the administration console with light and dark themes, consistent navigation, denser layouts, and clearer model, graph, source, query, and operations views. Remember the selected theme in the browser.

@@ -1309,10 +1309,8 @@ edges:
 #[tokio::test]
 async fn shortest_path_where_can_reference_outer_variables() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let users = RecordBatch::try_from_iter([(
-        "id",
-        Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as _,
-    )])?;
+    let users =
+        RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as _)])?;
     let edges = RecordBatch::try_from_iter([
         ("id", Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as _),
         ("src", Arc::new(Int64Array::from(vec![1, 2, 1, 3, 5])) as _),
@@ -1381,10 +1379,7 @@ edges:
             QueryOptions::default(),
         )
         .await?;
-    assert_eq!(
-        rows(&mut optional_none).await?,
-        vec![serde_json::json!({})]
-    );
+    assert_eq!(rows(&mut optional_none).await?, vec![serde_json::json!({})]);
     Ok(())
 }
 
@@ -1397,7 +1392,10 @@ async fn gremlin_repeat_barriers_where_predicates_and_variant_mean() -> Result<(
     ])?;
     let merchants = RecordBatch::try_from_iter([
         ("id", Arc::new(Int64Array::from(vec![3])) as _),
-        ("score", Arc::new(graphlake::arrow::array::Float64Array::from(vec![30.0])) as _),
+        (
+            "score",
+            Arc::new(graphlake::arrow::array::Float64Array::from(vec![30.0])) as _,
+        ),
     ])?;
     let transfers = RecordBatch::try_from_iter([
         ("id", Arc::new(Int64Array::from(vec![1, 2])) as _),

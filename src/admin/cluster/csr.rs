@@ -742,11 +742,9 @@ fn compact_byte_view<T: datafusion::arrow::datatypes::ByteViewType>(
     if oversized_views || oversized_nulls {
         let views = ScalarBuffer::from(gc.views().as_ref().to_vec());
         let nulls = gc.nulls().map(|n| NullBuffer::from_iter(n.iter()));
-        if let Ok(shrunk) = GenericByteViewArray::<T>::try_new(
-            views,
-            gc.data_buffers().to_vec(),
-            nulls,
-        ) {
+        if let Ok(shrunk) =
+            GenericByteViewArray::<T>::try_new(views, gc.data_buffers().to_vec(), nulls)
+        {
             return Arc::new(shrunk);
         }
     }
@@ -875,7 +873,10 @@ fn compact_view(array: datafusion::arrow::array::ArrayRef) -> datafusion::arrow:
         DataType::Dictionary(key_type, _) => {
             macro_rules! compact_dict {
                 ($k:ty) => {{
-                    let d = array.as_any().downcast_ref::<DictionaryArray<$k>>().unwrap();
+                    let d = array
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<$k>>()
+                        .unwrap();
                     let mut remap = HashMap::<usize, <$k as ArrowPrimitiveType>::Native>::new();
                     let mut take_indices = Vec::<u32>::new();
                     let mut new_keys =
@@ -897,9 +898,9 @@ fn compact_view(array: datafusion::arrow::array::ArrayRef) -> datafusion::arrow:
                                     new_keys.push(Some(mapped));
                                 } else {
                                     #[allow(irrefutable_let_patterns)]
-                                    let Ok(mapped) =
-                                        <$k as ArrowPrimitiveType>::Native::try_from(take_indices.len())
-                                    else {
+                                    let Ok(mapped) = <$k as ArrowPrimitiveType>::Native::try_from(
+                                        take_indices.len(),
+                                    ) else {
                                         remappable = false;
                                         break;
                                     };
@@ -1057,7 +1058,8 @@ mod compact_view_tests {
         );
 
         // Slicing a MapArray must slice entries & rebase offsets before gc().
-        let keys = Arc::new(StringViewArray::from(vec!["k"; 256])) as datafusion::arrow::array::ArrayRef;
+        let keys =
+            Arc::new(StringViewArray::from(vec!["k"; 256])) as datafusion::arrow::array::ArrayRef;
         let entry_fields = Fields::from(vec![
             Field::new("keys", DataType::Utf8View, false),
             Field::new("values", DataType::Utf8View, true),

@@ -147,8 +147,11 @@ impl ScalarUDFImpl for CheckedFunction {
             for (arg, cached) in args.args.iter().zip(&scalar_sizes) {
                 match (arg, cached) {
                     (_, Some(sz)) => {
-                        single_or_total = single_or_total
-                            .saturating_add(if scalar { *sz } else { sz.saturating_mul(rows) });
+                        single_or_total = single_or_total.saturating_add(if scalar {
+                            *sz
+                        } else {
+                            sz.saturating_mul(rows)
+                        });
                     }
                     (ColumnarValue::Array(array), None) => {
                         single_or_total =
@@ -173,8 +176,12 @@ impl ScalarUDFImpl for CheckedFunction {
                 if row.is_multiple_of(256) {
                     self.check()?;
                 }
-                per_batch = per_batch
-                    .saturating_add(row_bytes(self.name(), &args.args, &scalar_sizes, row)?);
+                per_batch = per_batch.saturating_add(row_bytes(
+                    self.name(),
+                    &args.args,
+                    &scalar_sizes,
+                    row,
+                )?);
             }
             if scalar {
                 let total = per_batch.saturating_mul(rows.max(1));
@@ -506,12 +513,9 @@ fn row_bytes(
     };
     // Builders may broadcast scalar inputs (including lists/structs) into a batch
     // before allocating output.
-    let input = args
-        .iter()
-        .enumerate()
-        .fold(0usize, |total, (i, _)| {
-            total.saturating_add(scalar_sizes[i].unwrap_or(0))
-        });
+    let input = args.iter().enumerate().fold(0usize, |total, (i, _)| {
+        total.saturating_add(scalar_sizes[i].unwrap_or(0))
+    });
     Ok(bytes.saturating_add(input).saturating_add(16))
 }
 

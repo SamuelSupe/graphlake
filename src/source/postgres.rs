@@ -1251,7 +1251,10 @@ fn predicate(expr: &Expr, schema: &Schema, types: &[Type]) -> Option<String> {
                     .filter(|date| (1..=9999).contains(&date.year()))?;
                 if tz.is_some() {
                     Some((
-                        format!("TIMESTAMPTZ '{}+00:00'", date.format("%Y-%m-%d %H:%M:%S%.6f")),
+                        format!(
+                            "TIMESTAMPTZ '{}+00:00'",
+                            date.format("%Y-%m-%d %H:%M:%S%.6f")
+                        ),
                         OperandFamily::Timestamptz,
                     ))
                 } else {
@@ -1608,8 +1611,16 @@ mod tests {
             )
             .is_none()
         );
-        assert!(expr_has_special_pg_type(&col("amt").gt(lit(0)), &schema, &types));
-        assert!(expr_has_special_pg_type(&col("d").is_not_null(), &schema, &types));
+        assert!(expr_has_special_pg_type(
+            &col("amt").gt(lit(0)),
+            &schema,
+            &types
+        ));
+        assert!(expr_has_special_pg_type(
+            &col("d").is_not_null(),
+            &schema,
+            &types
+        ));
 
         let plain_schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),

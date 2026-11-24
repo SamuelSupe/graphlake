@@ -90,7 +90,13 @@ fn snapshot_proof(table: &DeltaTable, version: u64, commit: &ObjectMeta) -> Stri
         hash.update(ver.as_bytes());
     }
     hash.update(b"\0");
-    hash.update(commit.last_modified.timestamp_nanos_opt().unwrap_or(0).to_le_bytes());
+    hash.update(
+        commit
+            .last_modified
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
     hash.update(commit.size.to_le_bytes());
     hash.finalize()
         .iter()
@@ -388,8 +394,14 @@ mod tests {
             .iter()
             .map(|entry| entry.requested)
             .collect();
-        assert!(retained.contains(&Some(0)), "LRU hit was evicted: {retained:?}");
-        assert!(!retained.contains(&Some(1)), "oldest unaccessed entry should be evicted: {retained:?}");
+        assert!(
+            retained.contains(&Some(0)),
+            "LRU hit was evicted: {retained:?}"
+        );
+        assert!(
+            !retained.contains(&Some(1)),
+            "oldest unaccessed entry should be evicted: {retained:?}"
+        );
         Ok(())
     }
 }

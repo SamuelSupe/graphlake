@@ -601,7 +601,9 @@ impl ImpactInput {
                 };
                 let (baseline, candidate, equivalent) = &engines[&task];
                 let previous = match baseline {
-                    Some(engine) if !equivalent => Some(run_case(engine, case, &options, start).await),
+                    Some(engine) if !equivalent => {
+                        Some(run_case(engine, case, &options, start).await)
+                    }
                     _ => None,
                 };
                 let proposed = run_case(candidate, case, &options, start).await;

@@ -479,9 +479,12 @@ impl ParquetFileReaderFactory for PinnedReaderFactory {
         _: Option<usize>,
         _: &ExecutionPlanMetricsSet,
     ) -> datafusion::common::Result<Box<dyn AsyncFileReader + Send>> {
-        let reader = self.readers.get(&file.object_meta.location).ok_or_else(|| {
-            datafusion::common::DataFusionError::Internal("missing pinned Parquet file".into())
-        })?;
+        let reader = self
+            .readers
+            .get(&file.object_meta.location)
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal("missing pinned Parquet file".into())
+            })?;
         Ok(Box::new(reader.clone()))
     }
 }

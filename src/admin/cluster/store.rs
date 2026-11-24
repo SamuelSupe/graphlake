@@ -322,7 +322,10 @@ impl Metadata {
             .await;
         if result.is_err() {
             let mut slot = self.query_lease.lock().await;
-            if slot.as_ref().is_some_and(|(_, _, current)| current == &lease) {
+            if slot
+                .as_ref()
+                .is_some_and(|(_, _, current)| current == &lease)
+            {
                 *slot = None;
             }
         }

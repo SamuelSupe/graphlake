@@ -228,17 +228,7 @@ async fn read(
             if let Some(name) = relation {
                 provider = Some(
                     snapshot
-                        .table(
-                            name,
-                            &[],
-                            &[],
-                            None,
-                            false,
-                            false,
-                            &runtime,
-                            size,
-                            true,
-                        )
+                        .table(name, &[], &[], None, false, false, &runtime, size, true)
                         .await?
                         .0,
                 );

@@ -584,7 +584,15 @@ async fn check_page_versions(
     request: &ExploreRequest,
     saved: &pages::Pages,
 ) -> ApiResult<()> {
-    check_versions(app, engine, options, request, &saved.sources, &saved.postgres).await
+    check_versions(
+        app,
+        engine,
+        options,
+        request,
+        &saved.sources,
+        &saved.postgres,
+    )
+    .await
 }
 
 async fn check_versions(

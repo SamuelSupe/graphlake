@@ -6,14 +6,14 @@
 
 ## 构建与安装
 
-Linux 安装包以 Debian 12（glibc 2.36）为兼容基线，提供 ARM64 和 x86_64 两种架构。构建时在 Debian 12 安装 Rust、C/C++ 工具链、LLD 和 Node.js 24，在仓库根目录运行 `RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.7 dist`。输出文件名包含发行标签、源归档 SHA-256 的前 12 位和架构。可设置 `GRAPHLAKE_BUILD_TARGET` 指定 `aarch64-unknown-linux-gnu` 或 `x86_64-unknown-linux-gnu`，交叉构建使用对应 Rust 目标和 Debian 12 的目标链接器及系统库。可用 `GRAPHLAKE_WEB_DIST` 复用同一份前端产物。打包会拒绝要求高于 glibc 2.36 的二进制。
+Linux 安装包以 Debian 12（glibc 2.36）为兼容基线，提供 ARM64 和 x86_64 两种架构。构建时在 Debian 12 安装 Rust、C/C++ 工具链、LLD 和 Node.js 24，在仓库根目录运行 `RUSTFLAGS="-C link-arg=-fuse-ld=lld" sh deploy/package.sh v1.1.8 dist`。输出文件名包含发行标签、源归档 SHA-256 的前 12 位和架构。可设置 `GRAPHLAKE_BUILD_TARGET` 指定 `aarch64-unknown-linux-gnu` 或 `x86_64-unknown-linux-gnu`，交叉构建使用对应 Rust 目标和 Debian 12 的目标链接器及系统库。可用 `GRAPHLAKE_WEB_DIST` 复用同一份前端产物。打包会拒绝要求高于 glibc 2.36 的二进制。
 
 包内含两个 Rust 可执行文件、构建后的网页、systemd 单元和 `BUILD-INFO`。构建信息记录基础提交、完整工作树源归档的摘要、目标、打包环境的工具链以及产物哈希。两个二进制的 `--version` 与 HTTP `/healthz` 的 `build` 字段带同一个构建标识。带未提交改动的构建也会附上对应源码归档。复用 `GRAPHLAKE_BIN_DIR` 时，打包会校验二进制的目标架构和构建标识，并在 `binary_origin` 标记为 `prebuilt`。
 
 在目标机执行以下命令。已有 `graphlake` 系统用户时跳过 `useradd`。`dist` 中的包应先通过受信任渠道传输，校验文件用于检查传输完整性。
 
 ```sh
-release=v1.1.7-SOURCE_SHA12
+release=v1.1.8-SOURCE_SHA12
 artifact=graphlake-$release-linux-$(uname -m)
 sha256sum -c "$artifact.tar.gz.sha256"
 sudo useradd --system --user-group --home-dir /var/lib/graphlake --shell /usr/sbin/nologin graphlake

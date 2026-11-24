@@ -600,9 +600,7 @@ fn value_at(
             )
             .map_err(|_| Error::invalid("result_type", "Unsupported driver result type"))?;
             let text = formatter.value(row).to_string();
-            *remaining = remaining
-                .checked_sub(text.len())
-                .ok_or_else(result_limit)?;
+            *remaining = remaining.checked_sub(text.len()).ok_or_else(result_limit)?;
             BoltValue::String(text)
         }
     })

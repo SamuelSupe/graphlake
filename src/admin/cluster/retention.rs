@@ -229,20 +229,19 @@ async fn prune_pointers(metadata: &Metadata, app: &App, pointers: &[GraphPointer
         };
         let files = app.models.lock().unwrap().read_files();
         let model = pointer.model.clone();
-        let current = match tokio::task::spawn_blocking(move || files.active_revision(&model))
-            .await?
-        {
-            Ok(revision) => revision,
-            Err(error) => {
-                crate::admin::telemetry::event(
-                    opentelemetry::logs::Severity::Warn,
-                    "retention_model_revision_unreadable",
-                    json!({"model": pointer.model, "error": error.message}),
-                );
-                drop((ha, local));
-                continue;
-            }
-        };
+        let current =
+            match tokio::task::spawn_blocking(move || files.active_revision(&model)).await? {
+                Ok(revision) => revision,
+                Err(error) => {
+                    crate::admin::telemetry::event(
+                        opentelemetry::logs::Severity::Warn,
+                        "retention_model_revision_unreadable",
+                        json!({"model": pointer.model, "error": error.message}),
+                    );
+                    drop((ha, local));
+                    continue;
+                }
+            };
         if current.as_deref() != Some(&pointer.revision) {
             let fence = ha
                 .as_ref()

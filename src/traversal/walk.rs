@@ -630,8 +630,7 @@ impl BreadthFirst {
         };
         if matches!(self.target, Target::Vertex(Some(target)) if target == self.start)
             && let Some(cycle) = &self.undirected_cycle
-            && (2 * depth + 1 > max_hops
-                || cycle.best_len.is_some_and(|best| 2 * depth + 1 > best))
+            && (2 * depth + 1 > max_hops || cycle.best_len.is_some_and(|best| 2 * depth + 1 > best))
         {
             self.queue.clear();
             self.materialize_undirected_cycles();

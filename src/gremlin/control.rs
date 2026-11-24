@@ -6,12 +6,12 @@ use super::{
     PATH, Step, Traversers, condition, parse::parse_expr, parse_chain, qualified, scalar_identity,
     text,
 };
-use opencypher::ExprKind;
 use super::{
     repeat::{OutputLimit, Repeat, Stage},
     variants::{Kind, extend_tags},
 };
 use crate::catalog::ident;
+use opencypher::ExprKind;
 
 #[derive(Clone)]
 pub(super) struct Group {

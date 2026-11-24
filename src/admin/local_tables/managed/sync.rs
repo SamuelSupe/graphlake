@@ -476,8 +476,11 @@ impl Managed {
         )
         .await?;
         ensure!(!cancel.is_cancelled(), "managed sync cancelled");
-        let next = cancellable(cancel, self.upload(id, run.id, &path, previous.as_ref(), None))
-            .await?;
+        let next = cancellable(
+            cancel,
+            self.upload(id, run.id, &path, previous.as_ref(), None),
+        )
+        .await?;
         let generation = next.as_ref().map(|h| h.generation);
         if let (Some(generation), Some(version)) =
             (generation.or(committed), WorkspaceVersion::read(&path))

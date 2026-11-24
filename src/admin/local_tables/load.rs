@@ -952,7 +952,8 @@ mod tests {
         .await?;
         assert_eq!(total, 2);
         assert!(committed.is_some());
-        let snapshot = Snapshot::read(&path)?.expect("indexed local snapshot after pure soft-delete");
+        let snapshot =
+            Snapshot::read(&path)?.expect("indexed local snapshot after pure soft-delete");
         assert_eq!(snapshot.rows(), 2);
         assert_eq!(
             key_index::checkpoint(snapshot.indexed.as_ref().unwrap())?,

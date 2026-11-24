@@ -1094,9 +1094,7 @@ impl<'a> Execution<'a> {
                     self.unavailable.lock().unwrap().insert(index);
                 }
                 continue;
-            } else if response
-                .as_ref()
-                .is_err_and(|error| error.is_connect())
+            } else if response.as_ref().is_err_and(|error| error.is_connect())
                 || response
                     .as_ref()
                     .is_ok_and(|r| r.status() == StatusCode::BAD_GATEWAY)

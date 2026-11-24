@@ -797,7 +797,8 @@ impl Hydrate {
         let mut estimated_take_bytes = keys.len().saturating_mul(std::mem::size_of::<u32>());
         for id in keys.iter().flatten() {
             if let Some(&idx) = indices.get(id) {
-                estimated_take_bytes = estimated_take_bytes.saturating_add(payload_sizes[idx as usize]);
+                estimated_take_bytes =
+                    estimated_take_bytes.saturating_add(payload_sizes[idx as usize]);
             }
         }
         // Reserve expanded output memory before materializing repeated payloads via `take`.

@@ -253,7 +253,12 @@ mod tests {
         let ids_list = Arc::new(ListArray::try_new(
             Arc::new(Field::new_list_field(DataType::Utf8, true)),
             OffsetBuffer::from_lengths([3, 1]),
-            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None, Some("x")])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                None,
+                Some("x"),
+            ])),
             None,
         )?);
         let vals_list = Arc::new(ListArray::try_new(

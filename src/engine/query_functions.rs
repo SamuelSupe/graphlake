@@ -571,7 +571,11 @@ mod tests {
         let values = Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef;
         let dict = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values)?) as ArrayRef;
 
-        let schema = Arc::new(Schema::new(vec![Field::new("n", dict.data_type().clone(), true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            dict.data_type().clone(),
+            true,
+        )]));
         let batch = RecordBatch::try_new(schema, vec![dict])?;
         ctx.register_batch("t", batch)?;
 

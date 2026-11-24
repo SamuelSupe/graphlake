@@ -524,11 +524,7 @@ mod tests {
     fn nested_is_null_predicates_are_not_pushed_down() {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, true),
-            Field::new(
-                "tags",
-                DataType::new_list(DataType::Utf8, true),
-                true,
-            ),
+            Field::new("tags", DataType::new_list(DataType::Utf8, true), true),
             Field::new(
                 "meta",
                 DataType::Struct(vec![Field::new("k", DataType::Utf8, true)].into()),

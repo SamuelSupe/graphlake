@@ -218,6 +218,7 @@ pub(in crate::admin) async fn mcp_schema(
     // Keep the published schema available when sources are offline or metadata slots are full.
     // Connector diagnostics may contain connection information and stay out of this response.
     let types = if include_types && let Ok(_permit) = app.schema_work.try_acquire() {
+        crate::admin::ops::limit_model_probe(&mut options);
         tokio::time::timeout(options.timeout, async {
             let _selection = super::super::local_tables::managed::resolve(
                 app,
@@ -227,7 +228,9 @@ pub(in crate::admin) async fn mcp_schema(
             )
             .await
             .ok()?;
-            Box::pin(engine.inspect_model(options, false)).await.ok()
+            Box::pin(engine.inspect_model_with_admission(options, false, &app.probe_admission))
+                .await
+                .ok()
         })
         .await
         .ok()

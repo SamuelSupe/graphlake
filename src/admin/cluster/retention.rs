@@ -191,18 +191,29 @@ async fn prune_pointers(metadata: &Metadata, app: &App, pointers: &[GraphPointer
         .map(|p| p.model.clone())
         .collect::<HashSet<_>>();
     let active = tokio::task::spawn_blocking(move || {
-        ids.into_iter()
-            .map(|id| {
-                let revision = files
-                    .active_revision(&id)
-                    .map_err(|error| anyhow::anyhow!(error.message))?;
-                Ok::<_, anyhow::Error>((id, revision))
-            })
-            .collect::<Result<HashMap<_, _>>>()
+        let mut map = HashMap::new();
+        for id in ids {
+            match files.active_revision(&id) {
+                Ok(revision) => {
+                    map.insert(id, revision);
+                }
+                Err(error) => {
+                    crate::admin::telemetry::event(
+                        opentelemetry::logs::Severity::Warn,
+                        "retention_model_revision_unreadable",
+                        json!({"model": id, "error": error.message}),
+                    );
+                }
+            }
+        }
+        map
     })
-    .await??;
+    .await?;
     for pointer in pointers {
-        if active[&pointer.model].as_deref() == Some(&pointer.revision) {
+        let Some(active_rev) = active.get(&pointer.model) else {
+            continue;
+        };
+        if active_rev.as_deref() == Some(&pointer.revision) {
             continue;
         }
         let (ha, local) = if let Some(ha) = &app.ha {
@@ -218,9 +229,20 @@ async fn prune_pointers(metadata: &Metadata, app: &App, pointers: &[GraphPointer
         };
         let files = app.models.lock().unwrap().read_files();
         let model = pointer.model.clone();
-        let current = tokio::task::spawn_blocking(move || files.active_revision(&model))
+        let current = match tokio::task::spawn_blocking(move || files.active_revision(&model))
             .await?
-            .map_err(|error| anyhow::anyhow!(error.message))?;
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                crate::admin::telemetry::event(
+                    opentelemetry::logs::Severity::Warn,
+                    "retention_model_revision_unreadable",
+                    json!({"model": pointer.model, "error": error.message}),
+                );
+                drop((ha, local));
+                continue;
+            }
+        };
         if current.as_deref() != Some(&pointer.revision) {
             let fence = ha
                 .as_ref()

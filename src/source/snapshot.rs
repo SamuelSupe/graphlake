@@ -130,7 +130,7 @@ impl Buffer {
     }
 
     pub(crate) fn push_chunks(&mut self, batch: RecordBatch, batch_size: usize) -> Result<()> {
-        let bytes = batch.get_array_memory_size();
+        let bytes = ipc_batch_bytes(&batch);
         // Leave room for the next connector page and downstream operators.
         // A source engine reservation already has its own share of the pool.
         if self.file.is_none()
@@ -157,7 +157,6 @@ impl Buffer {
             })?);
             self.budget.free();
         }
-        self.budget.try_grow(bytes)?;
         let chunks = (0..batch.num_rows())
             .step_by(batch_size)
             .map(|offset| batch.slice(offset, batch_size.min(batch.num_rows() - offset)));
@@ -168,8 +167,8 @@ impl Buffer {
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
-            self.budget.shrink(bytes);
         } else {
+            self.budget.try_grow(bytes)?;
             self.memory.extend(chunks);
         }
         Ok(())
@@ -309,4 +308,47 @@ pub(crate) fn ipc_batch_bytes(batch: &RecordBatch) -> usize {
         .iter()
         .map(|column| allocated(&column.to_data(), &mut seen))
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::{
+        arrow::{
+            array::StringArray,
+            datatypes::{DataType, Field, Schema},
+        },
+        execution::memory_pool::{GreedyMemoryPool, MemoryPool},
+    };
+    use std::io::Cursor;
+
+    #[test]
+    fn ipc_batch_bytes_deduplicates_shared_buffer_in_push_chunks() -> Result<()> {
+        let fields = (0..24)
+            .map(|i| Field::new(format!("c{i}"), DataType::Utf8, false))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        let col = Arc::new(StringArray::from(vec!["x".repeat(256); 64]));
+        let original = RecordBatch::try_new(Arc::clone(&schema), vec![col; 24])?;
+        let mut wire = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut wire, &schema)?;
+            writer.write(&original)?;
+            writer.finish()?;
+        }
+        let mut reader = StreamReader::try_new(Cursor::new(wire), None)?;
+        let decoded = reader.next().unwrap()?;
+        let deduped = ipc_batch_bytes(&decoded);
+        let naive = decoded.get_array_memory_size();
+        assert!(
+            deduped * 4 < naive,
+            "expected shared IPC buffer dedup: deduped={deduped}, naive={naive}"
+        );
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(deduped * 2));
+        let mut buffer = Buffer::new(&pool, None);
+        buffer.push_chunks(decoded, 16)?;
+        assert_eq!(buffer.memory().len(), 4);
+        Ok(())
+    }
 }

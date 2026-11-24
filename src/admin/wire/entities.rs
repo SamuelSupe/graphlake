@@ -264,7 +264,12 @@ fn property_values<'a>(
         .chain(names)
         .filter_map(|name| Some((name, get(name)?)))
         .filter(|(_, array)| array.is_valid(row))
-        .map(|(name, array)| Ok((name.clone(), value_at(array, row, 0, false, budget)?)))
+        .map(|(name, array)| {
+            *budget = budget
+                .checked_sub(name.len().saturating_add(std::mem::size_of::<String>()))
+                .ok_or_else(result_limit)?;
+            Ok((name.clone(), value_at(array, row, 0, false, budget)?))
+        })
         .collect()
 }
 
@@ -556,22 +561,19 @@ fn cached(values: &Hydrated, id: &Identity, budget: &mut usize) -> ApiResult<Opt
     Ok(Some(value.clone()))
 }
 
-pub(super) async fn prefetch_paths(
+fn collect_path_ids(
     catalog: &Catalog,
-    result: &mut QueryResult,
-    batch: &RecordBatch,
-    rows: std::ops::Range<usize>,
-) -> ApiResult<Hydrated> {
-    let mut ids = BTreeSet::new();
-    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        let Some(GraphColumn::Path { labels }) = result.graph_output.columns.get(field.name())
-        else {
-            continue;
-        };
-        for row in rows.clone() {
-            if column.is_null(row) {
-                continue;
-            }
+    column: &ArrayRef,
+    shape: &GraphColumn,
+    row: usize,
+    depth: usize,
+    ids: &mut BTreeSet<Identity>,
+) -> ApiResult<bool> {
+    if depth >= 32 || column.is_null(row) {
+        return Ok(true);
+    }
+    match shape {
+        GraphColumn::Path { labels } => {
             if let Some(labels) = labels {
                 let record = column
                     .as_any()
@@ -607,7 +609,53 @@ pub(super) async fn prefetch_paths(
                     }
                 }
             }
-            if ids.len() > 512 {
+            Ok(ids.len() <= 512)
+        }
+        GraphColumn::List(item) => {
+            let items = match ScalarValue::try_from_array(column, row).map_err(|_| invalid())? {
+                ScalarValue::List(items) => items.value(0),
+                ScalarValue::LargeList(items) => items.value(0),
+                ScalarValue::FixedSizeList(items) => items.value(0),
+                _ => return Err(invalid()),
+            };
+            for i in 0..items.len() {
+                if !collect_path_ids(catalog, &items, item, i, depth + 1, ids)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        GraphColumn::Record(shapes) => {
+            let record = column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(invalid)?;
+            for (field, child) in record.fields().iter().zip(record.columns()) {
+                if let Some(child_shape) = shapes.get(field.name())
+                    && !collect_path_ids(catalog, child, child_shape, row, depth + 1, ids)?
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(true),
+    }
+}
+
+pub(super) async fn prefetch_paths(
+    catalog: &Catalog,
+    result: &mut QueryResult,
+    batch: &RecordBatch,
+    rows: std::ops::Range<usize>,
+) -> ApiResult<Hydrated> {
+    let mut ids = BTreeSet::new();
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let Some(shape) = result.graph_output.columns.get(field.name()) else {
+            continue;
+        };
+        for row in rows.clone() {
+            if !collect_path_ids(catalog, column, shape, row, 0, &mut ids)? {
                 return Ok(BTreeMap::new());
             }
         }

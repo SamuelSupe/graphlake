@@ -26,6 +26,7 @@ pub(in crate::admin) struct ResultSnapshot {
     owner: Principal,
     arrow: Option<Arc<Captured>>,
     length: u64,
+    budget_bytes: u64,
     created: std::time::Instant,
     graph: Option<(Vec<Arc<graph::Fragment>>, bool)>,
 }
@@ -120,6 +121,12 @@ pub(super) fn save_snapshot(
     graph: Option<(Vec<graph::Fragment>, bool)>,
 ) {
     let length = arrow.as_ref().map_or(0, Captured::len);
+    let graph_bytes = graph.as_ref().map_or(0, |(pages, _)| {
+        pages
+            .iter()
+            .fold(0u64, |sum, page| sum.saturating_add(page.estimated_bytes()))
+    });
+    let budget_bytes = length.saturating_add(graph_bytes);
     let snapshot = ResultSnapshot {
         id,
         model,
@@ -127,6 +134,7 @@ pub(super) fn save_snapshot(
         owner,
         arrow: arrow.map(Arc::new),
         length,
+        budget_bytes,
         created: std::time::Instant::now(),
         graph: graph
             .map(|(pages, incomplete)| (pages.into_iter().map(Arc::new).collect(), incomplete)),
@@ -149,7 +157,11 @@ pub(super) fn save_snapshot(
         }
     }
     while results.len() >= SNAPSHOTS_TOTAL
-        || snapshot.length + results.iter().map(|saved| saved.length).sum::<u64>() > SNAPSHOT_BUDGET
+        || (!results.is_empty()
+            && snapshot
+                .budget_bytes
+                .saturating_add(results.iter().map(|saved| saved.budget_bytes).sum::<u64>())
+                > SNAPSHOT_BUDGET)
     {
         let index = first_owned(&results).unwrap_or(0);
         removed.extend(results.remove(index).and_then(|saved| saved.arrow));
@@ -332,9 +344,20 @@ pub(in crate::admin) async fn export(
     let file = file.into_file();
     drop(active);
     let ticket = Uuid::new_v4();
-    {
+    let mut removed = Vec::new();
+    let busy = {
         let mut downloads = app.downloads.lock().unwrap();
-        downloads.retain(|download| download.created.elapsed() < TICKET_TTL);
+        let mut index = 0;
+        while index < downloads.len() {
+            if downloads[index].created.elapsed() >= TICKET_TTL {
+                if let Some(expired) = downloads.remove(index) {
+                    removed.push(expired);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let mut busy = false;
         while downloads.len() >= 4
             || length
                 + downloads
@@ -347,20 +370,32 @@ pub(in crate::admin) async fn export(
                 .iter()
                 .position(|download| download.owner == principal)
             else {
-                return Err(Error::busy());
+                busy = true;
+                break;
             };
-            downloads.remove(index);
+            if let Some(evicted) = downloads.remove(index) {
+                removed.push(evicted);
+            }
         }
-        downloads.push_back(Download {
-            ticket,
-            owner: principal,
-            model: id.clone(),
-            file,
-            length,
-            filename: format!("{id}.arrow"),
-            model_revision: request.model_revision,
-            created: std::time::Instant::now(),
-        });
+        if !busy {
+            downloads.push_back(Download {
+                ticket,
+                owner: principal,
+                model: id.clone(),
+                file,
+                length,
+                filename: format!("{id}.arrow"),
+                model_revision: request.model_revision,
+                created: std::time::Instant::now(),
+            });
+        }
+        busy
+    };
+    if !removed.is_empty() {
+        crate::blocking(|| drop(removed));
+    }
+    if busy {
+        return Err(Error::busy());
     }
     Ok(Json(serde_json::json!({ "ticket": ticket.to_string() })).into_response())
 }

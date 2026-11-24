@@ -27,7 +27,10 @@ use datafusion::{
         row::{RowConverter, SortField},
     },
     common::{Result, ScalarValue, exec_err},
-    execution::{memory_pool::MemoryConsumer, runtime_env::RuntimeEnv},
+    execution::{
+        memory_pool::{MemoryConsumer, MemoryReservation},
+        runtime_env::RuntimeEnv,
+    },
     logical_expr::{
         BinaryExpr, ColumnarValue, Expr, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
         Signature, Volatility, expr_fn,
@@ -79,6 +82,36 @@ impl Hash for ScopeGuard {
     }
 }
 
+pub(super) fn reserve_scalar_broadcast(
+    args: &[ColumnarValue],
+    number_rows: usize,
+    label: &str,
+    guard: Option<&ScopeGuard>,
+) -> Result<Option<MemoryReservation>> {
+    let Some(guard) = guard else {
+        return Ok(None);
+    };
+    guard.check()?;
+    if number_rows <= 1 {
+        return Ok(None);
+    }
+    let mut bytes = 0usize;
+    for arg in args {
+        if let ColumnarValue::Scalar(scalar) = arg {
+            let one = crate::engine::query::allocation::slice_bytes(
+                scalar.to_array_of_size(1)?.as_ref(),
+            )?;
+            bytes = bytes.saturating_add(one.saturating_mul(number_rows));
+        }
+    }
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let reservation = MemoryConsumer::new(label).register(&guard.runtime.memory_pool);
+    reservation.try_grow(bytes)?;
+    Ok(Some(reservation))
+}
+
 pub(super) fn register_inner(
     context: &SessionContext,
     scope: Option<&crate::engine::query::QueryScope>,
@@ -94,17 +127,22 @@ pub(super) fn register_inner(
             Signature::any(2, Volatility::Immutable),
         ),
     ] {
-        context.register_udf(ScalarUDF::from(Property { name, signature }));
+        context.register_udf(ScalarUDF::from(Property {
+            name,
+            signature,
+            guard: guard.clone(),
+        }));
     }
-    context.register_udf(ScalarUDF::from(CypherList(Signature::variadic_any(
-        Volatility::Immutable,
-    ))));
+    context.register_udf(ScalarUDF::from(CypherList {
+        signature: Signature::variadic_any(Volatility::Immutable),
+        guard: guard.clone(),
+    }));
     context.register_udf(ScalarUDF::from(Size(Signature::any(
         1,
         Volatility::Immutable,
     ))));
     entity::register(context);
-    hydrate::register(context);
+    hydrate::register(context, guard.clone());
     arithmetic::register(context, guard.clone());
     map::register(context);
     numeric_distinct::register(context, guard.clone());
@@ -119,6 +157,7 @@ pub(super) fn register_inner(
         context.register_udf(ScalarUDF::from(ValueKey {
             mode,
             signature: Signature::any(1, Volatility::Immutable),
+            guard: guard.clone(),
         }));
     }
     for (name, arity) in [
@@ -140,6 +179,7 @@ const VARIANT: &str = "graphlake.cypher.variant";
 struct Property {
     name: &'static str,
     signature: Signature,
+    guard: Option<ScopeGuard>,
 }
 
 fn normalized(ty: &DataType) -> DataType {
@@ -255,6 +295,9 @@ impl ScalarUDFImpl for Property {
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
         if self.name == "__graphlake_cypher_case" {
+            if !matches!(&args[0], DataType::Struct(_) | DataType::Null) {
+                return datafusion::common::plan_err!("CASE value must be a record");
+            }
             let DataType::Struct(fields) = &args[1] else {
                 return exec_err!("CASE branches must be a record");
             };
@@ -266,19 +309,72 @@ impl ScalarUDFImpl for Property {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let mut arrays = args
+        let _broadcast = reserve_scalar_broadcast(
+            if self.name == "__graphlake_cypher_case" {
+                &args.args[..1]
+            } else {
+                &args.args
+            },
+            args.number_rows,
+            self.name,
+            self.guard.as_ref(),
+        )?;
+        if self.name == "__graphlake_cypher_case" {
+            if args.args[0].data_type().is_null() {
+                return Ok(ColumnarValue::Array(new_null_array(
+                    args.return_field.data_type(),
+                    args.number_rows,
+                )));
+            }
+            let input = args.args[0].to_array(args.number_rows)?;
+            let Some(record) = input.as_any().downcast_ref::<StructArray>() else {
+                return exec_err!("CASE value must be a record");
+            };
+            let _output_mem = if let Some(guard) = &self.guard {
+                guard.check()?;
+                let bytes = crate::engine::query::allocation::slice_bytes(input.as_ref())?;
+                if bytes > 0 {
+                    let reservation = MemoryConsumer::new("__graphlake_cypher_case output")
+                        .register(&guard.runtime.memory_pool);
+                    reservation.try_grow(bytes)?;
+                    Some(reservation)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let arrays = record.flatten().1;
+            return Ok(ColumnarValue::Array(merge_values(
+                arrays,
+                args.return_field.data_type(),
+                args.number_rows,
+            )?));
+        }
+        let arrays = args
             .args
             .iter()
             .map(|arg| arg.to_array(args.number_rows))
             .collect::<Result<Vec<_>>>()?;
-        if self.name == "__graphlake_cypher_case" {
-            arrays = arrays[0]
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .expect("typed CASE record")
-                .flatten()
-                .1;
-        }
+        let _output_mem = if let Some(guard) = &self.guard {
+            guard.check()?;
+            let mut bytes = 0usize;
+            for array in &arrays {
+                bytes = bytes.saturating_add(crate::engine::query::allocation::slice_bytes(
+                    array.as_ref(),
+                )?);
+            }
+            if bytes > 0 {
+                let reservation = MemoryConsumer::new("__graphlake_cypher_property output")
+                    .register(&guard.runtime.memory_pool);
+                reservation.try_grow(bytes)?;
+                Some(reservation)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(ColumnarValue::Array(merge_values(
             arrays,
             args.return_field.data_type(),
@@ -337,14 +433,17 @@ pub(super) fn merge_lanes(arrays: &[ArrayRef], ty: &DataType, rows: usize) -> Re
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct CypherList(Signature);
+struct CypherList {
+    signature: Signature,
+    guard: Option<ScopeGuard>,
+}
 
 impl ScalarUDFImpl for CypherList {
     fn name(&self) -> &str {
         "__graphlake_cypher_list"
     }
     fn signature(&self) -> &Signature {
-        &self.0
+        &self.signature
     }
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
@@ -352,11 +451,36 @@ impl ScalarUDFImpl for CypherList {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let _broadcast = reserve_scalar_broadcast(
+            &args.args,
+            args.number_rows,
+            "__graphlake_cypher_list broadcast",
+            self.guard.as_ref(),
+        )?;
         let arrays = args
             .args
             .iter()
             .map(|arg| arg.to_array(args.number_rows))
             .collect::<Result<Vec<_>>>()?;
+        let _output_mem = if let Some(guard) = &self.guard {
+            guard.check()?;
+            let mut bytes = 0usize;
+            for array in &arrays {
+                bytes = bytes.saturating_add(crate::engine::query::allocation::slice_bytes(
+                    array.as_ref(),
+                )?);
+            }
+            if bytes > 0 {
+                let reservation = MemoryConsumer::new("__graphlake_cypher_list output")
+                    .register(&guard.runtime.memory_pool);
+                reservation.try_grow(bytes)?;
+                Some(reservation)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let types = arrays
             .iter()
             .map(|array| array.data_type().clone())
@@ -376,7 +500,7 @@ impl ScalarUDFImpl for CypherList {
             .into_iter()
             .map(|array| merge_values(vec![array], item.data_type(), rows))
             .collect::<Result<Vec<_>>>()?;
-        let values = interleave_list(&arrays, item.data_type(), rows)?;
+        let values = interleave_list(&arrays, item.data_type(), rows, self.guard.as_ref())?;
         let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(width, rows));
         Ok(ColumnarValue::Array(Arc::new(ListArray::try_new(
             item, offsets, values, None,
@@ -384,7 +508,12 @@ impl ScalarUDFImpl for CypherList {
     }
 }
 
-fn interleave_list(arrays: &[ArrayRef], ty: &DataType, rows: usize) -> Result<ArrayRef> {
+fn interleave_list(
+    arrays: &[ArrayRef],
+    ty: &DataType,
+    rows: usize,
+    guard: Option<&ScopeGuard>,
+) -> Result<ArrayRef> {
     if arrays.is_empty() {
         return Ok(new_null_array(ty, 0));
     }
@@ -394,6 +523,11 @@ fn interleave_list(arrays: &[ArrayRef], ty: &DataType, rows: usize) -> Result<Ar
         .collect::<Vec<_>>();
     let mut values = MutableArrayData::new(data.iter().collect(), true, rows * arrays.len());
     for row in 0..rows {
+        if row.is_multiple_of(256)
+            && let Some(guard) = guard
+        {
+            guard.check()?;
+        }
         for lane in 0..arrays.len() {
             values.try_extend(lane, row, row + 1)?;
         }
@@ -459,6 +593,51 @@ mod memory_tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn cypher_udf_edge_cases_and_dictionary_text_do_not_panic() -> anyhow::Result<()> {
+        let scope = scope(4 * 1024 * 1024).await?;
+        let context = scope.session();
+        register_inner(&context, Some(&scope));
+
+        let case_null = context
+            .sql("SELECT __graphlake_cypher_case(NULL, named_struct('a', 1)) AS v")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(case_null.len(), 1);
+        assert!(case_null[0].column(0).is_null(0));
+
+        let bad_cmp = async {
+            context
+                .sql("SELECT __graphlake_cypher_compare(1, 2, 'bad') AS v")
+                .await?
+                .collect()
+                .await
+        }
+        .await;
+        assert!(bad_cmp.is_err(), "invalid compare operator must return Err");
+
+        let dict_ops = context
+            .sql(
+                "SELECT \
+                 __graphlake_cypher_add(arrow_cast('hi', 'Dictionary(Int32, Utf8)'), '_x') AS joined, \
+                 __graphlake_cypher_size(arrow_cast('hello', 'Dictionary(Int32, Utf8)')) AS len",
+            )
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(dict_ops.len(), 1);
+        assert_eq!(
+            ScalarValue::try_from_array(dict_ops[0].column(0), 0)?,
+            ScalarValue::Utf8View(Some("hi_x".into()))
+        );
+        assert_eq!(
+            ScalarValue::try_from_array(dict_ops[0].column(1), 0)?,
+            ScalarValue::UInt64(Some(5))
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -495,7 +674,7 @@ impl ScalarUDFImpl for Predicate {
         if let Some(operator) = operator {
             let left = info.get_data_type(&args[0])?;
             let right = info.get_data_type(&args[1])?;
-            if (text_type(&left) && text_type(&right))
+            if (plain_text_type(&left) && plain_text_type(&right))
                 || (left == DataType::Boolean && right == DataType::Boolean)
             {
                 return Ok(ExprSimplifyResult::Simplified(Expr::BinaryExpr(
@@ -540,17 +719,39 @@ impl ScalarUDFImpl for Predicate {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let _left_broadcast = reserve_scalar_broadcast(
+            &args.args[..1],
+            args.number_rows,
+            self.name,
+            self.guard.as_ref(),
+        )?;
         let input = args.args[0].to_array(args.number_rows)?;
         if self.name == "__graphlake_cypher_in"
             && let ColumnarValue::Scalar(ref right_scalar) = args.args[1]
         {
             return self.invoke_scalar_in(&input, right_scalar, args.number_rows);
         }
+        let _right_broadcast = reserve_scalar_broadcast(
+            &args.args[1..2],
+            args.number_rows,
+            self.name,
+            self.guard.as_ref(),
+        )?;
         let right = args.args[1].to_array(args.number_rows)?;
-        let op = if self.name == "__graphlake_cypher_compare" {
-            args.args[2].to_array(args.number_rows)?
+        let scalar_op = if self.name == "__graphlake_cypher_compare"
+            && let ColumnarValue::Scalar(scalar) = &args.args[2]
+        {
+            let ScalarValue::Utf8(Some(op)) = scalar.cast_to(&DataType::Utf8)? else {
+                return exec_err!("missing comparison operator");
+            };
+            Some(op)
         } else {
-            new_null_array(&DataType::Null, args.number_rows)
+            None
+        };
+        let op = if self.name == "__graphlake_cypher_compare" && scalar_op.is_none() {
+            Some(args.args[2].to_array(args.number_rows)?)
+        } else {
+            None
         };
         let mut output = BooleanBuilder::with_capacity(args.number_rows);
         for row in 0..args.number_rows {
@@ -565,11 +766,20 @@ impl ScalarUDFImpl for Predicate {
                 "__graphlake_cypher_in" => membership(&left, &right, self.guard.as_ref())?,
                 "__graphlake_cypher_equals" => equal(&left, &right)?,
                 _ => {
-                    let op = ScalarValue::try_from_array(&op, row)?.cast_to(&DataType::Utf8)?;
-                    let ScalarValue::Utf8(Some(op)) = op else {
-                        return exec_err!("missing comparison operator");
+                    let row_op;
+                    let op = if let Some(op) = scalar_op.as_deref() {
+                        op
+                    } else {
+                        let op_array = op.as_ref().expect("comparison operator column");
+                        let value =
+                            ScalarValue::try_from_array(op_array, row)?.cast_to(&DataType::Utf8)?;
+                        let ScalarValue::Utf8(Some(text)) = value else {
+                            return exec_err!("missing comparison operator");
+                        };
+                        row_op = text;
+                        row_op.as_str()
                     };
-                    match op.as_str() {
+                    match op {
                         "=" => equal(&left, &right)?,
                         "<>" => equal(&left, &right)?.map(|same| !same),
                         _ if left.is_null() || right.is_null() => None,
@@ -578,13 +788,15 @@ impl ScalarUDFImpl for Predicate {
                         {
                             Some(false)
                         }
-                        _ => ordering(&left, &right)?.map(|order| match op.as_str() {
-                            "<" => order.is_lt(),
-                            "<=" => !order.is_gt(),
-                            ">" => order.is_gt(),
-                            ">=" => !order.is_lt(),
-                            _ => unreachable!("generated comparison operator"),
-                        }),
+                        _ => ordering(&left, &right)?
+                            .map(|order| match op {
+                                "<" => Ok(order.is_lt()),
+                                "<=" => Ok(!order.is_gt()),
+                                ">" => Ok(order.is_gt()),
+                                ">=" => Ok(!order.is_lt()),
+                                other => exec_err!("unsupported comparison operator {other}"),
+                            })
+                            .transpose()?,
                     }
                 }
             };
@@ -749,11 +961,18 @@ fn membership(
     Ok(found)
 }
 
-pub(super) fn text_type(value: &DataType) -> bool {
+fn plain_text_type(value: &DataType) -> bool {
     matches!(
         value,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     )
+}
+
+pub(super) fn text_type(value: &DataType) -> bool {
+    match value {
+        DataType::Dictionary(_, inner) => text_type(inner),
+        other => plain_text_type(other),
+    }
 }
 
 fn integer_literal_as(expr: &Expr, ty: &DataType) -> Result<Option<Expr>> {
@@ -929,6 +1148,7 @@ enum KeyMode {
 struct ValueKey {
     mode: KeyMode,
     signature: Signature,
+    guard: Option<ScopeGuard>,
 }
 
 impl ValueKey {
@@ -966,19 +1186,41 @@ impl ScalarUDFImpl for ValueKey {
     }
 
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let _broadcast = reserve_scalar_broadcast(
+            &args.args[..1],
+            args.number_rows,
+            self.name(),
+            self.guard.as_ref(),
+        )?;
         let input = args.args.remove(0);
         if !self.encodes(&input.data_type()) {
             return Ok(input);
         }
         let input = input.to_array(args.number_rows)?;
+        let reservation = self
+            .guard
+            .as_ref()
+            .map(|guard| MemoryConsumer::new(self.name()).register(&guard.runtime.memory_pool));
         if self.mode == KeyMode::Capture {
             // A reusable CALL input must preserve values that compare equal
             // but behave differently in expressions, such as 1 and 1.0.
             let converter = RowConverter::new(vec![SortField::new(input.data_type().clone())])?;
             let rows = converter.convert_columns(&[input])?;
+            if let Some(reservation) = &reservation {
+                reservation.try_grow(rows.size())?;
+            }
             let mut keys = BinaryBuilder::new();
-            for row in rows.iter() {
-                keys.append_value(row.as_ref());
+            for (index, row) in rows.iter().enumerate() {
+                if index.is_multiple_of(256)
+                    && let Some(guard) = &self.guard
+                {
+                    guard.check()?;
+                }
+                let bytes = row.as_ref();
+                if let Some(reservation) = &reservation {
+                    reservation.try_grow(bytes.len().saturating_add(4))?;
+                }
+                keys.append_value(bytes);
             }
             return Ok(ColumnarValue::Array(Arc::new(keys.finish())));
         }
@@ -995,6 +1237,9 @@ impl ScalarUDFImpl for ValueKey {
             let ty_name = ty.to_string();
             let converter = RowConverter::new(vec![SortField::new(ty.clone())])?;
             let rows = converter.convert_columns(&[Arc::clone(&input)])?;
+            if let Some(reservation) = &reservation {
+                reservation.try_grow(rows.size())?;
+            }
             let mut keys = BinaryBuilder::with_capacity(input.len(), input.len() * 16);
             let mut key = Vec::new();
             let order_mode = matches!(self.mode, KeyMode::Order | KeyMode::GremlinOrder);
@@ -1008,6 +1253,11 @@ impl ScalarUDFImpl for ValueKey {
                 9
             };
             for index in 0..input.len() {
+                if index.is_multiple_of(256)
+                    && let Some(guard) = &self.guard
+                {
+                    guard.check()?;
+                }
                 if input.is_null(index) {
                     if order_mode {
                         keys.append_null();
@@ -1026,6 +1276,9 @@ impl ScalarUDFImpl for ValueKey {
                     encode_bytes(ty_name.as_bytes(), &mut key);
                     encode_bytes(rows.row(index).as_ref(), &mut key);
                 }
+                if let Some(reservation) = &reservation {
+                    reservation.try_grow(key.len().saturating_add(4))?;
+                }
                 keys.append_value(&key);
             }
             return Ok(ColumnarValue::Array(Arc::new(keys.finish())));
@@ -1033,6 +1286,11 @@ impl ScalarUDFImpl for ValueKey {
         let mut keys = BinaryBuilder::new();
         let mut key = Vec::new();
         for index in 0..input.len() {
+            if index.is_multiple_of(256)
+                && let Some(guard) = &self.guard
+            {
+                guard.check()?;
+            }
             key.clear();
             let value = ScalarValue::try_from_array(&input, index)?;
             if matches!(self.mode, KeyMode::Order | KeyMode::GremlinOrder) {
@@ -1044,6 +1302,9 @@ impl ScalarUDFImpl for ValueKey {
                 encode_order(value, &mut key, self.mode == KeyMode::GremlinOrder)?;
             } else {
                 encode_equivalence(value, &mut key)?;
+            }
+            if let Some(reservation) = &reservation {
+                reservation.try_grow(key.len().saturating_add(4))?;
             }
             keys.append_value(&key);
         }
@@ -1330,16 +1591,15 @@ impl ScalarUDFImpl for Size {
     }
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
-        if matches!(
-            args[0],
-            DataType::Null
-                | DataType::Utf8
-                | DataType::LargeUtf8
-                | DataType::Utf8View
-                | DataType::List(_)
-                | DataType::LargeList(_)
-                | DataType::FixedSizeList(_, _)
-        ) {
+        if text_type(&args[0])
+            || matches!(
+                args[0],
+                DataType::Null
+                    | DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::FixedSizeList(_, _)
+            )
+        {
             Ok(DataType::UInt64)
         } else {
             datafusion::common::plan_err!("size() requires a string or list")
@@ -1347,13 +1607,22 @@ impl ScalarUDFImpl for Size {
     }
 
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let kind = args.args[0].data_type();
-        let function = match kind {
-            DataType::Null => return args.args[0].cast_to(&DataType::UInt64, None),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                datafusion::functions::unicode::character_length()
+        let mut kind = args.args[0].data_type();
+        let function = if kind.is_null() {
+            return args.args[0].cast_to(&DataType::UInt64, None);
+        } else if text_type(&kind) {
+            if matches!(kind, DataType::Dictionary(..)) {
+                args.args[0] = args.args[0].cast_to(&DataType::Utf8View, None)?;
+                args.arg_fields = vec![Arc::new(Field::new(
+                    args.arg_fields[0].name(),
+                    DataType::Utf8View,
+                    args.arg_fields[0].is_nullable(),
+                ))];
+                kind = DataType::Utf8View;
             }
-            _ => datafusion::functions_nested::length::array_length_udf(),
+            datafusion::functions::unicode::character_length()
+        } else {
+            datafusion::functions_nested::length::array_length_udf()
         };
         args.return_field = Arc::new(Field::new("length", function.return_type(&[kind])?, true));
         function

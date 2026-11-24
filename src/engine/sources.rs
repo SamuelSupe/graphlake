@@ -321,9 +321,14 @@ pub(super) async fn prepare<'a, 'q>(
                         let snapshot = match pinned {
                             Some(snapshot) => snapshot,
                             None => Arc::new(
-                                Snapshot::open(dsn_env, scope.options.timeout, scope.reads.clone())
-                                    .await
-                                    .with_context(|| format!("opening PostgreSQL source {name}"))?,
+                                Snapshot::open_with_cancellation(
+                                    dsn_env,
+                                    scope.options.timeout,
+                                    scope.reads.clone(),
+                                    scope.options.cancellation.clone(),
+                                )
+                                .await
+                                .with_context(|| format!("opening PostgreSQL source {name}"))?,
                             ),
                         };
                         versions.insert(

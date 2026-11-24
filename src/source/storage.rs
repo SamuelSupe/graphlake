@@ -230,7 +230,7 @@ pub(crate) fn open(config: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
 fn credential_digest(path: &std::path::Path) -> Result<Option<[u8; 32]>> {
     // GCS loads a credential file once when building a client. Rotating at the
     // same path must change the key even if the old client has a live token.
-    match std::fs::read(path) {
+    match crate::blocking(|| std::fs::read(path)) {
         Ok(contents) => Ok(Some(Sha256::digest(&contents).into())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),

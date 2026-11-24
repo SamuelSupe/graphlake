@@ -83,6 +83,41 @@ pub(in crate::admin) struct Fragment {
 }
 
 impl Fragment {
+    pub fn estimated_bytes(&self) -> u64 {
+        let mut bytes = std::mem::size_of::<Self>() as u64;
+        for element in &self.elements {
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<Element>() as u64)
+                .saturating_add(element.id.len() as u64)
+                .saturating_add(element.identity.label.len() as u64)
+                .saturating_add(
+                    element
+                        .identity
+                        .key
+                        .iter()
+                        .map(|k| k.len() as u64 + std::mem::size_of::<String>() as u64)
+                        .sum::<u64>(),
+                )
+                .saturating_add(element.from.as_ref().map_or(0, |s| s.len() as u64))
+                .saturating_add(element.to.as_ref().map_or(0, |s| s.len() as u64));
+            if let Some(properties) = &element.properties {
+                for (k, v) in properties {
+                    bytes = bytes
+                        .saturating_add(k.len() as u64)
+                        .saturating_add(v.as_ref().map_or(0, |s| s.len() as u64))
+                        .saturating_add(64);
+                }
+            }
+        }
+        for [from, to] in &self.steps {
+            bytes = bytes
+                .saturating_add(from.len() as u64)
+                .saturating_add(to.len() as u64)
+                .saturating_add(std::mem::size_of::<[String; 2]>() as u64);
+        }
+        bytes
+    }
+
     pub fn prune_missing_endpoints(&mut self) {
         if !self.truncated {
             return;

@@ -182,6 +182,12 @@ pub(super) fn compact(
 ) -> Result<u64> {
     let scratch = scratch_file()?;
     let mut index = rusqlite::Connection::open(scratch.path())?;
+    let cancelled = scope.options.cancellation.clone();
+    let deadline = scope.deadline;
+    index.progress_handler(
+        1024,
+        Some(move || cancelled.is_cancelled() || tokio::time::Instant::now() >= deadline),
+    )?;
     let cache_kib = (scope.options.memory_bytes / 8192).clamp(32, 8192);
     let batch_size = scope.options.batch_size.min(128);
     index.pragma_update(None, "cache_size", -(cache_kib as i64))?;

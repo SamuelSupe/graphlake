@@ -474,9 +474,14 @@ impl Backend {
 #[async_trait::async_trait]
 impl RecordStream for Rows {
     async fn buffer_for_next_run(&mut self) -> Result<Option<Box<dyn RecordStream>>, BoltError> {
-        let limit = self.app.options.spill_bytes.min(64 * 1024 * 1024);
-        if limit == 0 || self.finished {
+        if self.finished {
             return Ok(None);
+        }
+        let limit = self.app.options.spill_bytes.min(64 * 1024 * 1024);
+        if limit == 0 {
+            return Err(BoltError::Transaction(
+                "Cannot open another statement in this transaction while a prior stream is active and spill_bytes is 0; pull or discard the previous result first".into(),
+            ));
         }
         // Only a second RUN needs to free the first stream's query slot.
         // The normal RUN/PULL sequence can stream directly from the engine.

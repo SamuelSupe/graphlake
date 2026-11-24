@@ -63,6 +63,7 @@ struct App {
     local_tables: local_tables::LocalTables,
     work: Arc<Semaphore>,
     admission: Arc<crate::engine::Admission>,
+    sync_admission: Arc<crate::engine::Admission>,
     probe_admission: Arc<crate::engine::Admission>,
     impact_admission: Arc<crate::engine::Admission>,
     exploration_admission: Arc<crate::engine::Admission>,
@@ -386,7 +387,7 @@ pub async fn serve_clustered_with_status(
             eprintln!("GraphLake model {id} unavailable: {error}");
         }
         let wire = driver_model
-            .map(|id| wire::Access::load(&models, id))
+            .map(|id| wire::Access::load(&models, id, QueryOptions::default().spill_bytes))
             .transpose()?;
         let bolt = match bolt_port {
             Some(port) => {
@@ -421,6 +422,11 @@ pub async fn serve_clustered_with_status(
                     .saturating_mul(query_memory)
                     .min(crate::EngineLimits::default().memory_bytes),
                 spill_bytes: query_slots as u64 * QueryOptions::default().spill_bytes,
+            })?),
+            sync_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
+                max_queries: 2,
+                memory_bytes: 2 * QueryOptions::default().memory_bytes,
+                spill_bytes: 2 * QueryOptions::default().spill_bytes,
             })?),
             probe_admission: Arc::new(crate::engine::Admission::new(crate::EngineLimits {
                 max_queries: 2,
@@ -734,6 +740,7 @@ async fn guard_request(
             value.action,
             "create_model"
                 | "save_model"
+                | "save_task_suite"
                 | "publish"
                 | "rollback"
                 | "unpublish"
@@ -866,6 +873,8 @@ async fn guard_request(
             && result.status() != StatusCode::NO_CONTENT
         {
             use futures::StreamExt;
+            let shutdown = app.shutdown.clone();
+            let ha_enabled = app.ha.is_some();
             let (parts, body) = result.into_parts();
             let body = axum::body::Body::from_stream(async_stream::stream! {
                 let mut chunks = body.into_data_stream();
@@ -874,6 +883,7 @@ async fn guard_request(
                         biased;
                         _ = access::revoked(&mut live) => Some(Err(axum::Error::new(std::io::Error::other("credentials revoked")))),
                         _ = await_leadership_pause(leadership.as_ref()), if !durable_mutation => Some(Err(axum::Error::new(std::io::Error::other("leadership interrupted")))),
+                        _ = shutdown.cancelled(), if ha_enabled && !is_probe && !durable_mutation => Some(Err(axum::Error::new(std::io::Error::other("coordinator lost leadership")))),
                         chunk = chunks.next() => chunk,
                     };
                     let Some(chunk) = chunk else { break };

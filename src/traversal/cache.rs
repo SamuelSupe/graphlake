@@ -209,7 +209,10 @@ impl Engine {
                     ".{}-stage-",
                     path.file_stem().unwrap_or_default().to_string_lossy()
                 );
-                clean_staging(&cache.dir, &prefix)?;
+                let clean_dir = cache.dir.clone();
+                let clean_prefix = prefix.clone();
+                tokio::task::spawn_blocking(move || clean_staging(&clean_dir, &clean_prefix))
+                    .await??;
                 let context = scope.session();
                 let labels = BTreeSet::from([edge.to_owned(), mapping.from.node.clone()]);
                 let prepared = self
@@ -239,11 +242,18 @@ impl Engine {
                 })
                 .await??;
                 scope.check()?;
-                file.persist(&path)
-                    .with_context(|| format!("publishing CSR generation to {}", path.display()))?;
-                File::open(&cache.dir)?
-                    .sync_all()
-                    .context("synchronizing CSR cache directory")?;
+                let persist_path = path.clone();
+                let sync_dir = cache.dir.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    file.persist(&persist_path).with_context(|| {
+                        format!("publishing CSR generation to {}", persist_path.display())
+                    })?;
+                    File::open(&sync_dir)?
+                        .sync_all()
+                        .context("synchronizing CSR cache directory")?;
+                    Ok(())
+                })
+                .await??;
                 Ok(RefreshReport {
                     generation,
                     vertices,

@@ -370,49 +370,73 @@ impl Control {
     }
 
     async fn load_catalog(&self, generation: &str) -> ApiResult<CatalogState> {
-        let read = async {
-            match self.read_snapshot(generation).await? {
-                CatalogSnapshot::Inline(state) => Ok(state),
-                CatalogSnapshot::Manifest { entries } => {
-                    ensure!(
-                        entries
-                            .values()
-                            .fold(0u64, |sum, object| sum.saturating_add(object.bytes))
-                            <= CATALOG_BYTES_LIMIT,
-                        "catalog exceeds size limit"
-                    );
-                    let files = stream::iter(entries)
-                        .map(|(name, object)| async move {
-                            ensure!(
-                                models::versions::valid_revision(&object.digest)
-                                    && object.bytes <= CATALOG_BLOB_LIMIT,
-                                "invalid catalog object metadata"
-                            );
-                            let key = self.objects.control_catalog_blob(&object.digest);
+        let snapshot = tokio::time::timeout(CATALOG_UPLOAD_IDLE, self.read_snapshot(generation))
+            .await
+            .map_err(|_| timeout())?
+            .map_err(|_| unavailable())?;
+        match snapshot {
+            CatalogSnapshot::Inline(state) => Ok(state),
+            CatalogSnapshot::Manifest { entries } => {
+                if entries
+                    .values()
+                    .fold(0u64, |sum, object| sum.saturating_add(object.bytes))
+                    > CATALOG_BYTES_LIMIT
+                {
+                    return Err(unavailable());
+                }
+                let mut unique = BTreeMap::<String, u64>::new();
+                for object in entries.values() {
+                    if !models::versions::valid_revision(&object.digest)
+                        || object.bytes > CATALOG_BLOB_LIMIT
+                    {
+                        return Err(unavailable());
+                    }
+                    if let Some(&prev) = unique.get(&object.digest) {
+                        if prev != object.bytes {
+                            return Err(unavailable());
+                        }
+                    } else {
+                        unique.insert(object.digest.clone(), object.bytes);
+                    }
+                }
+                let blobs: BTreeMap<String, String> = stream::iter(unique)
+                    .map(|(digest, expected_bytes)| async move {
+                        let key = self.objects.control_catalog_blob(&digest);
+                        let contents = tokio::time::timeout(CATALOG_UPLOAD_IDLE, async {
                             let result = self.objects.get(&key).await?;
                             ensure!(
-                                result.meta.size == object.bytes,
+                                result.meta.size == expected_bytes,
                                 "catalog object length mismatch"
                             );
                             let data = result.bytes().await?;
                             let contents = std::str::from_utf8(&data)?;
                             ensure!(
-                                models::revision(contents) == object.digest,
+                                models::revision(contents) == digest,
                                 "catalog object checksum mismatch"
                             );
-                            Ok::<_, anyhow::Error>((name, contents.to_owned()))
+                            Ok::<_, anyhow::Error>(contents.to_owned())
                         })
-                        .buffer_unordered(8)
-                        .try_collect()
-                        .await?;
-                    Ok(CatalogState { files })
-                }
+                        .await
+                        .map_err(|_| timeout())?
+                        .map_err(|_| unavailable())?;
+                        Ok::<_, Error>((digest, contents))
+                    })
+                    .buffer_unordered(8)
+                    .try_collect()
+                    .await?;
+                let files = entries
+                    .into_iter()
+                    .map(|(name, object)| {
+                        let contents = blobs
+                            .get(&object.digest)
+                            .expect("fetched deduplicated catalog blob")
+                            .clone();
+                        (name, contents)
+                    })
+                    .collect();
+                Ok(CatalogState { files })
             }
-        };
-        tokio::time::timeout(Duration::from_secs(30), read)
-            .await
-            .map_err(|_| timeout())?
-            .map_err(|_| unavailable())
+        }
     }
 
     pub async fn acquire(&self, stop: &CancellationToken) -> Result<Arc<Leadership>> {
@@ -714,10 +738,12 @@ impl Leadership {
 
     pub fn retire(&self) {
         self.stop.cancel();
+        self.window.lock().unwrap().uncertain.cancel();
     }
 
     pub async fn release(&self) {
         self.stop.cancel();
+        self.window.lock().unwrap().uncertain.cancel();
         if self.elected {
             let reason = match self.window.lock().unwrap().loss {
                 Some(ConfirmationFailure::SafetyWindowExpired) => {

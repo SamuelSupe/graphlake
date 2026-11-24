@@ -96,11 +96,16 @@ impl BreadthFirst {
         shortest: Option<(Shortest, usize)>,
         track_vertices: bool,
     ) -> Self {
+        let allow_return = matches!(shortest, Some((_, min)) if min >= 1);
         let mut predecessor = vec![None; graph.keys.num_rows()];
-        predecessor[start] = Some(Neighbor {
-            vertex: start,
-            edge: 0,
-        });
+        let mut touched = Vec::new();
+        if !allow_return {
+            predecessor[start] = Some(Neighbor {
+                vertex: start,
+                edge: 0,
+            });
+            touched.push(start);
+        }
         let queue = if matches!(target, Target::Vertex(None)) {
             VecDeque::new()
         } else {
@@ -111,13 +116,15 @@ impl BreadthFirst {
             target,
             queue,
             predecessor,
-            touched: vec![start],
+            touched,
             expansion: None,
             shortest,
             ties: matches!(shortest, Some((Shortest::All, _))).then(|| {
                 let size = graph.keys.num_rows();
                 let mut depths = vec![usize::MAX; size];
-                depths[start] = 0;
+                if !allow_return {
+                    depths[start] = 0;
+                }
                 Ties {
                     depths,
                     parents: vec![Vec::new(); size],
@@ -129,6 +136,7 @@ impl BreadthFirst {
     }
 
     fn restart(&mut self, start: usize, target: Target) {
+        let allow_return = matches!(self.shortest, Some((_, min)) if min >= 1);
         for vertex in self.touched.drain(..) {
             self.predecessor[vertex] = None;
             if let Some(ties) = &mut self.ties {
@@ -145,13 +153,15 @@ impl BreadthFirst {
         if !matches!(target, Target::Vertex(None)) {
             self.queue.push_back((start, 0));
         }
-        self.predecessor[start] = Some(Neighbor {
-            vertex: start,
-            edge: 0,
-        });
-        self.touched.push(start);
-        if let Some(ties) = &mut self.ties {
-            ties.depths[start] = 0;
+        if !allow_return {
+            self.predecessor[start] = Some(Neighbor {
+                vertex: start,
+                edge: 0,
+            });
+            self.touched.push(start);
+            if let Some(ties) = &mut self.ties {
+                ties.depths[start] = 0;
+            }
         }
     }
 
@@ -192,19 +202,19 @@ impl BreadthFirst {
         let Some((vertex, depth)) = self.queue.pop_front() else {
             return Step::Done;
         };
-        let found = matches!(self.target, Target::Vertex(Some(target)) if target == vertex);
+        let meets_min = self.shortest.is_none_or(|(_, min)| depth >= min);
+        let found =
+            meets_min && matches!(self.target, Target::Vertex(Some(target)) if target == vertex);
         if found {
             self.queue.clear();
-        } else if depth < max_hops {
+        } else if depth < max_hops && !(depth > 0 && vertex == self.start) {
             self.expansion = Some((
                 vertex,
                 depth,
                 graph.offsets[vertex]..graph.offsets[vertex + 1],
             ));
         }
-        let eligible = found
-            || matches!(self.target, Target::All)
-                && self.shortest.is_none_or(|(_, min)| depth >= min);
+        let eligible = found || matches!(self.target, Target::All) && meets_min;
         if !eligible {
             return Step::Visit { depth, hit: None };
         }
@@ -226,13 +236,15 @@ impl BreadthFirst {
         };
         if found || self.shortest.is_some() {
             let mut cursor = vertex;
-            while cursor != self.start {
+            let mut remaining = depth;
+            while remaining > 0 {
                 let parent = self.predecessor[cursor].expect("BFS predecessor");
                 edges.push(parent.edge);
                 cursor = parent.vertex;
                 if self.track_vertices {
                     vertices.push(cursor);
                 }
+                remaining -= 1;
             }
             edges.reverse();
             vertices.reverse();
@@ -270,7 +282,7 @@ impl EmitPaths {
         extra: &[Vec<Neighbor>],
     ) -> Option<Step> {
         let (vertex, index) = self.stack.last_mut()?;
-        if *vertex == start {
+        if *vertex == start && self.edges.len() == self.depth {
             let hit = Hit {
                 vertex: self.vertex,
                 depth: self.depth,

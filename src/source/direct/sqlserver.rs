@@ -79,23 +79,24 @@ impl Driver {
         if let Some(path) = ca_file {
             config.trust_cert_ca(path);
         }
-        let mut client = tokio::time::timeout(timeout, async {
+        let client = tokio::time::timeout(timeout, async {
             let tcp = TcpStream::connect(config.get_addr()).await?;
             tcp.set_nodelay(true)?;
             stats.request();
-            Ok::<_, anyhow::Error>(Client::connect(config, tcp.compat_write()).await?)
+            let mut client = Client::connect(config, tcp.compat_write()).await?;
+            client
+                .simple_query(format!(
+                    "SET LOCK_TIMEOUT {}",
+                    timeout.as_millis().clamp(1, i32::MAX as u128)
+                ))
+                .await?
+                .into_results()
+                .await?;
+            Ok::<_, anyhow::Error>(client)
         })
         .await
         .context("SQL Server connection timed out")?
         .context("connecting to SQL Server")?;
-        client
-            .simple_query(format!(
-                "SET LOCK_TIMEOUT {}",
-                timeout.as_millis().clamp(1, i32::MAX as u128)
-            ))
-            .await?
-            .into_results()
-            .await?;
         Ok(Self {
             client,
             runtime,

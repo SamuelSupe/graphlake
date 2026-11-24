@@ -391,7 +391,7 @@ async fn start(
     }
     let (request_id, language, mut options) = validate_request(request, app.options.clone())?;
     let mut active = register(app, request_id, id, principal)?;
-    let export = if preview {
+    let export = if preview && !request.capture_result {
         None
     } else {
         let started = tokio::time::Instant::now();
@@ -442,14 +442,15 @@ pub(super) async fn run(
     Extension(principal): Extension<Principal>,
     Json(mut request): Json<Request>,
 ) -> ApiResult<Response> {
-    request.preview_without_arrow = access::check_export(&app, &principal, &id).is_err();
-    if request.capture_result && request.preview_without_arrow {
+    let can_export = access::check_export(&app, &principal, &id).is_ok();
+    if request.capture_result && !can_export {
         return Err(access::forbidden());
     }
+    request.preview_without_arrow |= !can_export;
     if let Some(cluster) = &app.cluster {
         return cluster.execute(&app, id, principal, request, false).await;
     }
-    let (active, result, engine, _, policy, mut observations) =
+    let (active, result, engine, _export, policy, mut observations) =
         start(&app, &id, &request, &principal, true).await?;
     let snapshot = Uuid::new_v4();
     let options = QueryOptions {

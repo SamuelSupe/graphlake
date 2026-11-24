@@ -88,8 +88,9 @@ impl Managed {
             "managed snapshot generation mismatch"
         );
         if let Some(snapshot) = &frozen.snapshot {
-            // Validate the existing GLPQ mask, checkpoint and part constraints.
-            snapshot.encode()?;
+            // Validate the existing GLPQ mask, checkpoint and part constraints
+            // without re-encoding the entire manifest JSON.
+            snapshot.validate()?;
             ensure!(
                 snapshot.generation == head.generation
                     && frozen.files.len() == snapshot.parts.len()

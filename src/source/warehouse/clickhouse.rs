@@ -220,7 +220,7 @@ impl ClickHouse {
                         let budget = MemoryConsumer::new("GraphLake ClickHouse IPC output").register(&pool);
                         while let Some(batch) = reader.next().await.map_err(external)? {
                             check_schema(&expected, &batch.schema()).map_err(external)?;
-                            budget.try_resize(batch.get_array_memory_size())?;
+                            budget.try_resize(crate::source::snapshot::ipc_batch_bytes(&batch))?;
                             for offset in (0..batch.num_rows()).step_by(batch_size) {
                                 yield batch.slice(offset, batch_size.min(batch.num_rows() - offset));
                             }

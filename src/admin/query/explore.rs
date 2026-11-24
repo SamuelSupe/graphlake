@@ -192,13 +192,6 @@ pub(in crate::admin) async fn explore(
     };
     // A blocked neighbor scan must not consume the foreground query's slot.
     engine.use_admission(app.exploration_admission.clone());
-    let selection = crate::admin::local_tables::managed::resolve(
-        &app,
-        &mut engine,
-        &id,
-        app.options.timeout.as_secs() + 120,
-    )
-    .await?;
     if engine.catalog.freshness.policy != crate::FreshnessPolicy::default() {
         return Err(super::freshness::conflict(
             "此模型的严格查询策略需通过查询 API 或 MCP 执行",
@@ -343,6 +336,23 @@ pub(in crate::admin) async fn explore(
     } else {
         None
     };
+    let labels = edges
+        .into_iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let selection = if request.csr_generation.is_none() {
+        Some(
+            crate::admin::local_tables::managed::resolve(
+                &app,
+                &mut engine,
+                &id,
+                app.options.timeout.as_secs() + 120,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     if let Some(cursor) = &resume {
         if let Some(search) = &request.search {
             let index = app
@@ -355,6 +365,7 @@ pub(in crate::admin) async fn explore(
                     return Err(source_changed());
                 }
                 check_versions(
+                    &app,
                     &engine,
                     options.clone(),
                     &request,
@@ -380,7 +391,7 @@ pub(in crate::admin) async fn explore(
             if saved.versions != cursor.versions {
                 return Err(source_changed());
             }
-            check_page_versions(&engine, options.clone(), &request, &saved).await?;
+            check_page_versions(&app, &engine, options.clone(), &request, &saved).await?;
             return render_exploration(
                 &request,
                 &app,
@@ -398,7 +409,7 @@ pub(in crate::admin) async fn explore(
             existing.filter(|(_, saved)| snapshot.is_some() || can_replay(&saved.sources))
         {
             // A new graph query may deliberately start over after a source change.
-            if check_page_versions(&engine, options.clone(), &request, &saved)
+            if check_page_versions(&app, &engine, options.clone(), &request, &saved)
                 .await
                 .is_ok()
             {
@@ -426,7 +437,6 @@ pub(in crate::admin) async fn explore(
         .as_ref()
         .map_or_else(Uuid::new_v4, |cursor| cursor.session);
     let index = resume.as_ref().map_or(0, |cursor| cursor.page);
-    let labels = edges.into_iter().map(|(name, _)| name.clone()).collect();
     let neighbors = request.neighbors;
     let search = request.search.clone();
     let timeout = options.timeout;
@@ -568,17 +578,19 @@ fn check_expected(request: &ExploreRequest, sources: &[SourceVersion]) -> ApiRes
 }
 
 async fn check_page_versions(
+    app: &App,
     engine: &crate::Engine,
     options: crate::QueryOptions,
     request: &ExploreRequest,
     saved: &pages::Pages,
 ) -> ApiResult<()> {
-    check_versions(engine, options, request, &saved.sources, &saved.postgres).await
+    check_versions(app, engine, options, request, &saved.sources, &saved.postgres).await
 }
 
 async fn check_versions(
+    app: &App,
     engine: &crate::Engine,
-    options: crate::QueryOptions,
+    mut options: crate::QueryOptions,
     request: &ExploreRequest,
     sources: &[SourceVersion],
     snapshots: &std::sync::Mutex<BTreeMap<String, String>>,
@@ -587,7 +599,12 @@ async fn check_versions(
     if request.csr_generation.is_some() {
         return Ok(());
     }
-    let scope = engine.scope(options).await.map_err(query_error)?;
+    crate::admin::ops::limit_model_probe(&mut options);
+    let scope = Arc::new(
+        crate::engine::QueryScope::new(options, &app.probe_admission)
+            .await
+            .map_err(query_error)?,
+    );
     let mut postgres = snapshots.lock().unwrap().clone();
     let unchanged = scope
         .run(engine.exploration_versions_match(&scope, sources, &mut postgres))

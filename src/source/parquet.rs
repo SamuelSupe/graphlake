@@ -513,6 +513,7 @@ struct OpenedParquet {
     readers: Arc<PinnedReaderFactory>,
     files: Vec<PartitionedFile>,
     metadata: Vec<Arc<ParquetMetaData>>,
+    _metadata_budget: MemoryReservation,
     #[cfg(feature = "admin")]
     scan_objects: Vec<ScanObject>,
 }
@@ -819,6 +820,8 @@ impl OpenedParquet {
         let mut readers = BTreeMap::new();
         let mut files = Vec::new();
         let mut metadata = Vec::new();
+        let metadata_budget =
+            MemoryConsumer::new("GraphLake Parquet footer metadata").register(pool);
         #[cfg(feature = "admin")]
         let mut scan_objects = Vec::new();
         let parallelism = if store.is_some()
@@ -867,6 +870,7 @@ impl OpenedParquet {
             inputs.try_next().await?
         {
             let footer = builder.metadata();
+            metadata_budget.try_grow(footer.memory_size())?;
             metadata.push(Arc::clone(footer));
             file.footer = Some(Arc::clone(footer));
             if let Some(mask) = &mask {
@@ -927,6 +931,7 @@ impl OpenedParquet {
                 readers: Arc::new(PinnedReaderFactory(readers)),
                 files,
                 metadata,
+                _metadata_budget: metadata_budget,
                 #[cfg(feature = "admin")]
                 scan_objects,
             },

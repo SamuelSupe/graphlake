@@ -23,10 +23,20 @@ use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Driver {
-    connection: Arc<Connection>,
+    connection: Option<Arc<Connection>>,
     cancelled: CancellationToken,
     runtime: Arc<RuntimeEnv>,
     stats: Arc<ReadStats>,
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn_blocking(move || drop(connection));
+        }
+    }
 }
 struct Cancel {
     connection: Arc<Connection>,
@@ -109,7 +119,7 @@ impl Driver {
         .await
         .context("Oracle connection timed out")??;
         Ok(Self {
-            connection: Arc::new(connection),
+            connection: Some(Arc::new(connection)),
             cancelled: CancellationToken::new(),
             runtime,
             stats,
@@ -120,7 +130,11 @@ impl Driver {
         &self,
         work: impl FnOnce(&Connection, &CancellationToken) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let connection = self.connection.clone();
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("Oracle connection live")
+            .clone();
         let token = self.cancelled.clone();
         let mut guard = Cancel {
             connection: connection.clone(),

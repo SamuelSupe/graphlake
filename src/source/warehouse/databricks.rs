@@ -28,6 +28,7 @@ pub(crate) struct Databricks {
     http: Http,
     warehouse: String,
     catalog: String,
+    timeout: Duration,
 }
 fn ident(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
@@ -57,6 +58,7 @@ impl Databricks {
             http: Http::new(uri, Some(token_env), timeout, pool, stats)?,
             warehouse: warehouse.clone(),
             catalog: catalog.clone(),
+            timeout,
         })
     }
 
@@ -164,9 +166,24 @@ impl Databricks {
             let id = response.statement_id.take().context("missing Databricks statement ID")?;
             uuid::Uuid::parse_str(&id).context("invalid Databricks statement ID")?;
             let mut pending = Pending(Some(http.client.post(http.endpoint(&["api", "2.0", "sql", "statements", &id, "cancel"]))));
+            let deadline = tokio::time::Instant::now() + self.timeout;
             while matches!(response.status.state.as_str(), "PENDING" | "RUNNING") {
-                drop(budget); tokio::time::sleep(Duration::from_millis(200)).await;
-                (_, response, budget) = http.receive(http.client.get(http.endpoint(&["api", "2.0", "sql", "statements", &id]))).await?;
+                drop(budget);
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .context("Databricks statement timed out")?;
+                tokio::time::sleep(Duration::from_millis(200).min(remaining)).await;
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .context("Databricks statement timed out")?;
+                (_, response, budget) = tokio::time::timeout(
+                    remaining,
+                    http.receive(http.client.get(http.endpoint(&["api", "2.0", "sql", "statements", &id]))),
+                )
+                .await
+                .context("Databricks statement timed out")??;
             }
             verify(response.status.state == "SUCCEEDED", format!("Databricks statement ended with {}", response.status.state))?;
             let manifest = response.manifest.context("missing Databricks manifest")?;

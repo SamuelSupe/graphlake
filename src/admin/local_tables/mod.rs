@@ -369,7 +369,7 @@ fn start(app: &Arc<App>, key: String, mode: Option<Mode>, scheduled: bool) -> Ap
             let limit = options.spill_bytes;
             tokio::task::spawn_blocking(move || overlay::check_retired_space(&anchor, limit))
                 .await??;
-            load::run(&table, &path, mode, options, &app.admission).await
+            load::run(&table, &path, mode, options, &app.sync_admission).await
         })
         .catch_unwind()
         .await

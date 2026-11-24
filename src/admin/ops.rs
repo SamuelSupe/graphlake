@@ -451,7 +451,18 @@ pub(super) async fn model_ready(
     .await
     .map_err(|_| Error::storage())??;
     let deadline = app.options.timeout.min(Duration::from_secs(5));
-    let _selection = super::local_tables::managed::resolve(&app, &mut engine, &id, 30).await?;
+    let _selection = tokio::time::timeout(
+        deadline,
+        super::local_tables::managed::resolve(&app, &mut engine, &id, 30),
+    )
+    .await
+    .map_err(|_| {
+        Error::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "model_probe_incomplete",
+            "未能在探针期限内完成来源检查",
+        )
+    })??;
     let (coordinator, workers) = tokio::join!(
         SourceProbe::run(engine, app.options.clone(), &app.probe_admission),
         async {

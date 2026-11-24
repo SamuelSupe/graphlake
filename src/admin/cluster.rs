@@ -97,24 +97,30 @@ struct Heartbeats {
 impl Heartbeats {
     fn age(&mut self, id: Uuid, revision: i64, now: Instant) -> Duration {
         let interval = Duration::from_millis(WORKER_HEARTBEAT_TIMEOUT_MS);
+        let retain_window = (10 * interval).max(Duration::from_secs(120));
+        let age = {
+            let (current, since, seen) = self.jobs.entry(id).or_insert((revision, now, now));
+            if revision < *current {
+                *seen = now;
+                Duration::ZERO
+            } else {
+                if revision > *current {
+                    *current = revision;
+                    *since = now;
+                }
+                *seen = now;
+                now.duration_since(*since)
+            }
+        };
         if self
             .last_prune
             .is_none_or(|last| now.duration_since(last) >= interval)
         {
             self.jobs
-                .retain(|_, (_, _, seen)| now.duration_since(*seen) <= 4 * interval);
+                .retain(|_, (_, _, seen)| now.duration_since(*seen) <= retain_window);
             self.last_prune = Some(now);
         }
-        let (current, since, seen) = self.jobs.entry(id).or_insert((revision, now, now));
-        if revision < *current {
-            return Duration::ZERO;
-        }
-        if revision > *current {
-            *current = revision;
-            *since = now;
-        }
-        *seen = now;
-        now.duration_since(*since)
+        age
     }
 }
 
@@ -317,13 +323,16 @@ impl Coordinator {
                     _ = shutdown.cancelled() => break,
                     _ = interval.tick() => {
                         let Some(app) = app.upgrade() else { break };
+                        if app.ha.as_ref().is_some_and(super::ha::Ha::recovery_pending) {
+                            continue;
+                        }
                         let leader = app.ha.as_ref().map(|ha| ha.leader.as_ref());
                         let timeout = Duration::from_secs(120);
                         let (results, generations) = tokio::select! {
                             _ = shutdown.cancelled() => break,
                             sweeps = async {
                                 tokio::join!(
-                                    tokio::time::timeout(timeout, shared.objects.expire_results()),
+                                    tokio::time::timeout(timeout, shared.objects.expire_results(leader)),
                                     tokio::time::timeout(timeout, retention::sweep(
                                         &shared.metadata, &shared.objects, chrono::Utc::now(), leader, Some(&app)
                                     ))
@@ -551,7 +560,7 @@ impl Coordinator {
                 self.cancel(app, &job.owner, id).await?;
                 return Err(cancelled());
             }
-            self.dispatch(&dispatch, deadline).await?;
+            self.dispatch(&dispatch, deadline, true).await?;
             let mut polls = 0;
             loop {
                 let saved = self
@@ -661,6 +670,7 @@ impl Coordinator {
                         &dispatch,
                         Instant::now()
                             + Duration::from_millis(job.deadline_ms.saturating_sub(now_ms())),
+                        true,
                     )
                     .await?;
                 } else {
@@ -715,7 +725,12 @@ impl Coordinator {
             .ok()
     }
 
-    async fn dispatch(&self, dispatch: &Dispatch, deadline: Instant) -> ApiResult<()> {
+    async fn dispatch(
+        &self,
+        dispatch: &Dispatch,
+        deadline: Instant,
+        fail_on_exhausted: bool,
+    ) -> ApiResult<()> {
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let mut busy = false;
         for url in self
@@ -759,12 +774,13 @@ impl Coordinator {
             }
         }
         let error = if busy { Error::busy() } else { unavailable() };
-        if let Some(saved) = self
-            .shared
-            .metadata
-            .get(dispatch.id)
-            .await
-            .map_err(storage)?
+        if fail_on_exhausted
+            && let Some(saved) = self
+                .shared
+                .metadata
+                .get(dispatch.id)
+                .await
+                .map_err(storage)?
         {
             if saved.job.worker.is_some() || !matches!(saved.job.state, JobState::Running) {
                 return Ok(());
@@ -824,6 +840,7 @@ impl Coordinator {
         self.dispatch(
             &dispatch,
             Instant::now() + Duration::from_millis(job.deadline_ms.saturating_sub(now_ms())),
+            false,
         )
         .await
     }
@@ -1006,6 +1023,19 @@ mod heartbeat_tests {
         assert_eq!(
             heartbeats.age(id, 18, start + Duration::from_secs(16)),
             Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn heartbeats_preserve_stale_revision_across_long_poll_gaps() {
+        let id = Uuid::new_v4();
+        let start = Instant::now();
+        let mut heartbeats = Heartbeats::default();
+        assert_eq!(heartbeats.age(id, 7, start), Duration::ZERO);
+        // Polling after 60s (> 4 * 6s old prune window) must still measure full staleness.
+        assert_eq!(
+            heartbeats.age(id, 7, start + Duration::from_secs(60)),
+            Duration::from_secs(60)
         );
     }
 }

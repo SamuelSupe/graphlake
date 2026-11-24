@@ -199,20 +199,28 @@ impl Coordinator {
             .shared
             .objects
             .artifact(id, job.attempt, "result.arrow");
-        let result = self.shared.objects.get_arrow(&key).await?;
-        if job.export {
-            job.state = JobState::Downloaded;
-            if !self
-                .shared
-                .metadata
-                .replace(id, saved.revision, &job)
-                .await
-                .map_err(storage)?
-            {
-                return Err(expired());
+        let (length, body) = if method == Method::HEAD {
+            let meta = self.shared.objects.head_arrow(&key).await?;
+            (meta.size, axum::body::Body::empty())
+        } else {
+            let result = self.shared.objects.get_arrow(&key).await?;
+            if job.export {
+                job.state = JobState::Downloaded;
+                if !self
+                    .shared
+                    .metadata
+                    .replace(id, saved.revision, &job)
+                    .await
+                    .map_err(storage)?
+                {
+                    return Err(expired());
+                }
             }
-        }
-        let length = result.meta.size;
+            (
+                result.meta.size,
+                query::download::download_body(result.into_stream(), permit),
+            )
+        };
         let mut response = (
             [
                 (
@@ -229,7 +237,7 @@ impl Coordinator {
                     job.revision,
                 ),
             ],
-            query::download::download_body(result.into_stream(), permit),
+            body,
         )
             .into_response();
         response.extensions_mut().insert(AuditModel(job.model));

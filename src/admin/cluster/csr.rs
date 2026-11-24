@@ -19,6 +19,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use datafusion::arrow::{
+    array::Array,
     datatypes::Schema,
     ipc::{reader::StreamReader, writer::StreamWriter},
 };
@@ -726,16 +727,154 @@ async fn read_block(
 }
 
 fn compact_view(array: datafusion::arrow::array::ArrayRef) -> datafusion::arrow::array::ArrayRef {
-    use datafusion::arrow::array::{BinaryViewArray, StringViewArray};
-    if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
-        Arc::new(array.gc())
-    } else if let Some(array) = array.as_any().downcast_ref::<BinaryViewArray>() {
-        Arc::new(array.gc())
-    } else {
-        array
+    use datafusion::arrow::{
+        array::{
+            BinaryViewArray, DictionaryArray, FixedSizeListArray, LargeListArray, ListArray,
+            MapArray, StringViewArray, StructArray,
+        },
+        datatypes::{
+            DataType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
+            UInt64Type,
+        },
+    };
+    if let Some(view) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Arc::new(view.gc());
+    }
+    if let Some(view) = array.as_any().downcast_ref::<BinaryViewArray>() {
+        return Arc::new(view.gc());
+    }
+    match array.data_type() {
+        DataType::Struct(fields) => {
+            let s = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let cols = s
+                .columns()
+                .iter()
+                .map(|c| compact_view(Arc::clone(c)))
+                .collect();
+            StructArray::try_new(fields.clone(), cols, s.nulls().cloned())
+                .map(|a| Arc::new(a) as _)
+                .unwrap_or(array)
+        }
+        DataType::List(field) => {
+            let l = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let values = compact_view(Arc::clone(l.values()));
+            ListArray::try_new(
+                Arc::clone(field),
+                l.offsets().clone(),
+                values,
+                l.nulls().cloned(),
+            )
+            .map(|a| Arc::new(a) as _)
+            .unwrap_or(array)
+        }
+        DataType::LargeList(field) => {
+            let l = array.as_any().downcast_ref::<LargeListArray>().unwrap();
+            let values = compact_view(Arc::clone(l.values()));
+            LargeListArray::try_new(
+                Arc::clone(field),
+                l.offsets().clone(),
+                values,
+                l.nulls().cloned(),
+            )
+            .map(|a| Arc::new(a) as _)
+            .unwrap_or(array)
+        }
+        DataType::FixedSizeList(field, size) => {
+            let l = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let values = compact_view(Arc::clone(l.values()));
+            FixedSizeListArray::try_new(Arc::clone(field), *size, values, l.nulls().cloned())
+                .map(|a| Arc::new(a) as _)
+                .unwrap_or(array)
+        }
+        DataType::Map(field, ordered) => {
+            let m = array.as_any().downcast_ref::<MapArray>().unwrap();
+            let entries = compact_view(Arc::new(m.entries().clone()));
+            if let Some(entries) = entries.as_any().downcast_ref::<StructArray>() {
+                MapArray::try_new(
+                    Arc::clone(field),
+                    m.offsets().clone(),
+                    entries.clone(),
+                    m.nulls().cloned(),
+                    *ordered,
+                )
+                .map(|a| Arc::new(a) as _)
+                .unwrap_or(array)
+            } else {
+                array
+            }
+        }
+        DataType::Dictionary(key_type, _) => {
+            macro_rules! compact_dict {
+                ($k:ty) => {{
+                    let d = array.as_any().downcast_ref::<DictionaryArray<$k>>().unwrap();
+                    let values = compact_view(Arc::clone(d.values()));
+                    DictionaryArray::<$k>::try_new(d.keys().clone(), values)
+                        .map(|a| Arc::new(a) as _)
+                        .unwrap_or(array)
+                }};
+            }
+            match key_type.as_ref() {
+                DataType::Int8 => compact_dict!(Int8Type),
+                DataType::Int16 => compact_dict!(Int16Type),
+                DataType::Int32 => compact_dict!(Int32Type),
+                DataType::Int64 => compact_dict!(Int64Type),
+                DataType::UInt8 => compact_dict!(UInt8Type),
+                DataType::UInt16 => compact_dict!(UInt16Type),
+                DataType::UInt32 => compact_dict!(UInt32Type),
+                DataType::UInt64 => compact_dict!(UInt64Type),
+                _ => array,
+            }
+        }
+        _ => array,
     }
 }
 
 pub(crate) use execute::CypherCsr;
 pub(in crate::admin) use execute::Stats;
 pub(super) use execute::{ArcBlocks, query_csr, run_task};
+
+#[cfg(test)]
+mod compact_view_tests {
+    use super::*;
+    use datafusion::arrow::{
+        array::{ListArray, StringViewArray, StructArray},
+        buffer::OffsetBuffer,
+        datatypes::{DataType, Field, Fields},
+    };
+
+    #[test]
+    fn compact_view_reclaims_nested_list_and_struct_string_views() -> Result<()> {
+        let big = "a".repeat(4096);
+        let mut raw = vec![big.as_str(); 256];
+        raw[0] = "small_enough_view";
+        let views = StringViewArray::from(raw);
+        let sliced = Arc::new(views.slice(0, 1)) as datafusion::arrow::array::ArrayRef;
+        assert!(sliced.get_array_memory_size() > 512 * 1024);
+
+        let list = Arc::new(ListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Utf8View, true)),
+            OffsetBuffer::from_lengths([1]),
+            Arc::clone(&sliced),
+            None,
+        )?) as datafusion::arrow::array::ArrayRef;
+        let compacted_list = compact_view(list);
+        assert!(
+            compacted_list.get_array_memory_size() < 4096,
+            "nested List<Utf8View> was not compacted: {}",
+            compacted_list.get_array_memory_size()
+        );
+
+        let record = Arc::new(StructArray::try_new(
+            Fields::from(vec![Field::new("s", DataType::Utf8View, true)]),
+            vec![sliced],
+            None,
+        )?) as datafusion::arrow::array::ArrayRef;
+        let compacted_struct = compact_view(record);
+        assert!(
+            compacted_struct.get_array_memory_size() < 4096,
+            "nested Struct<Utf8View> was not compacted: {}",
+            compacted_struct.get_array_memory_size()
+        );
+        Ok(())
+    }
+}

@@ -732,9 +732,15 @@ fn walk_batches<'a>(
 ) -> futures::stream::BoxStream<'a, datafusion::common::Result<datafusion::arrow::array::RecordBatch>>
 {
     Box::pin(async_stream::try_stream! {
-        let max_hops = if output.shortest.is_some() {
-            max_hops.min(topology.keys.num_rows().saturating_sub(1))
-        } else { max_hops };
+        let max_hops = if let Some((_, min)) = output.shortest {
+            if min >= 1 {
+                max_hops.min(topology.keys.num_rows())
+            } else {
+                max_hops.min(topology.keys.num_rows().saturating_sub(1))
+            }
+        } else {
+            max_hops
+        };
         let path = !matches!(kind, TraversalKind::Reachable);
         let entry_bytes = size_of::<(usize, Hit)>()
             + if output.shortest.is_none() && path { (max_hops + 1) * 4 * size_of::<usize>() } else { 0 };

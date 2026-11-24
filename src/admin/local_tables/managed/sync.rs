@@ -348,6 +348,19 @@ impl Managed {
                         }
                     }
                 };
+                let mut worker_done = completed;
+                if !worker_done {
+                    // Wait for the cancelled worker to finish touching S3 / workspace
+                    // before clearing `pending` in etcd, preventing overlapping uploads.
+                    tokio::select! {
+                        biased;
+                        _ = app.shutdown.cancelled() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                        _ = &mut worker => {
+                            worker_done = true;
+                        }
+                    }
+                }
                 let mut logged = false;
                 let confirmation_deadline = tokio::time::sleep(Duration::from_secs(30));
                 tokio::pin!(confirmation_deadline);
@@ -376,7 +389,7 @@ impl Managed {
                         }
                     }
                 }
-                if !completed {
+                if !worker_done {
                     // Wait for any in-flight blocking task using this workspace to exit
                     // before clearing `running`, preventing concurrent workspace corruption.
                     tokio::select! {
@@ -459,7 +472,7 @@ impl Managed {
                 timeout: Duration::from_secs(record.table.config.timeout_seconds),
                 ..app.options.clone()
             },
-            &app.admission,
+            &app.sync_admission,
         )
         .await?;
         ensure!(!cancel.is_cancelled(), "managed sync cancelled");

@@ -671,7 +671,18 @@ impl Engine {
         options: QueryOptions,
         check_data: bool,
     ) -> Result<BTreeMap<String, SchemaRef>> {
-        let scope = self.scope(options).await?;
+        self.inspect_model_with_admission(options, check_data, &self.admission)
+            .await
+    }
+
+    #[cfg(feature = "admin")]
+    pub(crate) async fn inspect_model_with_admission(
+        &self,
+        options: QueryOptions,
+        check_data: bool,
+        admission: &Arc<Admission>,
+    ) -> Result<BTreeMap<String, SchemaRef>> {
+        let scope = Arc::new(QueryScope::new(options, admission).await?);
         scope
             .run(async {
                 let context = scope.session();

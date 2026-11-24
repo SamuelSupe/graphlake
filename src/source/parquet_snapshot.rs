@@ -215,7 +215,7 @@ impl Snapshot {
         Ok(Some(snapshot))
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         ensure!(
             (1..=MAX_BASE_PARTS).contains(&self.base_parts)

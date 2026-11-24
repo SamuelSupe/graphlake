@@ -1,6 +1,6 @@
 use object_store::path::Path as Key;
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Weak,
     time::Duration,
 };
@@ -11,7 +11,44 @@ use uuid::Uuid;
 use super::{Managed, api_error, backend};
 use crate::admin::{App, cluster::control::Leadership, local_tables::store::now, ops::Metrics};
 
-type ManifestFiles = VecDeque<(Key, String, Vec<Key>)>;
+const MANIFEST_CACHE_LIMIT: usize = 4096;
+const DELETE_BATCH_SIZE: usize = 64;
+
+#[derive(Default)]
+struct ManifestFiles {
+    entries: HashMap<(Key, String), Vec<Key>>,
+    order: VecDeque<(Key, String)>,
+}
+
+impl ManifestFiles {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, key: &Key, hash: &str) -> Option<&[Key]> {
+        self.entries
+            .get(&(key.clone(), hash.to_owned()))
+            .map(Vec::as_slice)
+    }
+
+    fn insert(&mut self, key: Key, hash: String, files: Vec<Key>) {
+        let id = (key, hash);
+        if let std::collections::hash_map::Entry::Occupied(mut slot) =
+            self.entries.entry(id.clone())
+        {
+            slot.insert(files);
+            return;
+        }
+        while self.entries.len() >= MANIFEST_CACHE_LIMIT {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(id.clone());
+        self.entries.insert(id, files);
+    }
+}
 
 impl Managed {
     async fn collect(
@@ -44,28 +81,25 @@ impl Managed {
                 .map(|item| &item.head),
         ) {
             let key = self.manifest_key(table, head);
-            let entry = if let Some(index) = cache
-                .iter()
-                .position(|(cached, hash, _)| *cached == key && *hash == head.sha256)
-            {
-                cache.remove(index).expect("cached manifest")
+            if let Some(files) = cache.get(&key, &head.sha256) {
+                keep.insert(key);
+                keep.extend(files.iter().cloned());
             } else {
                 let files = self.snapshot(table, head).await?.files;
                 let keys = files
                     .values()
                     .map(|file| self.objects.local_key(table, &file.location))
                     .collect::<Result<Vec<_>>>()?;
-                (key.clone(), head.sha256.clone(), keys)
-            };
-            keep.insert(key);
-            keep.extend(entry.2.iter().cloned());
-            cache.push_front(entry);
-            cache.truncate(256);
+                keep.insert(key.clone());
+                keep.extend(keys.iter().cloned());
+                cache.insert(key, head.sha256.clone(), keys);
+            }
         }
         let pending = state
             .pending
             .as_ref()
             .map(|pending| self.upload_prefix(table, pending.run));
+        let mut candidates = Vec::new();
         for object in listing {
             if keep.contains(&object.location)
                 || pending
@@ -75,11 +109,16 @@ impl Managed {
             {
                 continue;
             }
-            // Deleting an unreachable UUID object is irreversible; never keep
-            // deleting through a loss of metadata access or coordinator ownership.
+            candidates.push(object.location);
+        }
+        for chunk in candidates.chunks(DELETE_BATCH_SIZE) {
+            // Deleting unreachable UUID objects is irreversible; confirm coordinator
+            // ownership before each bounded batch.
             leader.confirm().await.map_err(api_error)?;
-            self.objects.delete_local(&object.location).await?;
-            metrics.gc_deleted();
+            let deleted = self.objects.delete_local_batch(chunk.to_vec()).await?;
+            for _ in 0..deleted {
+                metrics.gc_deleted();
+            }
         }
         let mut reclaimed = Vec::new();
         let mut mark = Vec::new();

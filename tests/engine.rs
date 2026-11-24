@@ -1029,3 +1029,120 @@ async fn cypher_in_list_fast_path_preserves_three_valued_logic_and_nan() -> Resu
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn shortest_path_and_all_shortest_paths_find_cycles_back_to_start() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let users = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as _),
+        (
+            "name",
+            Arc::new(StringArray::from(vec!["a", "b", "c", "self"])) as _,
+        ),
+    ])?;
+    let edges = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int64Array::from(vec![10, 11, 12, 13, 14])) as _,
+        ),
+        ("src", Arc::new(Int64Array::from(vec![1, 2, 1, 3, 4])) as _),
+        ("dst", Arc::new(Int64Array::from(vec![2, 1, 3, 1, 4])) as _),
+    ])?;
+    std::fs::write(dir.path().join("users.parquet"), parquet(&users)?)?;
+    std::fs::write(dir.path().join("edges.parquet"), parquet(&edges)?)?;
+    let path = dir.path().join("graph.yaml");
+    std::fs::write(
+        &path,
+        "graph: cycles
+sources:
+  data:
+    type: parquet
+    tables:
+      users: [users.parquet]
+      edges: [edges.parquet]
+nodes:
+  User:
+    source: data.users
+    key: [id]
+    properties: [name]
+edges:
+  LINK:
+    source: data.edges
+    key: [id]
+    from: { node: User, columns: [src] }
+    to: { node: User, columns: [dst] }
+",
+    )?;
+    let engine = Engine::new(Catalog::load(&path)?)?;
+    let mut single = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 1}), p = shortestPath((u)-[:LINK*1..4]->(u)) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut single).await?,
+        vec![serde_json::json!({"hops": 2})]
+    );
+
+    let mut all = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 1}), p = allShortestPaths((u)-[:LINK*1..4]->(u)) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut all).await?,
+        vec![
+            serde_json::json!({"hops": 2}),
+            serde_json::json!({"hops": 2}),
+        ]
+    );
+
+    let mut self_loop = engine
+        .query(
+            Language::Cypher,
+            "MATCH (u:User {id: 4}), p = shortestPath((u)-[:LINK*1..4]->(u)) RETURN length(p) AS hops",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(
+        rows(&mut self_loop).await?,
+        vec![serde_json::json!({"hops": 1})]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gremlin_times_zero_repeat_preserves_input_with_barriers() -> Result<()> {
+    let (_dir, engine) = local_fixture("key: [tenant, id]")?;
+    let mut count_barrier = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').times(0).repeat(__.count()).values('status').order()",
+            QueryOptions::default(),
+        )
+        .await?;
+    let statuses = rows(&mut count_barrier).await?;
+    assert_eq!(
+        statuses,
+        vec![
+            serde_json::json!({"value": "active"}),
+            serde_json::json!({"value": "active"}),
+            serde_json::json!({"value": "locked"}),
+            serde_json::json!({"value": "other"}),
+        ]
+    );
+
+    let mut dedup_barrier = engine
+        .query(
+            Language::Gremlin,
+            "g.V().hasLabel('Account').times(0).repeat(__.out('Transfer').dedup()).values('status').order()",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(rows(&mut dedup_barrier).await?, statuses);
+    Ok(())
+}

@@ -156,8 +156,8 @@ impl Snapshot {
                 conn.query_first::<Option<String>, _>("SELECT @@server_uuid"),
             )
             .await
+            .context("MySQL server_uuid probe timed out")?
             .ok()
-            .and_then(|res| res.ok())
             .flatten()
             .flatten()
             .filter(|id| !id.is_empty())
@@ -267,15 +267,19 @@ impl Snapshot {
             }) && let Some(statement) = native_scan(&schema, keys, plan, exact_text)
             {
                 self.stats.request();
-                let primary = conn
+                let primary: Vec<(String, Option<u64>)> = conn
                     .exec_map(
-                        "SELECT COLUMN_NAME FROM information_schema.STATISTICS
-                     WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME='PRIMARY' AND SUB_PART IS NULL ORDER BY SEQ_IN_INDEX",
+                        "SELECT COLUMN_NAME, SUB_PART FROM information_schema.STATISTICS
+                     WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME='PRIMARY' ORDER BY SEQ_IN_INDEX",
                         (database, table),
-                        |column: String| column,
+                        |(column, sub_part): (String, Option<u64>)| (column, sub_part),
                     )
                     .await?;
-                if primary.len() == keys.len() && primary.iter().all(|key| keys.contains(key)) {
+                if !primary.is_empty()
+                    && primary.iter().all(|(_, sub_part)| sub_part.is_none())
+                    && primary.len() == keys.len()
+                    && primary.iter().all(|(key, _)| keys.contains(key))
+                {
                     pushed = Some(statement);
                 }
             }
@@ -378,6 +382,19 @@ impl Snapshot {
             conn.disconnect().await?;
         }
         Ok(())
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            // Ensure cancelled or errored metadata/multi-table preparation
+            // releases the server connection instead of leaving an open transaction.
+            drop(OwnedConnection {
+                conn: Some(conn),
+                server_uuid: self.server_uuid.take(),
+            });
+        }
     }
 }
 

@@ -72,7 +72,9 @@ impl Hana {
             let _ = rustls::crypto::ring::default_provider().install_default();
             params.tls_with(ServerCerts::RootCertificates);
             if let Some(path) = ca_file {
-                let cert = std::fs::read_to_string(path).context("reading SAP HANA CA file")?;
+                let cert = tokio::fs::read_to_string(path)
+                    .await
+                    .context("reading SAP HANA CA file")?;
                 params.tls_with(ServerCerts::Direct(cert));
             }
         }
@@ -80,7 +82,10 @@ impl Hana {
             .with_fetch_size(batch_size.clamp(1, 1024) as u32)
             .with_read_timeout(Some(timeout));
         stats.request();
-        let connection = Connection::with_configuration(params, &config).await?;
+        let connection =
+            tokio::time::timeout(timeout, Connection::with_configuration(params, &config))
+                .await
+                .context("SAP HANA connection timed out")??;
         Ok(Self {
             connection,
             pool,

@@ -224,7 +224,14 @@ impl Destination {
             let mut writer = ArrowWriter::try_new(writer, schema, None)?;
             while let Some(batch) = batches.blocking_recv() {
                 scope.check()?;
-                let batch_memory = batch.get_array_memory_size().saturating_mul(2);
+                let mut logical = 0usize;
+                for col in batch.columns() {
+                    logical = logical.saturating_add(
+                        crate::engine::query::allocation::slice_bytes(col.as_ref())
+                            .unwrap_or_else(|_| col.get_array_memory_size()),
+                    );
+                }
+                let batch_memory = logical.saturating_mul(2);
                 if budget.try_grow(batch_memory).is_err() {
                     writer.flush()?;
                     budget.free();
@@ -292,6 +299,22 @@ impl Destination {
                             }
                             if col.is_null(row) {
                                 continue;
+                            }
+                            use datafusion::arrow::array::AsArray;
+                            match col.data_type() {
+                                DataType::Utf8 => {
+                                    write_csv_cell(&mut writer, col.as_string::<i32>().value(row))?;
+                                    continue;
+                                }
+                                DataType::LargeUtf8 => {
+                                    write_csv_cell(&mut writer, col.as_string::<i64>().value(row))?;
+                                    continue;
+                                }
+                                DataType::Utf8View => {
+                                    write_csv_cell(&mut writer, col.as_string_view().value(row))?;
+                                    continue;
+                                }
+                                _ => {}
                             }
                             cell.clear();
                             std::fmt::Write::write_fmt(

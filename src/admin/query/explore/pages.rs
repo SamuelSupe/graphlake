@@ -274,7 +274,7 @@ impl Pages {
             postgres: Mutex::new(postgres),
             selected,
             storage: Mutex::new(Storage {
-                file: tempfile::tempfile()?,
+                file: crate::blocking(tempfile::tempfile)?,
                 first_page,
                 history,
                 offsets: Vec::new(),
@@ -438,10 +438,13 @@ impl Pages {
         let mut matches = SearchMatches::new(search);
         loop {
             let (bytes, more) = self.wait_for_page(page).await?;
-            let graph: SearchFragment =
-                serde_json::from_slice(&bytes).map_err(|_| super::Error::storage())?;
             let cursor = self.cursor(cursors, id, page);
-            matches.add(&graph.elements, page, &cursor);
+            let graph = crate::blocking(|| {
+                let graph: SearchFragment =
+                    serde_json::from_slice(&bytes).map_err(|_| super::Error::storage())?;
+                matches.add(&graph.elements, page, &cursor);
+                Ok::<_, super::Error>(graph)
+            })?;
             size += bytes.len() + cursor.len();
             if size > SEARCH_BYTES {
                 indexed = None;

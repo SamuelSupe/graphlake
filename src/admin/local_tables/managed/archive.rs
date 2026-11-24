@@ -55,11 +55,20 @@ impl Managed {
             tokio::fs::write(directory.join("state.json"), serde_json::to_vec(&tables)?).await?;
             anyhow::Ok(())
         };
-        tokio::time::timeout(Duration::from_secs(4 * 3600), materialize).await??;
-        Ok(Some(Archive {
-            root,
-            pin: Some(pinned),
-        }))
+        match tokio::time::timeout(Duration::from_secs(4 * 3600), materialize).await {
+            Ok(Ok(())) => Ok(Some(Archive {
+                root,
+                pin: Some(pinned),
+            })),
+            Ok(Err(error)) => {
+                let _ = tokio::task::spawn_blocking(move || drop(root)).await;
+                Err(error)
+            }
+            Err(elapsed) => {
+                let _ = tokio::task::spawn_blocking(move || drop(root)).await;
+                Err(elapsed.into())
+            }
+        }
     }
 
     pub(in crate::admin) async fn restore_archive(

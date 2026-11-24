@@ -138,7 +138,13 @@ pub(super) fn open(anchor: &Path, managed: bool, scope: &QueryScope) -> Result<C
 }
 
 fn open_database(path: &Path, scope: &QueryScope) -> Result<Connection> {
-    let connection = Connection::open(path)?;
+    let mut connection = Connection::open(path)?;
+    let cancelled = scope.options.cancellation.clone();
+    let deadline = scope.deadline;
+    connection.progress_handler(
+        1024,
+        Some(move || cancelled.is_cancelled() || tokio::time::Instant::now() >= deadline),
+    )?;
     let cache_kib = (scope.options.memory_bytes / 8192).clamp(256, 8192);
     connection.pragma_update(None, "cache_size", -(cache_kib as i64))?;
     // UUID batches touch scattered B-tree leaves. Smaller pages bound how

@@ -1000,10 +1000,25 @@ fn has_view_type(ty: &DataType) -> bool {
     }
 }
 
+fn has_dictionary_type(ty: &DataType) -> bool {
+    match ty {
+        DataType::Dictionary(_, _) => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::Map(f, _) => has_dictionary_type(f.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| has_dictionary_type(f.data_type())),
+        _ => false,
+    }
+}
+
 struct SnapshotWriter {
     prefix: Key,
     schema: Arc<Schema>,
     has_view: bool,
+    has_dictionary: bool,
     writer: StreamWriter<Vec<u8>>,
     blocks: Vec<Block>,
     uploads: futures::stream::FuturesOrdered<futures::future::BoxFuture<'static, Result<Block>>>,
@@ -1053,11 +1068,16 @@ impl SnapshotWriter {
             .fields()
             .iter()
             .any(|field| has_view_type(field.data_type()));
+        let has_dictionary = schema
+            .fields()
+            .iter()
+            .any(|field| has_dictionary_type(field.data_type()));
         Ok(Self {
             filter_prefix: prefix.clone().join("filter-columns"),
             prefix,
             writer: Self::writer(&schema)?,
             has_view,
+            has_dictionary,
             schema,
             blocks: Vec::new(),
             uploads: Default::default(),
@@ -1100,15 +1120,17 @@ impl SnapshotWriter {
             let slice = loop {
                 let mut slice = batch.slice(offset, count);
                 if self.has_view {
-                    // Compact sliced view arrays so Arrow IPC does not rewrite the
-                    // parent batch's entire variadic data buffers into every block.
+                    // Compact sliced view arrays (including nested views) so Arrow IPC
+                    // does not rewrite the parent batch's variadic buffers into every block.
                     let arrays = slice
                         .columns()
                         .iter()
                         .map(|col| super::compact_view(Arc::clone(col)))
                         .collect::<Vec<_>>();
                     slice = RecordBatch::try_new(slice.schema(), arrays)?;
-                } else {
+                } else if !self.has_dictionary {
+                    // Dictionary slices emit the entire DictionaryBatch in Arrow IPC, so
+                    // always run the probe path when dictionaries are present.
                     let slice_bytes: usize = slice
                         .columns()
                         .iter()

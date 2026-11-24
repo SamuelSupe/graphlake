@@ -39,6 +39,7 @@ pub(super) struct Worker {
     probes: Semaphore,
     pub(super) stage_slots: Arc<Semaphore>,
     pub(super) admission: Arc<crate::engine::Admission>,
+    probe_admission: Arc<crate::engine::Admission>,
     pub(super) shutdown: CancellationToken,
     pub(super) arc_cache: super::csr::ArcBlocks,
     active_jobs: Arc<AtomicUsize>,
@@ -116,6 +117,14 @@ pub(super) fn router(
                 spill_bytes: (slots + remote) as u64 * QueryOptions::default().spill_bytes,
             })
             .expect("validated worker capacity"),
+        ),
+        probe_admission: Arc::new(
+            crate::engine::Admission::new(crate::EngineLimits {
+                max_queries: 2,
+                memory_bytes: 2 * super::super::ops::MODEL_PROBE_MEMORY_BYTES,
+                spill_bytes: 0,
+            })
+            .expect("validated worker probe capacity"),
         ),
         shutdown: shutdown.clone(),
         arc_cache: Default::default(),
@@ -214,7 +223,7 @@ async fn readiness(
                 .await
                 .map_err(error)?,
         );
-        SourceProbe::run(engine, options, &worker.admission).await
+        SourceProbe::run(engine, options, &worker.probe_admission).await
     })
     .await
     .map_err(|_| unavailable())??;
@@ -447,7 +456,11 @@ impl Worker {
     ) {
         let mut publication = self.publish_result(id, job, state).await;
         drop(slot);
+        let abandon_ms = job.deadline_ms.saturating_add(super::RESULT_TTL * 1000);
         while publication == Publication::Unknown {
+            if now_ms() >= abandon_ms {
+                return;
+            }
             // The Coordinator may need the original request to retry this attempt.
             // Leave both artifacts available until etcd resolves the outcome.
             tokio::select! {
@@ -778,6 +791,9 @@ mod tests {
             probes: Semaphore::new(0),
             stage_slots: Arc::new(Semaphore::new(0)),
             admission: Arc::new(crate::engine::Admission::new(
+                crate::EngineLimits::default(),
+            )?),
+            probe_admission: Arc::new(crate::engine::Admission::new(
                 crate::EngineLimits::default(),
             )?),
             shutdown: CancellationToken::new(),

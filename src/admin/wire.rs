@@ -42,7 +42,7 @@ pub(super) struct Access {
 }
 
 impl Access {
-    pub(super) fn load(models: &Models, model: String) -> Result<Self> {
+    pub(super) fn load(models: &Models, model: String, spill_bytes: u64) -> Result<Self> {
         ensure!(
             models.has_driver_model(&model).unwrap_or(false),
             "--driver-model must name a model with version history"
@@ -52,9 +52,7 @@ impl Access {
             sockets: tokio::sync::Semaphore::new(16),
             pending_sockets: Arc::new(tokio::sync::Semaphore::new(16)),
             expedited_socket: Arc::new(tokio::sync::Semaphore::new(1)),
-            bolt_spill: Arc::new(tokio::sync::Semaphore::new(
-                crate::QueryOptions::default().spill_bytes as usize,
-            )),
+            bolt_spill: Arc::new(tokio::sync::Semaphore::new(spill_bytes as usize)),
         })
     }
 }
@@ -562,6 +560,14 @@ fn value_at(
                 .iter()
                 .zip(v.columns())
                 .map(|(field, col)| {
+                    *remaining = remaining
+                        .checked_sub(
+                            field
+                                .name()
+                                .len()
+                                .saturating_add(std::mem::size_of::<String>()),
+                        )
+                        .ok_or_else(result_limit)?;
                     Ok((
                         field.name().clone(),
                         value_at(col, 0, depth + 1, false, remaining)?,
@@ -593,7 +599,11 @@ fn value_at(
                 &Default::default(),
             )
             .map_err(|_| Error::invalid("result_type", "Unsupported driver result type"))?;
-            BoltValue::String(formatter.value(row).to_string())
+            let text = formatter.value(row).to_string();
+            *remaining = remaining
+                .checked_sub(text.len())
+                .ok_or_else(result_limit)?;
+            BoltValue::String(text)
         }
     })
 }

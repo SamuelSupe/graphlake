@@ -158,9 +158,16 @@ impl HigherOrderUDFImpl for Reduce {
         else {
             return exec_err!("invalid reduce() arguments");
         };
-        let lists = lists.to_array(args.number_rows)?;
+        let lists_scalar = matches!(lists, ColumnarValue::Scalar(_));
+        let lists = match lists {
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(1)?,
+            ColumnarValue::Array(array) => Arc::clone(array),
+        };
         let ty = args.return_type();
-        if lists.data_type().is_null() || lists.null_count() == args.number_rows {
+        if lists.data_type().is_null()
+            || (lists_scalar && lists.is_null(0))
+            || (!lists_scalar && lists.null_count() == args.number_rows)
+        {
             return Ok(ColumnarValue::Array(new_null_array(ty, args.number_rows)));
         }
         let elements = match lists.data_type() {
@@ -171,16 +178,28 @@ impl HigherOrderUDFImpl for Reduce {
             }
             _ => return exec_err!("reduce() expects a list"),
         };
-        let initial = initial.to_array(args.number_rows)?;
+        let initial_scalar = matches!(initial, ColumnarValue::Scalar(_));
+        let initial = match initial {
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(1)?,
+            ColumnarValue::Array(array) => Arc::clone(array),
+        };
         let reservation =
             MemoryConsumer::new("GraphLake reduce()").register(&self.runtime.memory_pool);
         let mut output = Vec::with_capacity(args.number_rows);
         let mut bytes = 0usize;
         for row in 0..args.number_rows {
+            if self.cancelled.is_cancelled() {
+                return exec_err!("query cancelled");
+            }
+            if tokio::time::Instant::now() >= self.deadline {
+                return exec_err!("query deadline exceeded");
+            }
+            let list_row = if lists_scalar { 0 } else { row };
+            let init_row = if initial_scalar { 0 } else { row };
             let mut value = new_null_array(ty, 1);
-            if lists.is_valid(row) {
-                let items = elements(lists.as_ref(), row);
-                value = fit(initial.slice(row, 1), ty)?;
+            if lists.is_valid(list_row) {
+                let items = elements(lists.as_ref(), list_row);
+                value = fit(initial.slice(init_row, 1), ty)?;
                 for index in 0..items.len() {
                     if self.cancelled.is_cancelled() {
                         return exec_err!("query cancelled");

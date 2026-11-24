@@ -1,6 +1,14 @@
 use crate::source::SourceConsistency;
 
-use std::{collections::HashMap, fmt, io::Cursor, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    io::Cursor,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+use sha2::{Digest, Sha256};
 
 use anyhow::{Context, Result, ensure};
 use arrow_array_58::RecordBatch as IcebergBatch;
@@ -37,13 +45,24 @@ use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use super::{ReadStats, SourceVersion};
 use crate::{Comparison, Predicate as ReadPredicate};
 
+type CachedCatalog = (
+    [u8; 32],
+    Option<tokio::runtime::Id>,
+    Instant,
+    Arc<RestCatalog>,
+);
+
 pub(crate) async fn catalog(
     name: &str,
     uri: &str,
     warehouse: Option<&str>,
     token_env: Option<&str>,
-) -> Result<RestCatalog> {
-    let mut props = HashMap::from([("uri".into(), uri.into())]);
+) -> Result<Arc<RestCatalog>> {
+    static CATALOGS: OnceLock<Mutex<VecDeque<CachedCatalog>>> = OnceLock::new();
+    const CACHE_TTL: Duration = Duration::from_secs(300);
+    const CACHE_LIMIT: usize = 32;
+
+    let mut props: HashMap<String, String> = HashMap::from([("uri".into(), uri.into())]);
     if let Some(warehouse) = warehouse {
         props.insert("warehouse".into(), warehouse.into());
     }
@@ -67,10 +86,57 @@ pub(crate) async fn catalog(
             props.insert(property.into(), value);
         }
     }
-    Ok(RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
-        .load(name, props)
-        .await?)
+    let mut entries = props
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(name.len().to_le_bytes());
+    hasher.update(name.as_bytes());
+    for (k, v) in entries {
+        for part in [k.as_bytes(), v.as_bytes()] {
+            hasher.update(part.len().to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    let fingerprint: [u8; 32] = hasher.finalize().into();
+    let runtime = tokio::runtime::Handle::try_current().ok().map(|h| h.id());
+    {
+        let mut cache = CATALOGS.get_or_init(Mutex::default).lock().unwrap();
+        cache.retain(|(_, _, opened, _)| opened.elapsed() < CACHE_TTL);
+        if let Some(index) = cache
+            .iter()
+            .position(|(key, rt, _, _)| key == &fingerprint && *rt == runtime)
+        {
+            let entry = cache.remove(index).expect("located Iceberg catalog");
+            let client = Arc::clone(&entry.3);
+            cache.push_back(entry);
+            return Ok(client);
+        }
+    }
+    let built = Arc::new(
+        RestCatalogBuilder::default()
+            .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+            .load(name, props)
+            .await?,
+    );
+    let mut cache = CATALOGS.get_or_init(Mutex::default).lock().unwrap();
+    cache.retain(|(_, _, opened, _)| opened.elapsed() < CACHE_TTL);
+    if let Some(index) = cache
+        .iter()
+        .position(|(key, rt, _, _)| key == &fingerprint && *rt == runtime)
+    {
+        let entry = cache.remove(index).expect("located Iceberg catalog");
+        let existing = Arc::clone(&entry.3);
+        cache.push_back(entry);
+        return Ok(existing);
+    }
+    if cache.len() >= CACHE_LIMIT {
+        cache.pop_front();
+    }
+    cache.push_back((fingerprint, runtime, Instant::now(), Arc::clone(&built)));
+    Ok(built)
 }
 
 #[derive(Clone)]

@@ -72,7 +72,7 @@ pub(super) async fn write(
         } else {
             bytes
         })?;
-        tokio::task::block_in_place(|| -> Result<()> {
+        crate::blocking(|| -> Result<()> {
             let mut save = |bucket: usize,
                             batch: datafusion::arrow::array::RecordBatch|
              -> datafusion::common::Result<()> {
@@ -115,7 +115,7 @@ pub(super) async fn write(
     };
     for (index, bucket) in buckets.into_iter().enumerate() {
         let Some(bucket) = bucket else { continue };
-        let file = tokio::task::block_in_place(|| -> Result<_> {
+        let file = crate::blocking(|| -> Result<_> {
             bucket.writer.into_inner()?.finish()?;
             Ok(bucket.file)
         })?;
@@ -145,6 +145,7 @@ pub(super) fn read(
     let expected_schema = Arc::clone(&schema);
     let stream = async_stream::try_stream! {
         let reservation = MemoryConsumer::new("GraphLake shuffle decode").register(&pool);
+        let batch_reservation = MemoryConsumer::new("GraphLake shuffle batch").register(&pool);
         for (task, bucket, expected_length) in files {
             let key = cluster.key(task, &format!("bucket-{bucket}.arrow"));
             let object = cluster.shared.objects.get(&key).await.map_err(super::plan::external)?;
@@ -155,7 +156,10 @@ pub(super) fn read(
             let mut decoder = StreamDecoder::new();
             let mut received = 0_u64;
             while let Some(chunk) = bytes.try_next().await.map_err(super::plan::external)? {
-                received += chunk.len() as u64;
+                received = received.saturating_add(chunk.len() as u64);
+                if received > expected_length {
+                    Err(super::plan::external(anyhow::anyhow!("shuffle file exceeded expected length")))?;
+                }
                 reservation.try_resize(chunk.len())?;
                 let mut buffer = Buffer::from(chunk);
                 while !buffer.is_empty() {
@@ -164,7 +168,9 @@ pub(super) fn read(
                         if batch.schema() != expected_schema {
                             Err(datafusion::common::DataFusionError::Execution("shuffle schema mismatch".into()))?;
                         }
+                        batch_reservation.try_resize(crate::source::snapshot::ipc_batch_bytes(&batch))?;
                         yield batch;
+                        batch_reservation.free();
                     }
                 }
                 reservation.free();

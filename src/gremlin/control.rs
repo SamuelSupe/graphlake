@@ -560,7 +560,9 @@ impl Traversers<'_> {
                     "repeat() is limited to 256 iterations"
                 );
                 let rounds = if before { times } else { times.max(1) };
-                if emit.is_none() && !traversal_contains(&body, depth + 1, barrier)? {
+                if emit.is_none() && rounds == 0 {
+                    Ok(())
+                } else if emit.is_none() && !traversal_contains(&body, depth + 1, barrier)? {
                     for _ in 0..rounds {
                         self.apply(&body, depth + 1)?;
                     }
@@ -707,6 +709,7 @@ impl Traversers<'_> {
         self.labels.append(&mut step.labels);
         self.next_column = self.next_column.max(step.next_column);
         work.adopt(kinds.clone(), tags.clone());
+        let initial_kinds = self.kinds();
         self.adopt(kinds.clone(), tags.clone());
         let mut terminal = Vec::new();
         let (mut checked, mut checked_nested) = match end {
@@ -719,7 +722,11 @@ impl Traversers<'_> {
                 Vec::new(),
             ),
             LoopEnd::Times(rounds) => {
-                terminal = step.kinds();
+                terminal = if rounds == 0 {
+                    initial_kinds
+                } else {
+                    step.kinds()
+                };
                 let (round, _) = tracked.as_ref().expect("round counter");
                 (
                     format!(

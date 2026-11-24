@@ -374,7 +374,7 @@ pub(super) async fn call(
             };
             let request = parse(
                 json!({"request_id":uuid::Uuid::new_v4().to_string(),"model_revision":revision,"language":arg.language,"query":arg.query,
-                "parameters_json":arg.parameters.map(|value| Value::Object(value).to_string()),"timeout_ms":timeout,"csr_generation":arg.csr_generation,"freshness":arg.freshness}),
+                "parameters_json":arg.parameters.map(|value| Value::Object(value).to_string()),"timeout_ms":timeout,"csr_generation":arg.csr_generation,"freshness":arg.freshness,"preview_without_arrow":true}),
             )?;
             let response = query::run(state, Path(arg.model), actor, Json(request)).await?;
             let status = response.status();

@@ -410,12 +410,12 @@ fn range_bytes(args: &[ColumnarValue], row: usize, inclusive: bool) -> Result<us
         let mut long = i128::from(months) * 31 * DAY + fixed;
         let date = matches!(start.data_type(), DataType::Date32 | DataType::Date64);
         if date {
-            short = short.div_euclid(DAY) * DAY;
-            long = long.div_euclid(DAY) * DAY;
+            // Truncate sub-day nanos toward zero so e.g. `1 month - 1 day` (+27..+30 days)
+            // remains strictly monotonic instead of failing on mixed component signs.
+            short = (short / DAY) * DAY;
+            long = (long / DAY) * DAY;
         }
-        let descending_date = date && (months < 0 || days < 0);
-        if short == 0 || short.signum() != long.signum() || (date && (short < 0) != descending_date)
-        {
+        if short == 0 || short.signum() != long.signum() {
             return exec_err!("range step must advance monotonically");
         }
         let step = short.abs().min(long.abs());
@@ -499,24 +499,18 @@ fn row_bytes(
             };
             item_bytes(0)?.saturating_add(count().saturating_mul(fill))
         }
-        "array_concat" | "array_cat" | "list_concat" | "list_cat" => {
-            let mut total = 0usize;
-            for i in 0..args.len() {
-                total = total.saturating_add(item_bytes(i)?);
-            }
-            total
-        }
         "range" | "generate_series" | "__graphlake_cypher_range" => {
             range_bytes(args, row, name != "range")?
         }
         _ => unreachable!("only registered expanding functions use the allocation guard"),
     };
-    // Builders may broadcast scalar inputs into a batch before allocating output.
+    // Builders may broadcast scalar inputs (including lists/structs) into a batch
+    // before allocating output.
     let input = args
         .iter()
-        .filter(|arg| matches!(arg, ColumnarValue::Scalar(_)))
-        .fold(0usize, |total, arg| {
-            total.saturating_add(text(arg, row).map_or(0, str::len))
+        .enumerate()
+        .fold(0usize, |total, (i, _)| {
+            total.saturating_add(scalar_sizes[i].unwrap_or(0))
         });
     Ok(bytes.saturating_add(input).saturating_add(16))
 }
@@ -551,6 +545,19 @@ mod tests {
             expanded >= 32 * 4096,
             "Dictionary(_, Utf8View) must account for out-of-line bytes: {expanded}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn range_bytes_allows_mixed_sign_monotonic_date_intervals() -> Result<()> {
+        let interval = IntervalMonthDayNanoType::make_value(1, -1, 0);
+        let args = [
+            ColumnarValue::Scalar(ScalarValue::Date32(Some(0))),
+            ColumnarValue::Scalar(ScalarValue::Date32(Some(365))),
+            ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(interval))),
+        ];
+        let bytes = range_bytes(&args, 0, true)?;
+        assert!(bytes > 0 && bytes < 10_000, "unexpected bytes: {bytes}");
         Ok(())
     }
 }

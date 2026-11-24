@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -48,7 +48,9 @@ pub(crate) struct Snapshot {
     driver: Option<JoinHandle<()>>,
     tls: MakeRustlsConnect,
     next_cursor: AtomicU64,
+    in_flight: AtomicUsize,
     interrupted: AtomicBool,
+    cancelled: crate::CancellationToken,
     stats: Arc<ReadStats>,
     pub(crate) version: String,
     #[cfg(feature = "admin")]
@@ -56,27 +58,39 @@ pub(crate) struct Snapshot {
 }
 
 struct ActiveRequest<'a> {
+    in_flight: &'a AtomicUsize,
     interrupted: &'a AtomicBool,
     active: bool,
 }
 
 impl ActiveRequest<'_> {
     fn finish(&mut self) {
-        self.active = false;
+        if self.active {
+            self.active = false;
+            // PostgreSQL executes statements strictly serially on a single connection;
+            // once the last in-flight request completes, any earlier dropped statement
+            // has already finished draining on the backend.
+            if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.interrupted.store(false, Ordering::Release);
+            }
+        }
     }
 }
 
 impl Drop for ActiveRequest<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.interrupted.store(true, Ordering::Relaxed);
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.interrupted.store(true, Ordering::Release);
         }
     }
 }
 
 impl Snapshot {
     fn active_request(&self) -> ActiveRequest<'_> {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
         ActiveRequest {
+            in_flight: &self.in_flight,
             interrupted: &self.interrupted,
             active: true,
         }
@@ -344,10 +358,20 @@ impl Snapshot {
             .collect())
     }
 
+    #[cfg(feature = "admin")]
     pub(crate) async fn open(
         dsn_env: &str,
         timeout: Duration,
         stats: Arc<ReadStats>,
+    ) -> Result<Self> {
+        Self::open_with_cancellation(dsn_env, timeout, stats, crate::CancellationToken::new()).await
+    }
+
+    pub(crate) async fn open_with_cancellation(
+        dsn_env: &str,
+        timeout: Duration,
+        stats: Arc<ReadStats>,
+        cancelled: crate::CancellationToken,
     ) -> Result<Self> {
         let dsn = std::env::var(dsn_env)
             .with_context(|| format!("missing PostgreSQL DSN in {dsn_env}"))?;
@@ -414,7 +438,9 @@ impl Snapshot {
             tls,
             stats,
             next_cursor: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
             interrupted: AtomicBool::new(false),
+            cancelled,
             version: String::new(),
             #[cfg(feature = "admin")]
             exploration_snapshot: None,
@@ -670,6 +696,23 @@ impl PgTable {
                 Ok(None)
             }
             Native::Aggregate { function, column } => {
+                // Special PostgreSQL values (NaN / +-infinity) in NUMERIC, DATE,
+                // TIMESTAMP, and TIMESTAMPTZ satisfy SQL comparisons/COUNT directly in
+                // PostgreSQL without being decoded to Arrow. Refuse aggregate pushdown
+                // whenever the target column or any filter column uses those types.
+                let is_special = |name: &str| {
+                    self.schema.index_of(name).ok().is_some_and(|index| {
+                        matches!(
+                            self.types[index],
+                            Type::NUMERIC | Type::DATE | Type::TIMESTAMP | Type::TIMESTAMPTZ
+                        )
+                    })
+                };
+                if column.as_deref().is_some_and(is_special)
+                    || operation.filters.iter().any(|f| is_special(&f.column))
+                {
+                    return Ok(None);
+                }
                 let (function, data_type) = match function {
                     Aggregate::Count => ("COUNT", DataType::Int64),
                     Aggregate::Min | Aggregate::Max if column.as_deref().is_some_and(integer) => (
@@ -1036,8 +1079,13 @@ impl Drop for CursorCleanup {
             return;
         }
         let name = std::mem::take(&mut self.name);
-        let interrupted = snapshot.interrupted.swap(false, Ordering::AcqRel);
-        let cancel = interrupted.then(|| (snapshot.client.cancel_token(), snapshot.tls.clone()));
+        // Never cancel a shared REPEATABLE READ transaction for operator-local early
+        // stop (e.g. LIMIT or UNION ALL short-circuit), because PostgreSQL CancelRequest
+        // aborts the entire transaction block and kills sibling cursors / Bolt ReadTransactions.
+        // Only send cancel_query while shared if the query's own CancellationToken fired.
+        let cancel = (snapshot.cancelled.is_cancelled()
+            && snapshot.interrupted.swap(false, Ordering::AcqRel))
+        .then(|| (snapshot.client.cancel_token(), snapshot.tls.clone()));
         let weak = Arc::downgrade(&snapshot);
         drop(snapshot);
         runtime.spawn(async move {

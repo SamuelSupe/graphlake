@@ -102,9 +102,11 @@ async fn read(
     let mut listing = Listing::default();
     let stats = Arc::new(ReadStats::default());
     let timeout = app.options.timeout;
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_limit(app.options.memory_bytes, 1.0)
-        .build()?;
+    let runtime = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_limit(app.options.memory_bytes, 1.0)
+            .build()?,
+    );
     let pool: &Arc<dyn MemoryPool> = &runtime.memory_pool;
     let disk = &runtime.disk_manager;
     let size = app.options.batch_size;
@@ -127,7 +129,7 @@ async fn read(
             let mut driver = Box::pin(crate::source::direct::Driver::open(
                 source,
                 timeout,
-                Arc::new(runtime),
+                Arc::clone(&runtime),
                 stats,
                 1,
             ))
@@ -233,7 +235,7 @@ async fn read(
                             None,
                             false,
                             false,
-                            &Arc::new(runtime),
+                            &runtime,
                             size,
                             true,
                         )
@@ -322,7 +324,10 @@ async fn read(
         }
         Source::Delta { tables } => {
             if let Some(name) = relation {
-                let session = datafusion::prelude::SessionContext::new();
+                let session = datafusion::prelude::SessionContext::new_with_config_rt(
+                    datafusion::prelude::SessionConfig::new().with_batch_size(size),
+                    Arc::clone(&runtime),
+                );
                 provider = Some(
                     crate::source::delta::open(&tables[name], &session, &stats)
                         .await?
@@ -451,7 +456,10 @@ async fn read(
                         .0,
                 );
             } else {
-                let context = datafusion::prelude::SessionContext::new();
+                let context = datafusion::prelude::SessionContext::new_with_config_rt(
+                    datafusion::prelude::SessionConfig::new().with_batch_size(size),
+                    Arc::clone(&runtime),
+                );
                 let names = session
                     .browse(request.schema.as_deref(), &context, disk)
                     .await?;

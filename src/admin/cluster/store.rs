@@ -120,7 +120,7 @@ impl Metadata {
         let response = self
             .request(path, &body, retry, Duration::from_millis(timeout))
             .await;
-        if read_only
+        if retry
             && response.as_ref().is_err_and(|error| {
                 error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
                     error.is_timeout()
@@ -132,7 +132,8 @@ impl Metadata {
             })
         {
             // A brief election or an overloaded quorum can outlast the fast
-            // failover pass. Retrying only reads cannot duplicate a mutation.
+            // failover pass. Retrying reads and idempotent lease grants cannot
+            // duplicate a mutation.
             self.request(path, &body, true, Duration::from_secs(2))
                 .await
         } else {
@@ -310,14 +311,22 @@ impl Metadata {
                 granted
             }
         };
-        self.write(
-            id,
-            job,
-            json!({"target":"CREATE","create_revision":"0"}),
-            json!({"lease":lease}),
-            leader,
-        )
-        .await
+        let result = self
+            .write(
+                id,
+                job,
+                json!({"target":"CREATE","create_revision":"0"}),
+                json!({"lease":lease.clone()}),
+                leader,
+            )
+            .await;
+        if result.is_err() {
+            let mut slot = self.query_lease.lock().await;
+            if slot.as_ref().is_some_and(|(_, _, current)| current == &lease) {
+                *slot = None;
+            }
+        }
+        result
     }
 
     pub(in crate::admin::cluster) async fn replace(
@@ -514,6 +523,24 @@ impl Objects {
         }
     }
 
+    pub async fn delete_local_batch(&self, keys: Vec<Key>) -> Result<usize> {
+        use futures::StreamExt;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let stream = futures::stream::iter(keys.into_iter().map(Ok)).boxed();
+        let mut deleted = self.store.delete_stream(stream);
+        let mut count = 0usize;
+        while let Some(result) = deleted.next().await {
+            match result {
+                Ok(_) => count += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(count)
+    }
+
     pub fn remote(&self) -> bool {
         self.remote
     }
@@ -684,6 +711,16 @@ impl Objects {
         Ok(self.store.get(key).await?)
     }
 
+    pub(super) async fn head_arrow(&self, key: &Key) -> super::ApiResult<object_store::ObjectMeta> {
+        tokio::time::timeout(
+            crate::admin::query::download::DOWNLOAD_IDLE_TIMEOUT,
+            self.arrow_store.head(key),
+        )
+        .await
+        .map_err(|_| super::timeout())?
+        .map_err(super::storage)
+    }
+
     pub(super) async fn get_arrow(&self, key: &Key) -> super::ApiResult<object_store::GetResult> {
         tokio::time::timeout(
             crate::admin::query::download::DOWNLOAD_IDLE_TIMEOUT,
@@ -793,20 +830,51 @@ impl Objects {
             .await;
     }
 
-    pub async fn expire_results(&self) -> Result<()> {
-        use futures::{StreamExt, TryStreamExt};
+    pub(in crate::admin) async fn expire_results(
+        &self,
+        leader: Option<&super::control::Leadership>,
+    ) -> Result<()> {
+        use futures::TryStreamExt;
+        if let Some(leader) = leader {
+            leader
+                .confirm()
+                .await
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+        }
         let prefix = self.prefix.clone().join("results");
         // Leave time for the longest accepted query and readers starting at the TTL boundary.
         let oldest =
             chrono::Utc::now() - chrono::TimeDelta::seconds((super::RESULT_TTL + 120) as i64);
-        let objects = self
-            .store
-            .list(Some(&prefix))
-            .try_filter_map(move |meta| async move {
-                Ok((meta.last_modified < oldest).then_some(meta.location))
-            });
-        let mut deleted = self.store.delete_stream(objects.boxed());
-        while deleted.try_next().await?.is_some() {}
+        let mut listing = self.store.list(Some(&prefix));
+        let mut batch = Vec::with_capacity(64);
+        while let Some(meta) = listing.try_next().await? {
+            if let Some(leader) = leader {
+                leader
+                    .admission()
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+            }
+            if meta.last_modified < oldest {
+                batch.push(meta.location);
+                if batch.len() >= 64 {
+                    if let Some(leader) = leader {
+                        leader
+                            .confirm()
+                            .await
+                            .map_err(|error| anyhow::anyhow!(error.message))?;
+                    }
+                    self.delete_local_batch(std::mem::take(&mut batch)).await?;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            if let Some(leader) = leader {
+                leader
+                    .confirm()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+            }
+            self.delete_local_batch(batch).await?;
+        }
         Ok(())
     }
 }
@@ -861,6 +929,37 @@ mod tests {
         let result = metadata.call("/v3/kv/range", json!({"key":"YQ=="})).await;
         server.abort();
         assert_eq!(result?["header"]["revision"], "3");
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lease_grant_retries_when_the_fast_etcd_pass_times_out() -> Result<()> {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let router = Router::new().route(
+            "/v3/lease/grant",
+            post(move || {
+                let count = seen.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if count < 2 {
+                        tokio::time::sleep(Duration::from_millis(450)).await;
+                    }
+                    Json(json!({"ID":"42","TTL":"60"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?).parse::<url::Url>()?;
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let metadata = Metadata::new(
+            reqwest::Client::new(),
+            vec![endpoint.clone(), endpoint],
+            "test",
+        );
+        let result = metadata.call("/v3/lease/grant", json!({"TTL":"60"})).await;
+        server.abort();
+        assert_eq!(result?["ID"], "42");
         assert_eq!(requests.load(Ordering::Relaxed), 3);
         Ok(())
     }

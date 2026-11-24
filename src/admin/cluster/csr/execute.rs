@@ -1019,15 +1019,21 @@ impl<'a> Execution<'a> {
         let peers = &self.worker.workers;
         for offset in 0..peers.len() {
             let index = (route + offset) % peers.len();
-            if self.unavailable.lock().unwrap().contains(&index) {
-                continue;
-            }
+            let remaining_available = {
+                let unavailable = self.unavailable.lock().unwrap();
+                if unavailable.contains(&index) {
+                    continue;
+                }
+                (offset..peers.len())
+                    .filter(|step| !unavailable.contains(&((route + step) % peers.len())))
+                    .count()
+            };
             let endpoint = &peers[index];
             let output = Uuid::new_v4();
-            // Give healthy peers a realistic share of the remaining budget (never
-            // dividing by all 32 peers) so normal shard work does not cascade-timeout.
+            // Divide remaining budget only across remaining *available* peers
+            // (plus local fallback), capped at 3 so skewed shards keep realistic time.
             let remaining = self.graph.scope.remaining()?;
-            let attempts = u32::try_from((peers.len() - offset + 1).min(3)).unwrap_or(3);
+            let attempts = u32::try_from((remaining_available + 1).min(3)).unwrap_or(3);
             let attempt = remaining / attempts.max(1);
             let millis = attempt.as_millis();
             if millis == 0 {
@@ -1090,7 +1096,7 @@ impl<'a> Execution<'a> {
                 continue;
             } else if response
                 .as_ref()
-                .is_err_and(|error| error.is_connect() || error.is_timeout())
+                .is_err_and(|error| error.is_connect())
                 || response
                     .as_ref()
                     .is_ok_and(|r| r.status() == StatusCode::BAD_GATEWAY)

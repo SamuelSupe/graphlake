@@ -392,6 +392,27 @@ pub(crate) async fn route_table(
     );
     for (chunk, paths) in paths.chunks(batch_size).enumerate() {
         scope.check()?;
+        let mut chunk_bytes = paths.len().saturating_mul(64);
+        for path in paths {
+            for &id in &path.vertices {
+                let entity = &graph.vertices[id];
+                chunk_bytes = chunk_bytes
+                    .saturating_add(entity.label.len())
+                    .saturating_add(entity.key.iter().map(String::len).sum::<usize>())
+                    .saturating_add(entity.key.len().saturating_mul(4))
+                    .saturating_add(16);
+            }
+            for &id in &path.edges {
+                let entity = &graph.route_edges[id];
+                chunk_bytes = chunk_bytes
+                    .saturating_add(entity.label.len())
+                    .saturating_add(entity.key.iter().map(String::len).sum::<usize>())
+                    .saturating_add(entity.key.len().saturating_mul(4))
+                    .saturating_add(16);
+            }
+        }
+        let chunk_budget = working.new_empty();
+        chunk_budget.try_grow(chunk_bytes)?;
         let vertices = identity_lists(
             paths
                 .iter()
@@ -423,6 +444,7 @@ pub(crate) async fn route_table(
                 )),
             ],
         )?;
+        drop(chunk_budget);
         buffer.push(batch)?;
         tokio::task::yield_now().await;
     }
@@ -898,9 +920,21 @@ fn identity_field(name: &str) -> Field {
 fn identities<'a>(ids: impl Iterator<Item = &'a Identity>) -> Result<StructArray> {
     let mut labels = StringBuilder::new();
     let mut keys = ListBuilder::new(StringBuilder::new());
+    let mut label_bytes = 0usize;
+    let mut key_bytes = 0usize;
     for id in ids {
+        label_bytes = label_bytes.saturating_add(id.label.len());
+        ensure!(
+            i32::try_from(label_bytes).is_ok(),
+            "projected route output exceeds Arrow string capacity"
+        );
         labels.append_value(id.label.as_ref());
         for part in &id.key {
+            key_bytes = key_bytes.saturating_add(part.len());
+            ensure!(
+                i32::try_from(key_bytes).is_ok(),
+                "projected route output exceeds Arrow string capacity"
+            );
             keys.values().append_value(part);
         }
         keys.append(true);

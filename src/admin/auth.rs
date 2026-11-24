@@ -526,7 +526,7 @@ impl Auth {
             }
             let session = &sessions.tokens[&token];
             let idle_age = now.duration_since(session.last_used).unwrap_or_default();
-            let update = (self.shared.is_some() && touch && idle_age >= Duration::from_secs(5))
+            let update = (self.shared.is_some() && touch && idle_age >= Duration::from_secs(60))
                 .then_some(idle_age >= IDLE - Duration::from_secs(60));
             (session.principal.clone(), update)
         };
